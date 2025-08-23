@@ -77,10 +77,6 @@ png = "0.17.13"
 proptest = "1.4.0"
 trybuild = "1.0.96"
 
-[[bench]]
-name = "prefix_sum"
-harness = false
-
 # TODO: Fix bench
 # [[bench]]
 # name = "image_compression"

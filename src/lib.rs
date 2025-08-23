@@ -24,7 +24,6 @@ pub mod control_server;
 pub mod error_utils;
 pub mod fallible_entry;
 pub mod filtering;
-pub mod prefix_sum;
 pub mod prelude;
 pub mod serialization;
 pub mod server;
