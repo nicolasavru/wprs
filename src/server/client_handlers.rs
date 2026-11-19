@@ -626,14 +626,10 @@ impl WprsServerState {
             })));
 
         self.for_each_surface(|_, surface_data| {
-            let surface_state = surface_data
-                .data_map
-                .get::<LockedSurfaceState>()
-                .unwrap()
-                .0
-                .lock()
-                .unwrap()
-                .clone();
+            let Some(locked_state) = surface_data.data_map.get::<LockedSurfaceState>() else {
+                return;
+            };
+            let surface_state = locked_state.0.lock().unwrap().clone();
 
             let mut surface_state_to_send = surface_state.clone_without_buffer();
 
@@ -938,13 +934,11 @@ impl WprsServerState {
         match surface_event.payload {
             SurfaceEventPayload::OutputsChanged(outputs) => {
                 compositor::with_states(&surface, |surface_data| {
-                    let surface_state = &mut surface_data
+                    let locked_state = surface_data
                         .data_map
                         .get::<LockedSurfaceState>()
-                        .unwrap()
-                        .0
-                        .lock()
-                        .unwrap();
+                        .expect("surfaces in object_map have LockedSurfaceState");
+                    let surface_state = &mut locked_state.0.lock().unwrap();
 
                     let new_ids: HashSet<u32> =
                         HashSet::from_iter(outputs.iter().map(|output| output.id));

@@ -142,16 +142,18 @@ impl BufferHandler for WprsServerState {
 impl WprsServerState {
     fn send_toplevel_request(&self, toplevel: &ToplevelSurface, payload: ToplevelRequestPayload) {
         let surface = toplevel.wl_surface();
+        let Some(client) = surface.client() else {
+            return;
+        };
         self.serializer
             .writer()
             .send(SendType::Object(Request::Toplevel(ToplevelRequest {
-                client: serialization::ClientId::new(&surface.client().unwrap()),
+                client: serialization::ClientId::new(&client),
                 surface: (&surface.id()).into(),
                 payload,
             })))
     }
 
-    #[allow(clippy::missing_panics_doc)]
     pub fn update_state_and_send_toplevel_request<F>(
         &mut self,
         surface: &ToplevelSurface,
@@ -165,13 +167,11 @@ impl WprsServerState {
         // (e.g. if the client reconnects or a toplevel request is sent before the initial commit)
         // we also keep track of the current state.
         compositor::with_states(surface.wl_surface(), |surface_data| {
-            let surface_state = &mut surface_data
+            let locked_state = surface_data
                 .data_map
                 .get::<LockedSurfaceState>()
-                .unwrap()
-                .0
-                .lock()
-                .unwrap();
+                .expect("LockedSurfaceState inserted in new_toplevel");
+            let surface_state = &mut locked_state.0.lock().unwrap();
 
             if let Some(Role::XdgToplevel(toplevel_state)) = &mut surface_state.role {
                 toplevel_state_mutator(toplevel_state);
@@ -189,8 +189,7 @@ impl XdgShellHandler for WprsServerState {
 
     #[instrument(skip(self), level = "debug")]
     fn new_toplevel(&mut self, toplevel: ToplevelSurface) {
-        self.insert_surface(toplevel.wl_surface())
-            .log_and_ignore(loc!());
+        log_and_return!(self.insert_surface(toplevel.wl_surface()));
         compositor::with_states(toplevel.wl_surface(), |surface_data| {
             let surface_state = &mut surface_data
                 .data_map
@@ -215,14 +214,14 @@ impl XdgShellHandler for WprsServerState {
         // need to worry about destroying the toplevel,
         if toplevel.wl_surface().client().is_some() {
             compositor::with_states(toplevel.wl_surface(), |surface_data| {
-                let surface_state = &mut surface_data
+                surface_data
                     .data_map
                     .get::<LockedSurfaceState>()
-                    .unwrap()
+                    .expect("LockedSurfaceState inserted in new_toplevel")
                     .0
                     .lock()
-                    .unwrap();
-                surface_state.role = None;
+                    .unwrap()
+                    .role = None;
             });
 
             self.send_toplevel_request(&toplevel, ToplevelRequestPayload::Destroyed);
@@ -231,8 +230,7 @@ impl XdgShellHandler for WprsServerState {
 
     #[instrument(skip(self))]
     fn new_popup(&mut self, popup: PopupSurface, positioner: PositionerState) {
-        self.insert_surface(popup.wl_surface())
-            .log_and_ignore(loc!());
+        log_and_return!(self.insert_surface(popup.wl_surface()));
 
         // Uses with_states internally and with_states is not reentrant.
         let popup_state = log_and_return!(XdgPopupState::new(&popup, &positioner));
@@ -261,14 +259,14 @@ impl XdgShellHandler for WprsServerState {
         if let Some(client) = popup.wl_surface().client() {
             // Uses with_states internally and with_states is not reentrant.
             compositor::with_states(popup.wl_surface(), |surface_data| {
-                let surface_state = &mut surface_data
+                surface_data
                     .data_map
                     .get::<LockedSurfaceState>()
-                    .unwrap()
+                    .expect("LockedSurfaceState inserted in new_popup")
                     .0
                     .lock()
-                    .unwrap();
-                surface_state.role = None;
+                    .unwrap()
+                    .role = None;
             });
 
             self.serializer
@@ -380,13 +378,11 @@ impl XdgShellHandler for WprsServerState {
         let surface = popup.wl_surface();
         let xdg_positioner = XdgPositioner::new(&positioner);
         compositor::with_states(surface, |surface_data| {
-            let surface_state = &mut surface_data
+            let locked_state = surface_data
                 .data_map
                 .get::<LockedSurfaceState>()
-                .unwrap()
-                .0
-                .lock()
-                .unwrap();
+                .expect("LockedSurfaceState inserted in new_popup");
+            let surface_state = &mut locked_state.0.lock().unwrap();
 
             if let Some(Role::XdgPopup(popup_state)) = &mut surface_state.role {
                 popup_state.positioner = xdg_positioner;
@@ -640,7 +636,7 @@ pub fn commit(
     let sync = compositor::is_sync_subsurface(surface);
     let parent = compositor::get_parent(surface);
 
-    state.insert_surface(surface).log_and_ignore(loc!());
+    state.insert_surface(surface).location(loc!())?;
 
     let dirty = compositor::with_states(surface, |surface_data| {
         commit_impl(
@@ -980,13 +976,10 @@ impl SeatHandler for WprsServerState {
 impl WprsServerState {
     fn set_decoration_mode(&self, surface: &WlSurface, mode: Option<DecorationMode>) {
         compositor::with_states(surface, |surface_data| {
-            let surface_state = &mut surface_data
-                .data_map
-                .get::<LockedSurfaceState>()
-                .unwrap()
-                .0
-                .lock()
-                .unwrap();
+            let Some(locked_state) = surface_data.data_map.get::<LockedSurfaceState>() else {
+                return;
+            };
+            let surface_state = &mut locked_state.0.lock().unwrap();
 
             // even though the kde server decoration protocol can send decorations for any surface, only send them
             // for XdgTopLevel since that's what wprs currently expects

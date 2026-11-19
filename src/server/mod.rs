@@ -173,15 +173,19 @@ impl WprsServerState {
         }
     }
 
+    /// Inserts `surface` into `object_map` and initializes its
+    /// `LockedSurfaceState` (every surface in `object_map` has
+    /// `LockedSurfaceState`).
     #[instrument(skip(self), level = "debug")]
     pub fn insert_surface(&mut self, surface: &WlSurface) -> Result<()> {
+        let initial_state = SurfaceState::new(surface, None).location(loc!())?;
         self.object_map
             .insert(WlSurfaceId::new(surface), surface.id());
 
         let newly_inserted = compositor::with_states(surface, |surface_data| {
-            surface_data.data_map.insert_if_missing_threadsafe(|| {
-                LockedSurfaceState(Mutex::new(SurfaceState::new(surface, None).unwrap()))
-            })
+            surface_data
+                .data_map
+                .insert_if_missing_threadsafe(|| LockedSurfaceState(Mutex::new(initial_state)))
         });
         // TODO: https://github.com/Smithay/smithay/issues/538 - move into block
         // above.
