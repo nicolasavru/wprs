@@ -37,7 +37,6 @@ use std::arch::aarch64::vdupq_laneq_u8;
 use std::arch::aarch64::vdupq_n_u8;
 use std::arch::aarch64::vdupq_n_u32;
 use std::arch::aarch64::vextq_u8;
-use std::arch::aarch64::vgetq_lane_u8;
 use std::arch::aarch64::vld1q_u8;
 use std::arch::aarch64::vld4q_u8;
 use std::arch::aarch64::vmaxvq_u8;
@@ -170,11 +169,8 @@ fn soa_to_aos_u8_32x4<const CONST_ALPHA: bool>(
     input3: &[u8; 32],
     const_alpha: u8,
     out: &mut [Vec4u8; 32],
-    prev0: uint8x16_t,
-    prev1: uint8x16_t,
-    prev2: uint8x16_t,
-    mut prev3: uint8x16_t,
-) -> (uint8x16_t, uint8x16_t, uint8x16_t, uint8x16_t) {
+    (prev0, prev1, prev2, mut prev3): Carry4,
+) -> Carry4 {
     // SAFETY: vld1q_u8 reads 16 bytes per half; vst4q_u8 writes 64 bytes × 2.
     unsafe {
         let ch0_lo = vld1q_u8(input0.as_ptr());
@@ -236,7 +232,7 @@ pub(super) struct Kernel;
 
 impl FilterKernel for Kernel {
     type ForwardCarry = Carry4;
-    type InverseCarry = uint8x16_t;
+    type InverseCarry = Carry4;
     const STREAM_ALIGN: usize = 1;
 
     #[inline]
@@ -286,15 +282,6 @@ impl FilterKernel for Kernel {
     }
 
     #[inline]
-    fn advance_inverse_carry(carry: uint8x16_t, delta: u8) -> (uint8x16_t, u8) {
-        // SAFETY: register-to-register NEON; see module doc on #[target_feature].
-        unsafe {
-            let next = vaddq_u8(carry, vdupq_n_u8(delta));
-            (next, vgetq_lane_u8::<0>(next))
-        }
-    }
-
-    #[inline]
     unsafe fn splat_blocks<const STREAM: bool>(out_blocks: &mut [[Vec4u8; 32]], pixel: Vec4u8) {
         // SAFETY: each `out` has size `32 * 4 == 128` bytes, so the eight
         // 16-byte `vst1q_u8` stores cover `0..128` in bounds.
@@ -323,9 +310,9 @@ impl FilterKernel for Kernel {
         in3: &[u8; 32],
         const_alpha: u8,
         out: &mut [Vec4u8; 32],
-        (p0, p1, p2, p3): Carry4,
+        prev: Carry4,
     ) -> Carry4 {
-        soa_to_aos_u8_32x4::<CONST_ALPHA>(in0, in1, in2, in3, const_alpha, out, p0, p1, p2, p3)
+        soa_to_aos_u8_32x4::<CONST_ALPHA>(in0, in1, in2, in3, const_alpha, out, prev)
     }
 
     #[inline]

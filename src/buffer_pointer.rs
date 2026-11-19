@@ -13,7 +13,6 @@
 // limitations under the License.
 
 use std::array;
-use std::cmp;
 use std::iter::FusedIterator;
 use std::marker::PhantomData;
 use std::mem;
@@ -137,14 +136,6 @@ impl<'a, T: 'a + Copy> BufferPointer<'a, T> {
         }
     }
 
-    /// # Panics
-    /// If chunk_size == 0.
-    #[inline]
-    pub fn chunks(self, chunk_size: usize) -> Chunks<'a, T> {
-        assert!(chunk_size != 0);
-        Chunks::new(self, chunk_size)
-    }
-
     #[inline]
     pub fn array_chunks<const N: usize>(self) -> ArrayChunks<'a, T, N> {
         ArrayChunks::new(self)
@@ -175,8 +166,10 @@ impl<'a, T: 'a + Copy> BufferPointer<'a, T> {
 }
 
 // SAFETY: `BufferPointer` provides read-only copy access to `T` values across
-// threads, requiring `T: Send + Sync` in addition to `Copy`.
+// threads, requiring `T: Send + Sync` in addition to `Copy`. `Sync` allows
+// `WorkerPool` to share `&BufferPointer` across worker threads.
 unsafe impl<'a, T: 'a + Copy + Send + Sync> Send for BufferPointer<'a, T> {}
+unsafe impl<'a, T: 'a + Copy + Send + Sync> Sync for BufferPointer<'a, T> {}
 
 impl<'a, T: 'a + Copy> IntoIterator for &'a BufferPointer<'a, T> {
     type Item = T;
@@ -221,46 +214,6 @@ impl<T: Copy> Iterator for BufferPointerIter<'_, T> {
 
 impl<T: Copy> ExactSizeIterator for BufferPointerIter<'_, T> {}
 impl<T: Copy> FusedIterator for BufferPointerIter<'_, T> {}
-
-#[derive(Debug)]
-#[must_use = "iterators are lazy and do nothing unless consumed"]
-pub struct Chunks<'a, T: 'a + Copy> {
-    ptr: BufferPointer<'a, T>,
-    chunk_size: usize,
-}
-
-impl<'a, T: 'a + Copy> Chunks<'a, T> {
-    #[inline]
-    fn new(ptr: BufferPointer<'a, T>, chunk_size: usize) -> Self {
-        assert!(chunk_size != 0);
-        Self { ptr, chunk_size }
-    }
-}
-
-impl<'a, T: 'a + Copy> Iterator for Chunks<'a, T> {
-    type Item = BufferPointer<'a, T>;
-
-    #[inline]
-    fn next(&mut self) -> Option<Self::Item> {
-        if self.ptr.len == 0 {
-            None
-        } else {
-            let chunk_size = cmp::min(self.ptr.len, self.chunk_size);
-            let (fst, snd) = self.ptr.split_at(chunk_size);
-            self.ptr = snd;
-            Some(fst)
-        }
-    }
-
-    #[inline]
-    fn size_hint(&self) -> (usize, Option<usize>) {
-        let n = self.ptr.len.div_ceil(self.chunk_size);
-        (n, Some(n))
-    }
-}
-
-impl<T: Copy> ExactSizeIterator for Chunks<'_, T> {}
-impl<T: Copy> FusedIterator for Chunks<'_, T> {}
 
 #[derive(Debug)]
 #[must_use = "iterators are lazy and do nothing unless consumed"]
@@ -456,28 +409,6 @@ mod tests {
         let a_ptr = a.as_ptr();
         let a_bufptr = unsafe { BufferPointer::new(&a_ptr, a.len()) };
         let (_a_bufptr_0, _a_bufptr_1) = a_bufptr.split_at(6);
-    }
-
-    #[test]
-    fn test_chunks() {
-        let a: [u32; 5] = test_arr();
-        let a_ptr = a.as_ptr();
-        let a_bufptr = unsafe { BufferPointer::new(&a_ptr, a.len()) };
-
-        let chunks = a_bufptr.chunks(2);
-
-        let a_ptr0 = unsafe { a_ptr.offset(0) };
-        let a_ptr2 = unsafe { a_ptr.offset(2) };
-        let a_ptr4 = unsafe { a_ptr.offset(4) };
-
-        assert_eq!(
-            chunks.collect::<Vec<_>>(),
-            vec![
-                unsafe { BufferPointer::new(&a_ptr0, 2) },
-                unsafe { BufferPointer::new(&a_ptr2, 2) },
-                unsafe { BufferPointer::new(&a_ptr4, 1) },
-            ]
-        );
     }
 
     #[test]

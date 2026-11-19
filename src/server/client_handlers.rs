@@ -154,7 +154,9 @@ fn sync_surface_data(
                         compositor_utils::fault_probe_buffer(data);
                         filtering::filter_and_compress_streaming(
                             data,
-                            metadata.format,
+                            surface_state_to_send.client,
+                            surface_state_to_send.id,
+                            metadata,
                             compressor,
                             |raw_buffer_to_send| {
                                 raw_buffer_sent = true;

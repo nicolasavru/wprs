@@ -879,7 +879,9 @@ pub fn commit_impl(
                     compositor_utils::fault_probe_buffer(data);
                     filtering::filter_and_compress_streaming(
                         data,
-                        metadata.format,
+                        surface_state.client,
+                        surface_state.id,
+                        metadata,
                         &mut state.compressor,
                         |raw_buffer_to_send| {
                             raw_buffer_sent = true;

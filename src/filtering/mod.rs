@@ -14,10 +14,12 @@
 
 //! AoS↔SoA transposition and spatial/color filtering for pixel buffers.
 //!
-//! The pipeline transposes pixel data between array-of-structs (RGBA
-//! interleaved) and struct-of-arrays (channels separated), applies
-//! subtract_green (VP8L color decorrelation) and running_difference (delta
-//! encoding) for improved entropy, then feeds the result to zstd.
+//! The pipeline partitions pixel buffers into self-contained L2-resident tiles
+//! (`TILE_PIXELS`), transposes each tile between array-of-structs (RGBA
+//! interleaved) and struct-of-arrays (channels separated) inside per-worker
+//! scratch memory, applies subtract_green (VP8L color decorrelation) and
+//! running_difference (delta encoding), and compresses/decompresses directly in
+//! cache on the same worker thread.
 //!
 //! Architecture-specific backends:
 //! - `x86`: permutation-based transpose (SSE2 through AVX2)
@@ -34,27 +36,36 @@ mod arch;
 #[path = "neon.rs"]
 mod arch;
 
-/// Bytes per compression shard fed to zstd. Balances parallelism granularity
-/// against zstd context-window utilisation.
-const COMPRESSION_BLOCK_SIZE: usize = 128 * 1024;
-const N_FILTER_THREADS: usize = 4;
-
-use std::cmp;
-use std::mem;
+use std::borrow::Cow;
 use std::slice;
+use std::sync::Mutex;
+use std::sync::atomic::AtomicBool;
+use std::sync::atomic::AtomicUsize;
+use std::sync::atomic::Ordering;
 
 use itertools::izip;
-use lagoon::ThreadPool;
+use zstd::bulk::Compressor;
+use zstd::bulk::Decompressor;
 
 use crate::buffer_pointer::BufferPointer;
 use crate::buffer_pointer::KnownSizeBufferPointer;
 use crate::prelude::*;
+use crate::serialization::ClientId;
+use crate::serialization::framing::CompressedTile;
+use crate::serialization::framing::CompressedTileStream;
+use crate::serialization::framing::CompressedTiles;
+use crate::serialization::framing::RawBufferHeader;
+use crate::serialization::framing::StreamingCompressedTiles;
+use crate::serialization::framing::TILE_PIXELS;
+use crate::serialization::framing::TileChannel;
 use crate::serialization::wayland::BufferFormat;
-use crate::sharding_compression::CompressedShards;
-use crate::sharding_compression::DecompressedShards;
+use crate::serialization::wayland::BufferMetadata;
+use crate::serialization::wayland::WlSurfaceId;
+use crate::sharding_compression::CompressorWorkerState;
+use crate::sharding_compression::DecompressorWorkerState;
 use crate::sharding_compression::ShardingCompressor;
-use crate::sharding_compression::ShardingCompressorSink;
-use crate::sharding_compression::StreamingCompressedShards;
+use crate::sharding_compression::ShardingDecompressor;
+use crate::sharding_compression::compress_channel_slice;
 use crate::vec4u8::Vec4u8;
 
 /// Architecture-specific 32-pixel block kernel.
@@ -65,12 +76,7 @@ pub(crate) trait FilterKernel {
 
     fn zero_forward() -> Self::ForwardCarry;
 
-    fn zero_inverse() -> (
-        Self::InverseCarry,
-        Self::InverseCarry,
-        Self::InverseCarry,
-        Self::InverseCarry,
-    );
+    fn zero_inverse() -> Self::InverseCarry;
 
     fn or_accum_is_zero(acc: Self::ForwardCarry) -> (bool, bool, bool, bool);
 
@@ -83,8 +89,6 @@ pub(crate) trait FilterKernel {
         prev: Self::ForwardCarry,
         or_acc: &mut Self::ForwardCarry,
     ) -> Self::ForwardCarry;
-
-    fn advance_inverse_carry(carry: Self::InverseCarry, delta: u8) -> (Self::InverseCarry, u8);
 
     /// # Safety
     /// When `STREAM` is `true`, `out_blocks` must be aligned to `Self::STREAM_ALIGN`.
@@ -99,222 +103,102 @@ pub(crate) trait FilterKernel {
         in3: &[u8; 32],
         const_alpha: u8,
         out: &mut [Vec4u8; 32],
-        prev: (
-            Self::InverseCarry,
-            Self::InverseCarry,
-            Self::InverseCarry,
-            Self::InverseCarry,
-        ),
-    ) -> (
-        Self::InverseCarry,
-        Self::InverseCarry,
-        Self::InverseCarry,
-        Self::InverseCarry,
-    );
+        prev: Self::InverseCarry,
+    ) -> Self::InverseCarry;
 
     fn fence_stream();
 }
 
-// --- shared parallel pipeline ---
+// --- fused tile forward + compress ---
 
-fn shard_indices_and_chunk_size(len: usize, n_channels: usize) -> (Vec<usize>, usize) {
-    if len == 0 {
-        return (Vec::new(), 32);
-    }
-
-    let n_blocks = len / 32;
-    let lim = n_blocks * 32;
-    let rem = len % 32;
-    let blocks_per_thread = cmp::max(n_blocks / N_FILTER_THREADS, 1);
-    let thread_chunk_size = blocks_per_thread * 32;
-
-    let mut base_offsets = Vec::new();
-    let mut thread_start = 0;
-    while thread_start < lim {
-        let thread_end = cmp::min(thread_start + thread_chunk_size, lim);
-        let mut idx = thread_start;
-        while idx < thread_end {
-            base_offsets.push(idx);
-            idx += cmp::min(thread_end - idx, COMPRESSION_BLOCK_SIZE);
-        }
-        thread_start = thread_end;
-    }
-    if rem > 0 {
-        base_offsets.push(lim);
-    }
-
-    let mut indices = Vec::with_capacity(base_offsets.len() * n_channels);
-    for ch in 0..n_channels {
-        let ch_offset = ch * len;
-        indices.extend(base_offsets.iter().map(|&idx| idx + ch_offset));
-    }
-    (indices, thread_chunk_size)
-}
-
-fn emit_or_reuse_channel_shard(
-    compressor: &ShardingCompressorSink,
-    shard_idx: usize,
-    soa_len: usize,
+#[inline]
+fn encode_channel(
+    data: &[u8],
     tail_chunks_zero: bool,
-    buf: &mut Vec<u8>,
-) {
-    if tail_chunks_zero && buf[1..32] == [0u8; 31] {
-        compressor.send_constant_delta_shard(shard_idx, soa_len, buf[0]);
+    compressor: &mut Compressor<'static>,
+    zstd_scratch: &mut Vec<u8>,
+) -> TileChannel {
+    if data.len() >= 32
+        && data.len().is_multiple_of(32)
+        && tail_chunks_zero
+        && data[1..32] == [0u8; 31]
+    {
+        TileChannel::ConstantDelta(data[0])
     } else {
-        compressor.compress_shard(shard_idx, mem::take(buf));
+        compress_channel_slice(compressor, zstd_scratch, data)
     }
 }
 
-#[instrument(skip_all, level = "debug")]
-fn aos_to_soa_parallel_compression<K: FilterKernel, const HAS_ALPHA: bool>(
+fn filter_tile<K: FilterKernel, const HAS_ALPHA: bool>(
     aos: BufferPointer<Vec4u8>,
-    thread_chunk_size: usize,
-    compressor: ShardingCompressorSink,
-) {
-    if aos.is_empty() {
-        return;
+    tile_idx: u32,
+    state: &mut CompressorWorkerState,
+) -> CompressedTile {
+    let tile_len = aos.len();
+    debug_assert!(tile_len > 0 && tile_len <= TILE_PIXELS);
+    let lim = (tile_len / 32) * 32;
+    let (aos_blocks, aos_rem) = aos.split_at(lim);
+
+    let [s0_buf, s1_buf, s2_buf, s3_buf] = &mut state.soa_scratch.0;
+    let s0 = &mut s0_buf[..tile_len];
+    let s1 = &mut s1_buf[..tile_len];
+    let s2 = &mut s2_buf[..tile_len];
+    let s3 = &mut s3_buf[..tile_len];
+
+    let mut or_acc = K::zero_forward();
+    let mut prev = K::zero_forward();
+    let mut aos_chunks = aos_blocks.array_chunks::<32>();
+    let mut s0_chunks = s0.as_chunks_mut::<32>().0.iter_mut();
+    let mut s1_chunks = s1.as_chunks_mut::<32>().0.iter_mut();
+    let mut s2_chunks = s2.as_chunks_mut::<32>().0.iter_mut();
+    let mut s3_chunks = s3.as_chunks_mut::<32>().0.iter_mut();
+
+    if let Some(first_aos) = aos_chunks.next() {
+        prev = K::forward_block::<HAS_ALPHA, false>(
+            first_aos,
+            s0_chunks.next().unwrap(),
+            s1_chunks.next().unwrap(),
+            s2_chunks.next().unwrap(),
+            s3_chunks.next().unwrap(),
+            prev,
+            &mut or_acc,
+        );
+    }
+    for (aos_c, s0_c, s1_c, s2_c, s3_c) in
+        izip!(aos_chunks, s0_chunks, s1_chunks, s2_chunks, s3_chunks)
+    {
+        prev =
+            K::forward_block::<HAS_ALPHA, true>(aos_c, s0_c, s1_c, s2_c, s3_c, prev, &mut or_acc);
     }
 
-    let len = aos.len();
-    let lim = (len / 32) * 32;
-    let rem = len % 32;
-    let (aos_to_lim, aos_remainder) = aos.split_at(lim);
-
-    debug_span!("aos_to_soa_u8_32x4_loop").in_scope(|| {
-        ThreadPool::global().scoped(|s| {
-            for (thread_idx, aos) in aos_to_lim.chunks(thread_chunk_size).enumerate() {
-                let compressor = compressor.clone();
-                s.run(move || {
-                    let mut idx = thread_idx * thread_chunk_size;
-                    let mut prev = K::zero_forward();
-                    let mut soa0 = Vec::new();
-                    let mut soa1 = Vec::new();
-                    let mut soa2 = Vec::new();
-                    let mut soa3 = Vec::new();
-                    let mut dummy3 = [0u8; 32];
-
-                    for aos in aos.chunks(COMPRESSION_BLOCK_SIZE) {
-                        let soa_len = cmp::min(aos.len(), COMPRESSION_BLOCK_SIZE);
-                        soa0.resize(soa_len, 0);
-                        soa1.resize(soa_len, 0);
-                        soa2.resize(soa_len, 0);
-                        if HAS_ALPHA {
-                            soa3.resize(soa_len, 0);
-                        }
-
-                        let mut aos_chunks = aos.array_chunks::<32>();
-                        let mut s0_chunks = soa0.as_chunks_mut::<32>().0.iter_mut();
-                        let mut s1_chunks = soa1.as_chunks_mut::<32>().0.iter_mut();
-                        let mut s2_chunks = soa2.as_chunks_mut::<32>().0.iter_mut();
-                        let mut or_acc = K::zero_forward();
-
-                        if HAS_ALPHA {
-                            let mut s3_chunks = soa3.as_chunks_mut::<32>().0.iter_mut();
-                            if let Some(first_aos) = aos_chunks.next() {
-                                prev = K::forward_block::<true, false>(
-                                    first_aos,
-                                    s0_chunks.next().unwrap(),
-                                    s1_chunks.next().unwrap(),
-                                    s2_chunks.next().unwrap(),
-                                    s3_chunks.next().unwrap(),
-                                    prev,
-                                    &mut or_acc,
-                                );
-                            }
-                            for (aos_c, s0_c, s1_c, s2_c, s3_c) in
-                                izip!(aos_chunks, s0_chunks, s1_chunks, s2_chunks, s3_chunks)
-                            {
-                                prev = K::forward_block::<true, true>(
-                                    aos_c,
-                                    s0_c,
-                                    s1_c,
-                                    s2_c,
-                                    s3_c,
-                                    prev,
-                                    &mut or_acc,
-                                );
-                            }
-                        } else {
-                            if let Some(first_aos) = aos_chunks.next() {
-                                prev = K::forward_block::<false, false>(
-                                    first_aos,
-                                    s0_chunks.next().unwrap(),
-                                    s1_chunks.next().unwrap(),
-                                    s2_chunks.next().unwrap(),
-                                    &mut dummy3,
-                                    prev,
-                                    &mut or_acc,
-                                );
-                            }
-                            for (aos_c, s0_c, s1_c, s2_c) in
-                                izip!(aos_chunks, s0_chunks, s1_chunks, s2_chunks)
-                            {
-                                prev = K::forward_block::<false, true>(
-                                    aos_c,
-                                    s0_c,
-                                    s1_c,
-                                    s2_c,
-                                    &mut dummy3,
-                                    prev,
-                                    &mut or_acc,
-                                );
-                            }
-                        }
-
-                        let (z0, z1, z2, z3) = K::or_accum_is_zero(or_acc);
-                        emit_or_reuse_channel_shard(&compressor, idx, soa_len, z0, &mut soa0);
-                        emit_or_reuse_channel_shard(&compressor, idx + len, soa_len, z1, &mut soa1);
-                        emit_or_reuse_channel_shard(
-                            &compressor,
-                            idx + 2 * len,
-                            soa_len,
-                            z2,
-                            &mut soa2,
-                        );
-                        if HAS_ALPHA {
-                            emit_or_reuse_channel_shard(
-                                &compressor,
-                                idx + 3 * len,
-                                soa_len,
-                                z3,
-                                &mut soa3,
-                            );
-                        }
-
-                        idx += aos.len();
-                    }
-                });
-            }
-        });
-    });
-
-    if rem > 0 {
-        let mut rem0 = vec![0u8; rem];
-        let mut rem1 = vec![0u8; rem];
-        let mut rem2 = vec![0u8; rem];
-        let mut rem3 = if HAS_ALPHA {
-            vec![0u8; rem]
-        } else {
-            Vec::new()
-        };
-
-        for (i, s) in aos_remainder.into_iter().enumerate() {
-            rem0[i] = s.0;
-            rem1[i] = s.1;
-            rem2[i] = s.2;
-            if HAS_ALPHA {
-                rem3[i] = s.3;
-            }
-        }
-
-        compressor.compress_shard(len - rem, rem0);
-        compressor.compress_shard(2 * len - rem, rem1);
-        compressor.compress_shard(3 * len - rem, rem2);
+    for (i, px) in aos_rem.into_iter().enumerate() {
+        s0[lim + i] = px.0;
+        s1[lim + i] = px.1;
+        s2[lim + i] = px.2;
         if HAS_ALPHA {
-            compressor.compress_shard(4 * len - rem, rem3);
+            s3[lim + i] = px.3;
         }
+    }
+
+    let (z0, z1, z2, z3) = K::or_accum_is_zero(or_acc);
+    let compressor = &mut state.compressor;
+    let zstd_scratch = &mut state.zstd_scratch;
+    let ch0 = encode_channel(s0, z0, compressor, zstd_scratch);
+    let ch1 = encode_channel(s1, z1, compressor, zstd_scratch);
+    let ch2 = encode_channel(s2, z2, compressor, zstd_scratch);
+    let ch3 = if HAS_ALPHA {
+        encode_channel(s3, z3, compressor, zstd_scratch)
+    } else {
+        TileChannel::Omitted
+    };
+
+    CompressedTile {
+        tile_idx,
+        channels: [ch0, ch1, ch2, ch3],
     }
 }
+
+// --- fused tile decompress + unfilter ---
 
 const ZERO_CHUNK: [u8; 32] = [0; 32];
 
@@ -323,13 +207,12 @@ enum ChannelChunks<'a> {
     Constant {
         first_chunk: [u8; 32],
         emitted_first: bool,
-        remaining: usize,
     },
 }
 
 impl<'a> ChannelChunks<'a> {
     #[inline]
-    fn new(data: &'a [u8], n_chunks: usize, const_delta: Option<u8>) -> Self {
+    fn new(data: &'a [u8], const_delta: Option<u8>) -> Self {
         match const_delta {
             Some(d) => {
                 let mut first_chunk = [0u8; 32];
@@ -337,7 +220,6 @@ impl<'a> ChannelChunks<'a> {
                 Self::Constant {
                     first_chunk,
                     emitted_first: false,
-                    remaining: n_chunks,
                 }
             },
             None => Self::Slice(data.as_chunks::<32>().0.iter()),
@@ -351,10 +233,7 @@ impl<'a> ChannelChunks<'a> {
             Self::Constant {
                 first_chunk,
                 emitted_first,
-                remaining,
             } => {
-                debug_assert!(*remaining > 0);
-                *remaining -= 1;
                 if !*emitted_first {
                     *emitted_first = true;
                     first_chunk
@@ -378,47 +257,23 @@ unsafe fn unfilter_block<K: FilterKernel, const STREAM: bool, const HAS_ALPHA: b
     c2: Option<u8>,
     c3: Option<u8>,
     aos: &mut [Vec4u8],
-    prev: &mut (
-        K::InverseCarry,
-        K::InverseCarry,
-        K::InverseCarry,
-        K::InverseCarry,
-    ),
 ) {
     const { assert!(size_of::<[Vec4u8; 32]>().is_multiple_of(K::STREAM_ALIGN)) };
     let out_chunks = aos.as_chunks_mut::<32>().0;
-    let n_chunks = out_chunks.len();
 
     if let (Some(d0), Some(d1), Some(d2)) = (c0, c1, c2)
         && (!HAS_ALPHA || c3.is_some())
     {
-        let (p0, b_diff) = K::advance_inverse_carry(prev.0, d0);
-        let (p1, g) = K::advance_inverse_carry(prev.1, d1);
-        let (p2, r_diff) = K::advance_inverse_carry(prev.2, d2);
-        prev.0 = p0;
-        prev.1 = p1;
-        prev.2 = p2;
-        let a = if HAS_ALPHA {
-            let (p3, a) = K::advance_inverse_carry(prev.3, c3.unwrap());
-            prev.3 = p3;
-            a
-        } else {
-            0xFF
-        };
-        let pixel = Vec4u8(b_diff.wrapping_add(g), g, r_diff.wrapping_add(g), a);
+        let a = if HAS_ALPHA { c3.unwrap() } else { 0xFF };
+        let pixel = Vec4u8(d0.wrapping_add(d1), d1, d2.wrapping_add(d1), a);
         // SAFETY: Caller guarantees `out_chunks` satisfies `K::STREAM_ALIGN` when `STREAM` is `true`.
         unsafe { K::splat_blocks::<STREAM>(out_chunks, pixel) };
         return;
     }
 
+    let mut prev = K::zero_inverse();
     if !HAS_ALPHA || c3.is_some() {
-        let const_alpha = if HAS_ALPHA {
-            let (p3, a) = K::advance_inverse_carry(prev.3, c3.unwrap());
-            prev.3 = p3;
-            a
-        } else {
-            0xFF
-        };
+        let const_alpha = if HAS_ALPHA { c3.unwrap() } else { 0xFF };
 
         if c0.is_none() && c1.is_none() && c2.is_none() {
             for (s0, s1, s2, out) in izip!(
@@ -428,7 +283,7 @@ unsafe fn unfilter_block<K: FilterKernel, const STREAM: bool, const HAS_ALPHA: b
                 out_chunks,
             ) {
                 // SAFETY: Caller guarantees `out` satisfies `K::STREAM_ALIGN` when `STREAM` is `true`.
-                *prev = unsafe {
+                prev = unsafe {
                     K::inverse_block::<STREAM, true>(
                         s0,
                         s1,
@@ -436,17 +291,17 @@ unsafe fn unfilter_block<K: FilterKernel, const STREAM: bool, const HAS_ALPHA: b
                         &ZERO_CHUNK,
                         const_alpha,
                         out,
-                        *prev,
+                        prev,
                     )
                 };
             }
         } else {
-            let mut ch0 = ChannelChunks::new(soa0, n_chunks, c0);
-            let mut ch1 = ChannelChunks::new(soa1, n_chunks, c1);
-            let mut ch2 = ChannelChunks::new(soa2, n_chunks, c2);
+            let mut ch0 = ChannelChunks::new(soa0, c0);
+            let mut ch1 = ChannelChunks::new(soa1, c1);
+            let mut ch2 = ChannelChunks::new(soa2, c2);
             for out in out_chunks {
                 // SAFETY: Caller guarantees `out` satisfies `K::STREAM_ALIGN` when `STREAM` is `true`.
-                *prev = unsafe {
+                prev = unsafe {
                     K::inverse_block::<STREAM, true>(
                         ch0.next_chunk(),
                         ch1.next_chunk(),
@@ -454,7 +309,7 @@ unsafe fn unfilter_block<K: FilterKernel, const STREAM: bool, const HAS_ALPHA: b
                         &ZERO_CHUNK,
                         const_alpha,
                         out,
-                        *prev,
+                        prev,
                     )
                 };
             }
@@ -468,15 +323,15 @@ unsafe fn unfilter_block<K: FilterKernel, const STREAM: bool, const HAS_ALPHA: b
             out_chunks,
         ) {
             // SAFETY: Caller guarantees `out` satisfies `K::STREAM_ALIGN` when `STREAM` is `true`.
-            *prev = unsafe { K::inverse_block::<STREAM, false>(s0, s1, s2, s3, 0, out, *prev) };
+            prev = unsafe { K::inverse_block::<STREAM, false>(s0, s1, s2, s3, 0, out, prev) };
         }
     } else {
-        let mut ch0 = ChannelChunks::new(soa0, n_chunks, c0);
-        let mut ch1 = ChannelChunks::new(soa1, n_chunks, c1);
-        let mut ch2 = ChannelChunks::new(soa2, n_chunks, c2);
+        let mut ch0 = ChannelChunks::new(soa0, c0);
+        let mut ch1 = ChannelChunks::new(soa1, c1);
+        let mut ch2 = ChannelChunks::new(soa2, c2);
         for (s3, out) in izip!(soa3.as_chunks::<32>().0, out_chunks) {
             // SAFETY: Caller guarantees `out` satisfies `K::STREAM_ALIGN` when `STREAM` is `true`.
-            *prev = unsafe {
+            prev = unsafe {
                 K::inverse_block::<STREAM, false>(
                     ch0.next_chunk(),
                     ch1.next_chunk(),
@@ -484,170 +339,300 @@ unsafe fn unfilter_block<K: FilterKernel, const STREAM: bool, const HAS_ALPHA: b
                     s3,
                     0,
                     out,
-                    *prev,
+                    prev,
                 )
             };
         }
     }
 }
 
-#[instrument(skip_all, level = "debug")]
-fn soa_to_aos_parallel<K: FilterKernel, const HAS_ALPHA: bool>(
-    soa: &DecompressedShards,
-    aos: &mut [Vec4u8],
-) {
-    let len = aos.len();
-    let n_channels = if HAS_ALPHA { 4 } else { 3 };
-    assert_eq!(soa.len(), len * n_channels);
-    if len == 0 {
-        return;
+#[inline]
+fn decode_channel<'a>(
+    channel: &'a TileChannel,
+    tile_len: usize,
+    scratch: &'a mut [u8; TILE_PIXELS],
+    decompressor: &mut Decompressor<'static>,
+) -> Result<(&'a [u8], Option<u8>)> {
+    match channel {
+        TileChannel::ConstantDelta(d) => {
+            if tile_len < 32 || !tile_len.is_multiple_of(32) {
+                bail!("ConstantDelta channel invalid for tile_len {tile_len}");
+            }
+            Ok((&[][..], Some(*d)))
+        },
+        TileChannel::Uncompressed(data) => {
+            if data.len() != tile_len {
+                bail!("uncompressed channel len {} != {tile_len}", data.len());
+            }
+            Ok((data.as_slice(), None))
+        },
+        TileChannel::Zstd(data) => {
+            let out = &mut scratch[..tile_len];
+            let written = decompressor
+                .decompress_to_buffer(data, out)
+                .location(loc!())?;
+            if written != tile_len {
+                bail!("decompressed channel len {written} != {tile_len}");
+            }
+            Ok((out, None))
+        },
+        TileChannel::Omitted => bail!("unexpected Omitted channel on active plane"),
     }
+}
 
-    let (soa0, rest) = soa.data.split_at(len);
-    let (soa1, rest) = rest.split_at(len);
-    let (soa2, soa3) = if HAS_ALPHA {
-        rest.split_at(len)
+fn unfilter_tile<K: FilterKernel, const HAS_ALPHA: bool>(
+    tile: &CompressedTile,
+    aos: &mut [Vec4u8],
+    state: &mut DecompressorWorkerState,
+) -> Result<bool> {
+    let tile_len = aos.len();
+    debug_assert!(tile_len > 0 && tile_len <= TILE_PIXELS);
+    let [buf0, buf1, buf2, buf3] = &mut state.soa_scratch.0;
+
+    let (s0, c0) = decode_channel(&tile.channels[0], tile_len, buf0, &mut state.decompressor)
+        .location(loc!())?;
+    let (s1, c1) = decode_channel(&tile.channels[1], tile_len, buf1, &mut state.decompressor)
+        .location(loc!())?;
+    let (s2, c2) = decode_channel(&tile.channels[2], tile_len, buf2, &mut state.decompressor)
+        .location(loc!())?;
+    let (s3, c3) = if HAS_ALPHA {
+        decode_channel(&tile.channels[3], tile_len, buf3, &mut state.decompressor)
+            .location(loc!())?
     } else {
-        (rest, &[][..])
+        (&[][..], None)
     };
 
-    let n_blocks = len / 32;
-    let lim = n_blocks * 32;
-    let blocks_per_thread = cmp::max(n_blocks / N_FILTER_THREADS, 1);
-    let thread_chunk_size = blocks_per_thread * 32;
+    let lim = (tile_len / 32) * 32;
+    let stream = (aos.as_mut_ptr() as usize).is_multiple_of(K::STREAM_ALIGN);
 
-    if lim > 0 {
-        let constant_deltas = &soa.constant_deltas;
-        debug_span!("soa_to_aos_u8_32x4_loop").in_scope(|| {
-            ThreadPool::global().scoped(|s| {
-                for (thread_idx, aos_thread) in aos[..lim].chunks_mut(thread_chunk_size).enumerate()
-                {
-                    let thread_start = thread_idx * thread_chunk_size;
-                    let thread_end = thread_start + aos_thread.len();
-                    let s0_thread = &soa0[thread_start..thread_end];
-                    let s1_thread = &soa1[thread_start..thread_end];
-                    let s2_thread = &soa2[thread_start..thread_end];
-                    let s3_thread = if HAS_ALPHA {
-                        &soa3[thread_start..thread_end]
-                    } else {
-                        &[][..]
-                    };
-
-                    s.run(move || {
-                        let stream =
-                            (aos_thread.as_mut_ptr() as usize).is_multiple_of(K::STREAM_ALIGN);
-                        let mut prev = K::zero_inverse();
-                        let mut rel = 0;
-                        while rel < aos_thread.len() {
-                            let block_len =
-                                cmp::min(aos_thread.len() - rel, COMPRESSION_BLOCK_SIZE);
-                            let idx = thread_start + rel;
-                            let c0 = constant_deltas.get(&idx).copied();
-                            let c1 = constant_deltas.get(&(idx + len)).copied();
-                            let c2 = constant_deltas.get(&(idx + 2 * len)).copied();
-                            let c3 = if HAS_ALPHA {
-                                constant_deltas.get(&(idx + 3 * len)).copied()
-                            } else {
-                                None
-                            };
-                            let s3_sub = if HAS_ALPHA {
-                                &s3_thread[rel..rel + block_len]
-                            } else {
-                                &[][..]
-                            };
-
-                            if stream {
-                                // SAFETY: `stream` verified `aos_thread` is aligned to `K::STREAM_ALIGN`.
-                                unsafe {
-                                    unfilter_block::<K, true, HAS_ALPHA>(
-                                        &s0_thread[rel..rel + block_len],
-                                        &s1_thread[rel..rel + block_len],
-                                        &s2_thread[rel..rel + block_len],
-                                        s3_sub,
-                                        c0,
-                                        c1,
-                                        c2,
-                                        c3,
-                                        &mut aos_thread[rel..rel + block_len],
-                                        &mut prev,
-                                    );
-                                }
-                            } else {
-                                // SAFETY: `STREAM` is `false`.
-                                unsafe {
-                                    unfilter_block::<K, false, HAS_ALPHA>(
-                                        &s0_thread[rel..rel + block_len],
-                                        &s1_thread[rel..rel + block_len],
-                                        &s2_thread[rel..rel + block_len],
-                                        s3_sub,
-                                        c0,
-                                        c1,
-                                        c2,
-                                        c3,
-                                        &mut aos_thread[rel..rel + block_len],
-                                        &mut prev,
-                                    );
-                                }
-                            }
-
-                            rel += block_len;
-                        }
-                        if stream {
-                            K::fence_stream();
-                        }
-                    });
-                }
-            });
-        });
+    if stream {
+        // SAFETY: `stream` verified `aos.as_mut_ptr()` is aligned to
+        // `K::STREAM_ALIGN`.
+        unsafe {
+            unfilter_block::<K, true, HAS_ALPHA>(s0, s1, s2, s3, c0, c1, c2, c3, aos);
+        }
+    } else {
+        // SAFETY: `STREAM` is `false`, imposing no alignment requirement beyond `Vec4u8`.
+        unsafe {
+            unfilter_block::<K, false, HAS_ALPHA>(s0, s1, s2, s3, c0, c1, c2, c3, aos);
+        }
     }
 
-    for i in lim..len {
-        let a = if HAS_ALPHA { soa3[i] } else { 0xFF };
-        aos[i] = Vec4u8(soa0[i], soa1[i], soa2[i], a);
+    for i in lim..tile_len {
+        let a = if HAS_ALPHA { s3[i] } else { 0xFF };
+        aos[i] = Vec4u8(s0[i], s1[i], s2[i], a);
     }
+
+    Ok(stream && lim > 0)
 }
 
 // --- public API ---
 
+#[instrument(skip_all, level = "debug")]
 pub fn filter_and_compress_streaming(
     data: BufferPointer<u8>,
-    format: BufferFormat,
+    client: ClientId,
+    surface: WlSurfaceId,
+    metadata: BufferMetadata,
     compressor: &mut ShardingCompressor,
-    on_stream_ready: impl FnOnce(StreamingCompressedShards),
+    on_stream_ready: impl FnOnce(StreamingCompressedTiles),
 ) {
     assert!(data.len().is_multiple_of(4));
     // SAFETY: Vec4u8 is a repr(C, packed) wrapper around [u8; 4].
     let aos = unsafe { data.cast::<Vec4u8>() };
-    let has_alpha = format == BufferFormat::Argb8888;
-    let n_channels = if has_alpha { 4 } else { 3 };
-    let (indices, thread_chunk_size) = shard_indices_and_chunk_size(aos.len(), n_channels);
-    let (sink, streaming) = compressor.begin_streaming(indices, aos.len() * n_channels);
-    on_stream_ready(streaming);
-    if has_alpha {
-        aos_to_soa_parallel_compression::<arch::Kernel, true>(aos, thread_chunk_size, sink);
-    } else {
-        aos_to_soa_parallel_compression::<arch::Kernel, false>(aos, thread_chunk_size, sink);
-    }
+    let total_pixels = aos.len();
+    let has_alpha = metadata.format == BufferFormat::Argb8888;
+    let (tiles_tx, tiles_rx) = crossbeam_channel::unbounded();
+    let n_tiles = total_pixels.div_ceil(TILE_PIXELS);
+
+    let header = RawBufferHeader {
+        client,
+        surface,
+        metadata,
+        n_tiles: n_tiles as u32,
+    };
+    on_stream_ready(StreamingCompressedTiles {
+        header,
+        tiles: tiles_rx,
+    });
+
+    let next_tile = AtomicUsize::new(0);
+    compressor.pool.execute(n_tiles, |state| {
+        loop {
+            let tile_idx = next_tile.fetch_add(1, Ordering::Relaxed);
+            if tile_idx >= n_tiles {
+                break;
+            }
+            let start = tile_idx * TILE_PIXELS;
+            let tile_len = (total_pixels - start).min(TILE_PIXELS);
+            let (_, after_start) = aos.split_at(start);
+            let (aos_tile, _) = after_start.split_at(tile_len);
+
+            let tile = if has_alpha {
+                filter_tile::<arch::Kernel, true>(aos_tile, tile_idx as u32, state)
+            } else {
+                filter_tile::<arch::Kernel, false>(aos_tile, tile_idx as u32, state)
+            };
+
+            if tiles_tx.send(tile).is_err() {
+                break;
+            }
+        }
+    });
 }
 
+#[instrument(skip_all, level = "debug")]
 pub fn filter_and_compress(
     data: BufferPointer<u8>,
     format: BufferFormat,
     compressor: &mut ShardingCompressor,
-) -> CompressedShards {
+) -> CompressedTiles {
+    assert!(data.len().is_multiple_of(4));
+    let stride = i32::try_from(data.len()).expect("buffer byte length exceeds i32::MAX");
+    let total_pixels = data.len() / 4;
+    let metadata = BufferMetadata {
+        width: total_pixels as i32,
+        height: 1,
+        stride,
+        format,
+    };
     let mut streaming_opt = None;
-    filter_and_compress_streaming(data, format, compressor, |streaming| {
-        streaming_opt = Some(streaming);
-    });
-    streaming_opt.unwrap().collect_shards()
+    filter_and_compress_streaming(
+        data,
+        ClientId(0),
+        WlSurfaceId(0),
+        metadata,
+        compressor,
+        |streaming| {
+            streaming_opt = Some(streaming);
+        },
+    );
+    let mut tiles: Vec<CompressedTile> = streaming_opt.unwrap().tiles.into_iter().collect();
+    tiles.sort_by_key(|t| t.tile_idx);
+    CompressedTiles {
+        format,
+        total_pixels,
+        tiles,
+    }
 }
 
-pub fn unfilter(data: &DecompressedShards, format: BufferFormat, output_buf: &mut [u8]) {
-    let aos = bytemuck::cast_slice_mut(output_buf);
-    match format {
-        BufferFormat::Argb8888 => soa_to_aos_parallel::<arch::Kernel, true>(data, aos),
-        BufferFormat::Xrgb8888 => soa_to_aos_parallel::<arch::Kernel, false>(data, aos),
+fn unfilter_tiles_parallel<'a>(
+    decompressor: &mut ShardingDecompressor,
+    total_pixels: usize,
+    has_alpha: bool,
+    output_buf: &mut [u8],
+    next_tile: impl Fn() -> Option<Result<Cow<'a, CompressedTile>>> + Sync,
+) -> Result<()> {
+    let byte_len = total_pixels
+        .checked_mul(4)
+        .context(loc!(), "pixel count overflow")?;
+    if output_buf.len() < byte_len {
+        bail!("output_buf len {} < {byte_len}", output_buf.len());
     }
+
+    let expected_tiles = total_pixels.div_ceil(TILE_PIXELS);
+    let aos: &mut [Vec4u8] = bytemuck::cast_slice_mut(&mut output_buf[..byte_len]);
+    let aos_base = aos.as_mut_ptr() as usize;
+    let claimed: Vec<AtomicBool> = (0..expected_tiles)
+        .map(|_| AtomicBool::new(false))
+        .collect();
+    let completed = AtomicUsize::new(0);
+    let first_err: Mutex<Option<anyhow::Error>> = Mutex::new(None);
+
+    decompressor.pool.execute(expected_tiles, |state| {
+        let mut streamed_any = false;
+        while let Some(item) = next_tile() {
+            let res = (|| -> Result<bool> {
+                let tile = item?;
+                let idx = tile.tile_idx as usize;
+                if idx >= expected_tiles {
+                    bail!("tile_idx {idx} >= {expected_tiles}");
+                }
+                if claimed[idx].swap(true, Ordering::Relaxed) {
+                    bail!("duplicate tile_idx {idx}");
+                }
+                let start = idx * TILE_PIXELS;
+                let tile_len = (total_pixels - start).min(TILE_PIXELS);
+                // SAFETY: Fixed `TILE_PIXELS` chunks partition `0..total_pixels`
+                // into non-overlapping ranges, and `claimed[idx].swap(true)`
+                // guarantees exclusive access to `[start .. start + tile_len)`
+                // within `aos` for the duration of `pool.execute`.
+                let aos_tile = unsafe {
+                    slice::from_raw_parts_mut((aos_base as *mut Vec4u8).add(start), tile_len)
+                };
+                if has_alpha {
+                    unfilter_tile::<arch::Kernel, true>(&tile, aos_tile, state)
+                } else {
+                    unfilter_tile::<arch::Kernel, false>(&tile, aos_tile, state)
+                }
+            })();
+
+            match res {
+                Ok(used_stream) => {
+                    streamed_any |= used_stream;
+                    completed.fetch_add(1, Ordering::Relaxed);
+                },
+                Err(err) => {
+                    let mut guard = first_err.lock().unwrap();
+                    if guard.is_none() {
+                        *guard = Some(err);
+                    }
+                    break;
+                },
+            }
+        }
+        if streamed_any {
+            arch::Kernel::fence_stream();
+        }
+    });
+
+    if let Some(err) = first_err.into_inner().unwrap() {
+        return Err(err);
+    }
+    let done = completed.load(Ordering::Relaxed);
+    if done != expected_tiles {
+        bail!("received {done} tiles, expected {expected_tiles}");
+    }
+    Ok(())
+}
+
+#[instrument(skip_all, level = "debug")]
+pub fn decompress_and_unfilter_streaming(
+    stream: CompressedTileStream,
+    decompressor: &mut ShardingDecompressor,
+    output_buf: &mut [u8],
+) -> Result<()> {
+    let total_pixels = stream.header.metadata.validate().location(loc!())?;
+    let expected_tiles = total_pixels.div_ceil(TILE_PIXELS);
+    if stream.header.n_tiles as usize != expected_tiles {
+        bail!(
+            "header n_tiles {} != expected {}",
+            stream.header.n_tiles,
+            expected_tiles
+        );
+    }
+
+    let has_alpha = stream.header.metadata.format == BufferFormat::Argb8888;
+    let tiles_rx = &stream.tiles;
+    unfilter_tiles_parallel(decompressor, total_pixels, has_alpha, output_buf, || {
+        tiles_rx.recv().ok().map(|r| r.map(Cow::Owned))
+    })
+}
+
+#[instrument(skip_all, level = "debug")]
+pub fn decompress_and_unfilter(
+    tiles: &CompressedTiles,
+    decompressor: &mut ShardingDecompressor,
+    output_buf: &mut [u8],
+) -> Result<()> {
+    let total_pixels = tiles.total_pixels;
+    let n_tiles = tiles.tiles.len();
+    let has_alpha = tiles.format == BufferFormat::Argb8888;
+    let next_idx = AtomicUsize::new(0);
+    unfilter_tiles_parallel(decompressor, total_pixels, has_alpha, output_buf, || {
+        let i = next_idx.fetch_add(1, Ordering::Relaxed);
+        (i < n_tiles).then(|| Ok(Cow::Borrowed(&tiles.tiles[i])))
+    })
 }
 
 #[cfg(test)]
@@ -655,12 +640,9 @@ mod tests {
     use std::cell::RefCell;
     use std::num::NonZeroUsize;
 
-    use fallible_iterator::IteratorExt;
     use proptest::prelude::*;
 
     use super::*;
-    use crate::sharding_compression::CompressedShard;
-    use crate::sharding_compression::ShardingDecompressor;
 
     thread_local! {
         static TEST_CODEC: RefCell<Option<(ShardingCompressor, ShardingDecompressor)>> =
@@ -672,7 +654,7 @@ mod tests {
             let mut borrow = cell.borrow_mut();
             let (compressor, decompressor) = borrow.get_or_insert_with(|| {
                 (
-                    ShardingCompressor::new(NonZeroUsize::new(8).unwrap(), 1).unwrap(),
+                    ShardingCompressor::new(NonZeroUsize::new(4).unwrap(), 1).unwrap(),
                     ShardingDecompressor::new(NonZeroUsize::new(4).unwrap()).unwrap(),
                 )
             });
@@ -686,6 +668,52 @@ mod tests {
             .collect()
     }
 
+    fn materialize_channel(ch: &TileChannel, len: usize) -> Vec<u8> {
+        match ch {
+            TileChannel::ConstantDelta(first_byte) => {
+                let mut out = vec![0u8; len];
+                if len > 0 {
+                    out[0] = *first_byte;
+                }
+                out
+            },
+            TileChannel::Uncompressed(data) => data.clone(),
+            TileChannel::Zstd(data) => zstd::bulk::decompress(data, len).unwrap(),
+            TileChannel::Omitted => panic!("unexpected omitted channel"),
+        }
+    }
+
+    fn assert_decodes_at_both_alignments(
+        tiles: &CompressedTiles,
+        expected: &[u8],
+        decompressor: &mut ShardingDecompressor,
+    ) {
+        let mut buf = vec![0xAAu8; expected.len() + 36];
+        let aligned_off = (32 - (buf.as_ptr() as usize & 31)) & 31;
+        decompress_and_unfilter(
+            tiles,
+            decompressor,
+            &mut buf[aligned_off..aligned_off + expected.len()],
+        )
+        .unwrap();
+        assert_eq!(expected, &buf[aligned_off..aligned_off + expected.len()]);
+
+        // Poison the buffer before the misaligned (`STREAM = false` on x86,
+        // `STREAM_ALIGN = 32`) decode so 4-byte-periodic solid tiles cannot
+        // pass by reading stale bytes left behind by the aligned decode.
+        buf.fill(0xAA);
+        decompress_and_unfilter(
+            tiles,
+            decompressor,
+            &mut buf[aligned_off + 4..aligned_off + 4 + expected.len()],
+        )
+        .unwrap();
+        assert_eq!(
+            expected,
+            &buf[aligned_off + 4..aligned_off + 4 + expected.len()]
+        );
+    }
+
     fn test_roundtrip_impl(
         data: &[u8],
         compressor: &mut ShardingCompressor,
@@ -696,37 +724,8 @@ mod tests {
         let data_ptr = data.as_ptr();
         let buf_ptr = unsafe { BufferPointer::new(&data_ptr, data.len()) };
 
-        let shards = filter_and_compress(buf_ptr, BufferFormat::Argb8888, compressor);
-        let indices = shards.indices();
-        let uncompressed_size = shards.uncompressed_size();
-
-        let soa = decompressor
-            .decompress_to_owned(
-                &indices,
-                uncompressed_size,
-                shards
-                    .shards
-                    .into_iter()
-                    .map(Ok::<CompressedShard, anyhow::Error>)
-                    .transpose_into_fallible(),
-            )
-            .unwrap();
-
-        let mut buf = vec![0u8; data.len() + 36];
-        let aligned_off = (32 - (buf.as_ptr() as usize & 31)) & 31;
-        unfilter(
-            &soa,
-            BufferFormat::Argb8888,
-            &mut buf[aligned_off..aligned_off + data.len()],
-        );
-        assert_eq!(data, &buf[aligned_off..aligned_off + data.len()]);
-
-        unfilter(
-            &soa,
-            BufferFormat::Argb8888,
-            &mut buf[aligned_off + 4..aligned_off + 4 + data.len()],
-        );
-        assert_eq!(data, &buf[aligned_off + 4..aligned_off + 4 + data.len()]);
+        let tiles = filter_and_compress(buf_ptr, BufferFormat::Argb8888, compressor);
+        assert_decodes_at_both_alignments(&tiles, data, decompressor);
     }
 
     fn test_roundtrip_xrgb_impl(
@@ -739,30 +738,19 @@ mod tests {
         let data_ptr = data.as_ptr();
         let buf_ptr = unsafe { BufferPointer::new(&data_ptr, data.len()) };
 
-        let shards = filter_and_compress(buf_ptr, BufferFormat::Xrgb8888, compressor);
-        let indices = shards.indices();
-        assert_eq!(shards.uncompressed_size(), (data.len() / 4) * 3);
-
-        let soa = decompressor
-            .decompress_to_owned(
-                &indices,
-                shards.uncompressed_size(),
-                shards
-                    .shards
-                    .into_iter()
-                    .map(Ok::<CompressedShard, anyhow::Error>)
-                    .transpose_into_fallible(),
-            )
-            .unwrap();
+        let tiles = filter_and_compress(buf_ptr, BufferFormat::Xrgb8888, compressor);
+        assert!(
+            tiles
+                .tiles
+                .iter()
+                .all(|t| t.channels[3] == TileChannel::Omitted)
+        );
 
         let mut expected = data.to_vec();
         for px in expected.as_chunks_mut::<4>().0 {
             px[3] = 0xFF;
         }
-
-        let mut out = vec![0u8; data.len()];
-        unfilter(&soa, BufferFormat::Xrgb8888, &mut out);
-        assert_eq!(expected, out);
+        assert_decodes_at_both_alignments(&tiles, &expected, decompressor);
     }
 
     #[test]
@@ -799,6 +787,7 @@ mod tests {
                 100,
                 1920 * 1080,
                 32768 * 4 + 4,
+                TILE_PIXELS * 4 + 4,
                 1008 * 9513 * 4,
                 1008 * 951 * 4,
             ] {
@@ -807,14 +796,26 @@ mod tests {
                 test_roundtrip_xrgb_impl(&v, compressor, decompressor);
             }
 
-            // Multi-shard solid-color roundtrips exercising `ConstantDelta`.
+            // Multi-tile solid-color roundtrips exercising `splat_blocks` and
+            // constant-value tiles/tails.
             let solid: Vec<u8> = [0x20u8, 0x70, 0xD0, 0xFF]
                 .into_iter()
                 .cycle()
-                .take(COMPRESSION_BLOCK_SIZE * 4 * 6 + 20)
+                .take(TILE_PIXELS * 4 * 6 + 20)
                 .collect();
             test_roundtrip_impl(&solid, compressor, decompressor);
             test_roundtrip_xrgb_impl(&solid, compressor, decompressor);
+
+            // Translucent solid (`alpha = 0x80 != 0xFF`) + constant-value tail
+            // `tile_len = 36` (`36 >= 32` but not a multiple of 32, failing
+            // `encode_channel`'s `data.len().is_multiple_of(32)` guard).
+            let translucent_solid: Vec<u8> = [0x20u8, 0x70, 0xD0, 0x80]
+                .into_iter()
+                .cycle()
+                .take(TILE_PIXELS * 4 + 36 * 4)
+                .collect();
+            test_roundtrip_impl(&translucent_solid, compressor, decompressor);
+            test_roundtrip_xrgb_impl(&translucent_solid, compressor, decompressor);
 
             // Exhaustively cover all 16 `{Constant, Slice}` channel combinations
             // (`bit 0 = B-G`, `bit 1 = G`, `bit 2 = R-G`, `bit 3 = A`; set bit
@@ -822,7 +823,7 @@ mod tests {
             // Set `px[1]` (G) before `px[0]`/`px[2]` so `B - G` and `R - G` stay
             // constant even when G varies.
             for mask in 0u8..16 {
-                let mut data = test_vec(COMPRESSION_BLOCK_SIZE * 4 + 128);
+                let mut data = test_vec(TILE_PIXELS * 4 + 128);
                 for px in data.as_chunks_mut::<4>().0 {
                     if mask & 2 != 0 {
                         px[1] = 77;
@@ -863,81 +864,273 @@ mod tests {
         }
     }
 
-    /// Verify that the filtered SoA output matches known-good values.
-    ///
-    /// This test is architecture-independent: both x86 and aarch64 must
-    /// produce identical compressed shards for the same input, since a
-    /// buffer filtered on one architecture may be unfiltered on another.
+    /// Verify that the filtered SoA output matches known-good values across
+    /// multiple 32-pixel SIMD blocks (including nonlinear `subtract_green`,
+    /// block-boundary `ForwardCarry`, and both 128-bit lanes of `ACCUM_OR` tail
+    /// blocks). The filter math (`wrapping_sub` decorrelation + prefix-difference)
+    /// is byte-exact across all x86 SIMD tiers and aarch64 NEON for
+    /// cross-architecture wire compatibility.
     #[test]
     #[cfg_attr(miri, ignore)]
     fn test_filtered_output_deterministic() {
-        // 128 bytes = 32 pixels = exactly one SIMD block on both architectures.
-        let mut data = [0u8; 128];
-        for i in 0..32usize {
-            let k = i as u32;
-            data[i * 4] = ((k * k * 3 + 19) & 0xFF) as u8;
-            data[i * 4 + 1] = ((k * 17 + (k >> 2) * 41 + 5) & 0xFF) as u8;
-            data[i * 4 + 2] = ((k * k * 11 + k * 7 + 200) & 0xFF) as u8;
-            data[i * 4 + 3] = if i == 17 { 0xFE } else { 0xFF };
-        }
-        let data_ptr = data.as_ptr();
-        let buf_ptr = unsafe { BufferPointer::new(&data_ptr, data.len()) };
+        let n = 96usize; // 3 SIMD blocks of 32 pixels
+        let check_filtered_against_reference =
+            |data: &[u8], compressor: &mut ShardingCompressor, label: &str| {
+                let n = data.len() / 4;
+                let lim = (n / 32) * 32;
+                let data_ptr = data.as_ptr();
+                let buf_ptr = unsafe { BufferPointer::new(&data_ptr, data.len()) };
 
-        with_test_codec(|compressor, decompressor| {
-            let shards = filter_and_compress(buf_ptr, BufferFormat::Argb8888, compressor);
-            let indices = shards.indices();
-            let mut soa = decompressor
-                .decompress_to_owned(
-                    &indices,
-                    shards.uncompressed_size(),
-                    shards
-                        .shards
-                        .into_iter()
-                        .map(Ok::<CompressedShard, anyhow::Error>)
-                        .transpose_into_fallible(),
-                )
-                .unwrap();
-            for (&idx, &first_byte) in &soa.constant_deltas {
-                soa.data[idx] = first_byte;
-            }
+                let mut tiles = filter_and_compress(buf_ptr, BufferFormat::Argb8888, compressor);
+                assert_eq!(tiles.tiles.len(), 1);
+                let tile = tiles.tiles.pop().unwrap();
 
-            // SoA layout: 4 channel arrays concatenated, each of length n_pixels.
-            let n = 32;
-            assert!(soa.len() >= 4 * n);
-            let s0 = &soa.data[0..n];
-            let s1 = &soa.data[n..2 * n];
-            let s2 = &soa.data[2 * n..3 * n];
-            let s3 = &soa.data[3 * n..4 * n];
+                let mut expected = [vec![0u8; n], vec![0u8; n], vec![0u8; n], vec![0u8; n]];
+                for i in 0..n {
+                    expected[0][i] = data[i * 4];
+                    expected[1][i] = data[i * 4 + 1];
+                    expected[2][i] = data[i * 4 + 2];
+                    expected[3][i] = data[i * 4 + 3];
+                }
+                let [ch0, ch1, ch2, ..] = &mut expected;
+                for (b, (g, r)) in ch0[..lim]
+                    .iter_mut()
+                    .zip(ch1[..lim].iter().zip(ch2[..lim].iter_mut()))
+                {
+                    *b = b.wrapping_sub(*g);
+                    *r = r.wrapping_sub(*g);
+                }
+                for ch in &mut expected {
+                    let mut prev = 0u8;
+                    for v in &mut ch[..lim] {
+                        let orig = *v;
+                        *v = orig.wrapping_sub(prev);
+                        prev = orig;
+                    }
+                }
 
-            // Compute expected values via scalar reference implementation.
-            // Forward: transpose → subtract_green → running_difference.
-            let mut expected = [vec![0u8; n], vec![0u8; n], vec![0u8; n], vec![0u8; n]];
+                for (c, exp) in expected.iter().enumerate() {
+                    let actual = materialize_channel(&tile.channels[c], n);
+                    assert_eq!(&actual, exp, "channel {c} mismatch ({label})");
+                }
+                tile
+            };
+
+        with_test_codec(|compressor, _| {
+            let mut poly = vec![0u8; n * 4];
             for i in 0..n {
-                expected[0][i] = data[i * 4]; // channel 0
-                expected[1][i] = data[i * 4 + 1]; // channel 1 (green)
-                expected[2][i] = data[i * 4 + 2]; // channel 2
-                expected[3][i] = data[i * 4 + 3]; // channel 3
+                let k = i as u32;
+                poly[i * 4] = ((k * k * 3 + 19) & 0xFF) as u8;
+                poly[i * 4 + 1] = ((k * 17 + (k >> 2) * 41 + 5) & 0xFF) as u8;
+                poly[i * 4 + 2] = ((k * k * 11 + k * 7 + 200) & 0xFF) as u8;
+                poly[i * 4 + 3] = 0xFF;
             }
-            // subtract_green: ch0 -= ch1, ch2 -= ch1.
-            let [ch0, ch1, ch2, ..] = &mut expected;
-            for (b, (g, r)) in ch0.iter_mut().zip(ch1.iter().zip(ch2.iter_mut())) {
-                *b = b.wrapping_sub(*g);
-                *r = r.wrapping_sub(*g);
+            let poly_tile = check_filtered_against_reference(&poly, compressor, "poly");
+            assert_eq!(poly_tile.channels[3], TileChannel::ConstantDelta(0xFF));
+
+            let base = [0x12u8, 0x34, 0x56, 0xFF];
+            let expected_const_first = [
+                base[0].wrapping_sub(base[1]),
+                base[1],
+                base[2].wrapping_sub(base[1]),
+                base[3],
+            ];
+            // Exact `data.len() == 32` minimum and non-multiple-of-32 (`36`) boundaries
+            // of `encode_channel`'s `ConstantDelta` guard.
+            let tile_32 = check_filtered_against_reference(&base.repeat(32), compressor, "len=32");
+            for (c, &first_byte) in expected_const_first.iter().enumerate() {
+                assert_eq!(tile_32.channels[c], TileChannel::ConstantDelta(first_byte));
             }
-            // running_difference per channel.
-            for ch in &mut expected {
-                let mut prev = 0u8;
-                for v in ch.iter_mut() {
-                    let orig = *v;
-                    *v = orig.wrapping_sub(prev);
-                    prev = orig;
+            // For `len=36`, the 4-pixel raw non-zero tail mismatches a materialized
+            // `ConstantDelta` (whose bytes `1..36` are zero), so
+            // `check_filtered_against_reference` catches a missing
+            // `is_multiple_of(32)` guard without coupling to `MIN_SIZE_TO_COMPRESS`.
+            check_filtered_against_reference(&base.repeat(36), compressor, "len=36");
+            // Step perturbation (`idx..n` flipped) leaves a single non-zero delta at
+            // `idx` without changing `data[0]`: `1`/`31` bound `encode_channel`'s
+            // first-block `data[1..32]` check, `32`/`48` hit the lo/hi 16-byte halves
+            // of the second SIMD block (`ACCUM_OR`), and `95` is the last byte.
+            let cases = std::iter::once((0usize, None))
+                .chain((0..4).flat_map(|ch| [1usize, 31, 32, 48, 95].map(|idx| (ch, Some(idx)))));
+            for (perturb_ch, perturb_idx) in cases {
+                let mut data = base.repeat(n);
+                if let Some(idx) = perturb_idx {
+                    for i in idx..n {
+                        data[i * 4 + perturb_ch] ^= 1;
+                    }
+                }
+                let label = format!("ch={perturb_ch},idx={perturb_idx:?}");
+                let tile = check_filtered_against_reference(&data, compressor, &label);
+                for (c, &first_byte) in expected_const_first.iter().enumerate() {
+                    // Perturbing G (`perturb_ch == 1`) also perturbs B (`0`) and R (`2`)
+                    // via `subtract_green`.
+                    let expect_const = perturb_idx.is_none()
+                        || (c != perturb_ch && !(perturb_ch == 1 && (c == 0 || c == 2)));
+                    assert_eq!(
+                        tile.channels[c] == TileChannel::ConstantDelta(first_byte),
+                        expect_const,
+                        "unexpected ConstantDelta for channel {c} ({label}): {:?}",
+                        tile.channels[c]
+                    );
                 }
             }
+        });
+    }
 
-            assert_eq!(s0, &expected[0], "channel 0 mismatch");
-            assert_eq!(s1, &expected[1], "channel 1 mismatch");
-            assert_eq!(s2, &expected[2], "channel 2 mismatch");
-            assert_eq!(s3, &expected[3], "channel 3 mismatch");
+    #[test]
+    #[cfg_attr(miri, ignore)]
+    fn test_tile_pipeline_errors() {
+        with_test_codec(|compressor, decompressor| {
+            // Malformed wire error cases must return `Err` cleanly rather than panicking.
+            let bad_const_delta = CompressedTiles {
+                format: BufferFormat::Argb8888,
+                total_pixels: 50, // not a multiple of 32
+                tiles: vec![CompressedTile {
+                    tile_idx: 0,
+                    channels: [
+                        TileChannel::ConstantDelta(1),
+                        TileChannel::ConstantDelta(2),
+                        TileChannel::ConstantDelta(3),
+                        TileChannel::ConstantDelta(4),
+                    ],
+                }],
+            };
+            let mut out = vec![0u8; 50 * 4];
+            assert!(decompress_and_unfilter(&bad_const_delta, decompressor, &mut out).is_err());
+
+            for bad_ch0 in [
+                TileChannel::Omitted,
+                TileChannel::Uncompressed(vec![0u8; 31]),
+                TileChannel::Uncompressed(vec![0u8; 33]),
+                TileChannel::Zstd(zstd::bulk::compress(&[0u8; 16], 1).unwrap()),
+                TileChannel::Zstd(vec![0xFF, 0x00, 0x01]),
+            ] {
+                let bad_tile = CompressedTiles {
+                    format: BufferFormat::Argb8888,
+                    total_pixels: 32,
+                    tiles: vec![CompressedTile {
+                        tile_idx: 0,
+                        channels: [
+                            bad_ch0,
+                            TileChannel::ConstantDelta(2),
+                            TileChannel::ConstantDelta(3),
+                            TileChannel::ConstantDelta(4),
+                        ],
+                    }],
+                };
+                assert!(
+                    decompress_and_unfilter(&bad_tile, decompressor, &mut out[..32 * 4]).is_err()
+                );
+            }
+
+            let two_tile_pixels = TILE_PIXELS + 64;
+            let two_tile_data = test_vec(two_tile_pixels * 4);
+            let two_tile_ptr = two_tile_data.as_ptr();
+            let two_tile_buf = unsafe { BufferPointer::new(&two_tile_ptr, two_tile_data.len()) };
+
+            // Dropping `StreamingCompressedTiles` inside `on_stream_ready` (e.g. on
+            // client disconnect) must let workers exit cleanly and leave the pool reusable.
+            filter_and_compress_streaming(
+                two_tile_buf,
+                ClientId(1),
+                WlSurfaceId(1),
+                BufferMetadata {
+                    width: two_tile_pixels as i32,
+                    height: 1,
+                    stride: (two_tile_pixels * 4) as i32,
+                    format: BufferFormat::Argb8888,
+                },
+                compressor,
+                drop,
+            );
+
+            // Out-of-order tile arrival (`[tile_1, tile_0]`) must unfilter identically to
+            // `[tile_0, tile_1]`.
+            let mut two_tiles =
+                filter_and_compress(two_tile_buf, BufferFormat::Argb8888, compressor);
+            assert_eq!(two_tiles.tiles.len(), 2);
+            two_tiles.tiles.reverse();
+            assert_eq!(two_tiles.tiles[0].tile_idx, 1);
+            assert_eq!(two_tiles.tiles[1].tile_idx, 0);
+            let mut reversed_out = vec![0u8; two_tile_data.len()];
+            decompress_and_unfilter(&two_tiles, decompressor, &mut reversed_out).unwrap();
+            assert_eq!(reversed_out, two_tile_data);
+
+            // Missing tiles (`done < expected_tiles`).
+            for bad_tiles in [
+                CompressedTiles {
+                    format: BufferFormat::Argb8888,
+                    total_pixels: two_tile_pixels,
+                    tiles: Vec::new(),
+                },
+                CompressedTiles {
+                    format: BufferFormat::Argb8888,
+                    total_pixels: two_tile_pixels,
+                    tiles: vec![two_tiles.tiles[1].clone()],
+                },
+            ] {
+                assert!(
+                    decompress_and_unfilter(&bad_tiles, decompressor, &mut reversed_out).is_err()
+                );
+            }
+
+            // Undersized `output_buf`.
+            let mut short_out = vec![0u8; two_tile_data.len() - 4];
+            assert!(decompress_and_unfilter(&two_tiles, decompressor, &mut short_out).is_err());
+
+            // Out-of-range `tile_idx >= expected_tiles`.
+            let mut oob_idx = two_tiles.clone();
+            oob_idx.tiles[0].tile_idx = 2;
+            assert!(decompress_and_unfilter(&oob_idx, decompressor, &mut reversed_out).is_err());
+
+            // Duplicate `tile_idx = 0` on a 2-tile frame.
+            let mut dup_idx = two_tiles.clone();
+            dup_idx.tiles[0] = dup_idx.tiles[1].clone();
+            assert_eq!(dup_idx.tiles[0].tile_idx, 0);
+            assert_eq!(dup_idx.tiles[1].tile_idx, 0);
+            assert!(decompress_and_unfilter(&dup_idx, decompressor, &mut reversed_out).is_err());
+
+            // Mismatched `header.n_tiles` with 1 valid tile queued must fail
+            // `decompress_and_unfilter_streaming`'s upfront header guard rather
+            // than succeeding on the queued tile.
+            let mut stream_out = vec![0u8; 64 * 64 * 4];
+            for bad_n_tiles in [0, 2] {
+                let (tx, rx) = crossbeam_channel::unbounded();
+                tx.send(Ok(CompressedTile {
+                    tile_idx: 0,
+                    channels: [
+                        TileChannel::ConstantDelta(1),
+                        TileChannel::ConstantDelta(2),
+                        TileChannel::ConstantDelta(3),
+                        TileChannel::ConstantDelta(4),
+                    ],
+                }))
+                .unwrap();
+                drop(tx);
+                let mismatched_n_tiles_stream = CompressedTileStream {
+                    header: RawBufferHeader {
+                        client: ClientId(1),
+                        surface: WlSurfaceId(1),
+                        metadata: BufferMetadata {
+                            width: 64,
+                            height: 64,
+                            stride: 64 * 4,
+                            format: BufferFormat::Argb8888,
+                        },
+                        n_tiles: bad_n_tiles,
+                    },
+                    tiles: rx,
+                };
+                assert!(
+                    decompress_and_unfilter_streaming(
+                        mismatched_n_tiles_stream,
+                        decompressor,
+                        &mut stream_out,
+                    )
+                    .is_err(),
+                    "expected error for mismatched n_tiles={bad_n_tiles}"
+                );
+            }
         });
     }
 }

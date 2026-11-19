@@ -177,6 +177,7 @@ fn running_difference_32(block: __m256i, prev_block: __m256i) -> (__m256i, __m25
 }
 
 type ForwardCarry4 = (__m256i, __m256i, __m256i, __m256i);
+type InverseCarry4 = (__m128i, __m128i, __m128i, __m128i);
 
 #[inline]
 fn aos_to_soa_u8_32x4<const HAS_ALPHA: bool, const ACCUM_OR: bool>(
@@ -342,11 +343,8 @@ unsafe fn soa_to_aos_u8_32x4<const STREAM: bool, const CONST_ALPHA: bool>(
     input3: &[u8; 32],
     const_alpha: u8,
     out: &mut [Vec4u8; 32],
-    mut prev0: __m128i,
-    mut prev1: __m128i,
-    mut prev2: __m128i,
-    mut prev3: __m128i,
-) -> (__m128i, __m128i, __m128i, __m128i) {
+    (mut prev0, mut prev1, mut prev2, mut prev3): InverseCarry4,
+) -> InverseCarry4 {
     // SAFETY: simd/mod.rs exposes versions of this function for SSE2, SSSE3,
     // SSE4.1, AVX, and AVX2. Which version is used depends on compiler flags,
     // but there is no good way to plumb that through to avoid the unsafe; when
@@ -498,7 +496,7 @@ pub(super) struct Kernel;
 
 impl FilterKernel for Kernel {
     type ForwardCarry = ForwardCarry4;
-    type InverseCarry = __m128i;
+    type InverseCarry = InverseCarry4;
     const STREAM_ALIGN: usize = 32;
 
     #[inline]
@@ -512,7 +510,7 @@ impl FilterKernel for Kernel {
     }
 
     #[inline]
-    fn zero_inverse() -> (__m128i, __m128i, __m128i, __m128i) {
+    fn zero_inverse() -> Self::InverseCarry {
         // SAFETY: simd/mod.rs exposes versions of this function for SSE2,
         // SSSE3, SSE4.1, AVX, and AVX2.
         unsafe {
@@ -549,14 +547,6 @@ impl FilterKernel for Kernel {
     }
 
     #[inline]
-    fn advance_inverse_carry(carry: __m128i, delta: u8) -> (__m128i, u8) {
-        unsafe {
-            let next = _mm_add_epi8(carry, _mm_set1_epi8(delta as i8));
-            (next, _mm_extract_epi8::<0>(next) as u8)
-        }
-    }
-
-    #[inline]
     unsafe fn splat_blocks<const STREAM: bool>(out_blocks: &mut [[Vec4u8; 32]], pixel: Vec4u8) {
         // SAFETY: simd/mod.rs exposes versions of `_mm256_set1_epi32` for SSE2
         // through AVX2, `store_m256i_vec4u8` writes 8 `Vec4u8`s (32 bytes) per
@@ -582,22 +572,11 @@ impl FilterKernel for Kernel {
         in3: &[u8; 32],
         const_alpha: u8,
         out: &mut [Vec4u8; 32],
-        (p0, p1, p2, p3): (__m128i, __m128i, __m128i, __m128i),
-    ) -> (__m128i, __m128i, __m128i, __m128i) {
+        prev: Self::InverseCarry,
+    ) -> Self::InverseCarry {
         // SAFETY: Caller upholds 32-byte alignment on `out` when `STREAM` is `true`.
         unsafe {
-            soa_to_aos_u8_32x4::<STREAM, CONST_ALPHA>(
-                in0,
-                in1,
-                in2,
-                in3,
-                const_alpha,
-                out,
-                p0,
-                p1,
-                p2,
-                p3,
-            )
+            soa_to_aos_u8_32x4::<STREAM, CONST_ALPHA>(in0, in1, in2, in3, const_alpha, out, prev)
         }
     }
 

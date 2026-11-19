@@ -29,6 +29,7 @@ use crate::client::WprsClientState;
 use crate::client::subsurface;
 use crate::client::subsurface::RemoteSubSurface;
 use crate::fallible_entry::FallibleEntryExt;
+use crate::filtering;
 use crate::prelude::*;
 use crate::serialization::Capabilities;
 use crate::serialization::ClientId;
@@ -36,6 +37,7 @@ use crate::serialization::Event;
 use crate::serialization::RecvType;
 use crate::serialization::Request;
 use crate::serialization::SendType;
+use crate::serialization::framing::CompressedTileStream;
 use crate::serialization::wayland;
 use crate::serialization::wayland::BufferAssignment;
 use crate::serialization::wayland::ClientSurface;
@@ -56,7 +58,6 @@ use crate::serialization::xdg_shell::PopupRequest;
 use crate::serialization::xdg_shell::PopupRequestPayload;
 use crate::serialization::xdg_shell::ToplevelRequest;
 use crate::serialization::xdg_shell::ToplevelRequestPayload;
-use crate::sharding_compression::DecompressedShards;
 
 impl WprsClientState {
     #[instrument(skip(self), level = "debug")]
@@ -88,11 +89,7 @@ impl WprsClientState {
                 .location(loc!())?;
 
             remote_surface
-                .apply_buffer(
-                    surface_state.buffer.take(),
-                    &mut self.buffer_cache,
-                    &mut self.pool,
-                )
+                .apply_buffer(surface_state.buffer.take())
                 .location(loc!())?;
 
             remote_surface.set_transformation(
@@ -584,8 +581,43 @@ impl WprsClientState {
     }
 
     #[instrument(skip_all, level = "debug")]
-    fn handle_buffer(&mut self, buffer: DecompressedShards) -> Result<()> {
-        self.buffer_cache = Some(buffer);
+    fn handle_buffer(&mut self, buffer_stream: CompressedTileStream) -> Result<()> {
+        let client_id = buffer_stream.header.client;
+        let surface_id = buffer_stream.header.surface;
+        let metadata = buffer_stream.header.metadata;
+        metadata.validate().location(loc!())?;
+
+        let client = self.remote_display.client(&client_id);
+        let remote_surface = client
+            .surfaces
+            .entry(surface_id)
+            .or_insert_with_result(|| {
+                RemoteSurface::new(
+                    client.id,
+                    surface_id,
+                    &self.compositor_state,
+                    &self.qh,
+                    &mut self.object_bimap,
+                )
+            })
+            .location(loc!())?;
+
+        let decode_res = (|| -> Result<()> {
+            let canvas = remote_surface
+                .prepare_buffer_canvas(metadata, &mut self.pool)
+                .location(loc!())?;
+            filtering::decompress_and_unfilter_streaming(
+                buffer_stream,
+                &mut self.decompressor,
+                canvas,
+            )
+            .location(loc!())
+        })();
+
+        if let Err(err) = decode_res {
+            remote_surface.reset_buffer_for_resync();
+            return Err(err);
+        }
         Ok(())
     }
 

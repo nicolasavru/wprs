@@ -12,645 +12,498 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use std::collections::HashMap;
-use std::fmt;
-use std::io::Read;
-use std::io::Write;
+use std::alloc;
+use std::alloc::Layout;
+use std::any::Any;
 use std::num::NonZeroUsize;
+use std::panic;
+use std::panic::AssertUnwindSafe;
+use std::sync::Arc;
+use std::sync::Condvar;
+use std::sync::Mutex;
+use std::sync::PoisonError;
 use std::thread;
+use std::thread::JoinHandle;
 
-use crossbeam_channel::Receiver;
-use crossbeam_channel::Sender;
-use divbuf::DivBufMut;
-use divbuf::DivBufShared;
-use fallible_iterator::FallibleIterator;
-use fallible_iterator::IteratorExt;
-use rkyv::Archive;
-use rkyv::Deserialize;
-use rkyv::Serialize;
-use rkyv::rancor::Error as RancorError;
-use rkyv::util::AlignedVec;
 use zstd::bulk::Compressor;
 use zstd::bulk::Decompressor;
+use zstd::zstd_safe;
 
-use crate::arc_slice::ArcSlice;
 use crate::prelude::*;
-use crate::serialization::framing::Framed;
+use crate::serialization::framing::TILE_PIXELS;
+use crate::serialization::framing::TileChannel;
 
-// TODO: benchmark this and pick a value based on that.
-pub const MIN_SIZE_TO_COMPRESS: usize = 4096;
-const MAX_QUEUED_UNCOMPRESSED_SHARDS: usize = 64;
+#[repr(C, align(64))]
+pub(crate) struct TileSoaScratch(pub(crate) [[u8; TILE_PIXELS]; 4]);
 
-#[derive(Debug, Copy, Clone, Eq, PartialEq, Archive, Deserialize, Serialize)]
-pub enum ShardCompression {
-    Uncompressed,
-    Zstd,
-    ConstantDelta(u8),
+impl TileSoaScratch {
+    fn new_boxed() -> Box<Self> {
+        let layout = Layout::new::<Self>();
+        // SAFETY: `TileSoaScratch` is a plain byte array with non-zero size, so
+        // an all-zero allocation is valid for `Self`.
+        let ptr = unsafe { alloc::alloc_zeroed(layout) };
+        if ptr.is_null() {
+            alloc::handle_alloc_error(layout);
+        }
+        // SAFETY: `ptr` was allocated with `Layout::new::<Self>()` and
+        // initialized to valid zero bytes.
+        unsafe { Box::from_raw(ptr.cast::<Self>()) }
+    }
 }
 
-#[derive(Clone, Eq, PartialEq, Archive, Deserialize, Serialize)]
-pub struct CompressedShard {
-    pub idx: usize,
-    pub uncompressed_size: usize,
-    pub compression: ShardCompression,
-    pub data: Vec<u8>,
+struct PoolJob<S> {
+    n_active_target: usize,
+    func: unsafe fn(*const (), &mut S),
+    ctx: usize,
 }
 
-impl CompressedShard {
-    pub fn len(&self) -> usize {
-        match self.compression {
-            ShardCompression::ConstantDelta(_) => 1,
-            ShardCompression::Uncompressed | ShardCompression::Zstd => self.data.len(),
+impl<S> Copy for PoolJob<S> {}
+
+impl<S> Clone for PoolJob<S> {
+    fn clone(&self) -> Self {
+        *self
+    }
+}
+
+struct PoolSync<S> {
+    job: Option<PoolJob<S>>,
+    claimed_workers: usize,
+    active_workers: usize,
+    shutdown: bool,
+    panic_payload: Option<Box<dyn Any + Send + 'static>>,
+}
+
+struct ActiveJobGuard<'a, S> {
+    shared: &'a (Mutex<PoolSync<S>>, Condvar, Condvar),
+}
+
+impl<S> Drop for ActiveJobGuard<'_, S> {
+    fn drop(&mut self) {
+        let (mutex, _, done_cv) = self.shared;
+        let mut sync = mutex.lock().unwrap_or_else(PoisonError::into_inner);
+        sync.job = None;
+        while sync.active_workers > 0 {
+            sync = done_cv.wait(sync).unwrap_or_else(PoisonError::into_inner);
         }
     }
-
-    pub fn is_empty(&self) -> bool {
-        self.len() == 0
-    }
 }
 
-impl fmt::Debug for CompressedShard {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.debug_struct("CompressedShard")
-            .field("idx", &self.idx)
-            .field("compression", &self.compression)
-            .field("data", &format_args!("Vec<u8>[{:?}]", self.data.len()))
-            .finish()
-    }
+unsafe fn call_closure<F, S>(ctx: *const (), state: &mut S)
+where
+    F: Fn(&mut S) + Sync,
+{
+    // SAFETY: `ctx` points to `f` on `WorkerPool::execute`'s stack frame, which
+    // outlives all worker executions via `ActiveJobGuard`.
+    unsafe { (&*ctx.cast::<F>())(state) };
 }
 
-impl Framed for CompressedShard {
-    fn framed_write<W: Write>(&self, stream: &mut W) -> Result<()> {
-        self.idx.framed_write(stream).location(loc!())?;
-        self.uncompressed_size
-            .framed_write(stream)
-            .location(loc!())?;
-        match self.compression {
-            ShardCompression::Uncompressed => {
-                0u8.framed_write(stream).location(loc!())?;
-                self.data.framed_write(stream).location(loc!())?;
-            },
-            ShardCompression::Zstd => {
-                1u8.framed_write(stream).location(loc!())?;
-                self.data.framed_write(stream).location(loc!())?;
-            },
-            ShardCompression::ConstantDelta(first_byte) => {
-                2u8.framed_write(stream).location(loc!())?;
-                first_byte.framed_write(stream).location(loc!())?;
-            },
-        }
-        Ok(())
-    }
+fn worker_loop<S>(mut state: S, shared: Arc<(Mutex<PoolSync<S>>, Condvar, Condvar)>) {
+    let (mutex, work_cv, done_cv) = &*shared;
 
-    fn framed_read<R: Read>(stream: &mut R) -> Result<Self> {
-        let idx = usize::framed_read(stream).location(loc!())?;
-        let uncompressed_size = usize::framed_read(stream).location(loc!())?;
-        let tag = u8::framed_read(stream).location(loc!())?;
-        // TODO: this fails on client disconnection
-        let (compression, data) = match tag {
-            0 => (
-                ShardCompression::Uncompressed,
-                Vec::<u8>::framed_read(stream).location(loc!())?,
-            ),
-            1 => (
-                ShardCompression::Zstd,
-                Vec::<u8>::framed_read(stream).location(loc!())?,
-            ),
-            2 => (
-                ShardCompression::ConstantDelta(u8::framed_read(stream).location(loc!())?),
-                Vec::new(),
-            ),
-            _ => bail!("invalid ShardCompression tag: {tag}"),
+    loop {
+        let job = {
+            let mut sync = mutex.lock().unwrap_or_else(PoisonError::into_inner);
+            loop {
+                if sync.shutdown {
+                    return;
+                }
+                if let Some(job) = sync.job
+                    && sync.claimed_workers < job.n_active_target
+                {
+                    sync.claimed_workers += 1;
+                    sync.active_workers += 1;
+                    break job;
+                }
+                sync = work_cv.wait(sync).unwrap_or_else(PoisonError::into_inner);
+            }
         };
+
+        let res = panic::catch_unwind(AssertUnwindSafe(|| {
+            // SAFETY: `job.ctx` was created from `&f` in `WorkerPool::execute`,
+            // and `active_workers > 0` prevents `ActiveJobGuard` from returning
+            // while this call is in flight.
+            unsafe { (job.func)(job.ctx as *const (), &mut state) };
+        }));
+
+        let mut sync = mutex.lock().unwrap_or_else(PoisonError::into_inner);
+        if let Err(payload) = res
+            && sync.panic_payload.is_none()
+        {
+            sync.panic_payload = Some(payload);
+        }
+        sync.active_workers -= 1;
+        if sync.active_workers == 0 {
+            done_cv.notify_one();
+        }
+    }
+}
+
+pub(crate) struct WorkerPool<S> {
+    shared: Arc<(Mutex<PoolSync<S>>, Condvar, Condvar)>,
+    inline_state: S,
+    n_workers: usize,
+    handles: Vec<JoinHandle<()>>,
+}
+
+impl<S: Send + 'static> WorkerPool<S> {
+    fn new(
+        total_parallelism: NonZeroUsize,
+        mut make_state: impl FnMut() -> Result<S>,
+    ) -> Result<Self> {
+        let inline_state = make_state().location(loc!())?;
+        let n_workers = total_parallelism.get().saturating_sub(1);
+        // Build every worker state before spawning so a `make_state` error
+        // leaks no parked threads.
+        let mut worker_states = Vec::with_capacity(n_workers);
+        for _ in 0..n_workers {
+            worker_states.push(make_state().location(loc!())?);
+        }
+        let shared = Arc::new((
+            Mutex::new(PoolSync {
+                job: None,
+                claimed_workers: 0,
+                active_workers: 0,
+                shutdown: false,
+                panic_payload: None,
+            }),
+            Condvar::new(),
+            Condvar::new(),
+        ));
+
+        let mut handles = Vec::with_capacity(n_workers);
+        for state in worker_states {
+            let shared_clone = shared.clone();
+            handles.push(thread::spawn(move || {
+                worker_loop(state, shared_clone);
+            }));
+        }
+
         Ok(Self {
-            idx,
-            uncompressed_size,
-            compression,
-            data,
+            shared,
+            inline_state,
+            n_workers,
+            handles,
+        })
+    }
+
+    /// Runs `f` concurrently across the caller thread and up to
+    /// `(max_tasks - 1).min(self.n_workers)` background worker threads, passing
+    /// each participant its exclusive `&mut S` state. A worker may re-enter `f`
+    /// within the same job while `claimed_workers < n_active_target`, so `f`
+    /// must self-schedule work items (e.g. via an `AtomicUsize` counter) until
+    /// no work remains. Does nothing if `max_tasks == 0`. Blocks until all
+    /// participants return. If the caller thread's `f` panics, that panic
+    /// propagates after all workers finish; otherwise the first worker panic is
+    /// re-raised.
+    pub(crate) fn execute<F>(&mut self, max_tasks: usize, f: F)
+    where
+        F: Fn(&mut S) + Sync,
+    {
+        if max_tasks == 0 {
+            return;
+        }
+
+        let n_active_target = (max_tasks - 1).min(self.n_workers);
+        let job = PoolJob {
+            n_active_target,
+            func: call_closure::<F, S>,
+            ctx: (&raw const f) as usize,
+        };
+
+        {
+            let (mutex, work_cv, _) = &*self.shared;
+            let mut sync = mutex.lock().unwrap_or_else(PoisonError::into_inner);
+            sync.panic_payload = None;
+            sync.claimed_workers = 0;
+            sync.job = Some(job);
+            if n_active_target >= self.n_workers {
+                work_cv.notify_all();
+            } else {
+                for _ in 0..n_active_target {
+                    work_cv.notify_one();
+                }
+            }
+        }
+
+        {
+            let _guard = ActiveJobGuard {
+                shared: &self.shared,
+            };
+            f(&mut self.inline_state);
+        }
+
+        let mut sync = self.shared.0.lock().unwrap_or_else(PoisonError::into_inner);
+        if let Some(payload) = sync.panic_payload.take() {
+            drop(sync);
+            panic::resume_unwind(payload);
+        }
+    }
+}
+
+impl<S> Drop for WorkerPool<S> {
+    fn drop(&mut self) {
+        {
+            let (mutex, work_cv, _) = &*self.shared;
+            let mut sync = mutex.lock().unwrap_or_else(PoisonError::into_inner);
+            sync.shutdown = true;
+            work_cv.notify_all();
+        }
+        for handle in self.handles.drain(..) {
+            _ = handle.join();
+        }
+    }
+}
+
+pub(crate) struct CompressorWorkerState {
+    pub(crate) compressor: Compressor<'static>,
+    pub(crate) soa_scratch: Box<TileSoaScratch>,
+    pub(crate) zstd_scratch: Vec<u8>,
+}
+
+impl CompressorWorkerState {
+    fn new(compression_level: i32) -> Result<Self> {
+        let compressor = Compressor::new(compression_level).location(loc!())?;
+        let zstd_scratch = Vec::with_capacity(zstd_safe::compress_bound(TILE_PIXELS));
+        Ok(Self {
+            compressor,
+            soa_scratch: TileSoaScratch::new_boxed(),
+            zstd_scratch,
         })
     }
 }
 
-#[derive(Debug, Clone, Default, Eq, PartialEq)]
-pub struct DecompressedShards {
-    pub data: Vec<u8>,
-    pub constant_deltas: HashMap<usize, u8>,
-}
+/// Maximum filtered channel-slice length sent uncompressed without attempting
+/// zstd (`512 B` compresses ~4.4x in ~4.4 us at level 1, ~730 Mbps breakeven).
+const MIN_SIZE_TO_COMPRESS: usize = 512;
 
-impl DecompressedShards {
-    pub fn len(&self) -> usize {
-        self.data.len()
-    }
-
-    pub fn is_empty(&self) -> bool {
-        self.data.is_empty()
-    }
-}
-
-#[derive(Debug, Clone, Eq, PartialEq, Default, Archive, Deserialize, Serialize)]
-pub struct CompressedShards {
-    pub shards: Vec<CompressedShard>,
-}
-
-#[derive(Debug, Clone, Eq, PartialEq)]
-pub struct CompressedShardsRef<'a> {
-    pub shards: &'a CompressedShard,
-}
-
-impl CompressedShards {
-    pub fn new(mut shards: Vec<CompressedShard>) -> Self {
-        shards.sort_by_key(|k| k.idx);
-        Self { shards }
-    }
-
-    pub fn len(&self) -> usize {
-        self.shards.len()
-    }
-
-    pub fn is_empty(&self) -> bool {
-        self.shards.is_empty()
-    }
-
-    pub fn indices(&self) -> Vec<usize> {
-        self.shards.iter().map(|shard| shard.idx).collect()
-    }
-
-    pub fn uncompressed_size(&self) -> usize {
-        self.shards
-            .iter()
-            .map(|shard| shard.uncompressed_size)
-            .sum()
-    }
-
-    pub fn size(&self) -> usize {
-        self.shards.iter().map(CompressedShard::len).sum()
-    }
-
-    #[instrument(skip_all, level = "debug")]
-    pub fn streaming_framed_decompress_with<F, T, R: Read>(
-        stream: &mut R,
-        decompressor: &mut ShardingDecompressor,
-        f: F,
-    ) -> Result<T>
-    where
-        F: FnOnce(&[u8]) -> Result<T>,
-    {
-        let serialized_indices = AlignedVec::framed_read(stream).location(loc!())?;
-        let indices =
-            rkyv::from_bytes::<Vec<usize>, RancorError>(&serialized_indices).location(loc!())?;
-        debug!("read indices: {:?}", indices);
-
-        let uncompressed_size = usize::framed_read(stream).location(loc!())?;
-        debug!("read uncompressed_size: {:?}", uncompressed_size);
-
-        let shards = (0..indices.len())
-            .map(|_| CompressedShard::framed_read(stream))
-            .transpose_into_fallible();
-        debug!("read data");
-
-        decompressor.decompress_with(&indices, uncompressed_size, shards, f)
-    }
-
-    #[instrument(skip_all, level = "debug")]
-    pub fn streaming_framed_decompress_to_owned<R: Read>(
-        stream: &mut R,
-        decompressor: &mut ShardingDecompressor,
-    ) -> Result<DecompressedShards> {
-        let serialized_indices = AlignedVec::framed_read(stream).location(loc!())?;
-        let indices =
-            rkyv::from_bytes::<Vec<usize>, RancorError>(&serialized_indices).location(loc!())?;
-        debug!("read indices: {:?}", indices);
-
-        let uncompressed_size = usize::framed_read(stream).location(loc!())?;
-        debug!("read uncompressed_size: {:?}", uncompressed_size);
-
-        let shards = (0..indices.len())
-            .map(|_| CompressedShard::framed_read(stream))
-            .transpose_into_fallible();
-        debug!("read data");
-
-        decompressor.decompress_to_owned(&indices, uncompressed_size, shards)
-    }
-}
-
-impl Framed for CompressedShards {
-    fn framed_write<W: Write>(&self, stream: &mut W) -> Result<()> {
-        let indices = self.indices();
-        rkyv::to_bytes::<RancorError>(&indices)
-            .location(loc!())?
-            .framed_write(stream)
-            .location(loc!())?;
-
-        self.uncompressed_size()
-            .framed_write(stream)
-            .location(loc!())?;
-
-        for shard in self.shards.iter() {
-            shard.framed_write(stream).location(loc!())?;
-            // Flush here instaed of after writing all the frames so that the client
-            // can start decompressing the shards sooner.
-            stream.flush().location(loc!())?;
+pub(crate) fn compress_channel_slice(
+    compressor: &mut Compressor<'static>,
+    zstd_scratch: &mut Vec<u8>,
+    data: &[u8],
+) -> TileChannel {
+    if data.len() > MIN_SIZE_TO_COMPRESS {
+        let bound = zstd_safe::compress_bound(data.len());
+        zstd_scratch.clear();
+        zstd_scratch.reserve(bound);
+        let n = compressor
+            .compress_to_buffer(data, zstd_scratch)
+            .expect("dst reserved to compress_bound");
+        if n < data.len() {
+            return TileChannel::Zstd(zstd_scratch[..n].to_vec());
         }
-
-        Ok(())
     }
-
-    fn framed_read<R: Read>(stream: &mut R) -> Result<Self> {
-        let serialized_indices = AlignedVec::framed_read(stream).location(loc!())?;
-        let indices =
-            rkyv::from_bytes::<Vec<usize>, RancorError>(&serialized_indices).location(loc!())?;
-        let shards: Vec<CompressedShard> = (0..indices.len())
-            .map(|_| CompressedShard::framed_read(stream))
-            .transpose_into_fallible()
-            .collect()
-            .location(loc!())?;
-
-        Ok(Self { shards })
-    }
+    TileChannel::Uncompressed(data.to_vec())
 }
 
-const MAX_COALESCED_SHARD_BYTES: usize = 256 * 1024;
-
-pub struct StreamingCompressedShards {
-    pub indices: Vec<usize>,
-    pub uncompressed_size: usize,
-    pub shards: Receiver<CompressedShard>,
+pub(crate) struct DecompressorWorkerState {
+    pub(crate) decompressor: Decompressor<'static>,
+    pub(crate) soa_scratch: Box<TileSoaScratch>,
 }
 
-impl StreamingCompressedShards {
-    pub fn framed_write<W: Write>(self, stream: &mut W) -> Result<usize> {
-        rkyv::to_bytes::<RancorError>(&self.indices)
-            .location(loc!())?
-            .framed_write(stream)
-            .location(loc!())?;
-
-        self.uncompressed_size
-            .framed_write(stream)
-            .location(loc!())?;
-
-        let mut remaining = self.indices.len();
-        let mut total_compressed_size = 0;
-
-        while remaining > 0 {
-            let shard = self
-                .shards
-                .recv()
-                .context(loc!(), "shard sender dropped before sending all shards")?;
-            let mut batch_bytes = shard.len();
-            total_compressed_size += shard.len();
-            shard.framed_write(stream).location(loc!())?;
-            remaining -= 1;
-
-            // Coalesce any shards that are already ready in the channel into the
-            // same flush, while flushing immediately as soon as the channel is
-            // empty so the client can decompress completed shards while we are
-            // still compressing subsequent ones.
-            while remaining > 0
-                && batch_bytes < MAX_COALESCED_SHARD_BYTES
-                && let Ok(shard) = self.shards.try_recv()
-            {
-                batch_bytes += shard.len();
-                total_compressed_size += shard.len();
-                shard.framed_write(stream).location(loc!())?;
-                remaining -= 1;
-            }
-
-            stream.flush().location(loc!())?;
-        }
-
-        Ok(total_compressed_size)
-    }
-
-    #[instrument(skip_all, level = "debug")]
-    pub fn collect_shards(self) -> CompressedShards {
-        let shards = CompressedShards::new(self.shards.into_iter().collect());
-        debug_assert_eq!(self.indices, shards.indices());
-        shards
-    }
-}
-
-type CompressorJob = (
-    usize,
-    Box<dyn AsRef<[u8]> + Send + Sync + 'static>,
-    Sender<CompressedShard>,
-);
-
-fn spawn_compressor(compression_level: i32, input_rx: Receiver<CompressorJob>) -> Result<()> {
-    let mut compressor = Compressor::new(compression_level).location(loc!())?;
-    compressor.long_distance_matching(true).location(loc!())?;
-    thread::spawn(move || {
-        // The iterator (and, consequently, the thread) will terminate when all
-        // the input senders (which are all in the ShardingCompressor) are
-        // dropped.
-        for (idx, input, output_tx) in input_rx {
-            let input = (*input).as_ref();
-            let (compression, data) = if input.len() > MIN_SIZE_TO_COMPRESS {
-                (ShardCompression::Zstd, compressor.compress(input).unwrap())
-            } else {
-                (ShardCompression::Uncompressed, input.to_vec())
-            };
-
-            // Ignores error if the receiver dropped early (e.g., on client
-            // disconnect).
-            _ = output_tx.send(CompressedShard {
-                idx,
-                uncompressed_size: input.len(),
-                compression,
-                data,
-            });
-        }
-    });
-    Ok(())
-}
-
-#[derive(Clone)]
-pub struct ShardingCompressorSink {
-    compressor_input: Sender<CompressorJob>,
-    shard_tx: Sender<CompressedShard>,
-}
-
-impl ShardingCompressorSink {
-    pub fn compress_shard(&self, idx: usize, data: impl AsRef<[u8]> + Send + Sync + 'static) {
-        self.compressor_input
-            .send((idx, Box::new(data), self.shard_tx.clone()))
-            .unwrap();
-    }
-
-    pub fn send_constant_delta_shard(&self, idx: usize, uncompressed_size: usize, first_byte: u8) {
-        _ = self.shard_tx.send(CompressedShard {
-            idx,
-            uncompressed_size,
-            compression: ShardCompression::ConstantDelta(first_byte),
-            data: Vec::new(),
-        });
+impl DecompressorWorkerState {
+    fn new() -> Result<Self> {
+        Ok(Self {
+            decompressor: Decompressor::new().location(loc!())?,
+            soa_scratch: TileSoaScratch::new_boxed(),
+        })
     }
 }
 
 pub struct ShardingCompressor {
-    compressor_input: Sender<CompressorJob>,
+    pub(crate) pool: WorkerPool<CompressorWorkerState>,
 }
 
 impl ShardingCompressor {
     pub fn new(n_compressors: NonZeroUsize, compression_level: i32) -> Result<Self> {
-        let (compressor_input_tx, compressor_input_rx) =
-            crossbeam_channel::bounded(MAX_QUEUED_UNCOMPRESSED_SHARDS);
-        for _ in 0..n_compressors.get() {
-            spawn_compressor(compression_level, compressor_input_rx.clone()).location(loc!())?;
-        }
-
-        Ok(Self {
-            compressor_input: compressor_input_tx,
+        let pool = WorkerPool::new(n_compressors, || {
+            CompressorWorkerState::new(compression_level)
         })
+        .location(loc!())?;
+        Ok(Self { pool })
     }
-
-    pub fn begin_streaming(
-        &self,
-        indices: Vec<usize>,
-        uncompressed_size: usize,
-    ) -> (ShardingCompressorSink, StreamingCompressedShards) {
-        let (shard_tx, shard_rx) = crossbeam_channel::unbounded();
-        (
-            ShardingCompressorSink {
-                compressor_input: self.compressor_input.clone(),
-                shard_tx,
-            },
-            StreamingCompressedShards {
-                indices,
-                uncompressed_size,
-                shards: shard_rx,
-            },
-        )
-    }
-
-    #[instrument(skip_all, level = "debug")]
-    pub fn compress(&mut self, n_shards: NonZeroUsize, data: ArcSlice<u8>) -> CompressedShards {
-        let len = data.len();
-        if len == 0 {
-            return CompressedShards::default();
-        }
-        let chunk_size = (len / n_shards).max(1);
-        debug!("chunk_size: {:?}", chunk_size);
-        let indices = (0..len).step_by(chunk_size).collect();
-        let (sink, streaming) = self.begin_streaming(indices, len);
-        for (i, chunk) in data.chunks(chunk_size).enumerate() {
-            sink.compress_shard(i * chunk_size, chunk);
-        }
-        drop(sink);
-        streaming.collect_shards()
-    }
-}
-
-/// # Panics
-/// If there is a bug and the decompression buffer wasn't resized to be large enough.
-pub fn spawn_decompressor(
-    input_rx: Receiver<(CompressedShard, DivBufMut)>,
-    output_tx: Sender<()>,
-) -> Result<()> {
-    let mut decompressor = Decompressor::new().location(loc!())?;
-    thread::spawn(move || {
-        // The iterator (and, consequently, the thread) will terminate when all
-        // the input senders (which are all in the ShardingDecompressor) are
-        // dropped.
-        for (input, mut output) in input_rx.iter() {
-            let _span = debug_span!("decompressor").entered();
-            match input.compression {
-                ShardCompression::Zstd => {
-                    // We made DivBufMut large enough, so this should never panic.
-                    decompressor
-                        .decompress_to_buffer(&input.data, output.as_mut())
-                        .unwrap();
-                },
-                ShardCompression::Uncompressed => {
-                    // The last output block will be larger than the data.
-                    let output = &mut output[0..input.data.len()];
-                    output.copy_from_slice(&input.data);
-                },
-                ShardCompression::ConstantDelta(first_byte) => {
-                    if input.uncompressed_size > 0 {
-                        output[0] = first_byte;
-                        output[1..input.uncompressed_size].fill(0);
-                    }
-                },
-            }
-            drop(output); // release our handle
-
-            // This will be an error when the ShardingDecompressor is dropped,
-            // but the for loop (and consequently this thread) will terminate at
-            // the same time for the same reason.
-            _ = output_tx.send(());
-        }
-    });
-    Ok(())
 }
 
 pub struct ShardingDecompressor {
-    decompressor_input: Sender<(CompressedShard, DivBufMut)>,
-    decompressor_output: Receiver<()>,
-    buffer: DivBufShared,
+    pub(crate) pool: WorkerPool<DecompressorWorkerState>,
 }
 
 impl ShardingDecompressor {
     pub fn new(n_decompressors: NonZeroUsize) -> Result<Self> {
-        // These channels will have at most n_shards items in them, but we only
-        // know n_shards when decompress is called, not now.
-        let (decompressor_input_tx, decompressor_input_rx) = crossbeam_channel::unbounded();
-        let (decompressor_output_tx, decompressor_output_rx) = crossbeam_channel::unbounded();
+        let pool =
+            WorkerPool::new(n_decompressors, DecompressorWorkerState::new).location(loc!())?;
+        Ok(Self { pool })
+    }
+}
 
-        for _ in 0..n_decompressors.get() {
-            spawn_decompressor(
-                decompressor_input_rx.clone(),
-                decompressor_output_tx.clone(),
-            )
-            .location(loc!())?;
-        }
+#[cfg(test)]
+mod tests {
+    use std::sync::Barrier;
+    use std::sync::atomic::AtomicUsize;
+    use std::sync::atomic::Ordering;
 
-        Ok(Self {
-            decompressor_input: decompressor_input_tx,
-            decompressor_output: decompressor_output_rx,
-            buffer: DivBufShared::from(vec![0; 64 * 1024]),
-        })
+    use super::*;
+
+    #[test]
+    fn test_tile_soa_scratch_alignment_and_zero_init() {
+        let mut scratch = TileSoaScratch::new_boxed();
+        let addr = (&raw const *scratch) as usize;
+        assert_eq!(addr % 64, 0);
+        assert_eq!(scratch.0[0][0], 0);
+        assert_eq!(scratch.0[3][TILE_PIXELS - 1], 0);
+        scratch.0[2][123] = 0xAB;
+        assert_eq!(scratch.0[2][123], 0xAB);
     }
 
-    fn dispatch_shards_into<E: std::convert::From<anyhow::Error> + Send + Sync + 'static>(
-        decompressor_input: &Sender<(CompressedShard, DivBufMut)>,
-        target_buffer: &DivBufShared,
-        indices: &[usize],
-        mut compressed_shards: impl FallibleIterator<Item = CompressedShard, Error = E>,
-        dispatched: &mut usize,
-        mut constant_deltas: Option<&mut HashMap<usize, u8>>,
-    ) -> std::result::Result<(), E>
-    where
-        Result<(), E>: anyhow::Context<(), E>,
-    {
-        let mut mut_buf = target_buffer.try_mut().location(loc!())?;
+    #[test]
+    #[cfg_attr(miri, ignore)]
+    fn test_compress_channel_slice_selects_codec() {
+        let mut compressor = Compressor::new(1).unwrap();
+        let mut scratch = Vec::new();
+        let mut noise = vec![0u8; TILE_PIXELS];
+        let mut state = 0x9E37_79B9_7F4A_7C15u64;
+        for chunk in noise.as_chunks_mut::<8>().0 {
+            state = state.wrapping_add(0x9E37_79B9_7F4A_7C15);
+            let mut z = state;
+            z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+            z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+            z ^= z >> 31;
+            chunk.copy_from_slice(&z.to_le_bytes());
+        }
+        let compressible: Vec<u8> = (0..TILE_PIXELS).map(|i| (i / 64) as u8).collect();
 
-        let mut prev_idx = 0;
-        let mut output_divbufs: Vec<DivBufMut> = indices
-            .iter()
-            // The first index is 0, we don't need to split on it.
-            .skip(1)
-            .map(|idx| {
-                let buf = mut_buf.split_to(idx - prev_idx);
-                prev_idx = *idx;
-                buf
-            })
-            .collect();
-        output_divbufs.push(mut_buf);
+        assert_eq!(
+            compress_channel_slice(
+                &mut compressor,
+                &mut scratch,
+                &compressible[..MIN_SIZE_TO_COMPRESS]
+            ),
+            TileChannel::Uncompressed(compressible[..MIN_SIZE_TO_COMPRESS].to_vec())
+        );
+        let above_threshold = &compressible[..MIN_SIZE_TO_COMPRESS + 1];
+        let TileChannel::Zstd(compressed_above) =
+            compress_channel_slice(&mut compressor, &mut scratch, above_threshold)
+        else {
+            panic!("expected Zstd above MIN_SIZE_TO_COMPRESS");
+        };
+        assert_eq!(
+            zstd::bulk::decompress(&compressed_above, above_threshold.len()).unwrap(),
+            above_threshold
+        );
 
-        let mut index_divbuf_map: HashMap<usize, DivBufMut> =
-            indices.iter().cloned().zip(output_divbufs).collect();
+        assert_eq!(
+            compress_channel_slice(&mut compressor, &mut scratch, &noise),
+            TileChannel::Uncompressed(noise.clone())
+        );
+        let TileChannel::Zstd(compressed) =
+            compress_channel_slice(&mut compressor, &mut scratch, &compressible)
+        else {
+            panic!("expected Zstd for compressible input");
+        };
+        assert_eq!(
+            zstd::bulk::decompress(&compressed, compressible.len()).unwrap(),
+            compressible
+        );
+    }
 
-        while let Some(shard) = compressed_shards.next()? {
-            let divbuf = index_divbuf_map.remove(&shard.idx).unwrap();
-            if let Some(deltas) = constant_deltas.as_deref_mut()
-                && let ShardCompression::ConstantDelta(first_byte) = shard.compression
-            {
-                deltas.insert(shard.idx, first_byte);
-                drop(divbuf);
-                continue;
+    #[test]
+    fn test_worker_pool_dispatch_and_reuse() {
+        let mut next_id = 0usize;
+        let mut pool = WorkerPool::new(NonZeroUsize::new(4).unwrap(), || {
+            let id = next_id;
+            next_id += 1;
+            Ok(id)
+        })
+        .unwrap();
+
+        // max_tasks = 0 does not run the closure.
+        let calls = AtomicUsize::new(0);
+        pool.execute(0, |_| {
+            calls.fetch_add(1, Ordering::SeqCst);
+        });
+        assert_eq!(calls.load(Ordering::SeqCst), 0);
+
+        // max_tasks = 1 runs inline on worker 0 only.
+        pool.execute(1, |id| {
+            assert_eq!(*id, 0);
+            calls.fetch_add(1, Ordering::SeqCst);
+        });
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+
+        // Verify 1, 2 (`1 < n_active_target < n_workers`), and all 3 background
+        // workers wake deterministically alongside the inline caller thread.
+        for (max_tasks, expected_parties, iters) in [(2, 2, 8), (3, 3, 4), (12, 4, 2)] {
+            for _ in 0..iters {
+                let barrier = Barrier::new(expected_parties);
+                let participants = AtomicUsize::new(0);
+                pool.execute(max_tasks, |_| {
+                    participants.fetch_add(1, Ordering::SeqCst);
+                    barrier.wait();
+                });
+                assert_eq!(participants.load(Ordering::SeqCst), expected_parties);
             }
-            decompressor_input.send((shard, divbuf)).unwrap();
-            *dispatched += 1;
         }
-
-        Ok(())
     }
 
-    #[instrument(skip_all, level = "debug")]
-    fn iter_shards(&self, n: usize) -> impl Iterator<Item = ()> + '_ {
-        // Will only panic is the other end disconnected, which should never
-        // happen.
-        (0..n).map(|_| self.decompressor_output.recv().unwrap())
-    }
-
-    #[instrument(skip_all, level = "debug")]
-    fn collect_shards(&self, n: usize) {
-        self.iter_shards(n).for_each(|_| {});
-    }
-
-    /// IMPORTANT:
-    /// * Indices must be sorted.
-    /// * If indices != compressed_shards.collect().indices(), this function
-    ///   will either panic or return corrupt data.
-    #[instrument(skip_all, level = "debug")]
-    pub fn decompress_with<F, T, E: std::convert::From<anyhow::Error> + Send + Sync + 'static>(
-        &mut self,
-        indices: &[usize],
-        uncompressed_size: usize,
-        compressed_shards: impl FallibleIterator<Item = CompressedShard, Error = E>,
-        f: F,
-    ) -> Result<T>
-    where
-        Result<(), E>: anyhow::Context<(), E>,
-        F: FnOnce(&[u8]) -> Result<T>,
-    {
-        if indices.is_empty() {
-            bail!("Cannot call decompress_with on empty indices.");
+    #[test]
+    fn test_worker_pool_panic_and_partial_init_error() {
+        struct Counted(Arc<AtomicUsize>);
+        impl Drop for Counted {
+            fn drop(&mut self) {
+                self.0.fetch_add(1, Ordering::SeqCst);
+            }
         }
 
-        if uncompressed_size > self.buffer.len() {
-            self.buffer = DivBufShared::from(vec![0; uncompressed_size]);
-        }
+        // `WorkerPool::new` builds all states before spawning threads, so a
+        // mid-init error drops already-constructed states immediately without
+        // leaving background threads holding them.
+        let dropped = Arc::new(AtomicUsize::new(0));
+        let mut created = 0usize;
+        let err_res: Result<WorkerPool<Counted>> =
+            WorkerPool::new(NonZeroUsize::new(4).unwrap(), || {
+                created += 1;
+                if created == 3 {
+                    bail!("synthetic init failure");
+                }
+                Ok(Counted(dropped.clone()))
+            });
+        assert!(err_res.is_err());
+        assert_eq!(dropped.load(Ordering::SeqCst), 2);
 
-        let mut dispatched = 0;
-        Self::dispatch_shards_into(
-            &self.decompressor_input,
-            &self.buffer,
-            indices,
-            compressed_shards,
-            &mut dispatched,
-            None,
-        )
-        .location(loc!())?;
-        self.collect_shards(dispatched);
-
-        // We dropped mut_buf and all the buffers in the decompressor threads
-        // have been freed already, so this should never fail.
-        let decompressed_data = self.buffer.try_const().unwrap().split_to(uncompressed_size);
-        f(&decompressed_data)
-    }
-
-    /// IMPORTANT: see note on decompress_with.
-    #[instrument(skip_all, level = "debug")]
-    pub fn decompress_to_owned<E: std::convert::From<anyhow::Error> + Send + Sync + 'static>(
-        &mut self,
-        indices: &[usize],
-        uncompressed_size: usize,
-        compressed_shards: impl FallibleIterator<Item = CompressedShard, Error = E>,
-    ) -> Result<DecompressedShards>
-    where
-        Result<(), E>: anyhow::Context<(), E>,
-    {
-        if indices.is_empty() {
-            return Ok(DecompressedShards::default());
-        }
-
-        // Allocate >= 36 MB (> glibc's 32 MiB DEFAULT_MMAP_THRESHOLD_MAX) so
-        // calloc uses demand-zero mmap pages instead of single-threaded heap
-        // memset, leaving ConstantDelta pages and unused tail completely
-        // unfaulted.
-        let alloc_size = uncompressed_size.max(36_000_000);
-        let buf = DivBufShared::from(vec![0; alloc_size]);
-        let mut dispatched = 0;
-        let mut constant_deltas = HashMap::new();
-        Self::dispatch_shards_into(
-            &self.decompressor_input,
-            &buf,
-            indices,
-            compressed_shards,
-            &mut dispatched,
-            Some(&mut constant_deltas),
-        )
-        .location(loc!())?;
-        self.collect_shards(dispatched);
-
-        // We dropped mut_buf and all the buffers in the decompressor threads
-        // have been freed already, so this should never fail.
-        let mut data: Vec<u8> = buf.try_into().unwrap();
-        data.truncate(uncompressed_size);
-        Ok(DecompressedShards {
-            data,
-            constant_deltas,
+        let mut id = 0usize;
+        let mut pool = WorkerPool::new(NonZeroUsize::new(3).unwrap(), || {
+            let cur = id;
+            id += 1;
+            Ok(cur)
         })
+        .unwrap();
+
+        // Worker panic propagates cleanly.
+        let res = panic::catch_unwind(AssertUnwindSafe(|| {
+            let barrier = Barrier::new(2);
+            pool.execute(2, |worker_id| {
+                barrier.wait();
+                if *worker_id != 0 {
+                    panic!("worker boom");
+                }
+            });
+        }));
+        assert!(res.is_err());
+
+        // Dual inline + worker panic must not leave stale `panic_payload` for
+        // subsequent jobs.
+        let res_dual = panic::catch_unwind(AssertUnwindSafe(|| {
+            let barrier = Barrier::new(2);
+            pool.execute(2, |_| {
+                barrier.wait();
+                panic!("dual boom");
+            });
+        }));
+        assert!(res_dual.is_err());
+
+        let ok_calls = AtomicUsize::new(0);
+        pool.execute(3, |_| {
+            ok_calls.fetch_add(1, Ordering::SeqCst);
+        });
+        assert!(ok_calls.load(Ordering::SeqCst) >= 1);
     }
 }

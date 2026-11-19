@@ -14,6 +14,7 @@
 
 use std::collections::HashMap;
 use std::collections::HashSet;
+use std::num::NonZeroUsize;
 use std::sync::Arc;
 use std::sync::OnceLock;
 
@@ -56,7 +57,6 @@ use smithay_client_toolkit::shm::slot::SlotPool;
 
 use crate::client_utils::FrameDamage;
 use crate::client_utils::SeatObject;
-use crate::filtering;
 use crate::prelude::*;
 use crate::serialization::Capabilities;
 use crate::serialization::ClientId;
@@ -70,7 +70,7 @@ use crate::serialization::wayland::Region;
 use crate::serialization::wayland::SubsurfacePosition;
 use crate::serialization::wayland::ViewportState;
 use crate::serialization::wayland::WlSurfaceId;
-use crate::sharding_compression::DecompressedShards;
+use crate::sharding_compression::ShardingDecompressor;
 
 pub mod server_handlers;
 pub mod smithay_handlers;
@@ -132,7 +132,7 @@ pub struct WprsClientState {
 
     title_prefix: String,
 
-    buffer_cache: Option<DecompressedShards>,
+    decompressor: ShardingDecompressor,
 }
 
 impl WprsClientState {
@@ -200,25 +200,31 @@ impl WprsClientState {
             current_focus: None,
             current_cursor_image: None,
             title_prefix: options.title_prefix,
-            buffer_cache: None,
+            decompressor: ShardingDecompressor::new(NonZeroUsize::new(8).unwrap())
+                .location(loc!())?,
         })
     }
+}
+
+#[derive(Debug, Copy, Clone, Eq, PartialEq)]
+pub enum RemoteBufferState {
+    /// Decoded from `RawBuffer` and waiting for its matching `Commit`.
+    Prepared,
+    /// Promoted by `Commit` and waiting to be attached to the local `WlSurface`.
+    Dirty,
+    /// Attached and committed to the local `WlSurface`.
+    Clean,
 }
 
 #[derive(Debug)]
 pub struct RemoteBuffer {
     pub metadata: BufferMetadata,
-    pub data: DecompressedShards,
     pub active_buffer: SlotBuffer,
-    pub dirty: bool,
+    pub state: RemoteBufferState,
 }
 
 impl RemoteBuffer {
-    pub fn new(
-        metadata: BufferMetadata,
-        data: DecompressedShards,
-        pool: &mut SlotPool,
-    ) -> Result<Self> {
+    pub fn new(metadata: BufferMetadata, pool: &mut SlotPool) -> Result<Self> {
         metadata.validate().location(loc!())?;
         let active_buffer = pool
             .create_buffer(
@@ -232,40 +238,27 @@ impl RemoteBuffer {
 
         Ok(Self {
             metadata,
-            data,
             active_buffer,
-            dirty: true,
+            state: RemoteBufferState::Prepared,
         })
     }
 
-    fn update_data(&mut self, data: DecompressedShards) {
-        self.data = data;
-        self.dirty = true;
-    }
-
-    #[instrument(skip_all, level = "debug")]
-    fn write_data(&mut self, pool: &mut SlotPool) -> Result<()> {
-        let canvas = match pool.canvas(&self.active_buffer) {
-            Some(canvas) => canvas,
-            None => {
-                // This should be rare, but if the compositor has not
-                // released the previous_button_state buffer, we need
-                // double-buffering.
-                debug!("creating new buffer");
-                self.active_buffer = pool
-                    .create_buffer(
-                        self.metadata.width,
-                        self.metadata.height,
-                        self.metadata.stride,
-                        self.metadata.format.into(),
-                    )
-                    .location(loc!())?
-                    .0;
-                pool.canvas(&self.active_buffer).location(loc!())?
-            },
-        };
-        filtering::unfilter(&self.data, self.metadata.format, canvas);
-        Ok(())
+    fn canvas<'a>(&mut self, pool: &'a mut SlotPool) -> Result<&'a mut [u8]> {
+        if pool.canvas(&self.active_buffer).is_none() {
+            // This should be rare, but if the compositor has not
+            // released the previous buffer, we need double-buffering.
+            debug!("creating new buffer");
+            self.active_buffer = pool
+                .create_buffer(
+                    self.metadata.width,
+                    self.metadata.height,
+                    self.metadata.stride,
+                    self.metadata.format.into(),
+                )
+                .location(loc!())?
+                .0;
+        }
+        pool.canvas(&self.active_buffer).location(loc!())
     }
 }
 
@@ -412,94 +405,104 @@ impl RemoteSurface {
         moves
     }
 
-    pub fn write_data(&mut self, pool: &mut SlotPool) -> Result<()> {
-        if let Some(buffer) = &mut self.buffer {
-            buffer.write_data(pool).location(loc!())?;
-        }
-        Ok(())
+    fn has_in_flight_buffer(&self) -> bool {
+        matches!(
+            &self.buffer,
+            Some(buffer) if buffer.state == RemoteBufferState::Prepared
+        )
     }
 
     #[instrument(skip(self, pool), level = "debug")]
-    fn set_buffer(
+    pub(crate) fn prepare_buffer_canvas<'a>(
         &mut self,
         metadata: BufferMetadata,
-        data: DecompressedShards,
-        pool: &mut SlotPool,
-    ) -> Result<()> {
+        pool: &'a mut SlotPool,
+    ) -> Result<&'a mut [u8]> {
         let buffer = match &mut self.buffer {
-            // Surface was previously committed.
-            Some(buffer) => {
-                // Only buffer data was updated, we can reuse the buffer.
-                if buffer.metadata == metadata {
-                    buffer.update_data(data);
-                    buffer
-                } else {
-                    // Buffer was resized or format changed, need to
-                    // create a new one.
-                    self.frame_damage = FrameDamage::Full;
-                    *buffer = RemoteBuffer::new(metadata, data, pool).location(loc!())?;
-                    buffer
-                }
+            Some(buffer) if buffer.metadata == metadata => {
+                buffer.state = RemoteBufferState::Prepared;
+                buffer
             },
-            // First commit for surface with a buffer.
+            Some(buffer) => {
+                self.frame_damage = FrameDamage::Full;
+                *buffer = RemoteBuffer::new(metadata, pool).location(loc!())?;
+                buffer
+            },
             None => {
                 self.frame_damage = FrameDamage::Full;
-                self.buffer = Some(RemoteBuffer::new(metadata, data, pool).location(loc!())?);
-                self.buffer.as_mut().unwrap() // we just set this to Some
+                self.buffer = Some(RemoteBuffer::new(metadata, pool).location(loc!())?);
+                self.buffer.as_mut().unwrap()
             },
         };
+        buffer.canvas(pool).location(loc!())
+    }
 
-        if buffer.dirty {
-            buffer.write_data(pool).location(loc!())?;
-        }
-        Ok(())
+    pub(crate) fn reset_buffer_for_resync(&mut self) {
+        self.buffer = None;
+        self.frame_damage = FrameDamage::Empty;
     }
 
     #[instrument(skip(self), level = "debug")]
     fn clear_buffer(&mut self) {
         let wl_surface = self.wl_surface().clone();
-        self.buffer = None;
-        self.frame_damage = FrameDamage::Empty;
+        self.reset_buffer_for_resync();
         wl_surface.attach(None, 0, 0);
     }
 
-    #[instrument(skip(self, pool), level = "debug")]
-    pub fn apply_buffer(
-        &mut self,
-        new_buffer: Option<BufferAssignment>,
-        buffer_cache: &mut Option<DecompressedShards>,
-        pool: &mut SlotPool,
-    ) -> Result<()> {
+    #[instrument(skip(self), level = "debug")]
+    pub fn apply_buffer(&mut self, new_buffer: Option<BufferAssignment>) -> Result<()> {
         match new_buffer {
             Some(BufferAssignment::New(new_metadata)) => {
-                let Some(buffer_data) = buffer_cache.take() else {
+                let Some(buffer) = &mut self.buffer else {
+                    self.frame_damage = FrameDamage::Empty;
                     return Err(anyhow!(
                         "Received buffer commit with empty data. This can happen if wprsc reattaches between wprsd sending a buffer message and a commit message."
                     ));
                 };
-
-                self.set_buffer(new_metadata, buffer_data, pool)
-                    .location(loc!())?;
+                if buffer.state != RemoteBufferState::Prepared || buffer.metadata != new_metadata {
+                    let msg = format!(
+                        "Prepared buffer ({:?}, {:?}) did not match commit ({new_metadata:?})",
+                        buffer.state, buffer.metadata,
+                    );
+                    self.reset_buffer_for_resync();
+                    bail!(msg);
+                }
+                buffer.state = RemoteBufferState::Dirty;
             },
             Some(BufferAssignment::Removed) => {
                 self.clear_buffer();
             },
-            None => {},
+            None => {
+                if self.has_in_flight_buffer() {
+                    self.reset_buffer_for_resync();
+                    bail!(
+                        "received non-buffer Commit while a prepared RawBuffer was awaiting Commit"
+                    );
+                }
+            },
         }
         Ok(())
     }
 
     fn draw_buffer_impl(&mut self, frame_qh: Option<&QueueHandle<WprsClientState>>) -> Result<()> {
+        // Don't commit while a decoded `Prepared` buffer awaits its
+        // `Request::Surface(Commit)`: a bare commit would apply surface state
+        // left pending by an earlier deferred `handle_commit` on top of the
+        // previously attached buffer; `apply_buffer` promotes `Prepared -> Dirty`
+        // and the next draw commits both together.
+        if self.has_in_flight_buffer() {
+            return Ok(());
+        }
         let wl_surface = &self.wl_surface().clone();
         let attached = if let Some(buffer) = &mut self.buffer
-            && buffer.dirty
+            && buffer.state == RemoteBufferState::Dirty
         {
             buffer.active_buffer.attach_to(wl_surface).context(
                 loc!(),
                 "attaching a buffer failed, this probably means we're leaking buffers",
             )?;
             self.frame_damage.apply_and_clear(wl_surface);
-            buffer.dirty = false;
+            buffer.state = RemoteBufferState::Clean;
             true
         } else {
             false

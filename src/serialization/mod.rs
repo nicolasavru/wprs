@@ -22,7 +22,6 @@ use std::io::BufWriter;
 use std::io::Read;
 use std::io::Write;
 use std::net::Shutdown;
-use std::num::NonZeroUsize;
 use std::os::fd::AsFd;
 use std::os::unix::net::UnixListener;
 use std::os::unix::net::UnixStream;
@@ -59,13 +58,7 @@ use smithay::reexports::wayland_server::backend;
 use sysctl::Ctl;
 use sysctl::Sysctl;
 
-use crate::arc_slice::ArcSlice;
 use crate::prelude::*;
-use crate::sharding_compression::CompressedShards;
-use crate::sharding_compression::DecompressedShards;
-use crate::sharding_compression::ShardingCompressor;
-use crate::sharding_compression::ShardingDecompressor;
-use crate::sharding_compression::StreamingCompressedShards;
 use crate::utils;
 
 pub mod framing;
@@ -74,7 +67,11 @@ pub mod tuple;
 pub mod wayland;
 pub mod xdg_shell;
 
+use framing::CompressedTileStream;
 use framing::Framed;
+use framing::ObjectCompressor;
+use framing::ObjectDecompressor;
+use framing::StreamingCompressedTiles;
 
 #[derive(Archive, Deserialize, Serialize, Debug, Copy, Clone, Hash, Eq, PartialEq)]
 pub struct ClientId(pub u64);
@@ -216,7 +213,7 @@ where
         + for<'a> bytecheck::CheckBytes<HighValidator<'a, RancorError>>,
 {
     Object(ST),
-    RawBuffer(StreamingCompressedShards),
+    RawBuffer(StreamingCompressedTiles),
 }
 
 impl<ST> fmt::Debug for SendType<ST>
@@ -228,8 +225,8 @@ where
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::Object(obj) => write!(f, "Object({obj:?})"),
-            Self::RawBuffer(shards) => {
-                write!(f, "RawBuffer([{:?}])", shards.uncompressed_size)
+            Self::RawBuffer(tiles) => {
+                write!(f, "RawBuffer([{:?}])", tiles.uncompressed_size())
             },
         }
     }
@@ -242,7 +239,7 @@ where
         + for<'a> bytecheck::CheckBytes<HighValidator<'a, RancorError>>,
 {
     Object(RT),
-    RawBuffer(DecompressedShards),
+    RawBuffer(CompressedTileStream),
 }
 
 impl<RT> fmt::Debug for RecvType<RT>
@@ -254,7 +251,7 @@ where
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::Object(obj) => write!(f, "Object({obj:?})"),
-            Self::RawBuffer(vec) => write!(f, "RawBuffer([{:?}])", vec.len()),
+            Self::RawBuffer(stream) => write!(f, "RawBuffer([{:?}])", stream.header),
         }
     }
 }
@@ -404,10 +401,7 @@ where
         + for<'a> bytecheck::CheckBytes<HighValidator<'a, RancorError>>,
 {
     let mut stream = BufReader::with_capacity(256 * 1024, stream);
-
-    // TODO: try tuning this based on the number of cpus the machine has.
-    let mut decompressor =
-        ShardingDecompressor::new(NonZeroUsize::new(8).unwrap()).location(loc!())?;
+    let mut decompressor = ObjectDecompressor::new().location(loc!())?;
 
     Version::new().compare_and_warn(&Version::framed_read(&mut stream).location(loc!())?);
 
@@ -420,10 +414,8 @@ where
 
         match message_type {
             MessageType::Object => {
-                CompressedShards::streaming_framed_decompress_with(
-                    &mut stream,
-                    &mut decompressor,
-                    |buf| {
+                decompressor
+                    .read_framed_with(&mut stream, |buf| {
                         let obj = RecvType::Object(
                             debug_span!("deserialize")
                                 .in_scope(|| rkyv::from_bytes(buf))
@@ -436,24 +428,20 @@ where
                             .map_err(|e| anyhow!("{e}"))
                             .location(loc!())?;
                         Ok(())
-                    },
-                )
-                .location(loc!())?;
+                    })
+                    .location(loc!())?;
             },
             MessageType::RawBuffer => {
-                let obj = RecvType::RawBuffer(
-                    CompressedShards::streaming_framed_decompress_to_owned(
-                        &mut stream,
-                        &mut decompressor,
-                    )
-                    .location(loc!())?,
-                );
-                debug!("read obj: {obj:?}");
-                output_channel
-                    .send((conn_id, obj))
-                    // The error type is not Send + Sync, which anyhow requires.
-                    .map_err(|e| anyhow!("{e}"))
-                    .location(loc!())?;
+                CompressedTileStream::read_from_stream(&mut stream, |tile_stream| {
+                    let obj = RecvType::RawBuffer(tile_stream);
+                    debug!("read obj: {obj:?}");
+                    output_channel
+                        .send((conn_id, obj))
+                        // The error type is not Send + Sync, which anyhow requires.
+                        .map_err(|e| anyhow!("{e}"))
+                        .location(loc!())
+                })
+                .location(loc!())?;
             },
         }
     }
@@ -472,10 +460,7 @@ where
         stream,
     );
 
-    // This compressor is only used for objects, not raw buffers, so it doesn't
-    // need a lot of threads,
-    let mut compressor =
-        ShardingCompressor::new(NonZeroUsize::new(1).unwrap(), 1).location(loc!())?;
+    let mut compressor = ObjectCompressor::new(1).location(loc!())?;
 
     Version::new().framed_write(&mut stream).location(loc!())?;
     stream.flush().location(loc!())?;
@@ -493,27 +478,24 @@ where
         .entered();
         let (uncompressed_size, compressed_size) = match obj {
             SendType::Object(obj) => {
-                let serialized_data = ArcSlice::new(
-                    debug_span!("serialize")
-                        .in_scope(|| rkyv::to_bytes::<RancorError>(&obj))
-                        .location(loc!())?,
-                );
+                let serialized_data = debug_span!("serialize")
+                    .in_scope(|| rkyv::to_bytes::<RancorError>(&obj))
+                    .location(loc!())?;
 
-                let shards = compressor.compress(NonZeroUsize::new(1).unwrap(), serialized_data);
                 MessageType::Object
                     .framed_write(&mut stream)
                     .location(loc!())?;
-                shards.framed_write(&mut stream).location(loc!())?;
-                (shards.uncompressed_size(), shards.size())
+                let compressed_size = compressor
+                    .write_framed(&serialized_data, &mut stream)
+                    .location(loc!())?;
+                (serialized_data.len(), compressed_size)
             },
-            SendType::RawBuffer(streaming_shards) => {
-                let uncompressed_size = streaming_shards.uncompressed_size;
+            SendType::RawBuffer(streaming_tiles) => {
+                let uncompressed_size = streaming_tiles.uncompressed_size();
                 MessageType::RawBuffer
                     .framed_write(&mut stream)
                     .location(loc!())?;
-                let compressed_size = streaming_shards
-                    .framed_write(&mut stream)
-                    .location(loc!())?;
+                let compressed_size = streaming_tiles.framed_write(&mut stream).location(loc!())?;
                 (uncompressed_size, compressed_size)
             },
         };
@@ -521,7 +503,11 @@ where
 
         // metrics
         {
-            let compression_ratio = uncompressed_size as f64 / compressed_size as f64;
+            let compression_ratio = if compressed_size > 0 {
+                uncompressed_size as f64 / compressed_size as f64
+            } else {
+                1.0
+            };
             span.record("uncompressed_size", field::debug(uncompressed_size));
             span.record("compressed_size", compressed_size);
             span.record("compression_ratio", compression_ratio);
