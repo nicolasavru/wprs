@@ -17,6 +17,16 @@ jobs:
       - uses: moonrepo/setup-rust@abb2d32350334249b178c401e5ec5836e0cd88d3  # v1.3.0
       - run: sudo apt-get install libwayland-dev libxkbcommon-dev
       - run: cargo test --all-features
+      - name: Test non-AVX2 x86 SIMD backends
+        run: |
+          for flags in \
+            "-C target-cpu=x86-64" \
+            "-C target-cpu=x86-64 -C target-feature=+ssse3" \
+            "-C target-cpu=x86-64-v2" \
+            "-C target-cpu=x86-64-v2 -C target-feature=+avx"; do
+            echo "=== Testing RUSTFLAGS=$flags ==="
+            PROPTEST_CASES=16 RUSTFLAGS="$flags" cargo test --lib filtering
+          done
 
   miri:
     name: cargo +nightly miri test
@@ -56,6 +66,16 @@ jobs:
           channel: nightly
       - run: sudo apt-get install libwayland-dev libxkbcommon-dev
       - run: cargo +nightly cranky --all-targets -- -D warnings
+      - name: Lint non-AVX2 x86 SIMD backends
+        run: |
+          for flags in \
+            "-C target-cpu=x86-64" \
+            "-C target-cpu=x86-64 -C target-feature=+ssse3" \
+            "-C target-cpu=x86-64-v2" \
+            "-C target-cpu=x86-64-v2 -C target-feature=+avx"; do
+            echo "=== Linting RUSTFLAGS=$flags ==="
+            RUSTFLAGS="$flags" cargo +nightly cranky --all-targets -- -D warnings
+          done
 
   test-aarch64:
     name: cargo test --all-features (aarch64)
