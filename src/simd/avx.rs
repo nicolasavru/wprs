@@ -33,11 +33,16 @@ pub use std::arch::x86_64::_mm256_castsi256_si128;
 use std::arch::x86_64::_mm256_extractf128_si256;
 use std::arch::x86_64::_mm256_insertf128_ps;
 pub use std::arch::x86_64::_mm256_loadu_si256;
+use std::arch::x86_64::_mm256_or_ps;
 pub use std::arch::x86_64::_mm256_set_epi8;
 pub use std::arch::x86_64::_mm256_set_m128i;
+pub use std::arch::x86_64::_mm256_set1_epi8;
+pub use std::arch::x86_64::_mm256_set1_epi32;
+pub use std::arch::x86_64::_mm256_setzero_si256;
 pub use std::arch::x86_64::_mm256_shuffle_ps;
 pub use std::arch::x86_64::_mm256_storeu_si256;
 pub use std::arch::x86_64::_mm256_stream_si256;
+use std::arch::x86_64::_mm256_testz_si256;
 
 #[target_feature(enable = "avx")]
 #[inline]
@@ -194,4 +199,16 @@ pub fn _mm256_shuffle_epi8(a: __m256i, b: __m256i) -> __m256i {
     // 3. Combine back into 256-bit
     let res = _mm256_castsi128_si256(res_low);
     _mm256_inserti128_si256::<1>(res, res_high)
+}
+
+#[target_feature(enable = "avx")]
+#[inline]
+pub fn _mm256_or_si256(a: __m256i, b: __m256i) -> __m256i {
+    _mm256_castps_si256(_mm256_or_ps(_mm256_castsi256_ps(a), _mm256_castsi256_ps(b)))
+}
+
+#[target_feature(enable = "avx")]
+#[inline]
+pub fn _mm256_is_zero(a: __m256i) -> bool {
+    _mm256_testz_si256(a, a) != 0
 }

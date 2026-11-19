@@ -150,12 +150,11 @@ fn sync_surface_data(
                 let writer = serializer.writer();
                 let sync_res =
                     compositor_utils::with_buffer_contents(&wl_buffer, |data, spec| -> Result<_> {
-                        let metadata = surface_state_to_send
-                            .set_external_buffer(&spec)
-                            .location(loc!())?;
+                        let metadata = surface_state_to_send.set_buffer(&spec).location(loc!())?;
                         compositor_utils::fault_probe_buffer(data);
                         filtering::filter_and_compress_streaming(
                             data,
+                            metadata.format,
                             compressor,
                             |raw_buffer_to_send| {
                                 raw_buffer_sent = true;

@@ -872,13 +872,14 @@ pub fn commit_impl(
             let writer = state.serializer.writer();
             let commit_buf_res =
                 compositor_utils::with_buffer_contents(buffer, |data, spec| -> Result<_> {
-                    surface_state.set_external_buffer(&spec).location(loc!())?;
+                    let metadata = surface_state.set_buffer(&spec).location(loc!())?;
                     if !connected {
                         return Ok(false);
                     }
                     compositor_utils::fault_probe_buffer(data);
                     filtering::filter_and_compress_streaming(
                         data,
+                        metadata.format,
                         &mut state.compressor,
                         |raw_buffer_to_send| {
                             raw_buffer_sent = true;
@@ -940,7 +941,7 @@ pub fn commit_impl(
         .buffer
         .as_ref()
         .and_then(BufferAssignment::as_new)
-        .map(|buffer| (buffer.metadata.width, buffer.metadata.height));
+        .map(|metadata| (metadata.width, metadata.height));
     let raw_damage = mem::take(&mut surface_attributes.damage);
     let damage = compositor_utils::damage_to_buffer_rects(
         &raw_damage,

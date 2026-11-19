@@ -58,7 +58,6 @@ use crate::serialization::geometry::Point;
 use crate::serialization::geometry::Rectangle;
 use crate::serialization::geometry::Size;
 use crate::serialization::xdg_shell;
-use crate::vec4u8::Vec4u8s;
 
 #[derive(Archive, Deserialize, Serialize, Debug, Copy, Clone, Hash, Eq, PartialEq)]
 pub struct WlSurfaceId(pub u64);
@@ -192,43 +191,11 @@ impl BufferMetadata {
     }
 }
 
-#[derive(Clone, Eq, PartialEq, Archive, Deserialize, Serialize)]
-pub struct UncompressedBufferData(pub Vec4u8s);
-
-impl fmt::Debug for UncompressedBufferData {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.debug_tuple("UncompressedBufferData")
-            .field(&format_args!("Vec4u8s[{}]", self.0.len()))
-            .finish()
-    }
-}
-
-#[derive(Debug, Clone, Eq, PartialEq, EnumAsInner, Archive, Deserialize, Serialize)]
-pub enum BufferData {
-    External,
-    Uncompressed(UncompressedBufferData),
-}
-
-#[derive(Debug, Clone, Eq, PartialEq, Archive, Deserialize, Serialize)]
-pub struct Buffer {
-    pub metadata: BufferMetadata,
-    pub data: BufferData,
-}
-
-impl Buffer {
-    pub fn new_external(metadata: BufferMetadata) -> Self {
-        Self {
-            metadata,
-            data: BufferData::External,
-        }
-    }
-}
-
 // TODO: consider splitting SurfaceState, this only really makes sense for the
 // surface state we're sending, not the one we're storing.
 #[derive(Debug, Clone, Eq, PartialEq, EnumAsInner, Archive, Deserialize, Serialize)]
 pub enum BufferAssignment {
-    New(Buffer),
+    New(BufferMetadata),
     Removed,
 }
 
@@ -690,9 +657,9 @@ impl SurfaceState {
         })
     }
 
-    pub fn set_external_buffer(&mut self, metadata: &SmithayBufferData) -> Result<BufferMetadata> {
+    pub fn set_buffer(&mut self, metadata: &SmithayBufferData) -> Result<BufferMetadata> {
         let metadata = BufferMetadata::from_buffer_data(metadata).location(loc!())?;
-        self.buffer = Some(BufferAssignment::New(Buffer::new_external(metadata)));
+        self.buffer = Some(BufferAssignment::New(metadata));
         Ok(metadata)
     }
 

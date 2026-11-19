@@ -16,7 +16,6 @@ use std::collections::HashMap;
 use std::fmt;
 use std::io::Read;
 use std::io::Write;
-use std::mem;
 use std::num::NonZeroUsize;
 use std::thread;
 
@@ -42,21 +41,31 @@ use crate::serialization::framing::Framed;
 pub const MIN_SIZE_TO_COMPRESS: usize = 4096;
 const MAX_QUEUED_UNCOMPRESSED_SHARDS: usize = 64;
 
+#[derive(Debug, Copy, Clone, Eq, PartialEq, Archive, Deserialize, Serialize)]
+pub enum ShardCompression {
+    Uncompressed,
+    Zstd,
+    ConstantDelta(u8),
+}
+
 #[derive(Clone, Eq, PartialEq, Archive, Deserialize, Serialize)]
 pub struct CompressedShard {
     pub idx: usize,
     pub uncompressed_size: usize,
-    pub compression: bool,
+    pub compression: ShardCompression,
     pub data: Vec<u8>,
 }
 
 impl CompressedShard {
     pub fn len(&self) -> usize {
-        self.data.len()
+        match self.compression {
+            ShardCompression::ConstantDelta(_) => 1,
+            ShardCompression::Uncompressed | ShardCompression::Zstd => self.data.len(),
+        }
     }
 
     pub fn is_empty(&self) -> bool {
-        self.data.len() == 0
+        self.len() == 0
     }
 }
 
@@ -76,23 +85,65 @@ impl Framed for CompressedShard {
         self.uncompressed_size
             .framed_write(stream)
             .location(loc!())?;
-        self.compression.framed_write(stream).location(loc!())?;
-        self.data.framed_write(stream).location(loc!())?;
+        match self.compression {
+            ShardCompression::Uncompressed => {
+                0u8.framed_write(stream).location(loc!())?;
+                self.data.framed_write(stream).location(loc!())?;
+            },
+            ShardCompression::Zstd => {
+                1u8.framed_write(stream).location(loc!())?;
+                self.data.framed_write(stream).location(loc!())?;
+            },
+            ShardCompression::ConstantDelta(first_byte) => {
+                2u8.framed_write(stream).location(loc!())?;
+                first_byte.framed_write(stream).location(loc!())?;
+            },
+        }
         Ok(())
     }
 
     fn framed_read<R: Read>(stream: &mut R) -> Result<Self> {
         let idx = usize::framed_read(stream).location(loc!())?;
         let uncompressed_size = usize::framed_read(stream).location(loc!())?;
-        let compression = bool::framed_read(stream).location(loc!())?;
+        let tag = u8::framed_read(stream).location(loc!())?;
         // TODO: this fails on client disconnection
-        let data = Vec::<u8>::framed_read(stream).location(loc!())?;
+        let (compression, data) = match tag {
+            0 => (
+                ShardCompression::Uncompressed,
+                Vec::<u8>::framed_read(stream).location(loc!())?,
+            ),
+            1 => (
+                ShardCompression::Zstd,
+                Vec::<u8>::framed_read(stream).location(loc!())?,
+            ),
+            2 => (
+                ShardCompression::ConstantDelta(u8::framed_read(stream).location(loc!())?),
+                Vec::new(),
+            ),
+            _ => bail!("invalid ShardCompression tag: {tag}"),
+        };
         Ok(Self {
             idx,
             uncompressed_size,
             compression,
             data,
         })
+    }
+}
+
+#[derive(Debug, Clone, Default, Eq, PartialEq)]
+pub struct DecompressedShards {
+    pub data: Vec<u8>,
+    pub constant_deltas: HashMap<usize, u8>,
+}
+
+impl DecompressedShards {
+    pub fn len(&self) -> usize {
+        self.data.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.data.is_empty()
     }
 }
 
@@ -164,7 +215,7 @@ impl CompressedShards {
     pub fn streaming_framed_decompress_to_owned<R: Read>(
         stream: &mut R,
         decompressor: &mut ShardingDecompressor,
-    ) -> Result<Vec<u8>> {
+    ) -> Result<DecompressedShards> {
         let serialized_indices = AlignedVec::framed_read(stream).location(loc!())?;
         let indices =
             rkyv::from_bytes::<Vec<usize>, RancorError>(&serialized_indices).location(loc!())?;
@@ -293,11 +344,10 @@ fn spawn_compressor(compression_level: i32, input_rx: Receiver<CompressorJob>) -
         // dropped.
         for (idx, input, output_tx) in input_rx {
             let input = (*input).as_ref();
-            let compression = input.len() > MIN_SIZE_TO_COMPRESS;
-            let data = if compression {
-                compressor.compress(input).unwrap()
+            let (compression, data) = if input.len() > MIN_SIZE_TO_COMPRESS {
+                (ShardCompression::Zstd, compressor.compress(input).unwrap())
             } else {
-                input.to_vec()
+                (ShardCompression::Uncompressed, input.to_vec())
             };
 
             // Ignores error if the receiver dropped early (e.g., on client
@@ -324,6 +374,15 @@ impl ShardingCompressorSink {
         self.compressor_input
             .send((idx, Box::new(data), self.shard_tx.clone()))
             .unwrap();
+    }
+
+    pub fn send_constant_delta_shard(&self, idx: usize, uncompressed_size: usize, first_byte: u8) {
+        _ = self.shard_tx.send(CompressedShard {
+            idx,
+            uncompressed_size,
+            compression: ShardCompression::ConstantDelta(first_byte),
+            data: Vec::new(),
+        });
     }
 }
 
@@ -394,15 +453,24 @@ pub fn spawn_decompressor(
         // dropped.
         for (input, mut output) in input_rx.iter() {
             let _span = debug_span!("decompressor").entered();
-            if input.compression {
-                // We made DivBufMut large enough, so this should never panic.
-                decompressor
-                    .decompress_to_buffer(&input.data, output.as_mut())
-                    .unwrap();
-            } else {
-                // The last output block will be larger than the data.
-                let output = &mut output[0..input.data.len()];
-                output.copy_from_slice(&input.data);
+            match input.compression {
+                ShardCompression::Zstd => {
+                    // We made DivBufMut large enough, so this should never panic.
+                    decompressor
+                        .decompress_to_buffer(&input.data, output.as_mut())
+                        .unwrap();
+                },
+                ShardCompression::Uncompressed => {
+                    // The last output block will be larger than the data.
+                    let output = &mut output[0..input.data.len()];
+                    output.copy_from_slice(&input.data);
+                },
+                ShardCompression::ConstantDelta(first_byte) => {
+                    if input.uncompressed_size > 0 {
+                        output[0] = first_byte;
+                        output[1..input.uncompressed_size].fill(0);
+                    }
+                },
             }
             drop(output); // release our handle
 
@@ -439,78 +507,50 @@ impl ShardingDecompressor {
         Ok(Self {
             decompressor_input: decompressor_input_tx,
             decompressor_output: decompressor_output_rx,
-            // Make the buffer larger than most frames we'll see to avoid the
-            // performance hit of growing it later, but it will be grown if
-            // necessary anyway. A 4k frame is ~33MB.
-            buffer: DivBufShared::from(vec![0; 36_000_000]),
+            buffer: DivBufShared::from(vec![0; 64 * 1024]),
         })
     }
 
-    /// IMPORTANT:
-    /// * Indices must be sorted.
-    /// * If indices != compressed_shards.collect().indices(), this function
-    ///   will either panic or return corrupt data.
-    /// * If indices.len() < compressed_shards.len(), this function
-    ///   will hang forever.
-    /// * If indices.len() > compressed_shards.len(), the decompressed data will
-    ///   be incomplete or have chunks missing.
-    #[instrument(skip_all, level = "debug")]
-    fn decompress_impl<E: std::convert::From<anyhow::Error> + Send + Sync + 'static>(
-        &mut self,
+    fn dispatch_shards_into<E: std::convert::From<anyhow::Error> + Send + Sync + 'static>(
+        decompressor_input: &Sender<(CompressedShard, DivBufMut)>,
+        target_buffer: &DivBufShared,
         indices: &[usize],
-        uncompressed_size: usize,
         mut compressed_shards: impl FallibleIterator<Item = CompressedShard, Error = E>,
+        dispatched: &mut usize,
+        mut constant_deltas: Option<&mut HashMap<usize, u8>>,
     ) -> std::result::Result<(), E>
     where
         Result<(), E>: anyhow::Context<(), E>,
     {
-        // TODO(https://github.com/rust-lang/rust/issues/78485): use
-        // DivShared.uninitialized to allocate the buffer on demand here. The
-        // allocation is fast enough and it simplifies the code, but until the
-        // read_buf rfc is implemented, uninitialized is technically undefined
-        // behaviour, even though in practice it is likely fine and existing
-        // software relies on uninitialized Vec<u8>s.
+        let mut mut_buf = target_buffer.try_mut().location(loc!())?;
 
-        // resize should be a NOP if the buffer is large enough, but that seems
-        // to not be the case for unknown reasons and it's actually quite
-        // expensive. This is likely a bug somewhere. In the meantime, only
-        // resize if the buffer really isn't large enough.
-        if uncompressed_size > self.buffer.len() {
-            let _span = debug_span!("resize");
-            debug!(
-                "resizing buffer from {:?} to {:?}",
-                self.buffer.len(),
-                uncompressed_size
-            );
-            self.buffer = DivBufShared::from(vec![0; uncompressed_size]);
-        }
+        let mut prev_idx = 0;
+        let mut output_divbufs: Vec<DivBufMut> = indices
+            .iter()
+            // The first index is 0, we don't need to split on it.
+            .skip(1)
+            .map(|idx| {
+                let buf = mut_buf.split_to(idx - prev_idx);
+                prev_idx = *idx;
+                buf
+            })
+            .collect();
+        output_divbufs.push(mut_buf);
 
-        {
-            // We need mut_buf to split off blocks for each decompressor but
-            // need it gone afterwards so that after the decompressors are done,
-            // the only remaining reference to the data is self.buffer.
-            let mut mut_buf = self.buffer.try_mut().location(loc!())?;
+        let mut index_divbuf_map: HashMap<usize, DivBufMut> =
+            indices.iter().cloned().zip(output_divbufs).collect();
 
-            let mut prev_idx = 0;
-            let mut output_divbufs: Vec<DivBufMut> = indices
-                .iter()
-                // The first index is 0, we don't need to split on it.
-                .skip(1)
-                .map(|idx| {
-                    let buf = mut_buf.split_to(idx - prev_idx);
-                    prev_idx = *idx;
-                    buf
-                })
-                .collect();
-            output_divbufs.push(mut_buf);
-
-            let mut index_divbuf_map: HashMap<usize, DivBufMut> =
-                indices.iter().cloned().zip(output_divbufs).collect();
-
-            while let Some(shard) = compressed_shards.next()? {
-                let divbuf = index_divbuf_map.remove(&shard.idx).unwrap();
-                self.decompressor_input.send((shard, divbuf)).unwrap();
+        while let Some(shard) = compressed_shards.next()? {
+            let divbuf = index_divbuf_map.remove(&shard.idx).unwrap();
+            if let Some(deltas) = constant_deltas.as_deref_mut()
+                && let ShardCompression::ConstantDelta(first_byte) = shard.compression
+            {
+                deltas.insert(shard.idx, first_byte);
+                drop(divbuf);
+                continue;
             }
+            decompressor_input.send((shard, divbuf)).unwrap();
+            *dispatched += 1;
         }
 
         Ok(())
@@ -528,7 +568,10 @@ impl ShardingDecompressor {
         self.iter_shards(n).for_each(|_| {});
     }
 
-    /// IMPORTANT: see note on decompress_impl.
+    /// IMPORTANT:
+    /// * Indices must be sorted.
+    /// * If indices != compressed_shards.collect().indices(), this function
+    ///   will either panic or return corrupt data.
     #[instrument(skip_all, level = "debug")]
     pub fn decompress_with<F, T, E: std::convert::From<anyhow::Error> + Send + Sync + 'static>(
         &mut self,
@@ -545,9 +588,21 @@ impl ShardingDecompressor {
             bail!("Cannot call decompress_with on empty indices.");
         }
 
-        self.decompress_impl(indices, uncompressed_size, compressed_shards)
-            .location(loc!())?;
-        self.collect_shards(indices.len());
+        if uncompressed_size > self.buffer.len() {
+            self.buffer = DivBufShared::from(vec![0; uncompressed_size]);
+        }
+
+        let mut dispatched = 0;
+        Self::dispatch_shards_into(
+            &self.decompressor_input,
+            &self.buffer,
+            indices,
+            compressed_shards,
+            &mut dispatched,
+            None,
+        )
+        .location(loc!())?;
+        self.collect_shards(dispatched);
 
         // We dropped mut_buf and all the buffers in the decompressor threads
         // have been freed already, so this should never fail.
@@ -555,31 +610,47 @@ impl ShardingDecompressor {
         f(&decompressed_data)
     }
 
-    /// IMPORTANT: see note on decompress_impl.
+    /// IMPORTANT: see note on decompress_with.
     #[instrument(skip_all, level = "debug")]
     pub fn decompress_to_owned<E: std::convert::From<anyhow::Error> + Send + Sync + 'static>(
         &mut self,
         indices: &[usize],
         uncompressed_size: usize,
         compressed_shards: impl FallibleIterator<Item = CompressedShard, Error = E>,
-    ) -> Result<Vec<u8>>
+    ) -> Result<DecompressedShards>
     where
         Result<(), E>: anyhow::Context<(), E>,
     {
         if indices.is_empty() {
-            return Ok(vec![]);
+            return Ok(DecompressedShards::default());
         }
 
-        self.decompress_impl(indices, uncompressed_size, compressed_shards)
-            .location(loc!())?;
-        self.collect_shards(indices.len());
+        // Allocate >= 36 MB (> glibc's 32 MiB DEFAULT_MMAP_THRESHOLD_MAX) so
+        // calloc uses demand-zero mmap pages instead of single-threaded heap
+        // memset, leaving ConstantDelta pages and unused tail completely
+        // unfaulted.
+        let alloc_size = uncompressed_size.max(36_000_000);
+        let buf = DivBufShared::from(vec![0; alloc_size]);
+        let mut dispatched = 0;
+        let mut constant_deltas = HashMap::new();
+        Self::dispatch_shards_into(
+            &self.decompressor_input,
+            &buf,
+            indices,
+            compressed_shards,
+            &mut dispatched,
+            Some(&mut constant_deltas),
+        )
+        .location(loc!())?;
+        self.collect_shards(dispatched);
 
-        let len = self.buffer.len();
-        let buf = mem::replace(&mut self.buffer, DivBufShared::from(vec![0; len]));
         // We dropped mut_buf and all the buffers in the decompressor threads
         // have been freed already, so this should never fail.
-        let mut vec: Vec<u8> = buf.try_into().unwrap();
-        vec.truncate(uncompressed_size);
-        Ok(vec)
+        let mut data: Vec<u8> = buf.try_into().unwrap();
+        data.truncate(uncompressed_size);
+        Ok(DecompressedShards {
+            data,
+            constant_deltas,
+        })
     }
 }

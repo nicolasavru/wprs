@@ -35,9 +35,14 @@ use std::arch::aarch64::uint8x16x4_t;
 use std::arch::aarch64::vaddq_u8;
 use std::arch::aarch64::vdupq_laneq_u8;
 use std::arch::aarch64::vdupq_n_u8;
+use std::arch::aarch64::vdupq_n_u32;
 use std::arch::aarch64::vextq_u8;
+use std::arch::aarch64::vgetq_lane_u8;
 use std::arch::aarch64::vld1q_u8;
 use std::arch::aarch64::vld4q_u8;
+use std::arch::aarch64::vmaxvq_u8;
+use std::arch::aarch64::vorrq_u8;
+use std::arch::aarch64::vreinterpretq_u8_u32;
 use std::arch::aarch64::vst1q_u8;
 use std::arch::aarch64::vst4q_u8;
 use std::arch::aarch64::vsubq_u8;
@@ -89,7 +94,7 @@ fn accumulate_16(block: uint8x16_t, carry: uint8x16_t) -> (uint8x16_t, uint8x16_
 /// Carry state stays in the NEON register file throughout; the forward and
 /// inverse transforms are now symmetric in their carry representation.
 #[inline]
-fn aos_to_soa_u8_32x4(
+fn aos_to_soa_u8_32x4<const HAS_ALPHA: bool, const ACCUM_OR: bool>(
     input: *const u8,
     out0: &mut [u8; 32],
     out1: &mut [u8; 32],
@@ -99,6 +104,7 @@ fn aos_to_soa_u8_32x4(
     prev1: uint8x16_t,
     prev2: uint8x16_t,
     prev3: uint8x16_t,
+    or_acc: &mut (uint8x16_t, uint8x16_t, uint8x16_t, uint8x16_t),
 ) -> (uint8x16_t, uint8x16_t, uint8x16_t, uint8x16_t) {
     // SAFETY: `input` points to 128 bytes (32 × Vec4u8) from array_chunks::<32>.
     // vld4q_u8 reads 64 bytes; vst1q_u8 writes 16 bytes per half.
@@ -124,8 +130,22 @@ fn aos_to_soa_u8_32x4(
         let (d1_hi, next1) = running_difference_16(ch1_hi, mid1);
         let (d2_lo, mid2) = running_difference_16(ch2_lo, prev2);
         let (d2_hi, next2) = running_difference_16(ch2_hi, mid2);
-        let (d3_lo, mid3) = running_difference_16(ch3_lo, prev3);
-        let (d3_hi, next3) = running_difference_16(ch3_hi, mid3);
+        let (d3_lo, d3_hi, next3) = if HAS_ALPHA {
+            let (d_lo, mid) = running_difference_16(ch3_lo, prev3);
+            let (d_hi, next) = running_difference_16(ch3_hi, mid);
+            (d_lo, d_hi, next)
+        } else {
+            (prev3, prev3, prev3)
+        };
+
+        if ACCUM_OR {
+            or_acc.0 = vorrq_u8(or_acc.0, vorrq_u8(d0_lo, d0_hi));
+            or_acc.1 = vorrq_u8(or_acc.1, vorrq_u8(d1_lo, d1_hi));
+            or_acc.2 = vorrq_u8(or_acc.2, vorrq_u8(d2_lo, d2_hi));
+            if HAS_ALPHA {
+                or_acc.3 = vorrq_u8(or_acc.3, vorrq_u8(d3_lo, d3_hi));
+            }
+        }
 
         vst1q_u8(out0.as_mut_ptr(), d0_lo);
         vst1q_u8(out0.as_mut_ptr().add(16), d0_hi);
@@ -133,8 +153,10 @@ fn aos_to_soa_u8_32x4(
         vst1q_u8(out1.as_mut_ptr().add(16), d1_hi);
         vst1q_u8(out2.as_mut_ptr(), d2_lo);
         vst1q_u8(out2.as_mut_ptr().add(16), d2_hi);
-        vst1q_u8(out3.as_mut_ptr(), d3_lo);
-        vst1q_u8(out3.as_mut_ptr().add(16), d3_hi);
+        if HAS_ALPHA {
+            vst1q_u8(out3.as_mut_ptr(), d3_lo);
+            vst1q_u8(out3.as_mut_ptr().add(16), d3_hi);
+        }
 
         (next0, next1, next2, next3)
     }
@@ -142,16 +164,17 @@ fn aos_to_soa_u8_32x4(
 
 /// Inverse: prefix_sum → add_green → interleave, 32 pixels.
 #[inline]
-fn soa_to_aos_u8_32x4(
+fn soa_to_aos_u8_32x4<const CONST_ALPHA: bool>(
     input0: &[u8; 32],
     input1: &[u8; 32],
     input2: &[u8; 32],
     input3: &[u8; 32],
+    const_alpha: u8,
     out: &mut [Vec4u8; 32],
     prev0: uint8x16_t,
     prev1: uint8x16_t,
     prev2: uint8x16_t,
-    prev3: uint8x16_t,
+    mut prev3: uint8x16_t,
 ) -> (uint8x16_t, uint8x16_t, uint8x16_t, uint8x16_t) {
     // SAFETY: vld1q_u8 reads 16 bytes per half; vst4q_u8 writes 64 bytes × 2.
     unsafe {
@@ -161,8 +184,6 @@ fn soa_to_aos_u8_32x4(
         let ch1_hi = vld1q_u8(input1.as_ptr().add(16));
         let ch2_lo = vld1q_u8(input2.as_ptr());
         let ch2_hi = vld1q_u8(input2.as_ptr().add(16));
-        let ch3_lo = vld1q_u8(input3.as_ptr());
-        let ch3_hi = vld1q_u8(input3.as_ptr().add(16));
 
         // prefix_sum per channel (inverse of running_difference)
         let ch0_lo = prefix_sum_16(ch0_lo);
@@ -180,10 +201,17 @@ fn soa_to_aos_u8_32x4(
         let ch2_hi = prefix_sum_16(ch2_hi);
         let (ch2_hi, prev2) = accumulate_16(ch2_hi, prev2);
 
-        let ch3_lo = prefix_sum_16(ch3_lo);
-        let (ch3_lo, prev3) = accumulate_16(ch3_lo, prev3);
-        let ch3_hi = prefix_sum_16(ch3_hi);
-        let (ch3_hi, prev3) = accumulate_16(ch3_hi, prev3);
+        let (ch3_lo, ch3_hi) = if CONST_ALPHA {
+            let a = vdupq_n_u8(const_alpha);
+            (a, a)
+        } else {
+            let c3_lo = prefix_sum_16(vld1q_u8(input3.as_ptr()));
+            let (c3_lo, p3) = accumulate_16(c3_lo, prev3);
+            let c3_hi = prefix_sum_16(vld1q_u8(input3.as_ptr().add(16)));
+            let (c3_hi, p3) = accumulate_16(c3_hi, p3);
+            prev3 = p3;
+            (c3_lo, c3_hi)
+        };
 
         // add_green (inverse VP8L): B += G, R += G
         let ch0_lo = vaddq_u8(ch0_lo, ch1_lo);
@@ -212,27 +240,50 @@ pub(super) struct Kernel;
 impl FilterKernel for Kernel {
     type ForwardCarry = uint8x16_t;
     type InverseCarry = uint8x16_t;
+    type OrAccum = uint8x16_t;
     const STREAM_ALIGN: usize = 1;
 
+    #[inline]
     fn zero_forward() -> Carry4 {
         // SAFETY: register broadcast; see module doc on #[target_feature].
         let z = unsafe { vdupq_n_u8(0) };
         (z, z, z, z)
     }
 
+    #[inline]
     fn zero_inverse() -> Carry4 {
         Self::zero_forward()
     }
 
-    fn forward_block(
+    #[inline]
+    fn zero_or_accum() -> Carry4 {
+        Self::zero_forward()
+    }
+
+    #[inline]
+    fn or_accum_is_zero((a0, a1, a2, a3): Carry4) -> (bool, bool, bool, bool) {
+        // SAFETY: register-to-register NEON; see module doc on #[target_feature].
+        unsafe {
+            (
+                vmaxvq_u8(a0) == 0,
+                vmaxvq_u8(a1) == 0,
+                vmaxvq_u8(a2) == 0,
+                vmaxvq_u8(a3) == 0,
+            )
+        }
+    }
+
+    #[inline]
+    fn forward_block<const HAS_ALPHA: bool, const ACCUM_OR: bool>(
         input: KnownSizeBufferPointer<Vec4u8, 32>,
         out0: &mut [u8; 32],
         out1: &mut [u8; 32],
         out2: &mut [u8; 32],
         out3: &mut [u8; 32],
         (p0, p1, p2, p3): Carry4,
+        or_acc: &mut Carry4,
     ) -> Carry4 {
-        aos_to_soa_u8_32x4(
+        aos_to_soa_u8_32x4::<HAS_ALPHA, ACCUM_OR>(
             input.ptr().cast::<u8>(),
             out0,
             out1,
@@ -242,20 +293,54 @@ impl FilterKernel for Kernel {
             p1,
             p2,
             p3,
+            or_acc,
         )
     }
 
-    unsafe fn inverse_block<const STREAM: bool>(
+    #[inline]
+    fn advance_inverse_carry(carry: uint8x16_t, delta: u8) -> (uint8x16_t, u8) {
+        // SAFETY: register-to-register NEON; see module doc on #[target_feature].
+        unsafe {
+            let next = vaddq_u8(carry, vdupq_n_u8(delta));
+            (next, vgetq_lane_u8::<0>(next))
+        }
+    }
+
+    #[inline]
+    unsafe fn splat_blocks<const STREAM: bool>(out_blocks: &mut [[Vec4u8; 32]], pixel: Vec4u8) {
+        // SAFETY: each `out` has size `32 * 4 == 128` bytes, so the eight
+        // 16-byte `vst1q_u8` stores cover `0..128` in bounds.
+        unsafe {
+            let word = u32::from_ne_bytes([pixel.0, pixel.1, pixel.2, pixel.3]);
+            let vec = vreinterpretq_u8_u32(vdupq_n_u32(word));
+            for out in out_blocks {
+                let ptr = out.as_mut_ptr().cast::<u8>();
+                vst1q_u8(ptr, vec);
+                vst1q_u8(ptr.add(16), vec);
+                vst1q_u8(ptr.add(32), vec);
+                vst1q_u8(ptr.add(48), vec);
+                vst1q_u8(ptr.add(64), vec);
+                vst1q_u8(ptr.add(80), vec);
+                vst1q_u8(ptr.add(96), vec);
+                vst1q_u8(ptr.add(112), vec);
+            }
+        }
+    }
+
+    #[inline]
+    unsafe fn inverse_block<const STREAM: bool, const CONST_ALPHA: bool>(
         in0: &[u8; 32],
         in1: &[u8; 32],
         in2: &[u8; 32],
         in3: &[u8; 32],
+        const_alpha: u8,
         out: &mut [Vec4u8; 32],
         (p0, p1, p2, p3): Carry4,
     ) -> Carry4 {
-        soa_to_aos_u8_32x4(in0, in1, in2, in3, out, p0, p1, p2, p3)
+        soa_to_aos_u8_32x4::<CONST_ALPHA>(in0, in1, in2, in3, const_alpha, out, p0, p1, p2, p3)
     }
 
+    #[inline]
     fn fence_stream() {}
 }
 

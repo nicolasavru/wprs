@@ -32,6 +32,7 @@ use rkyv::util::AlignedVec;
 use wprs::arc_slice::ArcSlice;
 use wprs::buffer_pointer::BufferPointer;
 use wprs::filtering;
+use wprs::serialization::wayland::BufferFormat;
 use wprs::sharding_compression::CompressedShard;
 use wprs::sharding_compression::CompressedShards;
 use wprs::sharding_compression::ShardingCompressor;
@@ -131,11 +132,13 @@ fn filter_compress_png(c: &mut Criterion, path: &Path) {
 
     c.bench_function(&format!("filter and compress: {}", path.display()), |b| {
         b.iter(|| {
-            compressed_shards = filtering::filter_and_compress(buf_ptr, &mut compressor);
+            compressed_shards =
+                filtering::filter_and_compress(buf_ptr, BufferFormat::Argb8888, &mut compressor);
         })
     });
 
     let compressed_size = compressed_shards.size();
+    let shard_uncompressed_size = compressed_shards.uncompressed_size();
 
     let n_decompressors = NonZeroUsize::new(8).unwrap();
     let mut sharding_decompressor = ShardingDecompressor::new(n_decompressors).unwrap();
@@ -156,10 +159,10 @@ fn filter_compress_png(c: &mut Criterion, path: &Path) {
                 || compressed_shards.clone(),
                 |compressed_shards| {
                     let buf = sharding_decompressor
-                        .decompress_to_owned(&indices, uncompressed_size, compressed_shards)
+                        .decompress_to_owned(&indices, shard_uncompressed_size, compressed_shards)
                         .unwrap();
 
-                    filtering::unfilter(&buf.into(), &mut output_buf[..]);
+                    filtering::unfilter(&buf, BufferFormat::Argb8888, &mut output_buf[..]);
                 },
                 BatchSize::SmallInput,
             )

@@ -37,9 +37,14 @@ use crate::simd::_mm256_castsi256_si128;
 use crate::simd::_mm256_extract_epi8;
 use crate::simd::_mm256_extracti128_si256;
 use crate::simd::_mm256_inserti128_si256;
+use crate::simd::_mm256_is_zero;
 use crate::simd::_mm256_loadu_si256;
+use crate::simd::_mm256_or_si256;
 use crate::simd::_mm256_set_epi8;
 use crate::simd::_mm256_set_m128i;
+use crate::simd::_mm256_set1_epi8;
+use crate::simd::_mm256_set1_epi32;
+use crate::simd::_mm256_setzero_si256;
 use crate::simd::_mm256_shuffle_epi8;
 use crate::simd::_mm256_shuffle_ps;
 use crate::simd::_mm256_slli_si256;
@@ -210,7 +215,7 @@ fn running_difference_32(mut block: __m256i, prev: u8) -> (__m256i, u8) {
 }
 
 #[inline]
-fn aos_to_soa_u8_32x4(
+fn aos_to_soa_u8_32x4<const HAS_ALPHA: bool, const ACCUM_OR: bool>(
     input: KnownSizeBufferPointer<Vec4u8, 32>,
     out0: &mut [u8; 32],
     out1: &mut [u8; 32],
@@ -220,6 +225,7 @@ fn aos_to_soa_u8_32x4(
     prev1: u8,
     prev2: u8,
     prev3: u8,
+    or_acc: &mut (__m256i, __m256i, __m256i, __m256i),
 ) -> (u8, u8, u8, u8) {
     // SAFETY: simd/mod.rs exposes versions of this function for SSE2, SSSE3,
     // SSE4.1, AVX, and AVX2. Which version is used depends on compiler flags,
@@ -328,22 +334,9 @@ fn aos_to_soa_u8_32x4(
         t0 = _mm256_blend_epi32::<0b11001100>(u0, u1);
         t1 = _mm256_shufps_epi32::<0b00111001>(u2, u3);
         t2 = _mm256_shufps_epi32::<0b01001110>(u0, u1);
-        t3 = _mm256_shufps_epi32::<0b10010011>(u2, u3);
-
-        // print!("t0  ");
-        // crate::simd::print_vec_char_256_hex(t0);
-        // print!("t1  ");
-        // crate::simd::print_vec_char_256_hex(t1);
-        // print!("t2  ");
-        // crate::simd::print_vec_char_256_hex(t2);
-        // print!("t3  ");
-        // crate::simd::print_vec_char_256_hex(t3);
-        // print!("\n");
-
-        // t0  7c 78 74 70 | 6c 68 64 60 | 5c 58 54 50 | 4c 48 44 40 || 3c 38 34 30 | 2c 28 24 20 | 1c 18 14 10 | 0c 08 04 00
-        // t1  7d 79 75 71 | 6d 69 65 61 | 5d 59 55 51 | 4d 49 45 41 || 3d 39 35 31 | 2d 29 25 21 | 1d 19 15 11 | 0d 09 05 01
-        // t2  7e 7a 76 72 | 6e 6a 66 62 | 5e 5a 56 52 | 4e 4a 46 42 || 3e 3a 36 32 | 2e 2a 26 22 | 1e 1a 16 12 | 0e 0a 06 02
-        // t3  7f 7b 77 73 | 6f 6b 67 63 | 5f 5b 57 53 | 4f 4b 47 43 || 3f 3b 37 33 | 2f 2b 27 23 | 1f 1b 17 13 | 0f 0b 07 03
+        if HAS_ALPHA {
+            t3 = _mm256_shufps_epi32::<0b10010011>(u2, u3);
+        }
 
         (t0, t2) = subtract_green(t0, t1, t2);
 
@@ -352,12 +345,25 @@ fn aos_to_soa_u8_32x4(
         (t0, next0) = running_difference_32(t0, prev0);
         (t1, next1) = running_difference_32(t1, prev1);
         (t2, next2) = running_difference_32(t2, prev2);
-        (t3, next3) = running_difference_32(t3, prev3);
+        if HAS_ALPHA {
+            (t3, next3) = running_difference_32(t3, prev3);
+        }
+
+        if ACCUM_OR {
+            or_acc.0 = _mm256_or_si256(or_acc.0, t0);
+            or_acc.1 = _mm256_or_si256(or_acc.1, t1);
+            or_acc.2 = _mm256_or_si256(or_acc.2, t2);
+            if HAS_ALPHA {
+                or_acc.3 = _mm256_or_si256(or_acc.3, t3);
+            }
+        }
 
         store_m256i(out0, t0);
         store_m256i(out1, t1);
         store_m256i(out2, t2);
-        store_m256i(out3, t3);
+        if HAS_ALPHA {
+            store_m256i(out3, t3);
+        }
 
         (next0, next1, next2, next3)
     }
@@ -366,11 +372,12 @@ fn aos_to_soa_u8_32x4(
 /// # Safety
 /// When `STREAM` is `true`, `out` must be 32-byte aligned.
 #[inline]
-unsafe fn soa_to_aos_u8_32x4<const STREAM: bool>(
+unsafe fn soa_to_aos_u8_32x4<const STREAM: bool, const CONST_ALPHA: bool>(
     input0: &[u8; 32],
     input1: &[u8; 32],
     input2: &[u8; 32],
     input3: &[u8; 32],
+    const_alpha: u8,
     out: &mut [Vec4u8; 32],
     mut prev0: __m128i,
     mut prev1: __m128i,
@@ -402,12 +409,18 @@ unsafe fn soa_to_aos_u8_32x4<const STREAM: bool>(
         let mut t0 = load_m256i(input0);
         let mut t1 = load_m256i(input1);
         let mut t2 = load_m256i(input2);
-        let mut t3 = load_m256i(input3);
 
         (t0, prev0) = prefix_sum(t0, prev0);
         (t1, prev1) = prefix_sum(t1, prev1);
         (t2, prev2) = prefix_sum(t2, prev2);
-        (t3, prev3) = prefix_sum(t3, prev3);
+
+        let mut t3 = if CONST_ALPHA {
+            _mm256_set1_epi8(const_alpha as i8)
+        } else {
+            let (v, p3) = prefix_sum(load_m256i(input3), prev3);
+            prev3 = p3;
+            v
+        };
 
         (t0, t2) = add_green(t0, t1, t2);
 
@@ -523,12 +536,15 @@ pub(super) struct Kernel;
 impl FilterKernel for Kernel {
     type ForwardCarry = u8;
     type InverseCarry = __m128i;
+    type OrAccum = __m256i;
     const STREAM_ALIGN: usize = 32;
 
+    #[inline]
     fn zero_forward() -> (u8, u8, u8, u8) {
         (0, 0, 0, 0)
     }
 
+    #[inline]
     fn zero_inverse() -> (__m128i, __m128i, __m128i, __m128i) {
         // SAFETY: simd/mod.rs exposes versions of this function for SSE2,
         // SSSE3, SSE4.1, AVX, and AVX2.
@@ -538,29 +554,100 @@ impl FilterKernel for Kernel {
         }
     }
 
-    fn forward_block(
+    #[inline]
+    fn zero_or_accum() -> (__m256i, __m256i, __m256i, __m256i) {
+        // SAFETY: simd/mod.rs exposes versions of this function for SSE2,
+        // SSSE3, SSE4.1, AVX, and AVX2.
+        unsafe {
+            let z = _mm256_setzero_si256();
+            (z, z, z, z)
+        }
+    }
+
+    #[inline]
+    fn or_accum_is_zero(
+        (a0, a1, a2, a3): (__m256i, __m256i, __m256i, __m256i),
+    ) -> (bool, bool, bool, bool) {
+        // SAFETY: simd/mod.rs exposes versions of this function for SSE2,
+        // SSSE3, SSE4.1, AVX, and AVX2.
+        unsafe {
+            (
+                _mm256_is_zero(a0),
+                _mm256_is_zero(a1),
+                _mm256_is_zero(a2),
+                _mm256_is_zero(a3),
+            )
+        }
+    }
+
+    #[inline]
+    fn forward_block<const HAS_ALPHA: bool, const ACCUM_OR: bool>(
         input: KnownSizeBufferPointer<Vec4u8, 32>,
         out0: &mut [u8; 32],
         out1: &mut [u8; 32],
         out2: &mut [u8; 32],
         out3: &mut [u8; 32],
         (p0, p1, p2, p3): (u8, u8, u8, u8),
+        or_acc: &mut (__m256i, __m256i, __m256i, __m256i),
     ) -> (u8, u8, u8, u8) {
-        aos_to_soa_u8_32x4(input, out0, out1, out2, out3, p0, p1, p2, p3)
+        aos_to_soa_u8_32x4::<HAS_ALPHA, ACCUM_OR>(
+            input, out0, out1, out2, out3, p0, p1, p2, p3, or_acc,
+        )
     }
 
-    unsafe fn inverse_block<const STREAM: bool>(
+    #[inline]
+    fn advance_inverse_carry(carry: __m128i, delta: u8) -> (__m128i, u8) {
+        unsafe {
+            let next = _mm_add_epi8(carry, _mm_set1_epi8(delta as i8));
+            (next, _mm_extract_epi8::<0>(next) as u8)
+        }
+    }
+
+    #[inline]
+    unsafe fn splat_blocks<const STREAM: bool>(out_blocks: &mut [[Vec4u8; 32]], pixel: Vec4u8) {
+        // SAFETY: simd/mod.rs exposes versions of `_mm256_set1_epi32` for SSE2
+        // through AVX2, and `store_m256i_vec4u8` writes 8 `Vec4u8`s (32 bytes)
+        // per sub-slice (`STREAM` requires 32-byte alignment on `out_blocks`).
+        unsafe {
+            let word = u32::from_le_bytes([pixel.0, pixel.1, pixel.2, pixel.3]) as i32;
+            let vec = _mm256_set1_epi32(word);
+            for out in out_blocks {
+                store_m256i_vec4u8::<STREAM>(out.index_mut(0..8).try_into().unwrap(), vec);
+                store_m256i_vec4u8::<STREAM>(out.index_mut(8..16).try_into().unwrap(), vec);
+                store_m256i_vec4u8::<STREAM>(out.index_mut(16..24).try_into().unwrap(), vec);
+                store_m256i_vec4u8::<STREAM>(out.index_mut(24..32).try_into().unwrap(), vec);
+            }
+        }
+    }
+
+    #[inline]
+    unsafe fn inverse_block<const STREAM: bool, const CONST_ALPHA: bool>(
         in0: &[u8; 32],
         in1: &[u8; 32],
         in2: &[u8; 32],
         in3: &[u8; 32],
+        const_alpha: u8,
         out: &mut [Vec4u8; 32],
         (p0, p1, p2, p3): (__m128i, __m128i, __m128i, __m128i),
     ) -> (__m128i, __m128i, __m128i, __m128i) {
         // SAFETY: Caller upholds 32-byte alignment on `out` when `STREAM` is `true`.
-        unsafe { soa_to_aos_u8_32x4::<STREAM>(in0, in1, in2, in3, out, p0, p1, p2, p3) }
+        unsafe {
+            soa_to_aos_u8_32x4::<STREAM, CONST_ALPHA>(
+                in0,
+                in1,
+                in2,
+                in3,
+                const_alpha,
+                out,
+                p0,
+                p1,
+                p2,
+                p3,
+            )
+        }
     }
 
+    #[inline]
     fn fence_stream() {
         // SAFETY: `_mm_sfence` is baseline SSE (mandatory on all x86_64 CPUs).
         unsafe { _mm_sfence() };

@@ -19,11 +19,14 @@ use std::arch::x86_64::_mm_and_si128;
 use std::arch::x86_64::_mm_andnot_si128;
 use std::arch::x86_64::_mm_castps_si128;
 use std::arch::x86_64::_mm_castsi128_ps;
+use std::arch::x86_64::_mm_cmpeq_epi8;
 pub use std::arch::x86_64::_mm_loadu_si128;
+use std::arch::x86_64::_mm_movemask_epi8;
 use std::arch::x86_64::_mm_or_si128;
 use std::arch::x86_64::_mm_set_epi8;
 use std::arch::x86_64::_mm_set_epi32;
 pub use std::arch::x86_64::_mm_set1_epi8;
+use std::arch::x86_64::_mm_set1_epi32;
 pub use std::arch::x86_64::_mm_setzero_si128;
 pub use std::arch::x86_64::_mm_sfence;
 use std::arch::x86_64::_mm_shuffle_ps;
@@ -384,4 +387,41 @@ pub fn _mm256_shuffle_ps<const MASK: i32>(a: __m256, b: __m256) -> __m256 {
         // High lane shuffle: uses a.high and b.high
         high: _mm_shuffle_ps::<MASK>(a.high, b.high),
     }
+}
+
+#[target_feature(enable = "sse2")]
+#[inline]
+pub fn _mm256_setzero_si256() -> __m256i {
+    let z = _mm_setzero_si128();
+    __m256i { low: z, high: z }
+}
+
+#[target_feature(enable = "sse2")]
+#[inline]
+pub fn _mm256_set1_epi8(val: i8) -> __m256i {
+    let v = _mm_set1_epi8(val);
+    __m256i { low: v, high: v }
+}
+
+#[target_feature(enable = "sse2")]
+#[inline]
+pub fn _mm256_set1_epi32(val: i32) -> __m256i {
+    let v = _mm_set1_epi32(val);
+    __m256i { low: v, high: v }
+}
+
+#[target_feature(enable = "sse2")]
+#[inline]
+pub fn _mm256_or_si256(a: __m256i, b: __m256i) -> __m256i {
+    __m256i {
+        low: _mm_or_si128(a.low, b.low),
+        high: _mm_or_si128(a.high, b.high),
+    }
+}
+
+#[target_feature(enable = "sse2")]
+#[inline]
+pub fn _mm256_is_zero(a: __m256i) -> bool {
+    let merged = _mm_or_si128(a.low, a.high);
+    _mm_movemask_epi8(_mm_cmpeq_epi8(merged, _mm_setzero_si128())) == 0xFFFF
 }

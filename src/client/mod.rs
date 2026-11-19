@@ -63,17 +63,14 @@ use crate::serialization::ClientId;
 use crate::serialization::Event;
 use crate::serialization::Request;
 use crate::serialization::Serializer;
-use crate::serialization::wayland::Buffer;
 use crate::serialization::wayland::BufferAssignment;
-use crate::serialization::wayland::BufferData;
 use crate::serialization::wayland::BufferMetadata;
 use crate::serialization::wayland::CursorImage;
 use crate::serialization::wayland::Region;
 use crate::serialization::wayland::SubsurfacePosition;
-use crate::serialization::wayland::UncompressedBufferData;
 use crate::serialization::wayland::ViewportState;
 use crate::serialization::wayland::WlSurfaceId;
-use crate::vec4u8::Vec4u8s;
+use crate::sharding_compression::DecompressedShards;
 
 pub mod server_handlers;
 pub mod smithay_handlers;
@@ -135,7 +132,7 @@ pub struct WprsClientState {
 
     title_prefix: String,
 
-    buffer_cache: Option<UncompressedBufferData>,
+    buffer_cache: Option<DecompressedShards>,
 }
 
 impl WprsClientState {
@@ -211,36 +208,38 @@ impl WprsClientState {
 #[derive(Debug)]
 pub struct RemoteBuffer {
     pub metadata: BufferMetadata,
-    pub data: Vec4u8s,
+    pub data: DecompressedShards,
     pub active_buffer: SlotBuffer,
     pub dirty: bool,
 }
 
 impl RemoteBuffer {
-    #[allow(clippy::missing_panics_doc)]
-    pub fn new(buffer_msg: Buffer, pool: &mut SlotPool) -> Result<Self> {
-        buffer_msg.metadata.validate().location(loc!())?;
+    pub fn new(
+        metadata: BufferMetadata,
+        data: DecompressedShards,
+        pool: &mut SlotPool,
+    ) -> Result<Self> {
+        metadata.validate().location(loc!())?;
         let active_buffer = pool
             .create_buffer(
-                buffer_msg.metadata.width,
-                buffer_msg.metadata.height,
-                buffer_msg.metadata.stride,
-                buffer_msg.metadata.format.into(),
+                metadata.width,
+                metadata.height,
+                metadata.stride,
+                metadata.format.into(),
             )
             .location(loc!())?
             .0;
 
-        let data = buffer_msg.data.into_uncompressed().unwrap().0;
         Ok(Self {
-            metadata: buffer_msg.metadata,
+            metadata,
             data,
             active_buffer,
             dirty: true,
         })
     }
 
-    fn update_data(&mut self, buffer: Buffer) {
-        self.data = buffer.data.into_uncompressed().unwrap().0;
+    fn update_data(&mut self, data: DecompressedShards) {
+        self.data = data;
         self.dirty = true;
     }
 
@@ -265,7 +264,7 @@ impl RemoteBuffer {
                 pool.canvas(&self.active_buffer).location(loc!())?
             },
         };
-        filtering::unfilter(&self.data, canvas);
+        filtering::unfilter(&self.data, self.metadata.format, canvas);
         Ok(())
     }
 }
@@ -421,26 +420,31 @@ impl RemoteSurface {
     }
 
     #[instrument(skip(self, pool), level = "debug")]
-    fn set_buffer(&mut self, new_buffer: Buffer, pool: &mut SlotPool) -> Result<()> {
+    fn set_buffer(
+        &mut self,
+        metadata: BufferMetadata,
+        data: DecompressedShards,
+        pool: &mut SlotPool,
+    ) -> Result<()> {
         let buffer = match &mut self.buffer {
             // Surface was previously committed.
             Some(buffer) => {
                 // Only buffer data was updated, we can reuse the buffer.
-                if buffer.metadata == new_buffer.metadata {
-                    buffer.update_data(new_buffer);
+                if buffer.metadata == metadata {
+                    buffer.update_data(data);
                     buffer
                 } else {
                     // Buffer was resized or format changed, need to
                     // create a new one.
                     self.frame_damage = FrameDamage::Full;
-                    *buffer = RemoteBuffer::new(new_buffer, pool).location(loc!())?;
+                    *buffer = RemoteBuffer::new(metadata, data, pool).location(loc!())?;
                     buffer
                 }
             },
             // First commit for surface with a buffer.
             None => {
                 self.frame_damage = FrameDamage::Full;
-                self.buffer = Some(RemoteBuffer::new(new_buffer, pool).location(loc!())?);
+                self.buffer = Some(RemoteBuffer::new(metadata, data, pool).location(loc!())?);
                 self.buffer.as_mut().unwrap() // we just set this to Some
             },
         };
@@ -463,32 +467,19 @@ impl RemoteSurface {
     pub fn apply_buffer(
         &mut self,
         new_buffer: Option<BufferAssignment>,
-        buffer_cache: &mut Option<UncompressedBufferData>,
+        buffer_cache: &mut Option<DecompressedShards>,
         pool: &mut SlotPool,
     ) -> Result<()> {
         match new_buffer {
-            Some(BufferAssignment::New(mut new_buffer)) => {
-                if !new_buffer.data.is_external() {
-                    return Err(anyhow!(
-                        "Received buffer from surface state.  This means that somehow the buffer is being sent with the commit message, instead of inside the buffer message."
-                    ));
-                }
-
-                if let Some(buffer_data) = buffer_cache.take() {
-                    new_buffer.data = BufferData::Uncompressed(buffer_data);
-                }
-                // else use the data in new_buffer as the buffer is data is
-                // still sent inline on connection.
-
-                if new_buffer.data.is_external() {
-                    // TODO: do we want to log a warning and let the rest of the
-                    // commit work? Unclear that it matters.
+            Some(BufferAssignment::New(new_metadata)) => {
+                let Some(buffer_data) = buffer_cache.take() else {
                     return Err(anyhow!(
                         "Received buffer commit with empty data. This can happen if wprsc reattaches between wprsd sending a buffer message and a commit message."
                     ));
-                }
+                };
 
-                self.set_buffer(new_buffer, pool).location(loc!())?;
+                self.set_buffer(new_metadata, buffer_data, pool)
+                    .location(loc!())?;
             },
             Some(BufferAssignment::Removed) => {
                 self.clear_buffer();

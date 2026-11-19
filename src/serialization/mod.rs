@@ -62,6 +62,7 @@ use sysctl::Sysctl;
 use crate::arc_slice::ArcSlice;
 use crate::prelude::*;
 use crate::sharding_compression::CompressedShards;
+use crate::sharding_compression::DecompressedShards;
 use crate::sharding_compression::ShardingCompressor;
 use crate::sharding_compression::ShardingDecompressor;
 use crate::sharding_compression::StreamingCompressedShards;
@@ -241,7 +242,7 @@ where
         + for<'a> bytecheck::CheckBytes<HighValidator<'a, RancorError>>,
 {
     Object(RT),
-    RawBuffer(Vec<u8>),
+    RawBuffer(DecompressedShards),
 }
 
 impl<RT> fmt::Debug for RecvType<RT>
