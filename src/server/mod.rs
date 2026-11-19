@@ -43,6 +43,7 @@ use smithay::reexports::wayland_protocols_misc::server_decoration::server::org_k
 use smithay::wayland::viewporter::ViewporterState;
 
 use crate::prelude::*;
+use crate::serialization::wayland::BufferMetadata;
 use crate::serialization::wayland::SurfaceRequest;
 use crate::serialization::wayland::SurfaceRequestPayload;
 use crate::serialization::wayland::SurfaceState;
@@ -78,7 +79,7 @@ fn surface_destruction_callback(state: &mut WprsServerState, surface: &WlSurface
         })));
 
         state.object_map.remove(&surface_state.id);
-        state.synced_surfaces.remove(&surface_state.id);
+        state.synced_buffers.remove(&surface_state.id);
         state.dirty_sync_surfaces.remove(&surface_state.id);
         if matches!(
             &state.cursor_status,
@@ -121,7 +122,9 @@ pub struct WprsServerState {
     // object_map:
     // left: serialized surface id, right: local native surface id
     pub object_map: HashMap<WlSurfaceId, ObjectId>,
-    pub synced_surfaces: HashSet<WlSurfaceId>,
+    /// Tracks the last `BufferMetadata` sent to the currently connected client
+    /// for each surface so `commit_impl` can safely send partial row-bands.
+    pub synced_buffers: HashMap<WlSurfaceId, BufferMetadata>,
     /// Tracks synchronized subsurfaces that sent a `Commit` to `wprsc` since
     /// their desynchronized ancestor last committed, so bufferless parent sync
     /// commits still forward `Commit(parent)` to flush them on `wprsc`.
@@ -175,7 +178,7 @@ impl WprsServerState {
             // TODO: try tuning this based on the number of cpus the machine has.
             compressor: ShardingCompressor::new(NonZeroUsize::new(16).unwrap(), 1).unwrap(),
             object_map: HashMap::new(),
-            synced_surfaces: HashSet::new(),
+            synced_buffers: HashMap::new(),
             dirty_sync_surfaces: HashSet::new(),
             cursor_status: None,
             outputs: HashMap::new(),

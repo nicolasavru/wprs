@@ -16,7 +16,6 @@ use std::collections::HashMap;
 use std::collections::HashSet;
 use std::collections::hash_map::Entry;
 use std::ffi::OsStr;
-use std::mem;
 use std::os::fd::OwnedFd;
 use std::process::Stdio;
 use std::time::Duration;
@@ -497,6 +496,7 @@ pub fn commit_inner(
 ) -> Result<()> {
     let mut guard = surface_data.cached_state.get::<SurfaceAttributes>();
     let surface_attributes = guard.current();
+    compositor_utils::cap_surface_damage(&mut surface_attributes.damage);
 
     let x11_surface = state
         .compositor_state
@@ -560,23 +560,43 @@ pub fn commit_inner(
 
     match &surface_attributes.buffer {
         Some(BufferAssignment::NewBuffer(buffer)) => {
-            compositor_utils::with_buffer_contents(buffer, |data, spec| {
-                xwayland_surface.update_buffer(
-                    &spec,
-                    data,
-                    state.client_state.pool.as_mut().location(loc!())?,
-                )
-            })
-            .location(loc!())?
-            .location(loc!())?;
+            let damage =
+                compositor_utils::with_buffer_contents(buffer, |data, spec| -> Result<_> {
+                    // Xwayland surfaces have no viewport (`viewport_state` is `None`),
+                    // while `(spec.width, spec.height)` clamps damage to the buffer
+                    // bounds and inverts rotating/flipping `buffer_transform`s.
+                    let damage = compositor_utils::damage_to_buffer_rects(
+                        &surface_attributes.damage,
+                        surface_attributes.buffer_scale,
+                        surface_attributes.buffer_transform.into(),
+                        None,
+                        (spec.width, spec.height),
+                    );
+                    xwayland_surface.update_buffer(
+                        &spec,
+                        data,
+                        &damage,
+                        state.client_state.pool.as_mut().location(loc!())?,
+                    )?;
+                    Ok(damage)
+                })
+                .location(loc!())?
+                .location(loc!())?;
 
+            // Clear `surface_attributes.damage` only after the fallible buffer
+            // update succeeds so a failed commit leaves its damage queued.
+            surface_attributes.damage.clear();
+            xwayland_surface.damage.merge_commit(Some(damage), true);
             xwayland_surface.buffer_attached = false;
         },
         Some(BufferAssignment::Removed) => {
+            surface_attributes.damage.clear();
             xwayland_surface.buffer = None;
             xwayland_surface.damage = FrameDamage::Empty;
             xwayland_surface.wl_surface().attach(None, 0, 0);
         },
+        // Retain `surface_attributes.damage` across bufferless commits (bounded
+        // by `cap_surface_damage`) until the next `NewBuffer` or `Removed` commit.
         None => {},
     }
 
@@ -593,30 +613,6 @@ pub fn commit_inner(
     {
         decorated_subsurface.draw();
     }
-
-    let buffer_size = xwayland_surface
-        .buffer
-        .as_ref()
-        .map(|buffer| (buffer.metadata.width, buffer.metadata.height));
-    let raw_damage = mem::take(&mut surface_attributes.damage);
-    // Xwayland surfaces have no viewport (`viewport_state` is `None`),
-    // while `buffer_size` is still needed to clamp damage to the buffer
-    // bounds and invert rotating/flipping `buffer_transform`s.
-    let damage = compositor_utils::damage_to_buffer_rects(
-        &raw_damage,
-        surface_attributes.buffer_scale,
-        surface_attributes.buffer_transform.into(),
-        None,
-        buffer_size,
-    );
-
-    let had_new_buffer = matches!(
-        surface_attributes.buffer,
-        Some(BufferAssignment::NewBuffer(_))
-    );
-    xwayland_surface
-        .damage
-        .merge_commit(Some(damage), had_new_buffer);
 
     if xwayland_surface.ready() {
         if let Some(Role::SubSurface(subsurface)) = &mut xwayland_surface.role {

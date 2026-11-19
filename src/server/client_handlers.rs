@@ -13,6 +13,7 @@
 // limitations under the License.
 
 /// Handlers for events from the wprs client.
+use std::collections::HashMap;
 use std::collections::HashSet;
 use std::collections::hash_map::Entry;
 use std::fs::File;
@@ -68,6 +69,7 @@ use crate::serialization::Request;
 use crate::serialization::SendType;
 use crate::serialization::Serializer;
 use crate::serialization::wayland::BufferAssignment;
+use crate::serialization::wayland::BufferMetadata;
 use crate::serialization::wayland::ClientSurface;
 use crate::serialization::wayland::CursorImage;
 use crate::serialization::wayland::CursorImageStatus;
@@ -130,7 +132,7 @@ fn committed_wl_buffer(surface_data: &SurfaceData) -> Option<WlBuffer> {
 fn sync_surface_data(
     serializer: &Serializer<Request, Event>,
     compressor: &mut ShardingCompressor,
-    synced_surfaces: &mut HashSet<WlSurfaceId>,
+    synced_buffers: &mut HashMap<WlSurfaceId, BufferMetadata>,
     surface_data: &SurfaceData,
 ) {
     // Uncommitted child subsurfaces visited by `with_surface_tree_downward` do
@@ -148,15 +150,17 @@ fn sync_surface_data(
             Some(wl_buffer) => {
                 let mut raw_buffer_sent = false;
                 let writer = serializer.writer();
-                let sync_res =
-                    compositor_utils::with_buffer_contents(&wl_buffer, |data, spec| -> Result<_> {
+                let sync_res = compositor_utils::with_buffer_contents(
+                    &wl_buffer,
+                    |data, spec| -> Result<BufferMetadata> {
                         let metadata = surface_state_to_send.set_buffer(&spec).location(loc!())?;
-                        compositor_utils::fault_probe_buffer(data);
+                        compositor_utils::fault_probe_buffer(data, metadata.stride as usize, None);
                         filtering::filter_and_compress_streaming(
                             data,
                             surface_state_to_send.client,
                             surface_state_to_send.id,
                             metadata,
+                            None,
                             compressor,
                             |raw_buffer_to_send| {
                                 raw_buffer_sent = true;
@@ -164,10 +168,11 @@ fn sync_surface_data(
                             },
                         );
                         Ok(metadata)
-                    });
+                    },
+                );
                 match sync_res {
-                    Ok(Ok(_metadata)) => {
-                        synced_surfaces.insert(surface_state_to_send.id);
+                    Ok(Ok(metadata)) => {
+                        synced_buffers.insert(surface_state_to_send.id, metadata);
                     },
                     Ok(Err(err)) => {
                         warn!("skipping invalid buffer during surface sync: {err:?}");
@@ -214,7 +219,7 @@ impl WprsServerState {
                 sync_surface_data(
                     &self.serializer,
                     &mut self.compressor,
-                    &mut self.synced_surfaces,
+                    &mut self.synced_buffers,
                     surface_data,
                 );
             },
@@ -224,7 +229,7 @@ impl WprsServerState {
 
     pub(crate) fn sync_surface_if_unsynced(&mut self, surface: &WlSurface) {
         if self.serializer.other_end_connected()
-            && !self.synced_surfaces.contains(&WlSurfaceId::new(surface))
+            && !self.synced_buffers.contains_key(&WlSurfaceId::new(surface))
         {
             self.sync_surface_tree(surface);
         }
@@ -806,7 +811,7 @@ impl WprsServerState {
     #[instrument(skip_all, level = "debug")]
     fn handle_connect(&mut self) -> Result<()> {
         // TODO: sync client outputs
-        self.synced_surfaces.clear();
+        self.synced_buffers.clear();
         self.dirty_sync_surfaces.clear();
 
         self.serializer
@@ -1089,45 +1094,48 @@ impl WprsServerState {
 
     #[instrument(skip_all, level = "debug")]
     fn handle_surface_event(&mut self, surface_event: SurfaceEvent) -> Result<()> {
+        let outputs = match surface_event.payload {
+            SurfaceEventPayload::BufferResyncRequested => {
+                // Clear `synced_buffers` unconditionally before resolving the
+                // surface so the next application commit transmits a full frame
+                // without triggering an eager retry loop if client `/dev/shm` is full.
+                self.synced_buffers.remove(&surface_event.surface_id);
+                return Ok(());
+            },
+            SurfaceEventPayload::OutputsChanged(outputs) => outputs,
+        };
+
         let (_, _, surface) = self
             .object_client_surface_from_id(&surface_event.surface_id)
             .map_err(|err| match err {
                 UnknownSurfaceErr::ObjectId(surface_id) => anyhow!(
-                    "Ignoring {:?} event for unknown object {surface_id:?}",
-                    surface_event.payload
+                    "Ignoring OutputsChanged({outputs:?}) event for unknown object {surface_id:?}"
                 ),
                 UnknownSurfaceErr::Client(object_id) => anyhow!(
-                    "Ignoring {:?} event for unknown client {object_id:?}",
-                    surface_event.payload
+                    "Ignoring OutputsChanged({outputs:?}) event for unknown client {object_id:?}"
                 ),
                 UnknownSurfaceErr::Surface(client) => anyhow!(
-                    "Ignoring {:?} event for unknown surface {client:?}",
-                    surface_event.payload
+                    "Ignoring OutputsChanged({outputs:?}) event for unknown surface {client:?}"
                 ),
             })
             .warn(loc!())?;
 
-        match surface_event.payload {
-            SurfaceEventPayload::OutputsChanged(outputs) => {
-                compositor::with_states(&surface, |surface_data| {
-                    let locked_state = surface_data
-                        .data_map
-                        .get::<LockedSurfaceState>()
-                        .expect("surfaces in object_map have LockedSurfaceState");
-                    let surface_state = &mut locked_state.0.lock().unwrap();
+        compositor::with_states(&surface, |surface_data| {
+            let locked_state = surface_data
+                .data_map
+                .get::<LockedSurfaceState>()
+                .expect("surfaces in object_map have LockedSurfaceState");
+            let surface_state = &mut locked_state.0.lock().unwrap();
 
-                    let new_ids: HashSet<u32> =
-                        HashSet::from_iter(outputs.iter().map(|output| output.id));
-                    let old_ids = HashSet::from_iter(surface_state.output_ids.iter().cloned());
+            let new_ids: HashSet<u32> = HashSet::from_iter(outputs.iter().map(|output| output.id));
+            let old_ids = HashSet::from_iter(surface_state.output_ids.iter().cloned());
 
-                    compositor_utils::update_surface_outputs(&surface, &new_ids, &old_ids, |id| {
-                        self.outputs.get(id).map(|(output, _)| output)
-                    });
+            compositor_utils::update_surface_outputs(&surface, &new_ids, &old_ids, |id| {
+                self.outputs.get(id).map(|(output, _)| output)
+            });
 
-                    surface_state.output_ids = new_ids.iter().cloned().collect();
-                });
-            },
-        }
+            surface_state.output_ids = new_ids.iter().cloned().collect();
+        });
 
         Ok(())
     }

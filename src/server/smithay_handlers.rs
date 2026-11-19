@@ -210,7 +210,7 @@ impl XdgShellHandler for WprsServerState {
         // appropriate message would have been sent to the client, so we don't
         // need to worry about destroying the toplevel,
         if toplevel.wl_surface().client().is_some() {
-            self.synced_surfaces
+            self.synced_buffers
                 .remove(&WlSurfaceId::new(toplevel.wl_surface()));
             compositor::with_states(toplevel.wl_surface(), |surface_data| {
                 surface_data
@@ -256,7 +256,7 @@ impl XdgShellHandler for WprsServerState {
         // appropriate message would have been sent to the client, so we don't
         // need to worry about destroying the popup,
         if let Some(client) = popup.wl_surface().client() {
-            self.synced_surfaces
+            self.synced_buffers
                 .remove(&WlSurfaceId::new(popup.wl_surface()));
             // Uses with_states internally and with_states is not reentrant.
             compositor::with_states(popup.wl_surface(), |surface_data| {
@@ -799,6 +799,7 @@ pub fn commit_impl(
 
     let mut guard = surface_data.cached_state.get::<SurfaceAttributes>();
     let surface_attributes = guard.current();
+    compositor_utils::cap_surface_damage(&mut surface_attributes.damage);
     let mut frame_callbacks = mem::take(&mut surface_attributes.frame_callbacks);
 
     if !frame_callbacks.is_empty() {
@@ -864,38 +865,78 @@ pub fn commit_impl(
     }
 
     debug!("buffer assignment: {:?}", &surface_attributes.buffer);
+    let mut damage_to_send = None;
     let mut buffer_to_send = None;
 
     match &surface_attributes.buffer {
         Some(SmithayBufferAssignment::NewBuffer(buffer)) => {
+            let prev_synced = if connected {
+                state.synced_buffers.remove(&surface_state.id)
+            } else {
+                None
+            };
             let mut raw_buffer_sent = false;
             let writer = state.serializer.writer();
             let commit_buf_res =
                 compositor_utils::with_buffer_contents(buffer, |data, spec| -> Result<_> {
                     let metadata = surface_state.set_buffer(&spec).location(loc!())?;
                     if !connected {
-                        return Ok(false);
+                        return Ok(None);
                     }
-                    compositor_utils::fault_probe_buffer(data);
+                    let (damage, partial_bands) =
+                        if prev_synced == Some(metadata) && !surface_attributes.damage.is_empty() {
+                            let damage = compositor_utils::damage_to_buffer_rects(
+                                &surface_attributes.damage,
+                                surface_state.buffer_scale,
+                                surface_state
+                                    .buffer_transform
+                                    .unwrap_or(Transform::Normal)
+                                    .into(),
+                                surface_state.viewport_state.as_ref(),
+                                (metadata.width, metadata.height),
+                            );
+                            let partial_bands = filtering::compute_partial_row_bands(
+                                &damage,
+                                metadata.width,
+                                metadata.height,
+                            );
+                            (Some(damage), partial_bands)
+                        } else {
+                            // Full-buffer sync/resync, or an undamaged `NewBuffer`
+                            // commit: send `damage: None` with `BufferAssignment::New`
+                            // so `wprsc`'s `merge_commit` marks `FrameDamage::Full`.
+                            (None, None)
+                        };
+                    compositor_utils::fault_probe_buffer(
+                        data,
+                        metadata.stride as usize,
+                        partial_bands.as_deref(),
+                    );
                     filtering::filter_and_compress_streaming(
                         data,
                         surface_state.client,
                         surface_state.id,
                         metadata,
+                        partial_bands,
                         &mut state.compressor,
                         |raw_buffer_to_send| {
                             raw_buffer_sent = true;
                             writer.send(SendType::RawBuffer(raw_buffer_to_send));
                         },
                     );
-                    Ok(true)
+                    Ok(Some((metadata, damage)))
                 });
+
             match commit_buf_res {
-                Ok(Ok(true)) => {
-                    state.synced_surfaces.insert(surface_state.id);
-                    buffer_to_send.clone_from(&surface_state.buffer);
+                Ok(Ok(Some((metadata, damage)))) => {
+                    surface_attributes.damage.clear();
+                    state.synced_buffers.insert(surface_state.id, metadata);
+                    damage_to_send = damage;
+                    buffer_to_send = Some(BufferAssignment::New(metadata));
                 },
-                Ok(Ok(false)) => {},
+                Ok(Ok(None)) => {
+                    surface_attributes.damage.clear();
+                },
                 Ok(Err(err)) => {
                     return Err(err).location(loc!());
                 },
@@ -907,6 +948,7 @@ pub fn commit_impl(
                         warn!(
                             "shm buffer faulted during commit ({err:?}); detaching remote surface buffer"
                         );
+                        surface_attributes.damage.clear();
                         surface_state.buffer = None;
                         buffer_to_send = Some(BufferAssignment::Removed);
                     } else {
@@ -916,17 +958,18 @@ pub fn commit_impl(
             }
         },
         Some(SmithayBufferAssignment::Removed) => {
+            surface_attributes.damage.clear();
             surface_state.buffer = None;
-            if connected {
-                state.synced_surfaces.remove(&surface_state.id);
-                buffer_to_send = Some(BufferAssignment::Removed);
-            }
+            state.synced_buffers.remove(&surface_state.id);
+            buffer_to_send = Some(BufferAssignment::Removed);
         },
+        // Retain `surface_attributes.damage` across bufferless commits (bounded
+        // by `cap_surface_damage`) so damage posted before a subsequent
+        // same-size `NewBuffer` commit is included in its incremental row-bands.
         None => {},
     }
 
     let Some(prev_without_buffer) = prev_without_buffer else {
-        surface_attributes.damage.clear();
         return Ok(false);
     };
 
@@ -939,23 +982,7 @@ pub fn commit_impl(
         return Ok(false);
     }
 
-    let buffer_size = surface_state
-        .buffer
-        .as_ref()
-        .and_then(BufferAssignment::as_new)
-        .map(|metadata| (metadata.width, metadata.height));
-    let raw_damage = mem::take(&mut surface_attributes.damage);
-    let damage = compositor_utils::damage_to_buffer_rects(
-        &raw_damage,
-        surface_state.buffer_scale,
-        surface_state
-            .buffer_transform
-            .unwrap_or(Transform::Normal)
-            .into(),
-        surface_state.viewport_state.as_ref(),
-        buffer_size,
-    );
-    surface_state_to_send.damage = Some(damage);
+    surface_state_to_send.damage = damage_to_send;
 
     let client = surface_state_to_send.client;
     let surface = surface_state_to_send.id;

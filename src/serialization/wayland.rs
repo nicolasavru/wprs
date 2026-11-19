@@ -976,6 +976,7 @@ pub struct Output {
 #[derive(Debug, Clone, PartialEq, Eq, Archive, Deserialize, Serialize)]
 pub enum SurfaceEventPayload {
     OutputsChanged(Vec<Output>),
+    BufferResyncRequested,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Archive, Deserialize, Serialize)]

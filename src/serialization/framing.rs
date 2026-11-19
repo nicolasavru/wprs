@@ -240,15 +240,22 @@ impl ObjectDecompressor {
     }
 }
 
+#[derive(Debug, Copy, Clone, Eq, PartialEq)]
+pub struct RowBand {
+    pub y0: u32,
+    pub y1: u32,
+}
+
 #[derive(Debug, Clone, Eq, PartialEq)]
 pub struct RawBufferHeader {
     pub client: ClientId,
     pub surface: WlSurfaceId,
     pub metadata: BufferMetadata,
     pub n_tiles: u32,
+    pub bands: Option<Vec<RowBand>>,
 }
 
-const RAW_BUFFER_HEADER_LEN: usize = 33;
+const RAW_BUFFER_HEADER_LEN: usize = 34;
 
 impl Framed for RawBufferHeader {
     fn framed_write<W: Write>(&self, stream: &mut W) -> Result<()> {
@@ -263,7 +270,16 @@ impl Framed for RawBufferHeader {
             BufferFormat::Xrgb8888 => 1,
         };
         buf[29..33].copy_from_slice(&self.n_tiles.to_be_bytes());
-        stream.write_all(&buf).location(loc!())
+        buf[33] = u8::from(self.bands.is_some());
+        stream.write_all(&buf).location(loc!())?;
+        if let Some(bands) = &self.bands {
+            bands.len().framed_write(stream).location(loc!())?;
+            for band in bands {
+                band.y0.framed_write(stream).location(loc!())?;
+                band.y1.framed_write(stream).location(loc!())?;
+            }
+        }
+        Ok(())
     }
 
     fn framed_read<R: Read>(stream: &mut R) -> Result<Self> {
@@ -280,6 +296,23 @@ impl Framed for RawBufferHeader {
             tag => bail!("invalid BufferFormat tag: {tag}"),
         };
         let n_tiles = u32::from_be_bytes(buf[29..33].try_into().unwrap());
+        let bands = match buf[33] {
+            0 => None,
+            1 => {
+                let n_bands = u32::framed_read(stream).location(loc!())? as usize;
+                if height < 0 || n_bands > height as usize {
+                    bail!("invalid band count {n_bands} for buffer height {height}");
+                }
+                let mut bands = Vec::new();
+                for _ in 0..n_bands {
+                    let y0 = u32::framed_read(stream).location(loc!())?;
+                    let y1 = u32::framed_read(stream).location(loc!())?;
+                    bands.push(RowBand { y0, y1 });
+                }
+                Some(bands)
+            },
+            tag => bail!("invalid bands tag: {tag}"),
+        };
         Ok(Self {
             client,
             surface,
@@ -290,6 +323,7 @@ impl Framed for RawBufferHeader {
                 format,
             },
             n_tiles,
+            bands,
         })
     }
 }
@@ -421,7 +455,13 @@ impl StreamingCompressedTiles {
             BufferFormat::Xrgb8888 => 3,
         };
         let row_pixels = (self.header.metadata.stride as usize) / 4;
-        (self.header.metadata.height as usize) * row_pixels * n_channels
+        match &self.header.bands {
+            None => (self.header.metadata.height as usize) * row_pixels * n_channels,
+            Some(bands) => {
+                let damaged_rows: usize = bands.iter().map(|b| (b.y1 - b.y0) as usize).sum();
+                damaged_rows * row_pixels * n_channels
+            },
+        }
     }
 
     pub fn framed_write<W: Write>(self, stream: &mut W) -> Result<usize> {
@@ -527,28 +567,70 @@ mod tests {
     #[test]
     fn test_raw_buffer_header_framing_and_errors() {
         for format in [BufferFormat::Argb8888, BufferFormat::Xrgb8888] {
-            let hdr = RawBufferHeader {
-                client: ClientId(42),
-                surface: WlSurfaceId(99),
-                metadata: BufferMetadata {
-                    width: 640,
-                    height: 480,
-                    stride: 640 * 4 + 16,
-                    format,
-                },
-                n_tiles: 5,
-            };
-            let mut wire = Vec::new();
-            hdr.framed_write(&mut wire).unwrap();
-            let decoded = RawBufferHeader::framed_read(&mut wire.as_slice()).unwrap();
-            assert_eq!(decoded, hdr);
-            assert_eq!(decoded.metadata.validate().unwrap(), 480 * (640 + 4));
+            for (height, bands) in [
+                (480, None),
+                (480, Some(vec![])),
+                (
+                    480,
+                    Some(vec![RowBand { y0: 4, y1: 20 }, RowBand { y0: 50, y1: 100 }]),
+                ),
+                // Exact `n_bands == height as usize` boundary (`2 == 2`).
+                (
+                    2,
+                    Some(vec![RowBand { y0: 0, y1: 1 }, RowBand { y0: 1, y1: 2 }]),
+                ),
+            ] {
+                let hdr = RawBufferHeader {
+                    client: ClientId(42),
+                    surface: WlSurfaceId(99),
+                    metadata: BufferMetadata {
+                        width: 640,
+                        height,
+                        stride: 640 * 4 + 16,
+                        format,
+                    },
+                    n_tiles: 5,
+                    bands,
+                };
+                let mut wire = Vec::new();
+                hdr.framed_write(&mut wire).unwrap();
+                let decoded = RawBufferHeader::framed_read(&mut wire.as_slice()).unwrap();
+                assert_eq!(decoded, hdr);
+                assert_eq!(
+                    decoded.metadata.validate().unwrap(),
+                    (height as usize) * (640 + 4)
+                );
+            }
         }
 
         // Invalid BufferFormat tag at byte 28 must return Err.
         let mut bad = [0u8; RAW_BUFFER_HEADER_LEN];
         bad[28] = 9;
         assert!(RawBufferHeader::framed_read(&mut bad.as_slice()).is_err());
+
+        // Invalid bands tag at byte 33 must return Err.
+        let mut bad_bands = [0u8; RAW_BUFFER_HEADER_LEN];
+        bad_bands[33] = 2;
+        assert!(RawBufferHeader::framed_read(&mut bad_bands.as_slice()).is_err());
+
+        // `n_bands > height` or negative `height` with bands must return Err.
+        for bad_height in [1i32, -1i32] {
+            let bad_n_bands = RawBufferHeader {
+                client: ClientId(42),
+                surface: WlSurfaceId(99),
+                metadata: BufferMetadata {
+                    width: 640,
+                    height: bad_height,
+                    stride: 640 * 4,
+                    format: BufferFormat::Xrgb8888,
+                },
+                n_tiles: 1,
+                bands: Some(vec![RowBand { y0: 0, y1: 1 }, RowBand { y0: 1, y1: 2 }]),
+            };
+            let mut wire = Vec::new();
+            bad_n_bands.framed_write(&mut wire).unwrap();
+            assert!(RawBufferHeader::framed_read(&mut wire.as_slice()).is_err());
+        }
 
         // CompressedTile Xrgb8888 / Argb8888 framing and invalid channel tags.
         let xrgb_tile = CompressedTile {
@@ -596,6 +678,7 @@ mod tests {
                 format: BufferFormat::Xrgb8888,
             },
             n_tiles: 2,
+            bands: Some(vec![RowBand { y0: 0, y1: 10 }, RowBand { y0: 20, y1: 26 }]),
         };
         let tile0 = CompressedTile {
             tile_idx: 0,
@@ -626,14 +709,17 @@ mod tests {
         );
 
         // `StreamingCompressedTiles::uncompressed_size` accounts for padded
-        // `stride` (`68` pixels/row) and `BufferFormat` channel count.
-        for (format, expected) in [
-            (BufferFormat::Xrgb8888, 64 * 68 * 3),
-            (BufferFormat::Argb8888, 64 * 68 * 4),
+        // `stride` (`68` pixels/row), `BufferFormat` channel count, and `bands`.
+        for (format, bands, expected) in [
+            (BufferFormat::Xrgb8888, header.bands.clone(), 16 * 68 * 3),
+            (BufferFormat::Argb8888, header.bands.clone(), 16 * 68 * 4),
+            (BufferFormat::Xrgb8888, None, 64 * 68 * 3),
+            (BufferFormat::Argb8888, None, 64 * 68 * 4),
         ] {
             let (_tx_u, rx_u) = crossbeam_channel::unbounded();
             let mut h = header.clone();
             h.metadata.format = format;
+            h.bands = bands;
             let s = StreamingCompressedTiles {
                 header: h,
                 tiles: rx_u,

@@ -24,7 +24,6 @@ use smithay::reexports::wayland_server::protocol::wl_buffer::WlBuffer;
 use smithay::reexports::wayland_server::protocol::wl_surface::WlSurface;
 use smithay::utils::Buffer as BufferCoords;
 use smithay::utils::Logical;
-use smithay::utils::Point;
 use smithay::utils::Rectangle;
 use smithay::utils::Size;
 use smithay::utils::Transform;
@@ -36,7 +35,9 @@ use smithay::wayland::shm::BufferAccessError;
 use smithay::wayland::shm::BufferData;
 
 use crate::buffer_pointer::BufferPointer;
+use crate::constants;
 use crate::prelude::*;
+use crate::serialization::framing::RowBand;
 use crate::serialization::geometry::Rectangle as SerRectangle;
 use crate::serialization::wayland::OutputInfo;
 use crate::serialization::wayland::ViewportState;
@@ -104,8 +105,15 @@ fn fault_probe_range(data: BufferPointer<u8>, start: usize, end: usize) {
     }
 }
 
-pub fn fault_probe_buffer(data: BufferPointer<u8>) {
-    fault_probe_range(data, 0, data.len());
+pub fn fault_probe_buffer(data: BufferPointer<u8>, stride: usize, bands: Option<&[RowBand]>) {
+    match bands {
+        None => fault_probe_range(data, 0, data.len()),
+        Some(bands) => {
+            for band in bands {
+                fault_probe_range(data, band.y0 as usize * stride, band.y1 as usize * stride);
+            }
+        },
+    }
 }
 
 // Based on https://github.com/Smithay/smithay/blob/b1c682742ac7b9fa08736476df3e651489709ac2/src/desktop/wayland/utils.rs.
@@ -214,7 +222,7 @@ fn surface_damage_to_buffer(
     buffer_scale: i32,
     transform: Transform,
     viewport_state: Option<&ViewportState>,
-    buffer_size: Option<(i32, i32)>,
+    buffer_size: (i32, i32),
 ) -> Rectangle<i32, BufferCoords> {
     let src = viewport_state.and_then(|viewport_state| viewport_state.src);
     let dst = viewport_state.and_then(|viewport_state| viewport_state.dst);
@@ -223,31 +231,7 @@ fn surface_damage_to_buffer(
     // Whole buffer in surface-oriented buffer pixels (axes transposed for
     // rotating transforms, without dividing by `buffer_scale` and multiplying
     // back).
-    let oriented_size: Size<i32, BufferCoords> = match (src, buffer_size) {
-        (_, Some((width, height))) => transform.transform_size(Size::from((width, height))),
-        (Some(src), None) => Size::from((
-            ((src.loc.x + src.size.w).max(0.0) * scale).ceil() as i32,
-            ((src.loc.y + src.size.h).max(0.0) * scale).ceil() as i32,
-        )),
-        // Nothing to scale against: clamp non-positive dimensions and negative
-        // origins in `i64` so `transform_rect_in` cannot overflow (Smithay's
-        // integer `upscale` saturates at `i32::MAX`).
-        (None, None) => {
-            let x0 = i64::from(rect.loc.x).max(0);
-            let y0 = i64::from(rect.loc.y).max(0);
-            let x1 = (i64::from(rect.loc.x) + i64::from(rect.size.w)).clamp(0, i64::from(i32::MAX));
-            let y1 = (i64::from(rect.loc.y) + i64::from(rect.size.h)).clamp(0, i64::from(i32::MAX));
-            if x1 <= x0 || y1 <= y0 {
-                return Rectangle::default();
-            }
-            let clamped = Rectangle::new(
-                Point::from((x0 as i32, y0 as i32)),
-                Size::from(((x1 - x0) as i32, (y1 - y0) as i32)),
-            );
-            let area = Size::from((x1 as i32, y1 as i32));
-            return clamped.to_buffer(buffer_scale, transform.invert(), &area);
-        },
-    };
+    let oriented_size: Size<i32, BufferCoords> = transform.transform_size(Size::from(buffer_size));
     let area_w = f64::from(oriented_size.w);
     let area_h = f64::from(oriented_size.h);
 
@@ -289,15 +273,28 @@ fn surface_damage_to_buffer(
     )
 }
 
+/// Bounds retained `SurfaceAttributes::damage` at `SENT_DAMAGE_LIMIT` by
+/// collapsing it to a single full-buffer rect so damage queued across failed
+/// or bufferless commits cannot grow without bound or be clipped by an offset
+/// `wp_viewport` source crop.
+pub fn cap_surface_damage(damage: &mut Vec<Damage>) {
+    if damage.len() >= constants::SENT_DAMAGE_LIMIT {
+        damage.clear();
+        damage.push(Damage::Buffer(Rectangle::new(
+            (0, 0).into(),
+            (i32::MAX, i32::MAX).into(),
+        )));
+    }
+}
+
 /// Converts committed damage to buffer-pixel rects. Callers must pass
-/// Smithay-validated `buffer_scale >= 1` and `Some` positive `buffer_size`
-/// (when present).
+/// Smithay-validated `buffer_scale >= 1` and positive `buffer_size`.
 pub fn damage_to_buffer_rects(
     raw_damage: &[Damage],
     buffer_scale: i32,
     transform: Transform,
     viewport_state: Option<&ViewportState>,
-    buffer_size: Option<(i32, i32)>,
+    buffer_size: (i32, i32),
 ) -> Vec<SerRectangle<i32>> {
     raw_damage
         .iter()
@@ -317,6 +314,8 @@ pub fn damage_to_buffer_rects(
 
 #[cfg(test)]
 mod tests {
+    use smithay::utils::Point;
+
     use super::*;
     use crate::serialization::geometry;
 
@@ -345,19 +344,9 @@ mod tests {
                 1,
                 Transform::Normal,
                 None,
-                Some((100, 100))
+                (100, 100),
             ),
             buffer_rect(10, 20, 30, 40),
-        );
-    }
-
-    /// Without a buffer there is nothing to scale against, so buffer_scale is
-    /// all we can apply.
-    #[test]
-    fn no_buffer_uses_buffer_scale_only() {
-        assert_eq!(
-            surface_damage_to_buffer(damage(10, 20, 30, 40), 2, Transform::Normal, None, None),
-            buffer_rect(20, 40, 60, 80),
         );
     }
 
@@ -369,7 +358,7 @@ mod tests {
                 2,
                 Transform::Normal,
                 None,
-                Some((200, 200))
+                (200, 200),
             ),
             buffer_rect(20, 40, 60, 80),
         );
@@ -382,7 +371,7 @@ mod tests {
     #[test]
     fn viewport_destination_scales_damage() {
         let vp = viewport(None, Some((1733, 729)));
-        let buffer = Some((3466, 1458));
+        let buffer = (3466, 1458);
 
         // Full-surface damage has to reach the whole buffer.
         assert_eq!(
@@ -391,7 +380,7 @@ mod tests {
                 1,
                 Transform::Normal,
                 Some(&vp),
-                buffer
+                buffer,
             ),
             buffer_rect(0, 0, 3466, 1458),
         );
@@ -403,7 +392,7 @@ mod tests {
                 1,
                 Transform::Normal,
                 Some(&vp),
-                buffer
+                buffer,
             ),
             buffer_rect(32, 306, 3402, 806),
         );
@@ -436,7 +425,7 @@ mod tests {
                 1,
                 Transform::Normal,
                 Some(&viewport),
-                Some((400, 200))
+                (400, 200),
             ),
             buffer_rect(10, 10, 100, 50),
         );
@@ -449,7 +438,7 @@ mod tests {
                 2,
                 Transform::Normal,
                 Some(&viewport),
-                Some((400, 200)),
+                (400, 200),
             ),
             buffer_rect(20, 20, 200, 100),
         );
@@ -469,14 +458,14 @@ mod tests {
                 1,
                 Transform::_180,
                 Some(&viewport),
-                Some((400, 200))
+                (400, 200),
             ),
             buffer_rect(290, 140, 100, 50),
         );
     }
 
     /// Damage must never come out too small: a rect that lands on fractional
-    /// coordinates has to grow to cover them.
+    /// coordinates has to grow to cover them at buffer-pixel resolution.
     #[test]
     fn rounds_outward() {
         let viewport_1x = viewport(None, Some((100, 100)));
@@ -487,7 +476,7 @@ mod tests {
                 1,
                 Transform::Normal,
                 Some(&viewport_1x),
-                Some((150, 150)),
+                (150, 150),
             ),
             buffer_rect(1, 1, 2, 2),
         );
@@ -501,7 +490,7 @@ mod tests {
                 2,
                 Transform::Normal,
                 Some(&viewport_2x),
-                Some((300, 300)),
+                (300, 300),
             ),
             buffer_rect(1, 1, 2, 2),
         );
@@ -520,7 +509,7 @@ mod tests {
             (Transform::_270, (101, 100), buffer_rect(81, 0, 20, 20)),
         ] {
             assert_eq!(
-                surface_damage_to_buffer(damage(0, 0, 10, 10), 2, transform, None, Some(buffer)),
+                surface_damage_to_buffer(damage(0, 0, 10, 10), 2, transform, None, buffer),
                 expected,
                 "{transform:?} {buffer:?}"
             );
@@ -529,13 +518,7 @@ mod tests {
         // Non-power-of-two scale (`7`) stays within exact buffer bounds without
         // 1-ULP `(w / scale) * scale` overshoot (`29`).
         assert_eq!(
-            surface_damage_to_buffer(
-                damage(0, 0, 5, 5),
-                7,
-                Transform::Normal,
-                None,
-                Some((29, 29)),
-            ),
+            surface_damage_to_buffer(damage(0, 0, 5, 5), 7, Transform::Normal, None, (29, 29)),
             buffer_rect(0, 0, 29, 29),
         );
     }
@@ -552,7 +535,7 @@ mod tests {
             Some(geometry::Rectangle::new(20.0, 20.0, 560.0, 360.0)),
             Some((600, 400)),
         );
-        let buffer = Some((1200, 800));
+        let buffer = (1200, 800);
 
         let cases = [
             (Transform::Normal, buffer_rect(20, 20, 560, 360)),
@@ -605,37 +588,26 @@ mod tests {
                 2,
                 transform,
                 None,
-                Some((3840, 2160)),
+                (3840, 2160),
             );
             assert_eq!(full, buffer_rect(0, 0, 3840, 2160), "{transform:?}");
+            assert_eq!(
+                crate::filtering::compute_partial_row_bands(&[full.into()], 3840, 2160),
+                None,
+                "{transform:?}"
+            );
 
             let neg = surface_damage_to_buffer(
                 damage(i32::MIN / 2, -50, i32::MAX, i32::MAX),
                 2,
                 transform,
                 None,
-                Some((3840, 2160)),
+                (3840, 2160),
             );
             assert_eq!(neg, buffer_rect(0, 0, 3840, 2160), "{transform:?}");
 
-            // `(None, None)` fallback without a known buffer size clamps
-            // negative origins (`[-20, i32::MAX - 20) x [-10, 90)` ->
-            // `[0, i32::MAX - 20) x [0, 90)`) and saturates `upscale(2)` at `i32::MAX`.
-            let fallback =
-                surface_damage_to_buffer(damage(-20, -10, i32::MAX, 100), 2, transform, None, None);
-            let expected_fallback = match transform {
-                Transform::Normal
-                | Transform::_180
-                | Transform::Flipped
-                | Transform::Flipped180 => buffer_rect(0, 0, i32::MAX, 180),
-                Transform::_90 | Transform::_270 | Transform::Flipped90 | Transform::Flipped270 => {
-                    buffer_rect(0, 0, 180, i32::MAX)
-                },
-            };
-            assert_eq!(fallback, expected_fallback, "{transform:?}");
-
             // Completely off-screen, edge-touching, and non-positive rects
-            // clamp to empty `Rectangle::default()` on both paths (`Size::new`
+            // clamp to empty `Rectangle::default()` (`Size::new`
             // `debug_assert`s non-negative dimensions, while release builds
             // accept negative `wl_surface.damage` sizes into `pub w`/`pub h`).
             let (logical_w, logical_h) = match transform {
@@ -662,49 +634,107 @@ mod tests {
                 neg_h,
             ] {
                 assert_eq!(
-                    surface_damage_to_buffer(empty_rect, 2, transform, None, Some((3840, 2160))),
+                    surface_damage_to_buffer(empty_rect, 2, transform, None, (3840, 2160)),
                     Rectangle::default(),
                     "{transform:?} {empty_rect:?}"
-                );
-            }
-            for empty_rect in [
-                damage(-20, 10, 20, 20),
-                damage(10, -20, 20, 20),
-                damage(10, 10, 0, 20),
-                damage(10, 10, 20, 0),
-                neg_w,
-                neg_h,
-            ] {
-                assert_eq!(
-                    surface_damage_to_buffer(empty_rect, 2, transform, None, None),
-                    Rectangle::default(),
-                    "{transform:?} (None, None) {empty_rect:?}"
                 );
             }
         }
     }
 
     #[test]
-    fn test_fault_probe_buffer_bounds() {
+    fn cap_surface_damage_and_damage_to_buffer_rects() {
+        let mut raw_damage: Vec<Damage> = (0..constants::SENT_DAMAGE_LIMIT - 1)
+            .map(|i| {
+                if i == 0 {
+                    Damage::Buffer(buffer_rect(5, 6, 7, 8))
+                } else {
+                    Damage::Surface(damage(10, 20, 30, 40))
+                }
+            })
+            .collect();
+        cap_surface_damage(&mut raw_damage);
+        assert_eq!(raw_damage.len(), constants::SENT_DAMAGE_LIMIT - 1);
+
+        let converted =
+            damage_to_buffer_rects(&raw_damage, 2, Transform::Normal, None, (3840, 2160));
+        assert_eq!(converted.len(), constants::SENT_DAMAGE_LIMIT - 1);
+        assert_eq!(converted[0], SerRectangle::new(5, 6, 7, 8));
+        assert_eq!(converted[1], SerRectangle::new(20, 40, 60, 80));
+
+        // At `SENT_DAMAGE_LIMIT`, `cap_surface_damage` collapses to a single
+        // `Damage::Buffer` rect that forces a full-buffer sync (`None`) even
+        // under an offset `wp_viewport` source crop covering `< 75%` of height.
+        raw_damage.push(Damage::Surface(damage(1, 1, 2, 2)));
+        cap_surface_damage(&mut raw_damage);
+        assert_eq!(
+            raw_damage,
+            vec![Damage::Buffer(buffer_rect(0, 0, i32::MAX, i32::MAX))]
+        );
+
+        let cropped_vp = viewport(
+            Some(geometry::Rectangle::new(0.0, 400.0, 1920.0, 680.0)),
+            Some((1920, 680)),
+        );
+        for transform in [
+            Transform::Normal,
+            Transform::_90,
+            Transform::_180,
+            Transform::_270,
+            Transform::Flipped,
+            Transform::Flipped90,
+            Transform::Flipped180,
+            Transform::Flipped270,
+        ] {
+            let capped_rects =
+                damage_to_buffer_rects(&raw_damage, 2, transform, Some(&cropped_vp), (1920, 1080));
+            assert_eq!(
+                capped_rects,
+                vec![SerRectangle::new(0, 0, i32::MAX, i32::MAX)]
+            );
+            assert_eq!(
+                crate::filtering::compute_partial_row_bands(&capped_rects, 1920, 1080),
+                None,
+                "{transform:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_fault_probe_buffer_bounds_and_bands() {
         for len in [0usize, 1, 4096, 8195] {
             let buf = vec![0x5Au8; len];
             let ptr = buf.as_ptr();
             let bp = unsafe { BufferPointer::new(&ptr, len) };
-            fault_probe_buffer(bp);
+            fault_probe_buffer(bp, len.max(1), None);
         }
-        let buf = [0xA5u8; 64];
+
+        let buf = vec![0xA5u8; 192 * 64];
         let ptr = buf.as_ptr();
         let bp = unsafe { BufferPointer::new(&ptr, buf.len()) };
-        fault_probe_range(bp, 16, 16);
-        fault_probe_range(bp, 32, 0);
+        fault_probe_buffer(bp, 64, Some(&[]));
+        fault_probe_buffer(
+            bp,
+            64,
+            Some(&[
+                RowBand { y0: 0, y1: 0 },
+                RowBand { y0: 5, y1: 0 },
+                RowBand { y0: 192, y1: 192 },
+            ]),
+        );
+        fault_probe_buffer(bp, 64, Some(&[RowBand { y0: 2, y1: 140 }]));
     }
 
     #[test]
     #[should_panic]
     fn test_fault_probe_buffer_out_of_bounds() {
-        let buf = [0u8; 63];
+        let buf = [0u8; 191];
         let ptr = buf.as_ptr();
         let bp = unsafe { BufferPointer::new(&ptr, buf.len()) };
-        fault_probe_range(bp, 0, 64);
+        fault_probe_buffer(
+            bp,
+            64,
+            Some(&[RowBand { y0: 0, y1: 1 }, RowBand { y0: 2, y1: 3 }]),
+        );
     }
 }

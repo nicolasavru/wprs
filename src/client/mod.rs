@@ -53,16 +53,21 @@ use smithay_client_toolkit::shell::xdg::XdgShell;
 use smithay_client_toolkit::shell::xdg::XdgSurface;
 use smithay_client_toolkit::shm::Shm;
 use smithay_client_toolkit::shm::slot::Buffer as SlotBuffer;
+use smithay_client_toolkit::shm::slot::Slot;
 use smithay_client_toolkit::shm::slot::SlotPool;
 
 use crate::client_utils::FrameDamage;
 use crate::client_utils::SeatObject;
+use crate::client_utils::SwapchainStep;
+use crate::client_utils::advance_two_slot_swapchain;
+use crate::client_utils::subtract_row_bands;
 use crate::prelude::*;
 use crate::serialization::Capabilities;
 use crate::serialization::ClientId;
 use crate::serialization::Event;
 use crate::serialization::Request;
 use crate::serialization::Serializer;
+use crate::serialization::framing::RowBand;
 use crate::serialization::wayland::BufferAssignment;
 use crate::serialization::wayland::BufferMetadata;
 use crate::serialization::wayland::CursorImage;
@@ -133,6 +138,7 @@ pub struct WprsClientState {
     title_prefix: String,
 
     decompressor: ShardingDecompressor,
+    slot_copy_scratch: Vec<u8>,
 }
 
 impl WprsClientState {
@@ -202,8 +208,76 @@ impl WprsClientState {
             title_prefix: options.title_prefix,
             decompressor: ShardingDecompressor::new(NonZeroUsize::new(8).unwrap())
                 .location(loc!())?,
+            slot_copy_scratch: Vec::new(),
         })
     }
+}
+
+const SLOT_COPY_CHUNK: usize = 256 * 1024;
+
+fn for_each_band_chunk(bands: &[RowBand], stride: usize, mut copy_chunk: impl FnMut(usize, usize)) {
+    for band in bands {
+        let mut offset = band.y0 as usize * stride;
+        let byte_end = band.y1 as usize * stride;
+        while offset < byte_end {
+            let chunk = (byte_end - offset).min(SLOT_COPY_CHUNK);
+            copy_chunk(offset, chunk);
+            offset += chunk;
+        }
+    }
+}
+
+fn copy_row_bands(
+    pool: &mut SlotPool,
+    src_slot: &Slot,
+    dst_slot: &Slot,
+    stride: usize,
+    bands: &[RowBand],
+    scratch: &mut Vec<u8>,
+) {
+    for_each_band_chunk(bands, stride, |offset, chunk| {
+        if scratch.len() < chunk {
+            scratch.resize(SLOT_COPY_CHUNK, 0);
+        }
+        scratch[..chunk].copy_from_slice(&pool.raw_data_mut(src_slot)[offset..offset + chunk]);
+        pool.raw_data_mut(dst_slot)[offset..offset + chunk].copy_from_slice(&scratch[..chunk]);
+    });
+}
+
+fn prepare_remote_swapchain<P, B>(
+    pool: &mut P,
+    active_buffer: &mut B,
+    back_buffer: &mut Option<(B, Option<Vec<RowBand>>)>,
+    bands: Option<&[RowBand]>,
+    height: i32,
+    is_released: impl FnMut(&mut P, &B) -> bool,
+    alloc_buffer: impl FnOnce(&mut P, bool) -> Result<B>,
+    copy_bands: impl FnOnce(&mut P, &B, &B, &[RowBand]),
+) -> Result<()> {
+    let step = advance_two_slot_swapchain(
+        pool,
+        active_buffer,
+        back_buffer,
+        bands,
+        height,
+        is_released,
+        alloc_buffer,
+    )?;
+    if let Some(cur_bands) = bands {
+        let prev_bands = match step {
+            SwapchainStep::ReusedActive => return Ok(()),
+            SwapchainStep::Swapped { prev_bands } => prev_bands,
+            SwapchainStep::Allocated => None,
+        };
+        let full = [RowBand {
+            y0: 0,
+            y1: height as u32,
+        }];
+        let rows_to_copy = subtract_row_bands(prev_bands.as_deref().unwrap_or(&full), cur_bands);
+        let old_active = &back_buffer.as_ref().unwrap().0;
+        copy_bands(pool, old_active, active_buffer, &rows_to_copy);
+    }
+    Ok(())
 }
 
 #[derive(Debug, Copy, Clone, Eq, PartialEq)]
@@ -220,12 +294,15 @@ pub enum RemoteBufferState {
 pub struct RemoteBuffer {
     pub metadata: BufferMetadata,
     pub active_buffer: SlotBuffer,
+    /// Previous swapchain slot and the merged row-bands written to
+    /// `active_buffer` since this slot was last current (`None` requires
+    /// copying the undamaged complement on next partial reuse).
+    back_buffer: Option<(SlotBuffer, Option<Vec<RowBand>>)>,
     pub state: RemoteBufferState,
 }
 
 impl RemoteBuffer {
     pub fn new(metadata: BufferMetadata, pool: &mut SlotPool) -> Result<Self> {
-        metadata.validate().location(loc!())?;
         let active_buffer = pool
             .create_buffer(
                 metadata.width,
@@ -239,25 +316,55 @@ impl RemoteBuffer {
         Ok(Self {
             metadata,
             active_buffer,
+            back_buffer: None,
             state: RemoteBufferState::Prepared,
         })
     }
 
-    fn canvas<'a>(&mut self, pool: &'a mut SlotPool) -> Result<&'a mut [u8]> {
-        if pool.canvas(&self.active_buffer).is_none() {
-            // This should be rare, but if the compositor has not
-            // released the previous buffer, we need double-buffering.
-            debug!("creating new buffer");
-            self.active_buffer = pool
-                .create_buffer(
-                    self.metadata.width,
-                    self.metadata.height,
-                    self.metadata.stride,
-                    self.metadata.format.into(),
-                )
-                .location(loc!())?
-                .0;
-        }
+    fn canvas<'a>(
+        &mut self,
+        bands: Option<&[RowBand]>,
+        pool: &'a mut SlotPool,
+        copy_scratch: &mut Vec<u8>,
+    ) -> Result<&'a mut [u8]> {
+        let metadata = self.metadata;
+        prepare_remote_swapchain(
+            pool,
+            &mut self.active_buffer,
+            &mut self.back_buffer,
+            bands,
+            metadata.height,
+            |pool, buf| pool.canvas(buf).is_some(),
+            |pool, back_buffer_held| {
+                debug!(
+                    back_buffer_held,
+                    partial = bands.is_some(),
+                    bands = bands.map_or(0, <[_]>::len),
+                    width = metadata.width,
+                    height = metadata.height,
+                    "creating new buffer",
+                );
+                Ok(pool
+                    .create_buffer(
+                        metadata.width,
+                        metadata.height,
+                        metadata.stride,
+                        metadata.format.into(),
+                    )
+                    .location(loc!())?
+                    .0)
+            },
+            |pool, src_buf, dst_buf, rows| {
+                copy_row_bands(
+                    pool,
+                    &src_buf.slot(),
+                    &dst_buf.slot(),
+                    metadata.stride as usize,
+                    rows,
+                    copy_scratch,
+                );
+            },
+        )?;
         pool.canvas(&self.active_buffer).location(loc!())
     }
 }
@@ -412,32 +519,34 @@ impl RemoteSurface {
         )
     }
 
-    #[instrument(skip(self, pool), level = "debug")]
+    #[instrument(skip(self, pool, copy_scratch), level = "debug")]
     pub(crate) fn prepare_buffer_canvas<'a>(
         &mut self,
         metadata: BufferMetadata,
+        bands: Option<&[RowBand]>,
         pool: &'a mut SlotPool,
+        copy_scratch: &mut Vec<u8>,
     ) -> Result<&'a mut [u8]> {
-        let buffer = match &mut self.buffer {
-            Some(buffer) if buffer.metadata == metadata => {
-                buffer.state = RemoteBufferState::Prepared;
-                buffer
-            },
-            Some(buffer) => {
-                self.frame_damage = FrameDamage::Full;
-                *buffer = RemoteBuffer::new(metadata, pool).location(loc!())?;
-                buffer
-            },
-            None => {
-                self.frame_damage = FrameDamage::Full;
-                self.buffer = Some(RemoteBuffer::new(metadata, pool).location(loc!())?);
-                self.buffer.as_mut().unwrap()
-            },
+        let buffer = if let Some(buffer) = &mut self.buffer
+            && buffer.metadata == metadata
+        {
+            buffer.state = RemoteBufferState::Prepared;
+            buffer
+        } else {
+            if bands.is_some() {
+                bail!(
+                    "received partial row-band update without a matching buffer ({:?} -> {metadata:?})",
+                    self.buffer.as_ref().map(|b| b.metadata)
+                );
+            }
+            self.frame_damage = FrameDamage::Full;
+            self.buffer
+                .insert(RemoteBuffer::new(metadata, pool).location(loc!())?)
         };
-        buffer.canvas(pool).location(loc!())
+        buffer.canvas(bands, pool, copy_scratch).location(loc!())
     }
 
-    pub(crate) fn reset_buffer_for_resync(&mut self) {
+    pub(crate) fn drop_buffer(&mut self) {
         self.buffer = None;
         self.frame_damage = FrameDamage::Empty;
     }
@@ -445,7 +554,7 @@ impl RemoteSurface {
     #[instrument(skip(self), level = "debug")]
     fn clear_buffer(&mut self) {
         let wl_surface = self.wl_surface().clone();
-        self.reset_buffer_for_resync();
+        self.drop_buffer();
         wl_surface.attach(None, 0, 0);
     }
 
@@ -454,18 +563,16 @@ impl RemoteSurface {
         match new_buffer {
             Some(BufferAssignment::New(new_metadata)) => {
                 let Some(buffer) = &mut self.buffer else {
-                    self.frame_damage = FrameDamage::Empty;
                     return Err(anyhow!(
                         "Received buffer commit with empty data. This can happen if wprsc reattaches between wprsd sending a buffer message and a commit message."
                     ));
                 };
                 if buffer.state != RemoteBufferState::Prepared || buffer.metadata != new_metadata {
-                    let msg = format!(
+                    bail!(
                         "Prepared buffer ({:?}, {:?}) did not match commit ({new_metadata:?})",
-                        buffer.state, buffer.metadata,
+                        buffer.state,
+                        buffer.metadata,
                     );
-                    self.reset_buffer_for_resync();
-                    bail!(msg);
                 }
                 buffer.state = RemoteBufferState::Dirty;
             },
@@ -474,7 +581,6 @@ impl RemoteSurface {
             },
             None => {
                 if self.has_in_flight_buffer() {
-                    self.reset_buffer_for_resync();
                     bail!(
                         "received non-buffer Commit while a prepared RawBuffer was awaiting Commit"
                     );
@@ -722,5 +828,344 @@ impl RemoteDisplay {
 impl Default for RemoteDisplay {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_for_each_band_chunk_splits_at_slot_copy_chunk() {
+        let stride = 4096;
+        let b = |y0, y1| RowBand { y0, y1 };
+        let collect_chunks = |bands: &[RowBand]| {
+            let mut chunks = Vec::new();
+            for_each_band_chunk(bands, stride, |offset, chunk| chunks.push((offset, chunk)));
+            chunks
+        };
+
+        assert_eq!(collect_chunks(&[]), Vec::new());
+        // Sub-chunk band (`3 * 4096 = 12,288 B`), multi-chunk band (`85 * 4096 = 348,160 B`
+        // split as `256 KiB + 86,016 B`), and exact-chunk band (`64 * 4096 = 256 KiB`).
+        assert_eq!(
+            collect_chunks(&[b(2, 5), b(10, 95), b(100, 164)]),
+            vec![
+                (2 * stride, 3 * stride),
+                (10 * stride, SLOT_COPY_CHUNK),
+                (10 * stride + SLOT_COPY_CHUNK, 85 * stride - SLOT_COPY_CHUNK),
+                (100 * stride, SLOT_COPY_CHUNK),
+            ],
+        );
+    }
+
+    fn apply_remote_frame(
+        active: &mut usize,
+        back: &mut Option<(usize, Option<Vec<RowBand>>)>,
+        slots: &mut Vec<Vec<u8>>,
+        released: &[bool],
+        frame: &[u8],
+        bands: Option<&[RowBand]>,
+        height: i32,
+        stride: usize,
+    ) -> (usize, Option<bool>) {
+        let mut bytes_copied = 0usize;
+        let mut alloc_back_held = None;
+
+        prepare_remote_swapchain(
+            slots,
+            active,
+            back,
+            bands,
+            height,
+            |_, &idx| released[idx],
+            |slots, back_buffer_held| {
+                alloc_back_held = Some(back_buffer_held);
+                let idx = slots.len();
+                // Poison new slots so any uncopied undamaged row fails verification.
+                slots.push(vec![0xAAu8; frame.len()]);
+                Ok(idx)
+            },
+            |slots, &src_idx, &dst_idx, rows| {
+                let src = slots[src_idx].clone();
+                let dst = &mut slots[dst_idx];
+                for_each_band_chunk(rows, stride, |offset, chunk| {
+                    dst[offset..offset + chunk].copy_from_slice(&src[offset..offset + chunk]);
+                    bytes_copied += chunk;
+                });
+            },
+        )
+        .unwrap();
+
+        // Simulate `decompress_and_unfilter_streaming` writing only `bands` (or full frame).
+        let canvas = &mut slots[*active];
+        match bands {
+            Some(cur_bands) => {
+                for band in cur_bands {
+                    let start = band.y0 as usize * stride;
+                    let end = band.y1 as usize * stride;
+                    canvas[start..end].copy_from_slice(&frame[start..end]);
+                }
+            },
+            None => canvas.copy_from_slice(frame),
+        }
+
+        (bytes_copied, alloc_back_held)
+    }
+
+    #[test]
+    fn test_remote_buffer_swapchain_transitions() {
+        let width = 8usize;
+        let height = 20i32;
+        let stride = width * 4 + 8; // padded stride (40 bytes/row)
+        let byte_len = height as usize * stride;
+
+        let make_frame = |seed: u8| -> Vec<u8> {
+            (0..byte_len)
+                .map(|i| seed.wrapping_mul(37).wrapping_add(i as u8))
+                .collect()
+        };
+        let b = |y0, y1| RowBand { y0, y1 };
+        let patch_rows = |frame: &mut [u8], seed: u8, bands: &[RowBand]| {
+            let src = make_frame(seed);
+            for band in bands {
+                let start = band.y0 as usize * stride;
+                let end = band.y1 as usize * stride;
+                frame[start..end].copy_from_slice(&src[start..end]);
+            }
+        };
+
+        let mut frame = make_frame(1);
+        let mut slots = vec![frame.clone()];
+        let mut active = 0usize;
+        let mut back: Option<(usize, Option<Vec<RowBand>>)> = None;
+
+        // 1. In-place reuse keeps `back_buffer == None` (zero extra slot or copy).
+        patch_rows(&mut frame, 2, &[b(2, 5)]);
+        let (copied, alloc) = apply_remote_frame(
+            &mut active,
+            &mut back,
+            &mut slots,
+            &[true],
+            &frame,
+            Some(&[b(2, 5)]),
+            height,
+            stride,
+        );
+        assert_eq!((active, slots.len(), copied, alloc), (0, 1, 0, None));
+        assert_eq!(back, None);
+        assert_eq!(slots[active], frame);
+
+        // 2. First miss allocates `back_buffer` lazily (`back_buffer_held == false`)
+        // and copies the 17 undamaged complement rows.
+        patch_rows(&mut frame, 3, &[b(3, 6)]);
+        let (copied, alloc) = apply_remote_frame(
+            &mut active,
+            &mut back,
+            &mut slots,
+            &[false],
+            &frame,
+            Some(&[b(3, 6)]),
+            height,
+            stride,
+        );
+        assert_eq!(
+            (active, slots.len(), copied, alloc),
+            (1, 2, 17 * stride, Some(false))
+        );
+        assert_eq!(back, Some((0, Some(vec![b(3, 6)]))));
+        assert_eq!(slots[active], frame);
+
+        // 3. Alternating swap with `prev == cur` copies 0 bytes.
+        patch_rows(&mut frame, 4, &[b(3, 6)]);
+        let (copied, alloc) = apply_remote_frame(
+            &mut active,
+            &mut back,
+            &mut slots,
+            &[true, false],
+            &frame,
+            Some(&[b(3, 6)]),
+            height,
+            stride,
+        );
+        assert_eq!((active, slots.len(), copied, alloc), (0, 2, 0, None));
+        assert_eq!(back, Some((1, Some(vec![b(3, 6)]))));
+        assert_eq!(slots[active], frame);
+
+        // 4. Alternating swap with disjoint `prev` copies only `prev` (3 rows).
+        patch_rows(&mut frame, 5, &[b(12, 15)]);
+        let (copied, alloc) = apply_remote_frame(
+            &mut active,
+            &mut back,
+            &mut slots,
+            &[false, true],
+            &frame,
+            Some(&[b(12, 15)]),
+            height,
+            stride,
+        );
+        assert_eq!(
+            (active, slots.len(), copied, alloc),
+            (1, 2, 3 * stride, None)
+        );
+        assert_eq!(back, Some((0, Some(vec![b(12, 15)]))));
+        assert_eq!(slots[active], frame);
+
+        // 5. In-place reuse while `back_buffer` exists accumulates `back_bands`
+        // (`12..15 ∪ 14..18 = 12..18`); subsequent interior-overlap swap copies
+        // only `prev \ cur` (`12..14, 16..18` = 4 rows).
+        patch_rows(&mut frame, 6, &[b(14, 18)]);
+        let (copied, alloc) = apply_remote_frame(
+            &mut active,
+            &mut back,
+            &mut slots,
+            &[false, true],
+            &frame,
+            Some(&[b(14, 18)]),
+            height,
+            stride,
+        );
+        assert_eq!((active, slots.len(), copied, alloc), (1, 2, 0, None));
+        assert_eq!(back, Some((0, Some(vec![b(12, 18)]))));
+        assert_eq!(slots[active], frame);
+
+        patch_rows(&mut frame, 7, &[b(14, 16)]);
+        let (copied, alloc) = apply_remote_frame(
+            &mut active,
+            &mut back,
+            &mut slots,
+            &[true, false],
+            &frame,
+            Some(&[b(14, 16)]),
+            height,
+            stride,
+        );
+        assert_eq!(
+            (active, slots.len(), copied, alloc),
+            (0, 2, 4 * stride, None)
+        );
+        assert_eq!(back, Some((1, Some(vec![b(14, 16)]))));
+        assert_eq!(slots[active], frame);
+
+        // 6. Full-frame update on `active` invalidates `back_bands` to `None`;
+        // next partial swap copies the undamaged complement without a 3rd alloc.
+        frame = make_frame(8);
+        let (copied, alloc) = apply_remote_frame(
+            &mut active,
+            &mut back,
+            &mut slots,
+            &[true, false],
+            &frame,
+            None,
+            height,
+            stride,
+        );
+        assert_eq!((active, slots.len(), copied, alloc), (0, 2, 0, None));
+        assert_eq!(back, Some((1, None)));
+        assert_eq!(slots[active], frame);
+
+        patch_rows(&mut frame, 9, &[b(8, 11)]);
+        let (copied, alloc) = apply_remote_frame(
+            &mut active,
+            &mut back,
+            &mut slots,
+            &[false, true],
+            &frame,
+            Some(&[b(8, 11)]),
+            height,
+            stride,
+        );
+        assert_eq!(
+            (active, slots.len(), copied, alloc),
+            (1, 2, 17 * stride, None)
+        );
+        assert_eq!(back, Some((0, Some(vec![b(8, 11)]))));
+        assert_eq!(slots[active], frame);
+
+        // 7. Full-frame update on swap copies 0 bytes and marks `back_bands = None`.
+        frame = make_frame(10);
+        let (copied, alloc) = apply_remote_frame(
+            &mut active,
+            &mut back,
+            &mut slots,
+            &[true, false],
+            &frame,
+            None,
+            height,
+            stride,
+        );
+        assert_eq!((active, slots.len(), copied, alloc), (0, 2, 0, None));
+        assert_eq!(back, Some((1, None)));
+        assert_eq!(slots[active], frame);
+
+        // 8. Empty-bands (`Some(&[])`) swap with `prev_bands == None` copies all rows
+        // and records `Some(vec![])`, so a subsequent swap copies 0 bytes.
+        let (copied, alloc) = apply_remote_frame(
+            &mut active,
+            &mut back,
+            &mut slots,
+            &[false, true],
+            &frame,
+            Some(&[]),
+            height,
+            stride,
+        );
+        assert_eq!(
+            (active, slots.len(), copied, alloc),
+            (1, 2, 20 * stride, None)
+        );
+        assert_eq!(back, Some((0, Some(Vec::new()))));
+        assert_eq!(slots[active], frame);
+
+        patch_rows(&mut frame, 11, &[b(1, 3)]);
+        let (copied, alloc) = apply_remote_frame(
+            &mut active,
+            &mut back,
+            &mut slots,
+            &[true, false],
+            &frame,
+            Some(&[b(1, 3)]),
+            height,
+            stride,
+        );
+        assert_eq!((active, slots.len(), copied, alloc), (0, 2, 0, None));
+        assert_eq!(back, Some((1, Some(vec![b(1, 3)]))));
+        assert_eq!(slots[active], frame);
+
+        // 9. Both slots held -> triple-buffer fallback (`back_buffer_held == true`)
+        // allocates a 3rd slot and copies undamaged complement rows (18 rows).
+        patch_rows(&mut frame, 12, &[b(5, 7)]);
+        let (copied, alloc) = apply_remote_frame(
+            &mut active,
+            &mut back,
+            &mut slots,
+            &[false, false],
+            &frame,
+            Some(&[b(5, 7)]),
+            height,
+            stride,
+        );
+        assert_eq!(
+            (active, slots.len(), copied, alloc),
+            (2, 3, 18 * stride, Some(true))
+        );
+        assert_eq!(back, Some((0, Some(vec![b(5, 7)]))));
+        assert_eq!(slots[active], frame);
+
+        // 10. Both slots held on a full-frame update allocates with 0-byte copy.
+        frame = make_frame(13);
+        let (copied, alloc) = apply_remote_frame(
+            &mut active,
+            &mut back,
+            &mut slots,
+            &[false, false, false],
+            &frame,
+            None,
+            height,
+            stride,
+        );
+        assert_eq!((active, slots.len(), copied, alloc), (3, 4, 0, Some(true)));
+        assert_eq!(back, Some((2, None)));
+        assert_eq!(slots[active], frame);
     }
 }

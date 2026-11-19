@@ -125,9 +125,15 @@ use crate::args;
 use crate::buffer_pointer::BufferPointer;
 use crate::client_utils::FrameDamage;
 use crate::client_utils::SeatObject;
+use crate::client_utils::SwapchainStep;
+use crate::client_utils::advance_two_slot_swapchain;
+use crate::client_utils::combine_band_history;
+use crate::filtering;
 use crate::prelude::*;
 use crate::serialization;
+use crate::serialization::framing::RowBand;
 use crate::serialization::geometry::Point;
+use crate::serialization::geometry::Rectangle as SerRectangle;
 use crate::serialization::wayland::BufferMetadata;
 use crate::serialization::wayland::KeyState;
 use crate::xwayland_xdg_shell::compositor::DecorationBehavior;
@@ -976,98 +982,152 @@ impl ShmHandler for WprsState {
     }
 }
 
+fn copy_row_bands_or_full(
+    data: BufferPointer<u8>,
+    bands: Option<&[RowBand]>,
+    stride: usize,
+    canvas: &mut [u8],
+) {
+    if let Some(bands) = bands {
+        for band in bands {
+            let start = band.y0 as usize * stride;
+            let len = (band.y1 - band.y0) as usize * stride;
+            let (_, after_start) = data.split_at(start);
+            let (band_data, _) = after_start.split_at(len);
+            band_data.copy_to_nonoverlapping(&mut canvas[start..start + len]);
+        }
+    } else {
+        data.copy_to_nonoverlapping(canvas);
+    }
+}
+
+fn write_xwayland_swapchain<P, B>(
+    pool: &mut P,
+    active_buffer: &mut B,
+    back_buffer: &mut Option<(B, Option<Vec<RowBand>>)>,
+    cur_bands: Option<&[RowBand]>,
+    height: i32,
+    is_released: impl FnMut(&mut P, &B) -> bool,
+    write_slot: impl FnOnce(&mut P, &B, Option<&[RowBand]>),
+    alloc_and_write_full: impl FnOnce(&mut P, bool) -> Result<B>,
+) -> Result<()> {
+    match advance_two_slot_swapchain(
+        pool,
+        active_buffer,
+        back_buffer,
+        cur_bands,
+        height,
+        is_released,
+        alloc_and_write_full,
+    )? {
+        SwapchainStep::ReusedActive => write_slot(pool, active_buffer, cur_bands),
+        SwapchainStep::Swapped { prev_bands } => {
+            let merged = combine_band_history(prev_bands, cur_bands, height);
+            write_slot(pool, active_buffer, merged.as_deref());
+        },
+        SwapchainStep::Allocated => {},
+    }
+    Ok(())
+}
+
+fn create_buffer_with_data(
+    metadata: BufferMetadata,
+    data: BufferPointer<u8>,
+    pool: &mut SlotPool,
+) -> Result<Buffer> {
+    let (buffer, canvas) = pool
+        .create_buffer(
+            metadata.width,
+            metadata.height,
+            metadata.stride,
+            metadata.format.into(),
+        )
+        .location(loc!())?;
+    data.copy_to_nonoverlapping(canvas);
+    Ok(buffer)
+}
+
 #[derive(Debug)]
 pub struct XWaylandBuffer {
     pub metadata: BufferMetadata,
     pub active_buffer: Buffer,
+    /// Previous swapchain slot and the merged row-bands written to
+    /// `active_buffer` since this slot was last current (`None` requires a full
+    /// copy on next reuse).
+    back_buffer: Option<(Buffer, Option<Vec<RowBand>>)>,
 }
 
 impl XWaylandBuffer {
     #[instrument(skip_all, level = "debug")]
-    pub fn new(metadata: BufferMetadata, pool: &mut SlotPool) -> Result<Self> {
-        let active_buffer = pool
-            .create_buffer(
-                metadata.width,
-                metadata.height,
-                metadata.stride,
-                metadata.format.into(),
-            )
-            .location(loc!())?
-            .0;
+    pub fn new(
+        metadata: BufferMetadata,
+        data: BufferPointer<u8>,
+        pool: &mut SlotPool,
+    ) -> Result<Self> {
+        let active_buffer = create_buffer_with_data(metadata, data, pool).location(loc!())?;
 
         Ok(Self {
             metadata,
             active_buffer,
+            back_buffer: None,
         })
     }
 
     #[instrument(skip_all, level = "debug")]
-    pub fn write_data(&mut self, data: BufferPointer<u8>, pool: &mut SlotPool) -> Result<()> {
-        let canvas = match pool.canvas(&self.active_buffer) {
-            Some(canvas) => canvas,
-            None => {
-                // This should be rare, but if the compositor has not
-                // released the previous_button_state buffer, we need
-                // double-buffering.
-                debug!("previous buffer wasn't released, creating new buffer");
-                self.active_buffer = pool
-                    .create_buffer(
-                        self.metadata.width,
-                        self.metadata.height,
-                        self.metadata.stride,
-                        self.metadata.format.into(),
-                    )
-                    .location(loc!())?
-                    .0;
-                pool.canvas(&self.active_buffer).unwrap()
+    pub fn write_data(
+        &mut self,
+        data: BufferPointer<u8>,
+        damage: &[SerRectangle<i32>],
+        pool: &mut SlotPool,
+    ) -> Result<()> {
+        let metadata = self.metadata;
+        let cur_bands =
+            filtering::compute_partial_row_bands(damage, metadata.width, metadata.height);
+
+        write_xwayland_swapchain(
+            pool,
+            &mut self.active_buffer,
+            &mut self.back_buffer,
+            cur_bands.as_deref(),
+            metadata.height,
+            |pool, buf| pool.canvas(buf).is_some(),
+            |pool, buf, bands| {
+                let canvas = pool.canvas(buf).expect("released slot must provide canvas");
+                copy_row_bands_or_full(data, bands, metadata.stride as usize, canvas);
             },
-        };
-        data.copy_to_nonoverlapping(canvas);
-        Ok(())
+            |pool, back_buffer_held| {
+                debug!(back_buffer_held, "creating new buffer");
+                create_buffer_with_data(metadata, data, pool)
+            },
+        )
     }
 }
 
 impl XWaylandSurface {
-    #[instrument(skip(data, pool), level = "debug")]
+    #[instrument(skip(data, damage, pool), level = "debug")]
     pub fn update_buffer(
         &mut self,
         metadata: &BufferData,
         data: BufferPointer<u8>,
+        damage: &[SerRectangle<i32>],
         pool: &mut SlotPool,
     ) -> Result<()> {
         let metadata =
             serialization::wayland::BufferMetadata::from_buffer_data(metadata).location(loc!())?;
-        let buffer = match &mut self.buffer {
-            // Surface was previously committed.
-            Some(buffer) => {
-                // Only buffer data was updated, we can reuse the buffer.
-                if buffer.metadata == metadata {
-                    debug!(
-                        "metadata matched, reusing buffer, {:?}, {:?}",
-                        buffer.metadata, metadata
-                    );
-                    buffer
-                } else {
-                    // Buffer was resized or format changed, need to
-                    // create a new one.
-                    debug!(
-                        "metadata didn't match, creating new buffer, {:?}, {:?}",
-                        buffer.metadata, metadata
-                    );
-                    *buffer = XWaylandBuffer::new(metadata, pool).location(loc!())?;
-                    self.damage = FrameDamage::Full;
-                    buffer
-                }
-            },
-            // First commit for surface with a buffer.
-            None => {
-                self.buffer = Some(XWaylandBuffer::new(metadata, pool).location(loc!())?);
-                self.damage = FrameDamage::Full;
-                self.buffer.as_mut().unwrap()
-            },
-        };
-
-        buffer.write_data(data, pool).location(loc!())?;
+        if let Some(buffer) = &mut self.buffer
+            && buffer.metadata == metadata
+        {
+            debug!("metadata matched, reusing buffer, {metadata:?}");
+            buffer.write_data(data, damage, pool).location(loc!())?;
+        } else {
+            debug!(
+                "creating new buffer, old {:?}, new {:?}",
+                self.buffer.as_ref().map(|b| b.metadata),
+                metadata
+            );
+            self.buffer = Some(XWaylandBuffer::new(metadata, data, pool).location(loc!())?);
+            self.damage = FrameDamage::Full;
+        }
 
         Ok(())
     }
@@ -1907,5 +1967,252 @@ impl Dispatch<WlSubsurface, SubSurfaceData> for WprsState {
         _qh: &QueueHandle<Self>,
     ) {
         dbg!("SUBSURFACE DISPATCH");
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn apply_frame(
+        active: &mut usize,
+        back: &mut Option<(usize, Option<Vec<RowBand>>)>,
+        slots: &mut Vec<Vec<u8>>,
+        released: &[bool],
+        frame: &[u8],
+        cur_bands: Option<Vec<RowBand>>,
+        height: i32,
+        stride: usize,
+    ) -> Option<Option<Vec<RowBand>>> {
+        let ptr = frame.as_ptr();
+        // SAFETY: `frame` outlives `data` within this call.
+        let data = unsafe { BufferPointer::new(&ptr, frame.len()) };
+        let mut written = None;
+        write_xwayland_swapchain(
+            slots,
+            active,
+            back,
+            cur_bands.as_deref(),
+            height,
+            |_, &slot_idx| released[slot_idx],
+            |slots, &slot_idx, bands| {
+                assert!(released[slot_idx], "wrote held slot {slot_idx}");
+                written = Some(bands.map(ToOwned::to_owned));
+                copy_row_bands_or_full(data, bands, stride, &mut slots[slot_idx]);
+            },
+            |slots, _| {
+                let idx = slots.len();
+                let mut buf = vec![0u8; frame.len()];
+                data.copy_to_nonoverlapping(&mut buf);
+                slots.push(buf);
+                Ok(idx)
+            },
+        )
+        .unwrap();
+        written
+    }
+
+    #[test]
+    fn test_two_slot_swapchain_ping_pong_accumulation_and_fallback() {
+        let width = 8;
+        let height = 20;
+        let stride = width * 4 + 8; // padded stride (40 bytes/row)
+        let byte_len = height as usize * stride;
+        let b = |y0, y1| RowBand { y0, y1 };
+
+        let make_frame = |seed: u8| -> Vec<u8> {
+            (0..byte_len)
+                .map(|i| seed.wrapping_mul(31).wrapping_add(i as u8))
+                .collect()
+        };
+
+        // Initial full frame in slot 0.
+        let mut frame = make_frame(1);
+        let mut slots = vec![frame.clone()];
+        let mut active = 0usize;
+        let mut back: Option<(usize, Option<Vec<RowBand>>)> = None;
+
+        // 1. Compositor holds slot 0 (`released[0] == false`): partial update on
+        // rows 2..5 allocates slot 1 via fallback (`back` was `None`) and copies full.
+        let f2 = make_frame(2);
+        frame[2 * stride..5 * stride].copy_from_slice(&f2[2 * stride..5 * stride]);
+        let written = apply_frame(
+            &mut active,
+            &mut back,
+            &mut slots,
+            &[false],
+            &frame,
+            Some(vec![b(2, 5)]),
+            height,
+            stride,
+        );
+        assert_eq!(written, None);
+        assert_eq!(active, 1);
+        assert_eq!(slots.len(), 2);
+        assert_eq!(slots[active], frame);
+        assert_eq!(back, Some((0, Some(vec![b(2, 5)]))));
+
+        // 2. Ping-pong: compositor now holds slot 1 and releases slot 0.
+        // Updating rows 10..13 must copy `2..5 ∪ 10..13` into slot 0 so slot 0
+        // matches `frame` without missing frame 2's rows!
+        let f3 = make_frame(3);
+        frame[10 * stride..13 * stride].copy_from_slice(&f3[10 * stride..13 * stride]);
+        let written = apply_frame(
+            &mut active,
+            &mut back,
+            &mut slots,
+            &[true, false],
+            &frame,
+            Some(vec![b(10, 13)]),
+            height,
+            stride,
+        );
+        assert_eq!(written, Some(Some(vec![b(2, 5), b(10, 13)])));
+        assert_eq!(active, 0);
+        assert_eq!(slots.len(), 2);
+        assert_eq!(slots[active], frame);
+        assert_eq!(back, Some((1, Some(vec![b(10, 13)]))));
+
+        // 3. In-place reuse of `active` (slot 0 released across two frames) must
+        // accumulate both frames' bands into `back_bands` for slot 1.
+        let f4 = make_frame(4);
+        frame[0..2 * stride].copy_from_slice(&f4[0..2 * stride]);
+        let written = apply_frame(
+            &mut active,
+            &mut back,
+            &mut slots,
+            &[true, false],
+            &frame,
+            Some(vec![b(0, 2)]),
+            height,
+            stride,
+        );
+        assert_eq!(written, Some(Some(vec![b(0, 2)])));
+        assert_eq!(active, 0);
+        assert_eq!(slots[active], frame);
+
+        let f5 = make_frame(5);
+        frame[stride..4 * stride].copy_from_slice(&f5[stride..4 * stride]);
+        let written = apply_frame(
+            &mut active,
+            &mut back,
+            &mut slots,
+            &[true, false],
+            &frame,
+            Some(vec![b(1, 4)]),
+            height,
+            stride,
+        );
+        assert_eq!(written, Some(Some(vec![b(1, 4)])));
+        assert_eq!(active, 0);
+        assert_eq!(slots[active], frame);
+        assert_eq!(back, Some((1, Some(vec![b(0, 4), b(10, 13)]))));
+
+        // Now hold slot 0 and release slot 1: slot 1 catches up `0..4 ∪ 10..13 ∪ 18..20`.
+        let f6 = make_frame(6);
+        frame[18 * stride..20 * stride].copy_from_slice(&f6[18 * stride..20 * stride]);
+        let written = apply_frame(
+            &mut active,
+            &mut back,
+            &mut slots,
+            &[false, true],
+            &frame,
+            Some(vec![b(18, 20)]),
+            height,
+            stride,
+        );
+        assert_eq!(written, Some(Some(vec![b(0, 4), b(10, 13), b(18, 20)])));
+        assert_eq!(active, 1);
+        assert_eq!(slots[active], frame);
+
+        // 4. `>= 75%` height promotion (`0..13 ∪ 18..20` covers `15 / 20 == 75%`)
+        // promotes `back_bands` to `None`.
+        let f7 = make_frame(7);
+        frame[0..13 * stride].copy_from_slice(&f7[0..13 * stride]);
+        let written = apply_frame(
+            &mut active,
+            &mut back,
+            &mut slots,
+            &[false, true],
+            &frame,
+            Some(vec![b(0, 13)]),
+            height,
+            stride,
+        );
+        assert_eq!(written, Some(Some(vec![b(0, 13)])));
+        assert_eq!(active, 1);
+        assert_eq!(back, Some((0, None)));
+        assert_eq!(slots[active], frame);
+
+        // 4b. Releasing slot 0 whose history is `None` must full-copy it.
+        let f9 = make_frame(9);
+        frame[8 * stride..10 * stride].copy_from_slice(&f9[8 * stride..10 * stride]);
+        let written = apply_frame(
+            &mut active,
+            &mut back,
+            &mut slots,
+            &[true, false],
+            &frame,
+            Some(vec![b(8, 10)]),
+            height,
+            stride,
+        );
+        assert_eq!(written, Some(None));
+        assert_eq!(active, 0);
+        assert_eq!(slots[active], frame);
+        assert_eq!(back, Some((1, Some(vec![b(8, 10)]))));
+
+        // 4c. Full-frame (`cur_bands == None`) in-place write resets back history to `None`.
+        frame = make_frame(10);
+        let written = apply_frame(
+            &mut active,
+            &mut back,
+            &mut slots,
+            &[true, false],
+            &frame,
+            None,
+            height,
+            stride,
+        );
+        assert_eq!(written, Some(None));
+        assert_eq!(active, 0);
+        assert_eq!(slots[active], frame);
+        assert_eq!(back, Some((1, None)));
+
+        // 4d. Swapping to slot 1 after the full-frame write must full-copy it.
+        let f11 = make_frame(11);
+        frame[3 * stride..4 * stride].copy_from_slice(&f11[3 * stride..4 * stride]);
+        let written = apply_frame(
+            &mut active,
+            &mut back,
+            &mut slots,
+            &[false, true],
+            &frame,
+            Some(vec![b(3, 4)]),
+            height,
+            stride,
+        );
+        assert_eq!(written, Some(None));
+        assert_eq!(active, 1);
+        assert_eq!(slots[active], frame);
+
+        // 5. Both `active` (1) and `back` (0) held -> allocates 3rd slot (2).
+        let f8 = make_frame(8);
+        frame[5 * stride..7 * stride].copy_from_slice(&f8[5 * stride..7 * stride]);
+        let written = apply_frame(
+            &mut active,
+            &mut back,
+            &mut slots,
+            &[false, false],
+            &frame,
+            Some(vec![b(5, 7)]),
+            height,
+            stride,
+        );
+        assert_eq!(written, None);
+        assert_eq!(active, 2);
+        assert_eq!(slots.len(), 3);
+        assert_eq!(slots[active], frame);
+        assert_eq!(back, Some((1, Some(vec![b(5, 7)]))));
     }
 }

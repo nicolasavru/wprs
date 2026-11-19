@@ -55,9 +55,11 @@ use crate::serialization::framing::CompressedTile;
 use crate::serialization::framing::CompressedTileStream;
 use crate::serialization::framing::CompressedTiles;
 use crate::serialization::framing::RawBufferHeader;
+use crate::serialization::framing::RowBand;
 use crate::serialization::framing::StreamingCompressedTiles;
 use crate::serialization::framing::TILE_PIXELS;
 use crate::serialization::framing::TileChannel;
+use crate::serialization::geometry::Rectangle;
 use crate::serialization::wayland::BufferFormat;
 use crate::serialization::wayland::BufferMetadata;
 use crate::serialization::wayland::WlSurfaceId;
@@ -428,12 +430,112 @@ fn unfilter_tile<K: FilterKernel, const HAS_ALPHA: bool>(
 
 // --- public API ---
 
+/// Sorts, merges overlapping/adjacent `[y0, y1)` intervals, and returns `None`
+/// if merged damaged rows cover `>= 75%` of `height`.
+pub(crate) fn merge_row_bands(mut bands: Vec<RowBand>, height: i32) -> Option<Vec<RowBand>> {
+    if bands.is_empty() {
+        return Some(bands);
+    }
+
+    let height_u32 = height as u32;
+    bands.sort_unstable_by_key(|b| b.y0);
+    let mut write_idx = 0;
+    for read_idx in 1..bands.len() {
+        let next = bands[read_idx];
+        if next.y0 <= bands[write_idx].y1 {
+            bands[write_idx].y1 = bands[write_idx].y1.max(next.y1);
+        } else {
+            write_idx += 1;
+            bands[write_idx] = next;
+        }
+    }
+    bands.truncate(write_idx + 1);
+
+    let damaged_rows: u64 = bands.iter().map(|b| u64::from(b.y1 - b.y0)).sum();
+    if damaged_rows * 4 >= u64::from(height_u32) * 3 {
+        return None;
+    }
+
+    Some(bands)
+}
+
+/// Computes sorted, merged, non-overlapping damaged row-bands `[y0, y1)` when
+/// updating an existing buffer of identical dimensions/format and total damaged
+/// rows cover strictly less than 75% of `height`. Returns `None` when the
+/// caller should take the zero-overhead full-frame path.
+pub fn compute_partial_row_bands(
+    damage: &[Rectangle<i32>],
+    width: i32,
+    height: i32,
+) -> Option<Vec<RowBand>> {
+    if width <= 0 || height <= 0 || damage.is_empty() {
+        return None;
+    }
+
+    let height_u32 = height as u32;
+    let mut bands = Vec::with_capacity(damage.len());
+    for rect in damage {
+        let x0 = rect.loc.x.clamp(0, width);
+        let x1 = rect.loc.x.saturating_add(rect.size.w).clamp(0, width);
+        let y0 = rect.loc.y.clamp(0, height) as u32;
+        let y1 = rect.loc.y.saturating_add(rect.size.h).clamp(0, height) as u32;
+        if x0 >= x1 || y0 >= y1 {
+            continue;
+        }
+        if y0 == 0 && y1 == height_u32 {
+            // Short-circuit common full-surface damage in O(1) with zero extra
+            // work.
+            return None;
+        }
+        bands.push(RowBand { y0, y1 });
+    }
+
+    merge_row_bands(bands, height)
+}
+
+/// Validates that `bands` are sorted and non-overlapping, each band is
+/// non-empty (`y0 < y1`), and `y1 <= metadata.height` (an empty `bands` slice
+/// is valid), then splits them into `<= TILE_PIXELS` pixel spans
+/// `(start_pixel, len_pixels)`. `metadata` must already pass
+/// `BufferMetadata::validate`.
+fn tile_spans_for_bands(
+    bands: &[RowBand],
+    metadata: &BufferMetadata,
+) -> Result<Vec<(usize, usize)>> {
+    let row_pixels = (metadata.stride as usize) / 4;
+    let height_u32 = metadata.height as u32;
+    let mut spans = Vec::new();
+    let mut prev_y1 = 0u32;
+
+    for band in bands {
+        if band.y0 < prev_y1 || band.y0 >= band.y1 || band.y1 > height_u32 {
+            bail!(
+                "invalid or overlapping RowBand [{}..{}) for height {height_u32}",
+                band.y0,
+                band.y1
+            );
+        }
+        prev_y1 = band.y1;
+        let band_start = (band.y0 as usize) * row_pixels;
+        let band_end = (band.y1 as usize) * row_pixels;
+        let mut cur = band_start;
+        while cur < band_end {
+            let len = (band_end - cur).min(TILE_PIXELS);
+            spans.push((cur, len));
+            cur += len;
+        }
+    }
+
+    Ok(spans)
+}
+
 #[instrument(skip_all, level = "debug")]
 pub fn filter_and_compress_streaming(
     data: BufferPointer<u8>,
     client: ClientId,
     surface: WlSurfaceId,
     metadata: BufferMetadata,
+    bands: Option<Vec<RowBand>>,
     compressor: &mut ShardingCompressor,
     on_stream_ready: impl FnOnce(StreamingCompressedTiles),
 ) {
@@ -443,13 +545,21 @@ pub fn filter_and_compress_streaming(
     let total_pixels = aos.len();
     let has_alpha = metadata.format == BufferFormat::Argb8888;
     let (tiles_tx, tiles_rx) = crossbeam_channel::unbounded();
-    let n_tiles = total_pixels.div_ceil(TILE_PIXELS);
+
+    let spans_opt = bands
+        .as_ref()
+        .map(|b| tile_spans_for_bands(b, &metadata).expect("server generated invalid row bands"));
+    let n_tiles = match &spans_opt {
+        None => total_pixels.div_ceil(TILE_PIXELS),
+        Some(spans) => spans.len(),
+    };
 
     let header = RawBufferHeader {
         client,
         surface,
         metadata,
         n_tiles: n_tiles as u32,
+        bands,
     };
     on_stream_ready(StreamingCompressedTiles {
         header,
@@ -463,8 +573,13 @@ pub fn filter_and_compress_streaming(
             if tile_idx >= n_tiles {
                 break;
             }
-            let start = tile_idx * TILE_PIXELS;
-            let tile_len = (total_pixels - start).min(TILE_PIXELS);
+            let (start, tile_len) = match &spans_opt {
+                None => {
+                    let start = tile_idx * TILE_PIXELS;
+                    (start, (total_pixels - start).min(TILE_PIXELS))
+                },
+                Some(spans) => spans[tile_idx],
+            };
             let (_, after_start) = aos.split_at(start);
             let (aos_tile, _) = after_start.split_at(tile_len);
 
@@ -502,6 +617,7 @@ pub fn filter_and_compress(
         ClientId(0),
         WlSurfaceId(0),
         metadata,
+        None,
         compressor,
         |streaming| {
             streaming_opt = Some(streaming);
@@ -519,6 +635,7 @@ pub fn filter_and_compress(
 fn unfilter_tiles_parallel<'a>(
     decompressor: &mut ShardingDecompressor,
     total_pixels: usize,
+    spans: Option<&[(usize, usize)]>,
     has_alpha: bool,
     output_buf: &mut [u8],
     next_tile: impl Fn() -> Option<Result<Cow<'a, CompressedTile>>> + Sync,
@@ -530,7 +647,7 @@ fn unfilter_tiles_parallel<'a>(
         bail!("output_buf len {} < {byte_len}", output_buf.len());
     }
 
-    let expected_tiles = total_pixels.div_ceil(TILE_PIXELS);
+    let expected_tiles = spans.map_or_else(|| total_pixels.div_ceil(TILE_PIXELS), <[_]>::len);
     let aos: &mut [Vec4u8] = bytemuck::cast_slice_mut(&mut output_buf[..byte_len]);
     let aos_base = aos.as_mut_ptr() as usize;
     let claimed: Vec<AtomicBool> = (0..expected_tiles)
@@ -551,12 +668,19 @@ fn unfilter_tiles_parallel<'a>(
                 if claimed[idx].swap(true, Ordering::Relaxed) {
                     bail!("duplicate tile_idx {idx}");
                 }
-                let start = idx * TILE_PIXELS;
-                let tile_len = (total_pixels - start).min(TILE_PIXELS);
-                // SAFETY: Fixed `TILE_PIXELS` chunks partition `0..total_pixels`
-                // into non-overlapping ranges, and `claimed[idx].swap(true)`
-                // guarantees exclusive access to `[start .. start + tile_len)`
-                // within `aos` for the duration of `pool.execute`.
+                let (start, tile_len) = match spans {
+                    None => {
+                        let start = idx * TILE_PIXELS;
+                        (start, (total_pixels - start).min(TILE_PIXELS))
+                    },
+                    Some(spans) => spans[idx],
+                };
+                // SAFETY: `spans` (when `Some`, produced by `tile_spans_for_bands`
+                // over the same validated `metadata` that yielded `total_pixels`)
+                // or fixed `TILE_PIXELS` chunks are disjoint ranges inside
+                // `0..total_pixels`, and `claimed[idx].swap(true)` guarantees
+                // exclusive access to `[start .. start + tile_len)` within `aos`
+                // for the duration of `pool.execute`.
                 let aos_tile = unsafe {
                     slice::from_raw_parts_mut((aos_base as *mut Vec4u8).add(start), tile_len)
                 };
@@ -596,27 +720,63 @@ fn unfilter_tiles_parallel<'a>(
     Ok(())
 }
 
+pub struct ValidatedTileStream {
+    stream: CompressedTileStream,
+    total_pixels: usize,
+    spans: Option<Vec<(usize, usize)>>,
+}
+
+impl ValidatedTileStream {
+    pub fn new(stream: CompressedTileStream) -> Result<Self> {
+        let total_pixels = stream.header.metadata.validate().location(loc!())?;
+        let spans = match &stream.header.bands {
+            None => None,
+            Some(bands) => {
+                Some(tile_spans_for_bands(bands, &stream.header.metadata).location(loc!())?)
+            },
+        };
+        let expected_tiles = match &spans {
+            None => total_pixels.div_ceil(TILE_PIXELS),
+            Some(spans) => spans.len(),
+        };
+        if stream.header.n_tiles as usize != expected_tiles {
+            bail!(
+                "header n_tiles {} != expected {expected_tiles}",
+                stream.header.n_tiles,
+            );
+        }
+        Ok(Self {
+            stream,
+            total_pixels,
+            spans,
+        })
+    }
+
+    pub fn metadata(&self) -> BufferMetadata {
+        self.stream.header.metadata
+    }
+
+    pub fn bands(&self) -> Option<&[RowBand]> {
+        self.stream.header.bands.as_deref()
+    }
+}
+
 #[instrument(skip_all, level = "debug")]
 pub fn decompress_and_unfilter_streaming(
-    stream: CompressedTileStream,
+    validated: ValidatedTileStream,
     decompressor: &mut ShardingDecompressor,
     output_buf: &mut [u8],
 ) -> Result<()> {
-    let total_pixels = stream.header.metadata.validate().location(loc!())?;
-    let expected_tiles = total_pixels.div_ceil(TILE_PIXELS);
-    if stream.header.n_tiles as usize != expected_tiles {
-        bail!(
-            "header n_tiles {} != expected {}",
-            stream.header.n_tiles,
-            expected_tiles
-        );
-    }
-
-    let has_alpha = stream.header.metadata.format == BufferFormat::Argb8888;
-    let tiles_rx = &stream.tiles;
-    unfilter_tiles_parallel(decompressor, total_pixels, has_alpha, output_buf, || {
-        tiles_rx.recv().ok().map(|r| r.map(Cow::Owned))
-    })
+    let has_alpha = validated.stream.header.metadata.format == BufferFormat::Argb8888;
+    let tiles_rx = &validated.stream.tiles;
+    unfilter_tiles_parallel(
+        decompressor,
+        validated.total_pixels,
+        validated.spans.as_deref(),
+        has_alpha,
+        output_buf,
+        || tiles_rx.recv().ok().map(|r| r.map(Cow::Owned)),
+    )
 }
 
 #[instrument(skip_all, level = "debug")]
@@ -629,10 +789,17 @@ pub fn decompress_and_unfilter(
     let n_tiles = tiles.tiles.len();
     let has_alpha = tiles.format == BufferFormat::Argb8888;
     let next_idx = AtomicUsize::new(0);
-    unfilter_tiles_parallel(decompressor, total_pixels, has_alpha, output_buf, || {
-        let i = next_idx.fetch_add(1, Ordering::Relaxed);
-        (i < n_tiles).then(|| Ok(Cow::Borrowed(&tiles.tiles[i])))
-    })
+    unfilter_tiles_parallel(
+        decompressor,
+        total_pixels,
+        None,
+        has_alpha,
+        output_buf,
+        || {
+            let i = next_idx.fetch_add(1, Ordering::Relaxed);
+            (i < n_tiles).then(|| Ok(Cow::Borrowed(&tiles.tiles[i])))
+        },
+    )
 }
 
 #[cfg(test)]
@@ -641,6 +808,7 @@ mod tests {
     use std::num::NonZeroUsize;
 
     use proptest::prelude::*;
+    use rkyv::util::AlignedVec;
 
     use super::*;
 
@@ -978,6 +1146,223 @@ mod tests {
     }
 
     #[test]
+    fn test_compute_partial_row_bands() {
+        assert_eq!(compute_partial_row_bands(&[], 3840, 2160), None);
+        for (w, h) in [(0, 2160), (-1, 2160), (3840, 0), (3840, -1)] {
+            assert_eq!(
+                compute_partial_row_bands(&[Rectangle::new(0, 0, 10, 10)], w, h),
+                None,
+                "expected None for dimensions ({w}, {h})"
+            );
+        }
+        assert_eq!(
+            compute_partial_row_bands(&[Rectangle::new(0, 0, 3840, 2160)], 3840, 2160),
+            None
+        );
+        assert_eq!(
+            compute_partial_row_bands(&[Rectangle::new(0, 0, i32::MAX, i32::MAX)], 3840, 2160),
+            None
+        );
+        // 75% threshold: 1620 / 2160 == 75% -> full frame; 1619 / 2160 < 75% -> partial.
+        assert_eq!(
+            compute_partial_row_bands(&[Rectangle::new(0, 0, 100, 1620)], 3840, 2160),
+            None
+        );
+        assert_eq!(
+            compute_partial_row_bands(&[Rectangle::new(0, 0, 100, 1619)], 3840, 2160),
+            Some(vec![RowBand { y0: 0, y1: 1619 }])
+        );
+        // Out-of-order, overlapping, adjacent, bottom-touching (`0 < y0 < y1 == height`),
+        // and negative-coord rects merge cleanly.
+        assert_eq!(
+            compute_partial_row_bands(
+                &[
+                    Rectangle::new(10, 500, 50, 40),
+                    Rectangle::new(-10, -20, 100, 35),
+                    Rectangle::new(3800, 2150, 100, 30),
+                    Rectangle::new(0, 540, 20, 10),
+                    Rectangle::new(0, 510, 20, 20),
+                ],
+                3840,
+                2160,
+            ),
+            Some(vec![
+                RowBand { y0: 0, y1: 15 },
+                RowBand { y0: 500, y1: 550 },
+                RowBand { y0: 2150, y1: 2160 },
+            ])
+        );
+        // Off-screen, edge-touching (`x1 == 0`, `x0 == width`, `y1 == 0`, `y0 == height`),
+        // and non-positive-dimension rects yield an empty partial update (`0` damaged rows).
+        for rect in [
+            Rectangle::new(-100, -100, 20, 20),
+            Rectangle::new(-20, 10, 20, 20),
+            Rectangle::new(3840, 10, 20, 20),
+            Rectangle::new(10, -20, 20, 20),
+            Rectangle::new(10, 2160, 20, 20),
+            Rectangle::new(10, 10, 0, 20),
+            Rectangle::new(10, 10, 20, -5),
+            Rectangle::new(10, 10, -5, 20),
+        ] {
+            assert_eq!(
+                compute_partial_row_bands(&[rect], 3840, 2160),
+                Some(Vec::new()),
+                "expected empty bands for {rect:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_tile_spans_for_bands() {
+        let small_meta = BufferMetadata {
+            width: 256,
+            height: 20,
+            stride: 256 * 4,
+            format: BufferFormat::Xrgb8888,
+        };
+        let spans = tile_spans_for_bands(&[RowBand { y0: 2, y1: 12 }], &small_meta).unwrap();
+        assert_eq!(spans, vec![(2 * 256, 10 * 256)]);
+
+        let large_meta = BufferMetadata {
+            width: 512,
+            height: 400,
+            stride: 512 * 4,
+            format: BufferFormat::Xrgb8888,
+        };
+        let multi_tile_spans =
+            tile_spans_for_bands(&[RowBand { y0: 0, y1: 300 }], &large_meta).unwrap();
+        assert_eq!(
+            multi_tile_spans,
+            vec![
+                (0, TILE_PIXELS),
+                (TILE_PIXELS, TILE_PIXELS),
+                (2 * TILE_PIXELS, 300 * 512 - 2 * TILE_PIXELS),
+            ]
+        );
+
+        let meta_64 = BufferMetadata {
+            width: 64,
+            height: 64,
+            stride: 64 * 4,
+            format: BufferFormat::Xrgb8888,
+        };
+        // `y1 == height` boundary is accepted.
+        assert_eq!(
+            tile_spans_for_bands(&[RowBand { y0: 60, y1: 64 }], &meta_64).unwrap(),
+            vec![(60 * 64, 4 * 64)]
+        );
+        // Non-monotonic (`y0 == y1`, `y0 > y1`), overlapping/unsorted, and `y1 > height`.
+        for bad_bands in [
+            vec![RowBand { y0: 5, y1: 5 }],
+            vec![RowBand { y0: 10, y1: 5 }],
+            vec![RowBand { y0: 10, y1: 20 }, RowBand { y0: 15, y1: 25 }],
+            vec![RowBand { y0: 50, y1: 70 }],
+        ] {
+            assert!(tile_spans_for_bands(&bad_bands, &meta_64).is_err());
+        }
+    }
+
+    #[test]
+    #[cfg_attr(miri, ignore)]
+    fn test_partial_row_bands_streaming_roundtrip() {
+        with_test_codec(|compressor, decompressor| {
+            // Parameterized over format, padded stride, full-frame (`None`),
+            // empty partial (`Some(vec![])`), small `<= 512 B` Uncompressed
+            // band, and multi-tile Zstd bands.
+            for format in [BufferFormat::Argb8888, BufferFormat::Xrgb8888] {
+                for pad_bytes in [0i32, 16i32] {
+                    let width = 480i32;
+                    let height = 600i32;
+                    let stride = width * 4 + pad_bytes;
+                    let len = (stride * height) as usize;
+                    let mut frame0 = test_vec(len);
+                    // Keep byte 3 strictly `< 0xFF` across all `bands_case`s so
+                    // `Xrgb8888` alpha overwrite (`0xFF`) is verified on partial
+                    // bands and `rem > 0` scalar tails too.
+                    let frame1: Vec<u8> = (0..len).map(|i| ((i * 11 + 7) % 255) as u8).collect();
+                    let mut frame1_expected = frame1.clone();
+                    if format == BufferFormat::Xrgb8888 {
+                        for px in frame0.as_chunks_mut::<4>().0 {
+                            px[3] = 0xFF;
+                        }
+                        for px in frame1_expected.as_chunks_mut::<4>().0 {
+                            px[3] = 0xFF;
+                        }
+                    }
+
+                    // Odd row `y = 3` (`3 * 1936 == 16 mod 32` when `pad_bytes = 16`)
+                    // + even row `y = 300` (`0 mod 32`) on a 64-byte-aligned canvas
+                    // exercises both `STREAM = false` and `STREAM = true` on x86
+                    // (`STREAM_ALIGN = 32`).
+                    let partial_bands = compute_partial_row_bands(
+                        &[
+                            Rectangle::new(0, 3, width, 1), // <= 512 B Uncompressed tile
+                            Rectangle::new(50, 300, 100, 180),
+                        ],
+                        width,
+                        height,
+                    )
+                    .unwrap();
+
+                    for bands_case in [None, Some(Vec::new()), Some(partial_bands)] {
+                        let metadata = BufferMetadata {
+                            width,
+                            height,
+                            stride,
+                            format,
+                        };
+                        let ptr = frame1.as_ptr();
+                        let buf_ptr = unsafe { BufferPointer::new(&ptr, len) };
+
+                        let mut streaming_opt = None;
+                        filter_and_compress_streaming(
+                            buf_ptr,
+                            ClientId(1),
+                            WlSurfaceId(2),
+                            metadata,
+                            bands_case.clone(),
+                            compressor,
+                            |s| streaming_opt = Some(s),
+                        );
+                        let mut wire = Vec::new();
+                        streaming_opt.unwrap().framed_write(&mut wire).unwrap();
+
+                        let mut client_canvas = AlignedVec::<64>::with_capacity(len);
+                        client_canvas.extend_from_slice(&frame0);
+                        let mut wire_slice = wire.as_slice();
+                        let mut tile_stream_opt = None;
+                        CompressedTileStream::read_from_stream(&mut wire_slice, |tile_stream| {
+                            tile_stream_opt = Some(tile_stream);
+                            Ok(())
+                        })
+                        .unwrap();
+                        decompress_and_unfilter_streaming(
+                            ValidatedTileStream::new(tile_stream_opt.unwrap()).unwrap(),
+                            decompressor,
+                            &mut client_canvas,
+                        )
+                        .unwrap();
+
+                        let expected = match &bands_case {
+                            None => frame1_expected.clone(),
+                            Some(bands) => {
+                                let mut exp = frame0.clone();
+                                for b in bands {
+                                    let s = b.y0 as usize * stride as usize;
+                                    let e = b.y1 as usize * stride as usize;
+                                    exp[s..e].copy_from_slice(&frame1_expected[s..e]);
+                                }
+                                exp
+                            },
+                        };
+                        assert_eq!(&client_canvas[..], expected.as_slice());
+                    }
+                }
+            }
+        });
+    }
+
+    #[test]
     #[cfg_attr(miri, ignore)]
     fn test_tile_pipeline_errors() {
         with_test_codec(|compressor, decompressor| {
@@ -1040,6 +1425,7 @@ mod tests {
                     stride: (two_tile_pixels * 4) as i32,
                     format: BufferFormat::Argb8888,
                 },
+                None,
                 compressor,
                 drop,
             );
@@ -1090,23 +1476,9 @@ mod tests {
             assert_eq!(dup_idx.tiles[1].tile_idx, 0);
             assert!(decompress_and_unfilter(&dup_idx, decompressor, &mut reversed_out).is_err());
 
-            // Mismatched `header.n_tiles` with 1 valid tile queued must fail
-            // `decompress_and_unfilter_streaming`'s upfront header guard rather
-            // than succeeding on the queued tile.
-            let mut stream_out = vec![0u8; 64 * 64 * 4];
+            // Mismatched `header.n_tiles` must fail header validation cleanly.
             for bad_n_tiles in [0, 2] {
-                let (tx, rx) = crossbeam_channel::unbounded();
-                tx.send(Ok(CompressedTile {
-                    tile_idx: 0,
-                    channels: [
-                        TileChannel::ConstantDelta(1),
-                        TileChannel::ConstantDelta(2),
-                        TileChannel::ConstantDelta(3),
-                        TileChannel::ConstantDelta(4),
-                    ],
-                }))
-                .unwrap();
-                drop(tx);
+                let (_tx, rx) = crossbeam_channel::unbounded();
                 let mismatched_n_tiles_stream = CompressedTileStream {
                     header: RawBufferHeader {
                         client: ClientId(1),
@@ -1118,16 +1490,12 @@ mod tests {
                             format: BufferFormat::Argb8888,
                         },
                         n_tiles: bad_n_tiles,
+                        bands: None,
                     },
                     tiles: rx,
                 };
                 assert!(
-                    decompress_and_unfilter_streaming(
-                        mismatched_n_tiles_stream,
-                        decompressor,
-                        &mut stream_out,
-                    )
-                    .is_err(),
+                    ValidatedTileStream::new(mismatched_n_tiles_stream).is_err(),
                     "expected error for mismatched n_tiles={bad_n_tiles}"
                 );
             }
