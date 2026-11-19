@@ -16,14 +16,13 @@
 use std::collections::HashSet;
 use std::mem;
 use std::os::fd::OwnedFd;
+use std::sync::Arc;
 use std::time::Duration;
 
-use crossbeam_channel::Sender;
 use smithay::backend::renderer::utils::on_commit_buffer_handler;
 use smithay::input::pointer::AxisFrame;
 use smithay::input::pointer::ButtonEvent;
 use smithay::input::pointer::CursorImageStatus as SmithayCursorImageStatus;
-use smithay::input::pointer::CursorImageSurfaceData;
 use smithay::input::pointer::GestureHoldBeginEvent;
 use smithay::input::pointer::GestureHoldEndEvent;
 use smithay::input::pointer::GesturePinchBeginEvent;
@@ -97,14 +96,15 @@ use smithay::wayland::shm::ShmHandler;
 use smithay::wayland::shm::ShmState;
 use smithay::wayland::viewporter::ViewportCachedState;
 
-use crate::channel_utils::DiscardingSender;
 use crate::compositor_utils;
+use crate::filtering;
 use crate::prelude::*;
 use crate::serialization;
+use crate::serialization::Request;
+use crate::serialization::SendType;
+use crate::serialization::SerializerWriter;
 use crate::serialization::wayland::BufferAssignment;
 use crate::serialization::wayland::ClientSurface;
-use crate::serialization::wayland::CursorImage;
-use crate::serialization::wayland::CursorImageStatus;
 use crate::serialization::wayland::DataDestinationRequest;
 use crate::serialization::wayland::DataRequest;
 use crate::serialization::wayland::DataSource;
@@ -129,8 +129,6 @@ use crate::serialization::xdg_shell::XdgPopupState;
 use crate::serialization::xdg_shell::XdgPositioner;
 use crate::serialization::xdg_shell::XdgSurfaceState;
 use crate::serialization::xdg_shell::XdgToplevelState;
-use crate::serialization::Request;
-use crate::serialization::SendType;
 use crate::server::LockedSurfaceState;
 use crate::server::WprsServerState;
 
@@ -213,6 +211,8 @@ impl XdgShellHandler for WprsServerState {
         // appropriate message would have been sent to the client, so we don't
         // need to worry about destroying the toplevel,
         if toplevel.wl_surface().client().is_some() {
+            self.synced_surfaces
+                .remove(&WlSurfaceId::new(toplevel.wl_surface()));
             compositor::with_states(toplevel.wl_surface(), |surface_data| {
                 surface_data
                     .data_map
@@ -257,6 +257,8 @@ impl XdgShellHandler for WprsServerState {
         // appropriate message would have been sent to the client, so we don't
         // need to worry about destroying the popup,
         if let Some(client) = popup.wl_surface().client() {
+            self.synced_surfaces
+                .remove(&WlSurfaceId::new(popup.wl_surface()));
             // Uses with_states internally and with_states is not reentrant.
             compositor::with_states(popup.wl_surface(), |surface_data| {
                 surface_data
@@ -485,6 +487,12 @@ impl ClientDndGrabHandler for WprsServerState {
         icon: Option<WlSurface>,
         _seat: Seat<Self>,
     ) {
+        let icon_surface = icon.as_ref().and_then(|surface| {
+            let client_surface = ClientSurface::new(surface).log(loc!()).ok()?;
+            self.insert_surface(surface).log(loc!()).ok()?;
+            self.sync_surface_if_unsynced(surface);
+            Some(client_surface)
+        });
         self.dnd_source = source;
         if let Some(source) = &self.dnd_source {
             with_source_metadata(source, |source_metadata| {
@@ -492,11 +500,7 @@ impl ClientDndGrabHandler for WprsServerState {
                 self.serializer
                     .writer()
                     .send(SendType::Object(Request::Data(DataRequest::SourceRequest(
-                        DataSourceRequest::StartDrag(
-                            source_metadata.clone().into(),
-                            icon.as_ref()
-                                .and_then(|surface| ClientSurface::new(surface).log(loc!()).ok()),
-                        ),
+                        DataSourceRequest::StartDrag(source_metadata.clone().into(), icon_surface),
                     ))));
             })
             .log_and_ignore(loc!());
@@ -769,7 +773,8 @@ pub fn commit_impl(
         .0
         .lock()
         .unwrap();
-    let prev_without_buffer = surface_state.clone_without_buffer();
+    let connected = state.serializer.other_end_connected();
+    let prev_without_buffer = connected.then(|| surface_state.clone_without_buffer());
 
     if matches!(surface_data.role, Some("subsurface")) && surface_state.role.is_none() {
         // TODO: figure out why some subsurfaces don't have parents. Probably a
@@ -859,38 +864,55 @@ pub fn commit_impl(
         None => {},
     }
 
-    // This needs to be a clone_without_buffer, the extra copy of the buffer
-    // data arc will cause a deadlock otherwise.
-    let mut surface_state_to_send = surface_state.clone_without_buffer();
-
-    // TODO: make a function and dedupe with compositor.rs.
     debug!("buffer assignment: {:?}", &surface_attributes.buffer);
+    let mut buffer_to_send = None;
+
     match &surface_attributes.buffer {
         Some(SmithayBufferAssignment::NewBuffer(buffer)) => {
-            compositor_utils::with_buffer_contents(buffer, |data, spec| {
-                surface_state.set_buffer(&spec, data, &mut state.compressor)
-            })
-            .location(loc!())?
-            .location(loc!())?;
-
-            let raw_buffer_to_send = surface_state_to_send
-                .update_with_external_buffer(&surface_state.buffer)
+            let raw_buffer_opt =
+                compositor_utils::with_buffer_contents(buffer, |data, spec| -> Result<_> {
+                    surface_state.set_external_buffer(&spec).location(loc!())?;
+                    if !connected {
+                        return Ok(None);
+                    }
+                    Ok(Some(Arc::new(filtering::filter_and_compress(
+                        data,
+                        &mut state.compressor,
+                    ))))
+                })
+                .location(loc!())?
                 .location(loc!())?;
-
-            state
-                .serializer
-                .writer()
-                .send(SendType::RawBuffer(raw_buffer_to_send));
+            if let Some(raw_buffer_to_send) = raw_buffer_opt {
+                state.synced_surfaces.insert(surface_state.id);
+                buffer_to_send.clone_from(&surface_state.buffer);
+                state
+                    .serializer
+                    .writer()
+                    .send(SendType::RawBuffer(raw_buffer_to_send));
+            }
         },
         Some(SmithayBufferAssignment::Removed) => {
             surface_state.buffer = None;
-            surface_state_to_send.buffer = Some(BufferAssignment::Removed);
-        },
-        None => {
-            if (surface_state_to_send == prev_without_buffer) && !children_dirty {
-                return Ok(false);
+            if connected {
+                state.synced_surfaces.remove(&surface_state.id);
+                buffer_to_send = Some(BufferAssignment::Removed);
             }
         },
+        None => {},
+    }
+
+    let Some(prev_without_buffer) = prev_without_buffer else {
+        surface_attributes.damage.clear();
+        return Ok(false);
+    };
+
+    let mut surface_state_to_send = surface_state.clone_without_buffer();
+    surface_state_to_send.buffer = buffer_to_send;
+    if surface_state_to_send.buffer.is_none()
+        && surface_state_to_send == prev_without_buffer
+        && !children_dirty
+    {
+        return Ok(false);
     }
 
     let buffer_size = surface_state
@@ -941,53 +963,8 @@ impl SeatHandler for WprsServerState {
 
     #[instrument(skip(self, _seat), level = "debug")]
     fn cursor_image(&mut self, _seat: &Seat<Self>, image: SmithayCursorImageStatus) {
-        // TODO: move to a fn on serialization::CursorImaveStatus
-        let cursor_image_status = {
-            match image {
-                SmithayCursorImageStatus::Hidden => CursorImageStatus::Hidden,
-                SmithayCursorImageStatus::Surface(surface) => {
-                    self.insert_surface(&surface).log_and_ignore(loc!());
-
-                    let hotspot = compositor::with_states(&surface, |surface_data| {
-                        let hotspot = surface_data
-                            .data_map
-                            .get::<CursorImageSurfaceData>()
-                            .unwrap()
-                            .lock()
-                            .unwrap()
-                            .hotspot;
-
-                        let surface_state = &mut surface_data
-                            .data_map
-                            .get::<LockedSurfaceState>()
-                            .unwrap()
-                            .0
-                            .lock()
-                            .unwrap();
-                        surface_state.role = Some(Role::Cursor(hotspot.into()));
-
-                        hotspot
-                    });
-
-                    CursorImageStatus::Surface {
-                        client_surface: log_and_return!(ClientSurface::new(&surface)),
-                        hotspot: hotspot.into(),
-                    }
-                },
-                SmithayCursorImageStatus::Named(name) => {
-                    CursorImageStatus::Named(name.name().to_string())
-                },
-            }
-        };
-
-        // TODO: expose serial to this function, then remove last_enter_serial
-        // on client.
-        self.serializer
-            .writer()
-            .send(SendType::Object(Request::CursorImage(CursorImage {
-                serial: 0,
-                status: cursor_image_status,
-            })));
+        self.cursor_status = Some(image.clone());
+        self.send_cursor_status(&image);
     }
 }
 
@@ -1216,11 +1193,11 @@ impl PointerGrab<WprsServerState> for DndGrab {
 
 pub struct ClientState {
     compositor_state: CompositorClientState,
-    pub writer: DiscardingSender<Sender<SendType<Request>>>,
+    pub writer: SerializerWriter<Request>,
 }
 
 impl ClientState {
-    pub fn new(writer: DiscardingSender<Sender<SendType<Request>>>) -> Self {
+    pub fn new(writer: SerializerWriter<Request>) -> Self {
         Self {
             compositor_state: CompositorClientState::default(),
             writer,
@@ -1237,11 +1214,7 @@ impl ClientData for ClientState {
         self.writer
             .send(SendType::Object(Request::ClientDisconnected(
                 client_id.into(),
-            )))
-            // This should be infallible, writer is an InfallibleWriter,
-            // but we can't put an InfallibleWriter into ClientState
-            // for ClientData trait API reasons.
-            .unwrap();
+            )));
     }
 }
 

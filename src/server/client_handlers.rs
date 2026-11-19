@@ -20,6 +20,7 @@ use std::io::Read;
 use std::io::Write;
 use std::mem;
 use std::os::fd::AsFd;
+use std::sync::Arc;
 use std::thread;
 
 use nix::fcntl::OFlag;
@@ -27,6 +28,7 @@ use nix::unistd;
 use smithay::backend::input::Axis;
 use smithay::backend::input::ButtonState;
 use smithay::backend::input::KeyState as SmithayKeyState;
+use smithay::backend::renderer::utils::RendererSurfaceStateUserData;
 use smithay::input::keyboard::FilterResult;
 use smithay::input::keyboard::KeysymHandle;
 use smithay::input::keyboard::Layout;
@@ -34,29 +36,42 @@ use smithay::input::keyboard::ModifiersState;
 use smithay::input::keyboard::XkbContext;
 use smithay::input::pointer::AxisFrame;
 use smithay::input::pointer::ButtonEvent;
+use smithay::input::pointer::CursorImageStatus as SmithayCursorImageStatus;
+use smithay::input::pointer::CursorImageSurfaceData;
 use smithay::input::pointer::Focus;
 use smithay::input::pointer::MotionEvent;
 use smithay::output::Output;
 use smithay::output::PhysicalProperties;
 use smithay::reexports::wayland_server::Client;
 use smithay::reexports::wayland_server::backend::ObjectId;
+use smithay::reexports::wayland_server::protocol::wl_buffer::WlBuffer;
 use smithay::reexports::wayland_server::protocol::wl_surface::WlSurface;
 use smithay::utils::Rectangle;
 use smithay::utils::SERIAL_COUNTER;
 use smithay::utils::Serial;
 use smithay::wayland::compositor;
+use smithay::wayland::compositor::BufferAssignment as SmithayBufferAssignment;
+use smithay::wayland::compositor::SurfaceAttributes;
+use smithay::wayland::compositor::SurfaceData;
+use smithay::wayland::compositor::TraversalAction;
 use smithay::wayland::selection::data_device;
 use smithay::wayland::selection::data_device::SourceMetadata;
 use smithay::wayland::selection::primary_selection;
 
 use crate::args;
 use crate::compositor_utils;
+use crate::filtering;
 use crate::prelude::*;
 use crate::serialization::Capabilities;
 use crate::serialization::Event;
 use crate::serialization::RecvType;
 use crate::serialization::Request;
 use crate::serialization::SendType;
+use crate::serialization::Serializer;
+use crate::serialization::wayland::BufferAssignment;
+use crate::serialization::wayland::ClientSurface;
+use crate::serialization::wayland::CursorImage;
+use crate::serialization::wayland::CursorImageStatus;
 use crate::serialization::wayland::DataDestinationEvent;
 use crate::serialization::wayland::DataEvent;
 use crate::serialization::wayland::DataRequest;
@@ -70,6 +85,7 @@ use crate::serialization::wayland::OutputEvent;
 use crate::serialization::wayland::PointerEvent;
 use crate::serialization::wayland::PointerEventKind;
 use crate::serialization::wayland::RepeatInfo;
+use crate::serialization::wayland::Role;
 use crate::serialization::wayland::SurfaceEvent;
 use crate::serialization::wayland::SurfaceEventPayload;
 use crate::serialization::wayland::SurfaceRequest;
@@ -82,6 +98,7 @@ use crate::serialization::xdg_shell::ToplevelEvent;
 use crate::server::LockedSurfaceState;
 use crate::server::WprsServerState;
 use crate::server::smithay_handlers::DndGrab;
+use crate::sharding_compression::ShardingCompressor;
 
 enum UnknownSurfaceErr {
     ObjectId(WlSurfaceId),
@@ -89,7 +106,170 @@ enum UnknownSurfaceErr {
     Surface(Client),
 }
 
+fn committed_wl_buffer(surface_data: &SurfaceData) -> Option<WlBuffer> {
+    if let Some(SmithayBufferAssignment::NewBuffer(buffer)) = &surface_data
+        .cached_state
+        .get::<SurfaceAttributes>()
+        .current()
+        .buffer
+    {
+        return Some(buffer.clone());
+    }
+
+    surface_data
+        .data_map
+        .get::<RendererSurfaceStateUserData>()
+        .and_then(|state| {
+            state
+                .lock()
+                .unwrap()
+                .buffer()
+                .map(|buffer| WlBuffer::clone(buffer))
+        })
+}
+
+fn sync_surface_data(
+    serializer: &Serializer<Request, Event>,
+    compressor: &mut ShardingCompressor,
+    synced_surfaces: &mut HashSet<WlSurfaceId>,
+    surface_data: &SurfaceData,
+) {
+    // Uncommitted child subsurfaces visited by `with_surface_tree_downward` do
+    // not have `LockedSurfaceState` yet and will sync on their first commit.
+    let Some(locked_state) = surface_data.data_map.get::<LockedSurfaceState>() else {
+        return;
+    };
+    let mut surface_state_to_send = locked_state.0.lock().unwrap().clone();
+    // `wprsc` treats `damage: None` + `BufferAssignment::New` as full damage
+    // (`FrameDamage::merge_commit`).
+    surface_state_to_send.damage = None;
+
+    if matches!(surface_state_to_send.buffer, Some(BufferAssignment::New(_))) {
+        match committed_wl_buffer(surface_data) {
+            Some(wl_buffer) => {
+                let sync_res =
+                    compositor_utils::with_buffer_contents(&wl_buffer, |data, spec| -> Result<_> {
+                        let metadata = surface_state_to_send
+                            .set_external_buffer(&spec)
+                            .location(loc!())?;
+                        Ok((
+                            metadata,
+                            Arc::new(filtering::filter_and_compress(data, compressor)),
+                        ))
+                    });
+                match sync_res {
+                    Ok(Ok((_metadata, raw_buffer_to_send))) => {
+                        serializer
+                            .writer()
+                            .send(SendType::RawBuffer(raw_buffer_to_send));
+                        synced_surfaces.insert(surface_state_to_send.id);
+                    },
+                    Ok(Err(err)) => {
+                        warn!("skipping invalid buffer during surface sync: {err:?}");
+                        surface_state_to_send.buffer = None;
+                    },
+                    Err(err) => {
+                        warn!("skipping unreadable shm buffer during surface sync: {err:?}");
+                        surface_state_to_send.buffer = None;
+                    },
+                }
+            },
+            None => {
+                warn!(
+                    "surface {:?} had BufferAssignment::New without committed WlBuffer; clearing buffer for sync",
+                    surface_state_to_send.id
+                );
+                surface_state_to_send.buffer = None;
+            },
+        }
+    }
+
+    let client = surface_state_to_send.client;
+    let surface = surface_state_to_send.id;
+    serializer
+        .writer()
+        .send(SendType::Object(Request::Surface(SurfaceRequest {
+            client,
+            surface,
+            payload: SurfaceRequestPayload::Commit(surface_state_to_send),
+        })));
+}
+
 impl WprsServerState {
+    fn sync_surface_tree(&mut self, root: &WlSurface) {
+        compositor::with_surface_tree_downward(
+            root,
+            (),
+            |_, _, _| TraversalAction::DoChildren(()),
+            |_, surface_data, _| {
+                sync_surface_data(
+                    &self.serializer,
+                    &mut self.compressor,
+                    &mut self.synced_surfaces,
+                    surface_data,
+                );
+            },
+            |_, _, _| true,
+        );
+    }
+
+    pub(crate) fn sync_surface_if_unsynced(&mut self, surface: &WlSurface) {
+        if self.serializer.other_end_connected()
+            && !self.synced_surfaces.contains(&WlSurfaceId::new(surface))
+        {
+            self.sync_surface_tree(surface);
+        }
+    }
+
+    pub(crate) fn send_cursor_status(&mut self, image: &SmithayCursorImageStatus) {
+        let cursor_image_status = match image {
+            SmithayCursorImageStatus::Hidden => CursorImageStatus::Hidden,
+            SmithayCursorImageStatus::Surface(surface) => {
+                let client_surface = log_and_return!(ClientSurface::new(surface));
+                log_and_return!(self.insert_surface(surface));
+
+                let hotspot = compositor::with_states(surface, |surface_data| {
+                    let hotspot = surface_data
+                        .data_map
+                        .get::<CursorImageSurfaceData>()
+                        .unwrap()
+                        .lock()
+                        .unwrap()
+                        .hotspot;
+
+                    let surface_state = &mut surface_data
+                        .data_map
+                        .get::<LockedSurfaceState>()
+                        .unwrap()
+                        .0
+                        .lock()
+                        .unwrap();
+                    surface_state.role = Some(Role::Cursor(hotspot.into()));
+
+                    hotspot
+                });
+
+                self.sync_surface_if_unsynced(surface);
+
+                CursorImageStatus::Surface {
+                    client_surface,
+                    hotspot: hotspot.into(),
+                }
+            },
+            SmithayCursorImageStatus::Named(name) => {
+                CursorImageStatus::Named(name.name().to_string())
+            },
+        };
+
+        // TODO: expose serial to this function, then remove last_enter_serial
+        // on client.
+        self.serializer
+            .writer()
+            .send(SendType::Object(Request::CursorImage(CursorImage {
+                serial: 0,
+                status: cursor_image_status,
+            })));
+    }
     fn object_client_surface_from_id(
         &self,
         surface_id: &WlSurfaceId,
@@ -617,7 +797,8 @@ impl WprsServerState {
     #[instrument(skip_all, level = "debug")]
     fn handle_connect(&mut self) -> Result<()> {
         // TODO: sync client outputs
-        self.serializer.set_other_end_connected(true);
+        self.synced_surfaces.clear();
+        self.dirty_sync_surfaces.clear();
 
         self.serializer
             .writer()
@@ -625,34 +806,25 @@ impl WprsServerState {
                 xwayland: self.xwayland_enabled,
             })));
 
-        self.for_each_surface(|_, surface_data| {
-            let Some(locked_state) = surface_data.data_map.get::<LockedSurfaceState>() else {
-                return;
-            };
-            let surface_state = locked_state.0.lock().unwrap().clone();
+        let roots: Vec<WlSurface> = self
+            .xdg_shell_state
+            .toplevel_surfaces()
+            .iter()
+            .map(|s| s.wl_surface().clone())
+            .chain(
+                self.xdg_shell_state
+                    .popup_surfaces()
+                    .iter()
+                    .map(|s| s.wl_surface().clone()),
+            )
+            .collect();
+        for root in &roots {
+            self.sync_surface_tree(root);
+        }
 
-            let mut surface_state_to_send = surface_state.clone_without_buffer();
-
-            if let Some(crate::serialization::wayland::BufferAssignment::New(_)) =
-                &surface_state.buffer
-            {
-                let raw_buffer_to_send = surface_state_to_send
-                    .update_with_external_buffer(&surface_state.buffer)
-                    .unwrap();
-
-                self.serializer
-                    .writer()
-                    .send(SendType::RawBuffer(raw_buffer_to_send));
-            }
-
-            self.serializer
-                .writer()
-                .send(SendType::Object(Request::Surface(SurfaceRequest {
-                    client: surface_state.client,
-                    surface: surface_state.id,
-                    payload: SurfaceRequestPayload::Commit(surface_state_to_send),
-                })));
-        });
+        if let Some(cursor_status) = self.cursor_status.clone() {
+            self.send_cursor_status(&cursor_status);
+        }
 
         Ok(())
     }
@@ -676,26 +848,21 @@ impl WprsServerState {
                 let mut f = File::from(recv_fd);
 
                 {
-                    let writer = self.serializer.writer().into_inner();
+                    let writer = self.serializer.writer();
                     // The data source application will write to the other end
                     // of read_pipe at its convenience and then close the file
                     // descriptor, so spawn off a thread to perform that read
                     // and send the data to the client whenever the read is
-                    // completed. The thread will then terminate
+                    // completed. The thread will then terminate.
                     thread::spawn(move || {
                         debug!("in receive read thread");
                         let mut buf = Vec::new();
                         let bytes_read = f.read_to_end(&mut buf);
                         debug!("read selection ({bytes_read:?} bytes): {buf:?}");
-                        writer
-                            .send(SendType::Object(Request::Data(DataRequest::TransferData(
-                                source,
-                                DataToTransfer(buf),
-                            ))))
-                            // This should be infallible, writer is an
-                            // InfallibleWriter, but we can't prove that to the
-                            // compiler for thread lifetime reasons.
-                            .unwrap();
+                        writer.send(SendType::Object(Request::Data(DataRequest::TransferData(
+                            source,
+                            DataToTransfer(buf),
+                        ))));
                     });
                 }
 
@@ -957,7 +1124,17 @@ impl WprsServerState {
     }
 
     #[instrument(skip(self), level = "debug")]
-    pub fn handle_event(&mut self, event: RecvType<Event>) {
+    pub fn handle_event(&mut self, conn_id: u64, event: RecvType<Event>) {
+        if let RecvType::Object(Event::WprsClientConnect) = &event {
+            if !self.serializer.activate_connection(conn_id) {
+                debug!("ignoring WprsClientConnect from already-disconnected session {conn_id}");
+                return;
+            }
+        } else if !self.serializer.is_active_connection(conn_id) {
+            debug!("ignoring stale event from session {conn_id}");
+            return;
+        }
+
         match event {
             RecvType::Object(Event::WprsClientConnect) => self.handle_connect(),
             RecvType::Object(Event::Toplevel(toplevel)) => self.handle_toplevel(toplevel),

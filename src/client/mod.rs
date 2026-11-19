@@ -67,6 +67,7 @@ use crate::serialization::wayland::Buffer;
 use crate::serialization::wayland::BufferAssignment;
 use crate::serialization::wayland::BufferData;
 use crate::serialization::wayland::BufferMetadata;
+use crate::serialization::wayland::CursorImage;
 use crate::serialization::wayland::Region;
 use crate::serialization::wayland::SubsurfacePosition;
 use crate::serialization::wayland::UncompressedBufferData;
@@ -130,6 +131,7 @@ pub struct WprsClientState {
     last_implicit_grab_serial: Option<u32>,
     last_mouse_down_serial: Option<u32>,
     current_focus: Option<WlSurface>,
+    current_cursor_image: Option<CursorImage>,
 
     title_prefix: String,
 
@@ -199,6 +201,7 @@ impl WprsClientState {
             last_implicit_grab_serial: None,
             last_mouse_down_serial: None,
             current_focus: None,
+            current_cursor_image: None,
             title_prefix: options.title_prefix,
             buffer_cache: None,
         })

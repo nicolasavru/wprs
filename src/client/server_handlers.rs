@@ -70,11 +70,11 @@ impl WprsClientState {
             .buffer
             .as_ref()
             .is_some_and(BufferAssignment::is_new);
-        let client = self.remote_display.client(&client_id);
-        let surfaces = &mut client.surfaces;
 
         let frame_callback_completed = {
-            let remote_surface = surfaces
+            let client = self.remote_display.client(&client_id);
+            let remote_surface = client
+                .surfaces
                 .entry(surface_id)
                 .or_insert_with_result(|| {
                     RemoteSurface::new(
@@ -119,6 +119,9 @@ impl WprsClientState {
 
             remote_surface.frame_callback_completed
         };
+
+        let client = self.remote_display.client(&client_id);
+        let surfaces = &mut client.surfaces;
 
         subsurface::populate_subsurfaces(
             client.id,
@@ -186,6 +189,14 @@ impl WprsClientState {
 
     #[instrument(skip(self), level = "debug")]
     fn handle_surface_destroy(&mut self, client_id: ClientId, surface_id: WlSurfaceId) {
+        self.current_cursor_image.take_if(|img| {
+            matches!(
+                &img.status,
+                CursorImageStatus::Surface { client_surface, .. }
+                    if client_surface.client == client_id
+                        && client_surface.surface == surface_id
+            )
+        });
         self.object_bimap.remove_by_left(&(client_id, surface_id));
         if let Some(client) = self.remote_display.clients.get_mut(&client_id)
             && let Some(surface) = client.surfaces.remove(&surface_id)
@@ -287,11 +298,33 @@ impl WprsClientState {
         Ok(())
     }
 
-    #[instrument(skip(self), level = "debug")]
-    fn handle_cursor_image(&mut self, cursor_image: CursorImage) -> Result<()> {
-        // TODO: support multiple seats
-        let Some(themed_pointer) = self.seat_objects.last().location(loc!())?.pointer.as_ref()
-        else {
+    fn ensure_cursor_surface(&mut self, client_surface: ClientSurface) -> Result<()> {
+        let client = self.remote_display.client(&client_surface.client);
+        let remote_surface = client
+            .surfaces
+            .entry(client_surface.surface)
+            .or_insert_with_result(|| {
+                RemoteSurface::new(
+                    client.id,
+                    client_surface.surface,
+                    &self.compositor_state,
+                    &self.qh,
+                    &mut self.object_bimap,
+                )
+            })
+            .location(loc!())?;
+        remote_surface.role = Some(Role::Cursor);
+        Ok(())
+    }
+
+    pub(crate) fn apply_current_cursor_image(&mut self) -> Result<()> {
+        let Some(cursor_image) = self.current_cursor_image.clone() else {
+            return Ok(());
+        };
+        let Some(seat_obj) = self.seat_objects.last() else {
+            return Ok(());
+        };
+        let Some(themed_pointer) = seat_obj.pointer.as_ref() else {
             warn!("State has no pointer capability, ignoring cursor image.");
             return Ok(());
         };
@@ -307,31 +340,19 @@ impl WprsClientState {
                     .location(loc!())?;
             },
             CursorImageStatus::Surface {
-                client_surface: ClientSurface { client, surface },
+                client_surface,
                 hotspot,
             } => {
-                let client = self
+                let cursor_wl_surface = self
                     .remote_display
                     .clients
-                    .get_mut(&client)
-                    .location(loc!())?;
-                let remote_surface = client
-                    .surfaces
-                    .entry(surface)
-                    .or_insert_with_result(|| {
-                        RemoteSurface::new(
-                            client.id,
-                            surface,
-                            &self.compositor_state,
-                            &self.qh,
-                            &mut self.object_bimap,
-                        )
-                    })
-                    .location(loc!())?;
-                remote_surface.role = Some(Role::Cursor);
+                    .get(&client_surface.client)
+                    .and_then(|client| client.surfaces.get(&client_surface.surface))
+                    .map(|surface| surface.wl_surface().clone())
+                    .context(loc!(), "current_cursor_image references unknown surface")?;
                 themed_pointer.pointer().set_cursor(
                     self.last_enter_serial,
-                    Some(remote_surface.wl_surface()),
+                    Some(&cursor_wl_surface),
                     hotspot.x,
                     hotspot.y,
                 );
@@ -341,6 +362,16 @@ impl WprsClientState {
             },
         }
         Ok(())
+    }
+
+    #[instrument(skip(self), level = "debug")]
+    fn handle_cursor_image(&mut self, cursor_image: CursorImage) -> Result<()> {
+        if let CursorImageStatus::Surface { client_surface, .. } = cursor_image.status {
+            self.ensure_cursor_surface(client_surface)
+                .location(loc!())?;
+        }
+        self.current_cursor_image = Some(cursor_image);
+        self.apply_current_cursor_image()
     }
 
     #[instrument(skip(self), level = "debug")]
@@ -475,7 +506,7 @@ impl WprsClientState {
                 };
                 if let Some(mut read_pipe) = read_pipe {
                     debug!("spawning receive thread for mime {mime_type}");
-                    let writer = self.serializer.writer().clone().into_inner();
+                    let writer = self.serializer.writer();
                     // The data source application will write to the other end
                     // of read_pipe at its convenience and then close the file
                     // descriptor, so spawn off a thread to perform that read
@@ -486,15 +517,10 @@ impl WprsClientState {
                         let mut buf = Vec::new();
                         let bytes_read = read_pipe.read_to_end(&mut buf).location(loc!())?;
                         debug!("read selection ({bytes_read:?} bytes): {buf:?}");
-                        writer
-                            .send(SendType::Object(Event::Data(DataEvent::TransferData(
-                                source,
-                                DataToTransfer(buf),
-                            ))))
-                            // This should be infallible, writer is an
-                            // InfallibleWriter, but we can't prove that to the
-                            // compiler for thread lifetime reasons.
-                            .unwrap();
+                        writer.send(SendType::Object(Event::Data(DataEvent::TransferData(
+                            source,
+                            DataToTransfer(buf),
+                        ))));
                         Ok(())
                     });
                 }
@@ -537,6 +563,13 @@ impl WprsClientState {
 
     #[instrument(skip(self), level = "debug")]
     fn handle_client_disconnected(&mut self, client: ClientId) -> Result<()> {
+        self.current_cursor_image.take_if(|img| {
+            matches!(
+                &img.status,
+                CursorImageStatus::Surface { client_surface, .. }
+                    if client_surface.client == client
+            )
+        });
         self.remote_display.clients.remove(&client);
         self.object_bimap.retain(|(cid, _), _| *cid != client);
         Ok(())

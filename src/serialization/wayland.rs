@@ -15,7 +15,6 @@
 use std::fmt;
 use std::fmt::Debug;
 use std::num::NonZeroU32;
-use std::sync::Arc;
 
 use anyhow::Error;
 use enum_as_inner::EnumAsInner;
@@ -52,8 +51,6 @@ use smithay_client_toolkit::seat::pointer::PointerEventKind as SctkPointerEventK
 
 use super::tuple::Tuple2;
 use crate::args;
-use crate::buffer_pointer::BufferPointer;
-use crate::filtering;
 use crate::prelude::*;
 use crate::serialization;
 use crate::serialization::ClientId;
@@ -61,8 +58,6 @@ use crate::serialization::geometry::Point;
 use crate::serialization::geometry::Rectangle;
 use crate::serialization::geometry::Size;
 use crate::serialization::xdg_shell;
-use crate::sharding_compression::CompressedShards;
-use crate::sharding_compression::ShardingCompressor;
 use crate::vec4u8::Vec4u8s;
 
 #[derive(Archive, Deserialize, Serialize, Debug, Copy, Clone, Hash, Eq, PartialEq)]
@@ -208,25 +203,10 @@ impl fmt::Debug for UncompressedBufferData {
     }
 }
 
-#[derive(Clone, Eq, PartialEq, Archive, Deserialize, Serialize)]
-pub struct CompressedBufferData(pub Arc<CompressedShards>);
-
-impl fmt::Debug for CompressedBufferData {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.debug_tuple("CompressedBufferData")
-            .field(&format_args!(
-                "CompressedShards[{:?}]",
-                self.0.uncompressed_size()
-            ))
-            .finish()
-    }
-}
-
 #[derive(Debug, Clone, Eq, PartialEq, EnumAsInner, Archive, Deserialize, Serialize)]
 pub enum BufferData {
     External,
     Uncompressed(UncompressedBufferData),
-    Compressed(CompressedBufferData),
 }
 
 #[derive(Debug, Clone, Eq, PartialEq, Archive, Deserialize, Serialize)]
@@ -236,41 +216,11 @@ pub struct Buffer {
 }
 
 impl Buffer {
-    pub fn new(
-        metadata: &SmithayBufferData,
-        data: BufferPointer<u8>,
-        compressor: &mut ShardingCompressor,
-    ) -> Result<Self> {
-        let metadata = BufferMetadata::from_buffer_data(metadata).location(loc!())?;
-        let compressed_data = BufferData::Compressed(CompressedBufferData(Arc::new(
-            filtering::filter_and_compress(data, compressor),
-        )));
-        debug!(
-            "New Buffer: size {:?}, width {:?}, height {:?}, stride {:?}, data {:?} ",
-            &data.len(),
-            metadata.width,
-            metadata.height,
-            metadata.stride,
-            compressed_data,
-        );
-        Ok(Self {
+    pub fn new_external(metadata: BufferMetadata) -> Self {
+        Self {
             metadata,
-            data: compressed_data,
-        })
-    }
-
-    #[allow(clippy::missing_panics_doc)]
-    pub fn update(
-        &mut self,
-        metadata: &SmithayBufferData,
-        data: BufferPointer<u8>,
-        compressor: &mut ShardingCompressor,
-    ) -> Result<()> {
-        self.metadata = BufferMetadata::from_buffer_data(metadata).location(loc!())?;
-        self.data = BufferData::Compressed(CompressedBufferData(Arc::new(
-            filtering::filter_and_compress(data, compressor),
-        )));
-        Ok(())
+            data: BufferData::External,
+        }
     }
 }
 
@@ -740,55 +690,10 @@ impl SurfaceState {
         })
     }
 
-    #[instrument(skip(data, compressor), level = "debug")]
-    pub fn set_buffer(
-        &mut self,
-        metadata: &SmithayBufferData,
-        data: BufferPointer<u8>,
-        compressor: &mut ShardingCompressor,
-    ) -> Result<()> {
-        match &mut self.buffer {
-            // Only buffer data was updated, we can reuse the buffer.
-            Some(BufferAssignment::New(buffer)) => {
-                buffer.update(metadata, data, compressor).location(loc!())?;
-            },
-            Some(BufferAssignment::Removed) | None => {
-                self.buffer = Some(BufferAssignment::New(
-                    Buffer::new(metadata, data, compressor).location(loc!())?,
-                ));
-            },
-        }
-        Ok(())
-    }
-
-    pub fn update_with_external_buffer(
-        &mut self,
-        buffer: &Option<BufferAssignment>,
-    ) -> Result<Arc<CompressedShards>> {
-        self.buffer.clone_from(buffer);
-        // set_buffer (found above) sets buffer to
-        // Some(BufferAssignment::New(...)), so the 4 unwraps below should
-        // never fail.
-
-        let raw_buffer_to_send = buffer
-            .as_ref()
-            .location(loc!())?
-            .as_new()
-            .location(loc!())?
-            .data
-            .as_compressed()
-            .location(loc!())?
-            .0
-            .clone();
-
-        self.buffer
-            .as_mut()
-            .location(loc!())?
-            .as_new_mut()
-            .location(loc!())?
-            .data = BufferData::External;
-
-        Ok(raw_buffer_to_send)
+    pub fn set_external_buffer(&mut self, metadata: &SmithayBufferData) -> Result<BufferMetadata> {
+        let metadata = BufferMetadata::from_buffer_data(metadata).location(loc!())?;
+        self.buffer = Some(BufferAssignment::New(Buffer::new_external(metadata)));
+        Ok(metadata)
     }
 
     #[instrument(skip_all, level = "debug")]

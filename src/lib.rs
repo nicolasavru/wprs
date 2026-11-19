@@ -15,7 +15,6 @@
 pub mod arc_slice;
 pub mod args;
 pub mod buffer_pointer;
-pub mod channel_utils;
 pub mod client;
 pub mod client_utils;
 pub mod compositor_utils;

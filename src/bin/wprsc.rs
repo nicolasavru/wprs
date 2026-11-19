@@ -167,7 +167,7 @@ fn main() -> Result<()> {
         reader,
         |event, _metadata, state: &mut WprsClientState| {
             match event {
-                Event::Msg(msg) => state.handle_request(msg),
+                Event::Msg((_, msg)) => state.handle_request(msg),
                 Event::Closed => {
                     unreachable!("serialization::client_loop terminates the process when the server disconnects.");
                 },

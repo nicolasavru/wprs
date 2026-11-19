@@ -29,15 +29,12 @@ use std::path::Path;
 use std::process;
 use std::str;
 use std::sync::Arc;
-use std::sync::atomic::AtomicBool;
-use std::sync::atomic::Ordering;
+use std::sync::Mutex;
 use std::thread;
 use std::thread::Scope;
 use std::thread::ScopedJoinHandle;
-use std::time::Duration;
 
 use crossbeam_channel::Receiver;
-use crossbeam_channel::RecvTimeoutError;
 use crossbeam_channel::Sender;
 use nix::sys::socket;
 use nix::sys::socket::sockopt::RcvBuf;
@@ -62,8 +59,6 @@ use sysctl::Ctl;
 use sysctl::Sysctl;
 
 use crate::arc_slice::ArcSlice;
-use crate::channel_utils::DiscardingSender;
-use crate::channel_utils::InfallibleSender;
 use crate::prelude::*;
 use crate::sharding_compression::CompressedShards;
 use crate::sharding_compression::ShardingCompressor;
@@ -279,7 +274,126 @@ impl Framed for MessageType {
     }
 }
 
-fn read_loop<R, RT>(mut stream: R, output_channel: channel::SyncSender<RecvType<RT>>) -> Result<()>
+enum ConnectionSession<T> {
+    Disconnected,
+    Pending { conn_id: u64, sender: Sender<T> },
+    Active { conn_id: u64, sender: Sender<T> },
+}
+
+struct ConnectionState<T> {
+    next_conn_id: u64,
+    session: ConnectionSession<T>,
+}
+
+struct ConnectionSlot<T> {
+    state: Mutex<ConnectionState<T>>,
+}
+
+impl<T> ConnectionSlot<T> {
+    fn new_server() -> Arc<Self> {
+        Arc::new(Self {
+            state: Mutex::new(ConnectionState {
+                next_conn_id: 0,
+                session: ConnectionSession::Disconnected,
+            }),
+        })
+    }
+
+    fn new_client(sender: Sender<T>) -> Arc<Self> {
+        Arc::new(Self {
+            state: Mutex::new(ConnectionState {
+                next_conn_id: 1,
+                session: ConnectionSession::Active { conn_id: 1, sender },
+            }),
+        })
+    }
+
+    fn begin_connection(&self, sender: Sender<T>) -> u64 {
+        let mut guard = self.state.lock().unwrap();
+        guard.next_conn_id += 1;
+        let conn_id = guard.next_conn_id;
+        guard.session = ConnectionSession::Pending { conn_id, sender };
+        conn_id
+    }
+
+    fn activate_connection(&self, conn_id: u64) -> bool {
+        let mut guard = self.state.lock().unwrap();
+        match &guard.session {
+            ConnectionSession::Pending {
+                conn_id: pending_id,
+                sender,
+            } if *pending_id == conn_id => {
+                let sender = sender.clone();
+                guard.session = ConnectionSession::Active { conn_id, sender };
+                true
+            },
+            _ => false,
+        }
+    }
+
+    fn is_connected(&self) -> bool {
+        matches!(
+            self.state.lock().unwrap().session,
+            ConnectionSession::Active { .. }
+        )
+    }
+
+    fn is_active_connection(&self, conn_id: u64) -> bool {
+        matches!(
+            &self.state.lock().unwrap().session,
+            ConnectionSession::Active { conn_id: active_id, .. } if *active_id == conn_id
+        )
+    }
+
+    fn end_connection(&self, conn_id: u64) {
+        let mut guard = self.state.lock().unwrap();
+        let matches_id = match &guard.session {
+            ConnectionSession::Disconnected => false,
+            ConnectionSession::Pending { conn_id: id, .. }
+            | ConnectionSession::Active { conn_id: id, .. } => *id == conn_id,
+        };
+        if matches_id {
+            guard.session = ConnectionSession::Disconnected;
+        }
+    }
+}
+
+pub struct SerializerWriter<ST>(Arc<ConnectionSlot<SendType<ST>>>)
+where
+    ST: Serializable,
+    ST::Archived: Deserialize<ST, HighDeserializer<RancorError>>
+        + for<'a> bytecheck::CheckBytes<HighValidator<'a, RancorError>>;
+
+impl<ST> SerializerWriter<ST>
+where
+    ST: Serializable,
+    ST::Archived: Deserialize<ST, HighDeserializer<RancorError>>
+        + for<'a> bytecheck::CheckBytes<HighValidator<'a, RancorError>>,
+{
+    pub fn send(&self, msg: SendType<ST>) {
+        let guard = self.0.state.lock().unwrap();
+        if let ConnectionSession::Active { sender, .. } = &guard.session {
+            _ = sender.send(msg);
+        }
+    }
+}
+
+impl<ST> Clone for SerializerWriter<ST>
+where
+    ST: Serializable,
+    ST::Archived: Deserialize<ST, HighDeserializer<RancorError>>
+        + for<'a> bytecheck::CheckBytes<HighValidator<'a, RancorError>>,
+{
+    fn clone(&self) -> Self {
+        Self(self.0.clone())
+    }
+}
+
+fn read_loop<R, RT>(
+    conn_id: u64,
+    mut stream: R,
+    output_channel: channel::SyncSender<(u64, RecvType<RT>)>,
+) -> Result<()>
 where
     R: Read,
     RT: Serializable,
@@ -312,7 +426,7 @@ where
                         );
                         debug!("read obj: {obj:?}");
                         output_channel
-                            .send(obj)
+                            .send((conn_id, obj))
                             // The error type is not Send + Sync, which anyhow requires.
                             .map_err(|e| anyhow!("{e}"))
                             .location(loc!())?;
@@ -331,7 +445,7 @@ where
                 );
                 debug!("read obj: {obj:?}");
                 output_channel
-                    .send(obj)
+                    .send((conn_id, obj))
                     // The error type is not Send + Sync, which anyhow requires.
                     .map_err(|e| anyhow!("{e}"))
                     .location(loc!())?;
@@ -340,11 +454,7 @@ where
     }
 }
 
-fn write_loop<W, ST>(
-    stream: W,
-    input_channel: Receiver<SendType<ST>>,
-    other_end_connected: Arc<AtomicBool>,
-) -> Result<()>
+fn write_loop<W, ST>(stream: W, input_channel: Receiver<SendType<ST>>) -> Result<()>
 where
     W: Write,
     ST: Serializable,
@@ -365,20 +475,7 @@ where
     Version::new().framed_write(&mut stream).location(loc!())?;
     stream.flush().location(loc!())?;
 
-    loop {
-        let obj = match input_channel.recv_timeout(Duration::from_secs(1)) {
-            Ok(obj) => obj,
-            Err(RecvTimeoutError::Timeout) => {
-                if !other_end_connected.load(Ordering::Acquire) {
-                    break;
-                } else {
-                    continue;
-                }
-            },
-            Err(RecvTimeoutError::Disconnected) => {
-                break;
-            },
-        };
+    while let Ok(obj) = input_channel.recv() {
         debug!("sending obj: {:?}", obj);
 
         // recv blocks while waiting for data, so start the span afterward.
@@ -442,10 +539,10 @@ where
 
 fn spawn_rw_loops<'scope, ST, RT>(
     scope: &'scope Scope<'scope, '_>,
+    conn_id: u64,
     stream: UnixStream,
-    read_channel_tx: channel::SyncSender<RecvType<RT>>,
+    read_channel_tx: channel::SyncSender<(u64, RecvType<RT>)>,
     write_channel_rx: Receiver<SendType<ST>>,
-    other_end_connected: Arc<AtomicBool>,
 ) -> Result<(
     ScopedJoinHandle<'scope, Result<()>>,
     ScopedJoinHandle<'scope, Result<()>>,
@@ -459,20 +556,18 @@ where
         + for<'a> bytecheck::CheckBytes<HighValidator<'a, RancorError>>,
 {
     let read_stream = stream.try_clone().location(loc!())?;
-    let read_thread = scope.spawn(move || read_loop(read_stream, read_channel_tx));
+    let read_thread = scope.spawn(move || read_loop(conn_id, read_stream, read_channel_tx));
 
     let write_stream = stream.try_clone().location(loc!())?;
-    let write_thread =
-        scope.spawn(move || write_loop(write_stream, write_channel_rx, other_end_connected));
+    let write_thread = scope.spawn(move || write_loop(write_stream, write_channel_rx));
 
     Ok((read_thread, write_thread))
 }
 
 fn accept_loop<ST, RT>(
     listener: UnixListener,
-    read_channel_tx: channel::SyncSender<RecvType<RT>>,
-    write_channel_rx: Receiver<SendType<ST>>,
-    other_end_connected: Arc<AtomicBool>,
+    read_channel_tx: channel::SyncSender<(u64, RecvType<RT>)>,
+    slot: Arc<ConnectionSlot<SendType<ST>>>,
 ) where
     ST: Serializable,
     ST::Archived: Deserialize<ST, HighDeserializer<RancorError>>
@@ -486,17 +581,19 @@ fn accept_loop<ST, RT>(
             debug!("waiting for client connection");
             let (stream, _) = listener.accept().unwrap();
             info!("wprs client connected");
+            let (conn_tx, conn_rx) = crossbeam_channel::unbounded();
+            let conn_id = slot.begin_connection(conn_tx);
             let (read_thread, write_thread) = spawn_rw_loops(
                 scope,
+                conn_id,
                 stream.try_clone().unwrap(),
                 read_channel_tx.clone(),
-                write_channel_rx.clone(),
-                other_end_connected.clone(),
+                conn_rx,
             )
             .unwrap();
             let read_thread_result = utils::join_unwrap(read_thread);
             debug!("read thread joined: {read_thread_result:?}");
-            other_end_connected.store(false, Ordering::Relaxed);
+            slot.end_connection(conn_id);
             // Shut down the socket before joining `write_thread` so a `write_all`
             // or `flush` blocked on a full send buffer wakes immediately with
             // `EPIPE`/`ESHUTDOWN` if the peer stopped reading. Ignore `ENOTCONN`
@@ -510,9 +607,8 @@ fn accept_loop<ST, RT>(
 
 fn client_loop<ST, RT>(
     stream: UnixStream,
-    read_channel_tx: channel::SyncSender<RecvType<RT>>,
+    read_channel_tx: channel::SyncSender<(u64, RecvType<RT>)>,
     write_channel_rx: Receiver<SendType<ST>>,
-    other_end_connected: Arc<AtomicBool>,
 ) -> Result<()>
 where
     ST: Serializable,
@@ -523,14 +619,8 @@ where
         + for<'a> bytecheck::CheckBytes<HighValidator<'a, RancorError>>,
 {
     thread::scope(|scope| {
-        let (read_thread, _) = spawn_rw_loops(
-            scope,
-            stream,
-            read_channel_tx,
-            write_channel_rx,
-            other_end_connected,
-        )
-        .location(loc!())?;
+        let (read_thread, _) =
+            spawn_rw_loops(scope, 1, stream, read_channel_tx, write_channel_rx).location(loc!())?;
 
         // TODO: consider actually look at the error and not printing the reason
         // if was actually just a disconnection and not some other error.
@@ -554,9 +644,8 @@ where
     RT::Archived: Deserialize<RT, HighDeserializer<RancorError>>
         + for<'a> bytecheck::CheckBytes<HighValidator<'a, RancorError>>,
 {
-    read_handle: Option<Channel<RecvType<RT>>>,
-    write_handle: DiscardingSender<Sender<SendType<ST>>>,
-    other_end_connected: Arc<AtomicBool>,
+    read_handle: Option<Channel<(u64, RecvType<RT>)>>,
+    slot: Arc<ConnectionSlot<SendType<ST>>>,
 }
 
 impl<ST, RT> Serializer<ST, RT>
@@ -572,26 +661,20 @@ where
         let listener = utils::bind_user_socket(sock_path).location(loc!())?;
         enlarge_socket_buffer(&listener);
 
-        let (reader_tx, reader_rx): (channel::SyncSender<RecvType<RT>>, Channel<RecvType<RT>>) =
-            channel::sync_channel(CHANNEL_SIZE);
-        let (writer_tx, writer_rx): (Sender<SendType<ST>>, Receiver<SendType<ST>>) =
-            crossbeam_channel::unbounded();
-        let other_end_connected = Arc::new(AtomicBool::new(false));
+        let (reader_tx, reader_rx): (
+            channel::SyncSender<(u64, RecvType<RT>)>,
+            Channel<(u64, RecvType<RT>)>,
+        ) = channel::sync_channel(CHANNEL_SIZE);
+        let slot = ConnectionSlot::new_server();
 
         {
-            let other_end_connected = other_end_connected.clone();
-            thread::spawn(move || accept_loop(listener, reader_tx, writer_rx, other_end_connected));
+            let slot = slot.clone();
+            thread::spawn(move || accept_loop(listener, reader_tx, slot));
         }
-
-        let writer_tx = DiscardingSender {
-            sender: writer_tx,
-            actually_send: other_end_connected.clone(),
-        };
 
         Ok(Self {
             read_handle: Some(reader_rx),
-            write_handle: writer_tx,
-            other_end_connected,
+            slot,
         })
     }
 
@@ -599,26 +682,19 @@ where
         let stream = UnixStream::connect(sock_path).location(loc!())?;
         enlarge_socket_buffer(&stream);
 
-        let (reader_tx, reader_rx): (channel::SyncSender<RecvType<RT>>, Channel<RecvType<RT>>) =
-            channel::sync_channel(CHANNEL_SIZE);
+        let (reader_tx, reader_rx): (
+            channel::SyncSender<(u64, RecvType<RT>)>,
+            Channel<(u64, RecvType<RT>)>,
+        ) = channel::sync_channel(CHANNEL_SIZE);
         let (writer_tx, writer_rx): (Sender<SendType<ST>>, Receiver<SendType<ST>>) =
             crossbeam_channel::unbounded();
-        let other_end_connected = Arc::new(AtomicBool::new(true));
+        let slot = ConnectionSlot::new_client(writer_tx);
 
-        {
-            let other_end_connected = other_end_connected.clone();
-            thread::spawn(move || client_loop(stream, reader_tx, writer_rx, other_end_connected));
-        }
-
-        let writer_tx = DiscardingSender {
-            sender: writer_tx,
-            actually_send: other_end_connected.clone(),
-        };
+        thread::spawn(move || client_loop(stream, reader_tx, writer_rx));
 
         Ok(Self {
             read_handle: Some(reader_rx),
-            write_handle: writer_tx,
-            other_end_connected,
+            slot,
         })
     }
 
@@ -627,20 +703,104 @@ where
     // well, ever. Change this to return an &mut once rust supports partial
     // borrowing of struct fields.
     // TODO: rename to receiver.
-    pub fn reader(&mut self) -> Option<Channel<RecvType<RT>>> {
+    pub fn reader(&mut self) -> Option<Channel<(u64, RecvType<RT>)>> {
         self.read_handle.take()
     }
 
-    // TODO: rename to writer.
-    pub fn writer(&self) -> InfallibleSender<'_, DiscardingSender<Sender<SendType<ST>>>> {
-        InfallibleSender::new(self.write_handle.clone(), self)
+    pub fn writer(&self) -> SerializerWriter<ST> {
+        SerializerWriter(self.slot.clone())
     }
 
-    pub fn other_end_connected(&mut self) -> bool {
-        self.other_end_connected.load(Ordering::Acquire)
+    pub fn other_end_connected(&self) -> bool {
+        self.slot.is_connected()
     }
 
-    pub fn set_other_end_connected(&mut self, state: bool) {
-        self.other_end_connected.store(state, Ordering::Relaxed);
+    pub fn activate_connection(&mut self, conn_id: u64) -> bool {
+        self.slot.activate_connection(conn_id)
+    }
+
+    pub fn is_active_connection(&self, conn_id: u64) -> bool {
+        self.slot.is_active_connection(conn_id)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use crossbeam_channel::TryRecvError;
+
+    use super::*;
+
+    #[test]
+    fn test_connection_slot_session_gating() {
+        let slot: Arc<ConnectionSlot<SendType<u32>>> = ConnectionSlot::new_server();
+        let writer = SerializerWriter(slot.clone());
+
+        // 1. Detached server discards sends and reports disconnected.
+        assert!(!slot.is_connected());
+        assert!(!slot.is_active_connection(1));
+        writer.send(SendType::Object(10));
+
+        // 2. Pending session keeps `is_connected() == false` and discards pre-activation sends.
+        let (tx1, rx1) = crossbeam_channel::unbounded();
+        let c1 = slot.begin_connection(tx1);
+        assert_eq!(c1, 1);
+        assert!(!slot.is_connected());
+        assert!(!slot.is_active_connection(c1));
+        writer.send(SendType::Object(20));
+        assert!(matches!(rx1.try_recv(), Err(TryRecvError::Empty)));
+
+        // 3. Ending a pending connection before activation drops sender and rejects late activation.
+        slot.end_connection(c1);
+        assert!(matches!(rx1.try_recv(), Err(TryRecvError::Disconnected)));
+        assert!(!slot.activate_connection(c1));
+        assert!(!slot.is_connected());
+
+        // 4. Activating `c2` delivers messages once and rejects duplicate activation.
+        let (tx2, rx2) = crossbeam_channel::unbounded();
+        let c2 = slot.begin_connection(tx2);
+        assert_eq!(c2, 2);
+        assert!(slot.activate_connection(c2));
+        assert!(!slot.activate_connection(c2));
+        assert!(slot.is_connected());
+        assert!(slot.is_active_connection(c2));
+        writer.send(SendType::Object(30));
+        assert!(matches!(rx2.try_recv(), Ok(SendType::Object(30))));
+
+        // 5. Rapid reconnect `c3` immediately closes `rx2`, ignores stale `c2`
+        // calls, and buffers nothing until `c3` activates.
+        let (tx3, rx3) = crossbeam_channel::unbounded();
+        let c3 = slot.begin_connection(tx3);
+        assert_eq!(c3, 3);
+        assert!(!slot.is_connected());
+        assert!(!slot.is_active_connection(c2));
+        assert!(matches!(rx2.try_recv(), Err(TryRecvError::Disconnected)));
+        writer.send(SendType::Object(40));
+        assert!(matches!(rx3.try_recv(), Err(TryRecvError::Empty)));
+        slot.end_connection(c2);
+        assert!(!slot.activate_connection(c2));
+        assert!(slot.activate_connection(c3));
+        assert!(!slot.is_active_connection(c2));
+        slot.end_connection(c2);
+        assert!(slot.is_connected());
+        assert!(slot.is_active_connection(c3));
+        writer.send(SendType::Object(50));
+        assert!(matches!(rx3.try_recv(), Ok(SendType::Object(50))));
+
+        // 6. Ending `c3` drops `tx3` and leaves `writer.send` a safe no-op.
+        slot.end_connection(c3);
+        assert!(!slot.is_connected());
+        assert!(!slot.is_active_connection(c3));
+        assert!(matches!(rx3.try_recv(), Err(TryRecvError::Disconnected)));
+        writer.send(SendType::Object(60));
+
+        // 7. Client slot starts active immediately.
+        let (tx_client, rx_client) = crossbeam_channel::unbounded();
+        let client_slot: Arc<ConnectionSlot<SendType<u32>>> = ConnectionSlot::new_client(tx_client);
+        let client_writer = SerializerWriter(client_slot.clone());
+        assert!(client_slot.is_connected());
+        assert!(client_slot.is_active_connection(1));
+        assert!(!client_slot.is_active_connection(2));
+        client_writer.send(SendType::Object(70));
+        assert!(matches!(rx_client.try_recv(), Ok(SendType::Object(70))));
     }
 }

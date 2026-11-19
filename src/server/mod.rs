@@ -22,6 +22,7 @@ use std::time::Instant;
 
 use smithay::input::Seat;
 use smithay::input::SeatState;
+use smithay::input::pointer::CursorImageStatus as SmithayCursorImageStatus;
 use smithay::output::Output;
 use smithay::reexports::calloop::LoopHandle;
 use smithay::reexports::wayland_server::backend::GlobalId;
@@ -32,8 +33,6 @@ use smithay::reexports::wayland_server::DisplayHandle;
 use smithay::reexports::wayland_server::Resource;
 use smithay::wayland::compositor;
 use smithay::wayland::compositor::CompositorState;
-use smithay::wayland::compositor::SurfaceData;
-use smithay::wayland::compositor::TraversalAction;
 use smithay::wayland::selection::data_device::DataDeviceState;
 use smithay::wayland::selection::primary_selection::PrimarySelectionState;
 use smithay::wayland::shell::kde::decoration::KdeDecorationState;
@@ -79,7 +78,14 @@ fn surface_destruction_callback(state: &mut WprsServerState, surface: &WlSurface
         })));
 
         state.object_map.remove(&surface_state.id);
+        state.synced_surfaces.remove(&surface_state.id);
         state.dirty_sync_surfaces.remove(&surface_state.id);
+        if matches!(
+            &state.cursor_status,
+            Some(SmithayCursorImageStatus::Surface(cursor_surface)) if cursor_surface == surface
+        ) {
+            state.cursor_status = None;
+        }
     });
 }
 
@@ -115,10 +121,12 @@ pub struct WprsServerState {
     // object_map:
     // left: serialized surface id, right: local native surface id
     pub object_map: HashMap<WlSurfaceId, ObjectId>,
+    pub synced_surfaces: HashSet<WlSurfaceId>,
     /// Tracks synchronized subsurfaces that sent a `Commit` to `wprsc` since
     /// their desynchronized ancestor last committed, so bufferless parent sync
     /// commits still forward `Commit(parent)` to flush them on `wprsc`.
     pub dirty_sync_surfaces: HashSet<WlSurfaceId>,
+    pub cursor_status: Option<SmithayCursorImageStatus>,
     pub outputs: HashMap<u32, (Output, GlobalId)>,
     serial_map: SerialMap,
     pressed_keys: HashSet<u32>,
@@ -167,7 +175,9 @@ impl WprsServerState {
             // TODO: try tuning this based on the number of cpus the machine has.
             compressor: ShardingCompressor::new(NonZeroUsize::new(16).unwrap(), 1).unwrap(),
             object_map: HashMap::new(),
+            synced_surfaces: HashSet::new(),
             dirty_sync_surfaces: HashSet::new(),
+            cursor_status: None,
             outputs: HashMap::new(),
             serial_map: SerialMap::new(),
             pressed_keys: HashSet::new(),
@@ -199,30 +209,5 @@ impl WprsServerState {
             compositor::add_destruction_hook(surface, surface_destruction_callback);
         }
         Ok(())
-    }
-
-    pub fn for_each_surface<F>(&self, mut processor: F)
-    where
-        F: FnMut(&WlSurface, &SurfaceData),
-    {
-        for surface in self.xdg_shell_state.toplevel_surfaces() {
-            compositor::with_surface_tree_downward(
-                surface.wl_surface(),
-                (),
-                |_, _, _| TraversalAction::DoChildren(()),
-                |surface, surface_data, _| processor(surface, surface_data),
-                |_, _, _| true,
-            );
-        }
-
-        for surface in self.xdg_shell_state.popup_surfaces() {
-            compositor::with_surface_tree_downward(
-                surface.wl_surface(),
-                (),
-                |_, _, _| TraversalAction::DoChildren(()),
-                |surface, surface_data, _| processor(surface, surface_data),
-                |_, _, _| true,
-            )
-        }
     }
 }

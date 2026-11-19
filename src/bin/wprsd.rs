@@ -179,7 +179,7 @@ fn init_wayland_listener(
     event_loop: &EventLoop<WprsServerState>,
 ) -> Result<()> {
     let listening_socket = ListeningSocketSource::with_name(wayland_display).location(loc!())?;
-    let writer = state.serializer.writer().into_inner();
+    let writer = state.serializer.writer();
     let mut dh = display.handle();
 
     event_loop
@@ -286,7 +286,7 @@ pub fn main() -> Result<()> {
         .handle()
         .insert_source(reader, |event, _metadata, state| {
             match event {
-                Event::Msg(msg) => state.handle_event(msg),
+                Event::Msg((conn_id, msg)) => state.handle_event(conn_id, msg),
                 Event::Closed => {
                     unreachable!("reader is an in-memory channel whose write end has the same lifetime as serializer: the lifetime of the program.")
                 },

@@ -626,6 +626,7 @@ impl PointerHandler for WprsClientState {
             match event.kind {
                 PointerEventKind::Enter { serial } => {
                     self.last_enter_serial = serial;
+                    self.apply_current_cursor_image().log_and_ignore(loc!());
                 },
                 PointerEventKind::Press { serial, .. } => {
                     self.last_mouse_down_serial = Some(serial);
