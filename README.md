@@ -201,16 +201,15 @@ lossless image compression algorithm:
    color channel is more closely spatially correlated with itself than with the
    other
    channels.
-2. Apply an adjacent (wrapping) difference to each color channel (differential
-   pulse-code modulation). This improves the compression ratio by taking
-   advantage of spatial correlation and transforms (for example) a solid-colored
-   line into a single color byte and then a sequence of 0-bytes, or a gradient
-   into a sequence of 1-bytes, etc.
-3. Transform each color channel into a
+2. Transform each color channel into a
    [YUV](https://en.wikipedia.org/wiki/Y%E2%80%B2UV)-like color space: `y := g,
-   u := b - g, v := r - g, a := a`. This improves the compression ratio in a
-   similar way as the previous step but by taking advantage of cross-color
-   correlation.
+   u := b - g, v := r - g, a := a` (wrapping). This improves the compression
+   ratio by taking advantage of cross-color correlation.
+3. Apply an adjacent (wrapping) difference to each color channel (differential
+   pulse-code modulation). This improves the compression ratio in a similar way
+   as the previous step, taking advantage of spatial correlation to transform
+   (for example) a solid-colored line into a single color byte and then a
+   sequence of 0-bytes, or a gradient into a sequence of 1-bytes, etc.
 4. Compress the data with zstd.
 
 This algorithm was designed for reasonably good compression ratios while being

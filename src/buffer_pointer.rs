@@ -25,11 +25,11 @@ use crate::utils::AssertN3;
 
 /// A slice-like wrapper around a pointer and length.
 ///
-/// The unsafe boundary is at construction: `ptr` must be non-null, aligned, and
-/// valid for reads of `len` elements for the lifetime of the BufferPointer.
-/// Assuming the pointer isn't {d,r}eallocated by anything else, during the
-/// lifetime of BufferPointer, the implemented operations on BufferPointer will
-/// be safe.
+/// The unsafe boundary is at construction: `ptr` must be valid for reads of
+/// `len` elements for the lifetime of the `BufferPointer` (`new` checks
+/// non-null and alignment). Assuming the pointer isn't {d,r}eallocated by
+/// anything else, during the lifetime of `BufferPointer`, the implemented
+/// operations on `BufferPointer` will be safe.
 ///
 /// Useful when you have a raw pointer that cannot be wrapped in a slice (using
 /// slice::from_raw_parts), for example if it points to shared memory that could
@@ -68,8 +68,11 @@ impl<'a, T: 'a + Copy> BufferPointer<'a, T> {
     }
 
     /// # Safety
-    /// * `ptr` must be non-null, aligned, and valid for reads of `len` elements for
-    ///   the lifetime of the BufferPointer.
+    /// * `ptr` must be valid for reads of `len` elements for the lifetime of the
+    ///   `BufferPointer`.
+    ///
+    /// # Panics
+    /// If `*ptr` is null or unaligned for `T`.
     pub unsafe fn new(ptr: &'a *const T, len: usize) -> Self {
         unsafe { Self::new_impl(ptr.to_owned(), len, PhantomData::<&'a T>) }
     }
@@ -90,8 +93,8 @@ impl<'a, T: 'a + Copy> BufferPointer<'a, T> {
     /// All possible bit patterns of T must be valid bit patterns of U, including any
     /// padding.
     /// # Panics
-    /// If the current type and the new type are don't have the same alignment or
-    /// if the computer size of the buffer would be different after the cast.
+    /// If `self.ptr` is not aligned to `align_of::<U>()` or if
+    /// `size_of::<T>() * self.len()` is not a multiple of `size_of::<U>()`.
     pub unsafe fn cast<U: Copy>(self) -> BufferPointer<'a, U> {
         // TODO(https://github.com/rust-lang/rust/issues/96284): use ptr.is_aligned.
         let new_ptr = self.ptr().cast::<U>();
@@ -152,7 +155,7 @@ impl<'a, T: 'a + Copy> BufferPointer<'a, T> {
     }
 
     /// # Panics
-    /// If dst.len > len or if dst overlaps with self.
+    /// If `dst.len() < self.len()` or if `dst` overlaps with `self`.
     pub fn copy_to_nonoverlapping(self, dst: &mut [T]) {
         assert!(dst.len() >= self.len());
         assert!(!self.as_ptr_range().contains(&dst.as_ptr()));
@@ -329,8 +332,11 @@ impl<'a, T: 'a + Copy, const N: usize> KnownSizeBufferPointer<'a, T, N> {
     }
 
     /// # Safety
-    /// * `ptr` must be non-null, aligned, and valid for reads of `N` elements for
-    ///   the lifetime of the BufferPointer.
+    /// * `ptr` must be valid for reads of `N` elements for the lifetime of the
+    ///   `KnownSizeBufferPointer`.
+    ///
+    /// # Panics
+    /// If `*ptr` is null or unaligned for `T`.
     pub unsafe fn new(ptr: &'a *const T) -> Self {
         unsafe { Self::new_impl(ptr.to_owned(), PhantomData::<&'a T>) }
     }
@@ -351,14 +357,12 @@ impl<'a, T: 'a + Copy, const N: usize> KnownSizeBufferPointer<'a, T, N> {
         unsafe { &*self.ptr.add(i) }
     }
 
-    /// # Panics
-    /// If dst.len > len or if dst overlaps with self.
     pub fn copy_to_array(self) -> [T; N] {
         let mut out = MaybeUninit::<[T; N]>::uninit();
 
-        // SAFETY: precondition for BufferPointer::new requires self.ptr to be
-        // valid for reads of self.len elements and we verified that dst.len()
-        // >= self.len() and that self and dst are non-overlapping.
+        // SAFETY: precondition for KnownSizeBufferPointer::new requires
+        // self.ptr to be valid for reads of N elements, and `out` is a fresh
+        // stack allocation of N elements that cannot overlap `self`.
         unsafe {
             self.ptr()
                 .copy_to_nonoverlapping(out.as_mut_ptr().cast(), self.len());
@@ -371,8 +375,7 @@ impl<'a, T: 'a + Copy, const N: usize> KnownSizeBufferPointer<'a, T, N> {
     /// Partitions KnownSizeBufferPointer of length N into N_PARTS
     /// KnownSizeBufferPointers of length SIZE.
     ///
-    /// # Panics
-    /// If SIZE * N_PARTS != self.len().
+    /// Fails to compile if SIZE * N_PARTS != N.
     pub fn as_chunks<const SIZE: usize, const N_PARTS: usize>(
         self,
     ) -> [KnownSizeBufferPointer<'a, T, SIZE>; N_PARTS] {
