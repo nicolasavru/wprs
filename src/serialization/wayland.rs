@@ -163,7 +163,14 @@ impl BufferMetadata {
         Ok(metadata)
     }
 
+    /// Validates positive dimensions, 4-byte-aligned stride `>= width * 4`, and
+    /// a single buffer's signed 32-bit `wl_shm` byte size (leaving 63 bytes of
+    /// headroom so rounding that single buffer up to 64-byte slot alignment fits
+    /// in `i32`; does not bound the shared `SlotPool` across multiple buffers),
+    /// returning total buffer pixels (`height * stride / 4`).
     pub fn validate(&self) -> Result<usize> {
+        const MAX_SHM_BUFFER_BYTES: i32 = i32::MAX - 63;
+
         if self.width <= 0 || self.height <= 0 {
             bail!("invalid buffer dimensions: {}x{}", self.width, self.height);
         }
@@ -177,9 +184,16 @@ impl BufferMetadata {
         if self.stride < min_stride {
             bail!("buffer stride {} < width * 4 ({min_stride})", self.stride);
         }
-        let byte_len = (self.height as usize)
-            .checked_mul(self.stride as usize)
-            .context(loc!(), "buffer height * stride overflow")?;
+        let byte_len = self
+            .height
+            .checked_mul(self.stride)
+            .filter(|&len| len <= MAX_SHM_BUFFER_BYTES)
+            .with_context(loc!(), || {
+                format!(
+                    "buffer byte size ({} * {}) exceeds wl_shm limit ({MAX_SHM_BUFFER_BYTES})",
+                    self.height, self.stride
+                )
+            })? as usize;
         Ok(byte_len / 4)
     }
 
@@ -1116,6 +1130,73 @@ impl From<&ViewportCachedState> for ViewportState {
         Self {
             src: viewport_state.src.map(Into::into),
             dst: viewport_state.dst.map(Into::into),
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_buffer_metadata_validate() {
+        let min_valid = BufferMetadata {
+            width: 1,
+            height: 1,
+            stride: 4,
+            format: BufferFormat::Argb8888,
+        };
+        assert_eq!(min_valid.validate().unwrap(), 1);
+
+        let valid = BufferMetadata {
+            width: 640,
+            height: 480,
+            stride: 640 * 4 + 16,
+            format: BufferFormat::Argb8888,
+        };
+        assert_eq!(valid.validate().unwrap(), 480 * (640 + 4));
+
+        // Exact `MAX_SHM_BUFFER_BYTES` (`i32::MAX - 63 == 0x7FFF_FFC0`) boundary
+        // with tight unpadded `stride == width * 4`.
+        let max_valid = BufferMetadata {
+            width: (i32::MAX - 63) / 4,
+            height: 1,
+            stride: i32::MAX - 63,
+            format: BufferFormat::Xrgb8888,
+        };
+        assert_eq!(
+            max_valid.validate().unwrap(),
+            ((i32::MAX - 63) as usize) / 4
+        );
+
+        let invalid_cases = [
+            // Non-positive dimensions.
+            (0, 480, 640 * 4),
+            (-1, 480, 640 * 4),
+            (640, 0, 640 * 4),
+            (640, -1, 640 * 4),
+            // Unaligned stride (`stride % 4 != 0`).
+            (10, 10, 42),
+            // Stride smaller than `width * 4` (including `<= 0`) or `width * 4` overflow.
+            (640, 480, 0),
+            (640, 480, -4),
+            (10, 10, 36),
+            (i32::MAX / 2 + 1, 1, i32::MAX - 63),
+            // Exceeds `i32::MAX - 63` (`0x7FFF_FFC0`) or overflows `height * stride`.
+            (1, 1, i32::MAX - 59),
+            (16384, 65536, 65536),
+        ];
+        for (width, height, stride) in invalid_cases {
+            let meta = BufferMetadata {
+                width,
+                height,
+                stride,
+                format: BufferFormat::Argb8888,
+            };
+            assert!(
+                meta.validate().is_err(),
+                "expected validate() error for ({width}, {height}, {stride})"
+            );
         }
     }
 }

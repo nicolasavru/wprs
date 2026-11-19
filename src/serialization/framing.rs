@@ -66,7 +66,9 @@ impl Framed for u32 {
 
 impl Framed for usize {
     fn framed_write<W: Write>(&self, stream: &mut W) -> Result<()> {
-        (*self as u32).framed_write(stream)
+        u32::try_from(*self)
+            .context(loc!(), "framed usize exceeds u32::MAX")?
+            .framed_write(stream)
     }
 
     fn framed_read<R: Read>(stream: &mut R) -> Result<Self> {
@@ -133,5 +135,19 @@ impl Framed for String {
     fn framed_read<R: Read>(stream: &mut R) -> Result<Self> {
         let bytes = Vec::<u8>::framed_read(stream).location(loc!())?;
         Self::from_utf8(bytes).location(loc!())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_usize_framed_write_u32_overflow() {
+        assert!(
+            ((u32::MAX as usize) + 1)
+                .framed_write(&mut Vec::new())
+                .is_err()
+        );
     }
 }
