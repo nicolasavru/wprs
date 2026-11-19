@@ -101,7 +101,6 @@ use crate::channel_utils::DiscardingSender;
 use crate::compositor_utils;
 use crate::prelude::*;
 use crate::serialization;
-use crate::serialization::tuple::Tuple2;
 use crate::serialization::wayland::BufferAssignment;
 use crate::serialization::wayland::ClientSurface;
 use crate::serialization::wayland::CursorImage;
@@ -495,12 +494,8 @@ impl ClientDndGrabHandler for WprsServerState {
                     .send(SendType::Object(Request::Data(DataRequest::SourceRequest(
                         DataSourceRequest::StartDrag(
                             source_metadata.clone().into(),
-                            icon.map(|surface| {
-                                Tuple2(
-                                    serialization::ClientId::new(&surface.client().unwrap()),
-                                    (&surface.id()).into(),
-                                )
-                            }),
+                            icon.as_ref()
+                                .and_then(|surface| ClientSurface::new(surface).log(loc!()).ok()),
                         ),
                     ))));
             })

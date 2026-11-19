@@ -130,22 +130,6 @@ impl Default for SerialMap {
     }
 }
 
-/// Computes the number of chunks that will result from splitting a collection
-/// of size len into chunks of chunk_size.
-///
-/// # Panics
-/// If chunk_size = 0.
-pub fn n_chunks(len: usize, chunk_size: usize) -> usize {
-    assert!(chunk_size != 0);
-    if len == 0 {
-        0
-    } else {
-        let n = len / chunk_size;
-        let rem = len % chunk_size;
-        if rem > 0 { n + 1 } else { n }
-    }
-}
-
 pub fn bind_user_socket<P: AsRef<Path>>(sock_path: P) -> Result<UnixListener> {
     if sock_path.as_ref().try_exists().location(loc!())? {
         fs::remove_file(&sock_path).location(loc!())?;

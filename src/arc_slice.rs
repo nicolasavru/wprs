@@ -28,8 +28,6 @@ use std::ops::Deref;
 use std::ops::Range;
 use std::sync::Arc;
 
-use crate::utils;
-
 pub struct ArcSlice<T> {
     // Ideally we'd make this generic over Send and Sync (i.e., ArcSlice would
     // be Send + Sync iff data is Send + Sync, but we'd need higher-kinded types
@@ -151,7 +149,7 @@ impl<T> Iterator for Chunks<T> {
 
     #[inline]
     fn size_hint(&self) -> (usize, Option<usize>) {
-        let n = utils::n_chunks(self.arc_slice.len(), self.chunk_size);
+        let n = self.arc_slice.len().div_ceil(self.chunk_size);
         (n, Some(n))
     }
 }

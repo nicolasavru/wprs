@@ -36,7 +36,6 @@ use crate::serialization::Event;
 use crate::serialization::RecvType;
 use crate::serialization::Request;
 use crate::serialization::SendType;
-use crate::serialization::tuple::Tuple2;
 use crate::serialization::wayland;
 use crate::serialization::wayland::BufferAssignment;
 use crate::serialization::wayland::ClientSurface;
@@ -350,7 +349,7 @@ impl WprsClientState {
             DataRequest::SourceRequest(DataSourceRequest::StartDrag(mut source_metadata, icon)) => {
                 let icon_surface = match icon {
                     None => None,
-                    Some(Tuple2(client, surface)) => {
+                    Some(ClientSurface { client, surface }) => {
                         let client = self.remote_display.client(&client);
                         let remote_surface = client
                             .surfaces

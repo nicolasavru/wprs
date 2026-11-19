@@ -80,7 +80,6 @@ impl From<&backend::ObjectId> for WlSurfaceId {
     }
 }
 
-// TODO: consider removing
 #[derive(Debug, Copy, Clone, Eq, PartialEq, Archive, Deserialize, Serialize)]
 pub struct ClientSurface {
     pub client: ClientId,
@@ -1001,7 +1000,7 @@ pub enum DataSourceRequest {
     // DnDSetSourceActions(u32),
 
     // wl_data_device requests
-    StartDrag(SourceMetadata, Option<Tuple2<ClientId, WlSurfaceId>>),
+    StartDrag(SourceMetadata, Option<ClientSurface>),
     SetSelection(DataSource, SourceMetadata),
 }
 

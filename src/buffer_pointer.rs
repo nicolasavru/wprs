@@ -18,7 +18,6 @@ use std::marker::PhantomData;
 use std::mem;
 use std::ops::Range;
 
-use crate::utils;
 use crate::utils::AssertN;
 use crate::utils::AssertN3;
 
@@ -250,7 +249,7 @@ impl<'a, T: 'a + Copy> Iterator for Chunks<'a, T> {
 
     #[inline]
     fn size_hint(&self) -> (usize, Option<usize>) {
-        let n = utils::n_chunks(self.ptr.len, self.chunk_size);
+        let n = self.ptr.len.div_ceil(self.chunk_size);
         (n, Some(n))
     }
 }
