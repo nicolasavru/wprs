@@ -29,17 +29,18 @@ use crate::simd::_mm_set1_epi8;
 use crate::simd::_mm_setzero_si128;
 use crate::simd::_mm_sfence;
 use crate::simd::_mm256_add_epi8;
+use crate::simd::_mm256_alignr_epi8;
 use crate::simd::_mm256_blend_epi32;
 use crate::simd::_mm256_castps_si256;
 use crate::simd::_mm256_castsi128_si256;
 use crate::simd::_mm256_castsi256_ps;
 use crate::simd::_mm256_castsi256_si128;
-use crate::simd::_mm256_extract_epi8;
 use crate::simd::_mm256_extracti128_si256;
 use crate::simd::_mm256_inserti128_si256;
 use crate::simd::_mm256_is_zero;
 use crate::simd::_mm256_loadu_si256;
 use crate::simd::_mm256_or_si256;
+use crate::simd::_mm256_permute2x128_si256;
 use crate::simd::_mm256_set_epi8;
 use crate::simd::_mm256_set_m128i;
 use crate::simd::_mm256_set1_epi8;
@@ -92,9 +93,8 @@ fn store_m256i(dst: &mut [u8; 32], val: __m256i) {
 #[inline]
 unsafe fn store_m256i_vec4u8<const STREAM: bool>(dst: &mut [Vec4u8; 8], val: __m256i) {
     debug_assert!(!STREAM || (dst.as_mut_ptr() as usize).is_multiple_of(32));
-    // SAFETY: dst is 8 Vec4u8s, which is 32 u8s, which is 256 bits, so it is
-    // safe to write 256 bits to it. When STREAM is true, caller guarantees dst
-    // is 32-byte aligned.
+    // SAFETY: dst is 8 Vec4u8s (32 bytes = 256 bits), and the caller upholds
+    // 32-byte alignment when `STREAM` is `true`.
     unsafe {
         if STREAM {
             _mm256_stream_si256(dst.as_mut_ptr().cast::<__m256i>(), val);
@@ -166,53 +166,17 @@ fn prefix_sum(block: __m256i, prev_block: __m128i) -> (__m256i, __m128i) {
 }
 
 #[inline]
-fn running_difference_32(mut block: __m256i, prev: u8) -> (__m256i, u8) {
+fn running_difference_32(block: __m256i, prev_block: __m256i) -> (__m256i, __m256i) {
     // SAFETY: simd/mod.rs exposes versions of this function for SSE2, SSSE3,
-    // SSE4.1, AVX, and AVX2. Which version is used depends on compiler flags,
-    // but there is no good way to plumb that through to avoid the unsafe.
+    // SSE4.1, AVX, and AVX2.
     unsafe {
-        let carry = _mm256_set_epi8(
-            0,
-            0,
-            0,
-            0,
-            0,
-            0,
-            0,
-            0,
-            0,
-            0,
-            0,
-            0,
-            0,
-            0,
-            0,
-            _mm256_extract_epi8::<15>(block) as i8,
-            0,
-            0,
-            0,
-            0,
-            0,
-            0,
-            0,
-            0,
-            0,
-            0,
-            0,
-            0,
-            0,
-            0,
-            0,
-            prev as i8,
-        );
-        let next = _mm256_extract_epi8::<31>(block) as u8;
-
-        block = _mm256_sub_epi8(block, _mm256_slli_si256::<1>(block));
-        block = _mm256_sub_epi8(block, carry);
-
-        (block, next)
+        let prev_lane = _mm256_permute2x128_si256::<0x21>(prev_block, block);
+        let shifted = _mm256_alignr_epi8::<15>(block, prev_lane);
+        (_mm256_sub_epi8(block, shifted), block)
     }
 }
+
+type ForwardCarry4 = (__m256i, __m256i, __m256i, __m256i);
 
 #[inline]
 fn aos_to_soa_u8_32x4<const HAS_ALPHA: bool, const ACCUM_OR: bool>(
@@ -221,12 +185,9 @@ fn aos_to_soa_u8_32x4<const HAS_ALPHA: bool, const ACCUM_OR: bool>(
     out1: &mut [u8; 32],
     out2: &mut [u8; 32],
     out3: &mut [u8; 32],
-    prev0: u8,
-    prev1: u8,
-    prev2: u8,
-    prev3: u8,
-    or_acc: &mut (__m256i, __m256i, __m256i, __m256i),
-) -> (u8, u8, u8, u8) {
+    (prev0, prev1, prev2, prev3): ForwardCarry4,
+    or_acc: &mut ForwardCarry4,
+) -> ForwardCarry4 {
     // SAFETY: simd/mod.rs exposes versions of this function for SSE2, SSSE3,
     // SSE4.1, AVX, and AVX2. Which version is used depends on compiler flags,
     // but there is no good way to plumb that through to avoid the unsafe.
@@ -340,8 +301,10 @@ fn aos_to_soa_u8_32x4<const HAS_ALPHA: bool, const ACCUM_OR: bool>(
 
         (t0, t2) = subtract_green(t0, t1, t2);
 
-        #[allow(unused_assignments)]
-        let (mut next0, mut next1, mut next2, mut next3) = (0, 0, 0, 0);
+        let next0;
+        let next1;
+        let next2;
+        let mut next3 = prev3;
         (t0, next0) = running_difference_32(t0, prev0);
         (t1, next1) = running_difference_32(t1, prev1);
         (t2, next2) = running_difference_32(t2, prev2);
@@ -534,14 +497,18 @@ use crate::filtering::FilterKernel;
 pub(super) struct Kernel;
 
 impl FilterKernel for Kernel {
-    type ForwardCarry = u8;
+    type ForwardCarry = ForwardCarry4;
     type InverseCarry = __m128i;
-    type OrAccum = __m256i;
     const STREAM_ALIGN: usize = 32;
 
     #[inline]
-    fn zero_forward() -> (u8, u8, u8, u8) {
-        (0, 0, 0, 0)
+    fn zero_forward() -> Self::ForwardCarry {
+        // SAFETY: simd/mod.rs exposes versions of this function for SSE2,
+        // SSSE3, SSE4.1, AVX, and AVX2.
+        unsafe {
+            let z = _mm256_setzero_si256();
+            (z, z, z, z)
+        }
     }
 
     #[inline]
@@ -555,19 +522,7 @@ impl FilterKernel for Kernel {
     }
 
     #[inline]
-    fn zero_or_accum() -> (__m256i, __m256i, __m256i, __m256i) {
-        // SAFETY: simd/mod.rs exposes versions of this function for SSE2,
-        // SSSE3, SSE4.1, AVX, and AVX2.
-        unsafe {
-            let z = _mm256_setzero_si256();
-            (z, z, z, z)
-        }
-    }
-
-    #[inline]
-    fn or_accum_is_zero(
-        (a0, a1, a2, a3): (__m256i, __m256i, __m256i, __m256i),
-    ) -> (bool, bool, bool, bool) {
+    fn or_accum_is_zero((a0, a1, a2, a3): Self::ForwardCarry) -> (bool, bool, bool, bool) {
         // SAFETY: simd/mod.rs exposes versions of this function for SSE2,
         // SSSE3, SSE4.1, AVX, and AVX2.
         unsafe {
@@ -587,12 +542,10 @@ impl FilterKernel for Kernel {
         out1: &mut [u8; 32],
         out2: &mut [u8; 32],
         out3: &mut [u8; 32],
-        (p0, p1, p2, p3): (u8, u8, u8, u8),
-        or_acc: &mut (__m256i, __m256i, __m256i, __m256i),
-    ) -> (u8, u8, u8, u8) {
-        aos_to_soa_u8_32x4::<HAS_ALPHA, ACCUM_OR>(
-            input, out0, out1, out2, out3, p0, p1, p2, p3, or_acc,
-        )
+        prev: Self::ForwardCarry,
+        or_acc: &mut Self::ForwardCarry,
+    ) -> Self::ForwardCarry {
+        aos_to_soa_u8_32x4::<HAS_ALPHA, ACCUM_OR>(input, out0, out1, out2, out3, prev, or_acc)
     }
 
     #[inline]
@@ -606,8 +559,9 @@ impl FilterKernel for Kernel {
     #[inline]
     unsafe fn splat_blocks<const STREAM: bool>(out_blocks: &mut [[Vec4u8; 32]], pixel: Vec4u8) {
         // SAFETY: simd/mod.rs exposes versions of `_mm256_set1_epi32` for SSE2
-        // through AVX2, and `store_m256i_vec4u8` writes 8 `Vec4u8`s (32 bytes)
-        // per sub-slice (`STREAM` requires 32-byte alignment on `out_blocks`).
+        // through AVX2, `store_m256i_vec4u8` writes 8 `Vec4u8`s (32 bytes) per
+        // sub-slice, and the caller upholds 32-byte alignment on `out_blocks`
+        // when `STREAM` is `true` (each 8-pixel sub-slice is at a +32B offset).
         unsafe {
             let word = u32::from_le_bytes([pixel.0, pixel.1, pixel.2, pixel.3]) as i32;
             let vec = _mm256_set1_epi32(word);
@@ -691,14 +645,28 @@ mod tests {
             24, 25, 26, 27, 28, 29, 30, 31,
         ];
         let mut output = [0; 32];
-        store_m256i(
-            (&mut output[..]).try_into().unwrap(),
-            running_difference_32(load_m256i((&input[..]).try_into().unwrap()), 0).0,
-        );
+        let carry = unsafe {
+            let (diff, carry) = running_difference_32(
+                load_m256i((&input[..]).try_into().unwrap()),
+                _mm256_setzero_si256(),
+            );
+            store_m256i((&mut output[..]).try_into().unwrap(), diff);
+            carry
+        };
         let expected = [
             0, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1,
             1, 1, 1,
         ];
         assert_eq!(output, expected);
+
+        let input2 = [40u8; 32];
+        let mut output2 = [0; 32];
+        store_m256i(
+            (&mut output2[..]).try_into().unwrap(),
+            running_difference_32(load_m256i((&input2[..]).try_into().unwrap()), carry).0,
+        );
+        let mut expected2 = [0u8; 32];
+        expected2[0] = 9;
+        assert_eq!(output2, expected2);
     }
 }

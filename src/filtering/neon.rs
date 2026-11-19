@@ -89,6 +89,8 @@ fn accumulate_16(block: uint8x16_t, carry: uint8x16_t) -> (uint8x16_t, uint8x16_
 
 // --- 32-pixel fused blocks ---
 
+type Carry4 = (uint8x16_t, uint8x16_t, uint8x16_t, uint8x16_t);
+
 /// Forward: deinterleave → subtract_green → running_difference, 32 pixels.
 ///
 /// Carry state stays in the NEON register file throughout; the forward and
@@ -100,12 +102,9 @@ fn aos_to_soa_u8_32x4<const HAS_ALPHA: bool, const ACCUM_OR: bool>(
     out1: &mut [u8; 32],
     out2: &mut [u8; 32],
     out3: &mut [u8; 32],
-    prev0: uint8x16_t,
-    prev1: uint8x16_t,
-    prev2: uint8x16_t,
-    prev3: uint8x16_t,
-    or_acc: &mut (uint8x16_t, uint8x16_t, uint8x16_t, uint8x16_t),
-) -> (uint8x16_t, uint8x16_t, uint8x16_t, uint8x16_t) {
+    (prev0, prev1, prev2, prev3): Carry4,
+    or_acc: &mut Carry4,
+) -> Carry4 {
     // SAFETY: `input` points to 128 bytes (32 × Vec4u8) from array_chunks::<32>.
     // vld4q_u8 reads 64 bytes; vst1q_u8 writes 16 bytes per half.
     unsafe {
@@ -233,14 +232,11 @@ fn soa_to_aos_u8_32x4<const CONST_ALPHA: bool>(
 
 // --- kernel trait impl ---
 
-type Carry4 = (uint8x16_t, uint8x16_t, uint8x16_t, uint8x16_t);
-
 pub(super) struct Kernel;
 
 impl FilterKernel for Kernel {
-    type ForwardCarry = uint8x16_t;
+    type ForwardCarry = Carry4;
     type InverseCarry = uint8x16_t;
-    type OrAccum = uint8x16_t;
     const STREAM_ALIGN: usize = 1;
 
     #[inline]
@@ -252,11 +248,6 @@ impl FilterKernel for Kernel {
 
     #[inline]
     fn zero_inverse() -> Carry4 {
-        Self::zero_forward()
-    }
-
-    #[inline]
-    fn zero_or_accum() -> Carry4 {
         Self::zero_forward()
     }
 
@@ -280,7 +271,7 @@ impl FilterKernel for Kernel {
         out1: &mut [u8; 32],
         out2: &mut [u8; 32],
         out3: &mut [u8; 32],
-        (p0, p1, p2, p3): Carry4,
+        prev: Carry4,
         or_acc: &mut Carry4,
     ) -> Carry4 {
         aos_to_soa_u8_32x4::<HAS_ALPHA, ACCUM_OR>(
@@ -289,10 +280,7 @@ impl FilterKernel for Kernel {
             out1,
             out2,
             out3,
-            p0,
-            p1,
-            p2,
-            p3,
+            prev,
             or_acc,
         )
     }

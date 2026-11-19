@@ -14,6 +14,9 @@
 
 use std::arch::x86_64::_mm_extract_epi16;
 use std::arch::x86_64::_mm_load_si128;
+use std::arch::x86_64::_mm_or_si128;
+use std::arch::x86_64::_mm_slli_si128;
+use std::arch::x86_64::_mm_srli_si128;
 use std::arch::x86_64::_mm_store_si128;
 
 pub use crate::simd::sse2_base::*;
@@ -41,12 +44,6 @@ pub fn _mm_extract_epi8<const INDEX: i32>(a: __m128i) -> i32 {
     } else {
         word & 0xFF
     }
-}
-
-#[target_feature(enable = "sse2")]
-#[inline]
-pub fn _mm256_extract_epi8<const INDEX: i32>(a: __m256i) -> i32 {
-    _mm256_extract_epi8!(a, INDEX)
 }
 
 /// Emulates SSSE3 _mm_shuffle_epi8 using non SIMD instructions
@@ -88,4 +85,56 @@ fn _mm_shuffle_epi8(a: __m128i, b: __m128i) -> __m128i {
 #[inline]
 pub fn _mm256_shuffle_epi8(a: __m256i, b: __m256i) -> __m256i {
     _mm256_shuffle_epi8!(a, b)
+}
+
+#[target_feature(enable = "sse2")]
+#[inline]
+fn _mm_alignr_epi8_sse2<const SHIFT: i32>(a: __m128i, b: __m128i) -> __m128i {
+    match SHIFT {
+        0 => b,
+        1 => _mm_or_si128(_mm_slli_si128::<15>(a), _mm_srli_si128::<1>(b)),
+        2 => _mm_or_si128(_mm_slli_si128::<14>(a), _mm_srli_si128::<2>(b)),
+        3 => _mm_or_si128(_mm_slli_si128::<13>(a), _mm_srli_si128::<3>(b)),
+        4 => _mm_or_si128(_mm_slli_si128::<12>(a), _mm_srli_si128::<4>(b)),
+        5 => _mm_or_si128(_mm_slli_si128::<11>(a), _mm_srli_si128::<5>(b)),
+        6 => _mm_or_si128(_mm_slli_si128::<10>(a), _mm_srli_si128::<6>(b)),
+        7 => _mm_or_si128(_mm_slli_si128::<9>(a), _mm_srli_si128::<7>(b)),
+        8 => _mm_or_si128(_mm_slli_si128::<8>(a), _mm_srli_si128::<8>(b)),
+        9 => _mm_or_si128(_mm_slli_si128::<7>(a), _mm_srli_si128::<9>(b)),
+        10 => _mm_or_si128(_mm_slli_si128::<6>(a), _mm_srli_si128::<10>(b)),
+        11 => _mm_or_si128(_mm_slli_si128::<5>(a), _mm_srli_si128::<11>(b)),
+        12 => _mm_or_si128(_mm_slli_si128::<4>(a), _mm_srli_si128::<12>(b)),
+        13 => _mm_or_si128(_mm_slli_si128::<3>(a), _mm_srli_si128::<13>(b)),
+        14 => _mm_or_si128(_mm_slli_si128::<2>(a), _mm_srli_si128::<14>(b)),
+        15 => _mm_or_si128(_mm_slli_si128::<1>(a), _mm_srli_si128::<15>(b)),
+        16 => a,
+        17..=31 => match SHIFT - 16 {
+            1 => _mm_srli_si128::<1>(a),
+            2 => _mm_srli_si128::<2>(a),
+            3 => _mm_srli_si128::<3>(a),
+            4 => _mm_srli_si128::<4>(a),
+            5 => _mm_srli_si128::<5>(a),
+            6 => _mm_srli_si128::<6>(a),
+            7 => _mm_srli_si128::<7>(a),
+            8 => _mm_srli_si128::<8>(a),
+            9 => _mm_srli_si128::<9>(a),
+            10 => _mm_srli_si128::<10>(a),
+            11 => _mm_srli_si128::<11>(a),
+            12 => _mm_srli_si128::<12>(a),
+            13 => _mm_srli_si128::<13>(a),
+            14 => _mm_srli_si128::<14>(a),
+            15 => _mm_srli_si128::<15>(a),
+            _ => unreachable!(),
+        },
+        _ => _mm_setzero_si128(),
+    }
+}
+
+#[target_feature(enable = "sse2")]
+#[inline]
+pub fn _mm256_alignr_epi8<const SHIFT: i32>(a: __m256i, b: __m256i) -> __m256i {
+    __m256i {
+        low: _mm_alignr_epi8_sse2::<SHIFT>(a.low, b.low),
+        high: _mm_alignr_epi8_sse2::<SHIFT>(a.high, b.high),
+    }
 }

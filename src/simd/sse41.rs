@@ -15,10 +15,5 @@
 pub use std::arch::x86_64::_mm_extract_epi8;
 
 pub use crate::simd::sse2_base::*;
+pub use crate::simd::ssse3::_mm256_alignr_epi8;
 pub use crate::simd::ssse3::_mm256_shuffle_epi8;
-
-#[target_feature(enable = "sse4.1")]
-#[inline]
-pub fn _mm256_extract_epi8<const INDEX: i32>(a: __m256i) -> i32 {
-    _mm256_extract_epi8!(a, INDEX)
-}

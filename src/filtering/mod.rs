@@ -61,15 +61,9 @@ use crate::vec4u8::Vec4u8;
 pub(crate) trait FilterKernel {
     type ForwardCarry: Copy + Send;
     type InverseCarry: Copy + Send;
-    type OrAccum: Copy + Send;
     const STREAM_ALIGN: usize;
 
-    fn zero_forward() -> (
-        Self::ForwardCarry,
-        Self::ForwardCarry,
-        Self::ForwardCarry,
-        Self::ForwardCarry,
-    );
+    fn zero_forward() -> Self::ForwardCarry;
 
     fn zero_inverse() -> (
         Self::InverseCarry,
@@ -78,11 +72,7 @@ pub(crate) trait FilterKernel {
         Self::InverseCarry,
     );
 
-    fn zero_or_accum() -> (Self::OrAccum, Self::OrAccum, Self::OrAccum, Self::OrAccum);
-
-    fn or_accum_is_zero(
-        acc: (Self::OrAccum, Self::OrAccum, Self::OrAccum, Self::OrAccum),
-    ) -> (bool, bool, bool, bool);
+    fn or_accum_is_zero(acc: Self::ForwardCarry) -> (bool, bool, bool, bool);
 
     fn forward_block<const HAS_ALPHA: bool, const ACCUM_OR: bool>(
         input: KnownSizeBufferPointer<Vec4u8, 32>,
@@ -90,19 +80,9 @@ pub(crate) trait FilterKernel {
         out1: &mut [u8; 32],
         out2: &mut [u8; 32],
         out3: &mut [u8; 32],
-        prev: (
-            Self::ForwardCarry,
-            Self::ForwardCarry,
-            Self::ForwardCarry,
-            Self::ForwardCarry,
-        ),
-        or_acc: &mut (Self::OrAccum, Self::OrAccum, Self::OrAccum, Self::OrAccum),
-    ) -> (
-        Self::ForwardCarry,
-        Self::ForwardCarry,
-        Self::ForwardCarry,
-        Self::ForwardCarry,
-    );
+        prev: Self::ForwardCarry,
+        or_acc: &mut Self::ForwardCarry,
+    ) -> Self::ForwardCarry;
 
     fn advance_inverse_carry(carry: Self::InverseCarry, delta: u8) -> (Self::InverseCarry, u8);
 
@@ -226,7 +206,7 @@ fn aos_to_soa_parallel_compression<K: FilterKernel, const HAS_ALPHA: bool>(
                         let mut s0_chunks = soa0.as_chunks_mut::<32>().0.iter_mut();
                         let mut s1_chunks = soa1.as_chunks_mut::<32>().0.iter_mut();
                         let mut s2_chunks = soa2.as_chunks_mut::<32>().0.iter_mut();
-                        let mut or_acc = K::zero_or_accum();
+                        let mut or_acc = K::zero_forward();
 
                         if HAS_ALPHA {
                             let mut s3_chunks = soa3.as_chunks_mut::<32>().0.iter_mut();

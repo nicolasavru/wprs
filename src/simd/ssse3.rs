@@ -12,6 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+use std::arch::x86_64::_mm_alignr_epi8;
 use std::arch::x86_64::_mm_shuffle_epi8;
 
 use cfg_if::cfg_if;
@@ -19,7 +20,6 @@ use cfg_if::cfg_if;
 cfg_if! {
     if #[cfg(all(target_arch = "x86_64", not(target_feature = "sse4.1")))] {
         pub use crate::simd::sse2::_mm_extract_epi8;
-        pub use crate::simd::sse2::_mm256_extract_epi8;
     }
 }
 pub use crate::simd::sse2_base::*;
@@ -28,4 +28,13 @@ pub use crate::simd::sse2_base::*;
 #[inline]
 pub fn _mm256_shuffle_epi8(a: __m256i, b: __m256i) -> __m256i {
     _mm256_shuffle_epi8!(a, b)
+}
+
+#[target_feature(enable = "ssse3")]
+#[inline]
+pub fn _mm256_alignr_epi8<const SHIFT: i32>(a: __m256i, b: __m256i) -> __m256i {
+    __m256i {
+        low: _mm_alignr_epi8::<SHIFT>(a.low, b.low),
+        high: _mm_alignr_epi8::<SHIFT>(a.high, b.high),
+    }
 }

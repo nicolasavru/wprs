@@ -12,11 +12,13 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+use std::array;
 use std::cmp;
 use std::iter::FusedIterator;
 use std::marker::PhantomData;
 use std::mem;
 use std::ops::Range;
+use std::ptr::NonNull;
 
 use crate::utils::AssertN;
 use crate::utils::AssertN3;
@@ -34,7 +36,7 @@ use crate::utils::AssertN3;
 /// be mutated during the lifetime of the slice.
 #[derive(Debug, Eq, PartialEq)]
 pub struct BufferPointer<'a, T: 'a + Copy> {
-    ptr: *const T,
+    ptr: NonNull<T>,
     len: usize,
     lifetime: PhantomData<&'a T>,
 }
@@ -53,16 +55,11 @@ impl<'a, T: 'a + Copy> Clone for BufferPointer<'a, T> {
 }
 
 impl<'a, T: 'a + Copy> BufferPointer<'a, T> {
-    /// # Safety: same as new.
-    unsafe fn new_impl(ptr: *const T, len: usize, lifetime: PhantomData<&'a T>) -> Self {
-        assert!(!ptr.is_null());
-        // TODO(https://github.com/rust-lang/rust/issues/96284): use ptr.is_aligned.
-        assert!(ptr.align_offset(mem::align_of::<T>()) == 0);
-        Self {
-            ptr: ptr.to_owned(),
-            len,
-            lifetime,
-        }
+    /// # Safety
+    /// `ptr` must be aligned for `T` and valid for reads of `len` elements for `'a`.
+    #[inline]
+    unsafe fn new_unchecked(ptr: NonNull<T>, len: usize, lifetime: PhantomData<&'a T>) -> Self {
+        Self { ptr, len, lifetime }
     }
 
     /// # Safety
@@ -71,18 +68,28 @@ impl<'a, T: 'a + Copy> BufferPointer<'a, T> {
     ///
     /// # Panics
     /// If `*ptr` is null or unaligned for `T`.
+    #[inline]
     pub unsafe fn new(ptr: &'a *const T, len: usize) -> Self {
-        unsafe { Self::new_impl(ptr.to_owned(), len, PhantomData::<&'a T>) }
+        let ptr = NonNull::new((*ptr).cast_mut()).expect("BufferPointer must be non-null");
+        assert!(ptr.is_aligned());
+        Self {
+            ptr,
+            len,
+            lifetime: PhantomData::<&'a T>,
+        }
     }
 
+    #[inline]
     pub fn ptr(self) -> *const T {
-        self.ptr
+        self.ptr.as_ptr()
     }
 
+    #[inline]
     pub fn len(self) -> usize {
         self.len
     }
 
+    #[inline]
     pub fn is_empty(self) -> bool {
         self.len() == 0
     }
@@ -93,10 +100,10 @@ impl<'a, T: 'a + Copy> BufferPointer<'a, T> {
     /// # Panics
     /// If `self.ptr` is not aligned to `align_of::<U>()` or if
     /// `size_of::<T>() * self.len()` is not a multiple of `size_of::<U>()`.
+    #[inline]
     pub unsafe fn cast<U: Copy>(self) -> BufferPointer<'a, U> {
-        // TODO(https://github.com/rust-lang/rust/issues/96284): use ptr.is_aligned.
-        let new_ptr = self.ptr().cast::<U>();
-        assert!(new_ptr.align_offset(mem::align_of::<U>()) == 0);
+        let new_ptr = self.ptr.cast::<U>();
+        assert!(new_ptr.is_aligned());
 
         let old_size = mem::size_of::<T>();
         let new_size = mem::size_of::<U>();
@@ -107,9 +114,9 @@ impl<'a, T: 'a + Copy> BufferPointer<'a, T> {
             self.len()
         );
 
-        // SAFETY: we verify that the new pointer is aligned and that length in
-        // bytes doesn't change.
-        unsafe { BufferPointer::new_impl(new_ptr, new_len, PhantomData) }
+        // SAFETY: self.ptr is non-null, and we verified that new_ptr is aligned
+        // and that length in bytes doesn't change.
+        unsafe { BufferPointer::new_unchecked(new_ptr, new_len, PhantomData) }
     }
 
     /// Splits BufferPointer([0, len]) into BufferPointer([0, mid-1]) and
@@ -117,39 +124,37 @@ impl<'a, T: 'a + Copy> BufferPointer<'a, T> {
     ///
     /// # Panics
     /// If mid > len.
+    #[inline]
     pub fn split_at(self, mid: usize) -> (Self, Self) {
         assert!(mid <= self.len());
-        // SAFETY: the lengths of the outputs are less then the length of self.
+        // SAFETY: self.ptr is non-null, aligned, and valid for self.len elements;
+        // adding `mid` preserves alignment and stays within the allocation.
         unsafe {
             (
-                BufferPointer::new_impl(self.ptr, mid, self.lifetime),
-                BufferPointer::new_impl(self.ptr().add(mid), self.len() - mid, self.lifetime),
+                Self::new_unchecked(self.ptr, mid, self.lifetime),
+                Self::new_unchecked(self.ptr.add(mid), self.len() - mid, self.lifetime),
             )
         }
     }
 
     /// # Panics
     /// If chunk_size == 0.
+    #[inline]
     pub fn chunks(self, chunk_size: usize) -> Chunks<'a, T> {
         assert!(chunk_size != 0);
         Chunks::new(self, chunk_size)
     }
 
+    #[inline]
     pub fn array_chunks<const N: usize>(self) -> ArrayChunks<'a, T, N> {
         ArrayChunks::new(self)
     }
 
-    /// # Panics
-    /// If self.len() != N.
-    pub fn as_known_size<const N: usize>(self) -> KnownSizeBufferPointer<'a, T, N> {
-        assert_eq!(self.len(), N);
-        unsafe { KnownSizeBufferPointer::new_impl(self.ptr, self.lifetime) }
-    }
-
     fn as_ptr_range(&self) -> Range<*const T> {
+        let start = self.ptr();
         // SAFETY: precondition for BufferPointer::new requires self.ptr to be valid
         // for reads of self.len elements.
-        self.ptr..unsafe { self.ptr.add(self.len) }
+        start..unsafe { start.add(self.len) }
     }
 
     /// # Panics
@@ -157,7 +162,7 @@ impl<'a, T: 'a + Copy> BufferPointer<'a, T> {
     pub fn copy_to_nonoverlapping(self, dst: &mut [T]) {
         assert!(dst.len() >= self.len());
         assert!(!self.as_ptr_range().contains(&dst.as_ptr()));
-        assert!(!dst.as_ptr_range().contains(&self.ptr));
+        assert!(!dst.as_ptr_range().contains(&self.ptr()));
 
         // SAFETY: precondition for BufferPointer::new requires self.ptr to be
         // valid for reads of self.len elements and we verified that dst.len()
@@ -279,9 +284,14 @@ impl<'a, T: 'a + Copy, const N: usize> Iterator for ArrayChunks<'a, T, N> {
         if self.ptr.len < N {
             None
         } else {
-            let (fst, snd) = self.ptr.split_at(N);
-            self.ptr = snd;
-            Some(fst.as_known_size::<N>())
+            let cur = self.ptr.ptr;
+            // SAFETY: `self.ptr.len >= N` and `N != 0`, so `cur` is valid for `N`
+            // elements and advancing by `N` stays within the allocation.
+            self.ptr = unsafe {
+                BufferPointer::new_unchecked(cur.add(N), self.ptr.len - N, self.ptr.lifetime)
+            };
+            // SAFETY: `cur` is non-null, aligned, and valid for `N` elements.
+            Some(unsafe { KnownSizeBufferPointer::new_unchecked(cur, PhantomData) })
         }
     }
 
@@ -297,7 +307,7 @@ impl<T: Copy, const N: usize> FusedIterator for ArrayChunks<'_, T, N> {}
 
 #[derive(Debug, Eq, PartialEq)]
 pub struct KnownSizeBufferPointer<'a, T: 'a + Copy, const N: usize> {
-    ptr: *const T,
+    ptr: NonNull<T>,
     lifetime: PhantomData<&'a T>,
 }
 
@@ -314,30 +324,17 @@ impl<'a, T: 'a + Copy, const N: usize> Clone for KnownSizeBufferPointer<'a, T, N
 }
 
 impl<'a, T: 'a + Copy, const N: usize> KnownSizeBufferPointer<'a, T, N> {
-    /// # Safety: same as new.
-    unsafe fn new_impl(ptr: *const T, lifetime: PhantomData<&'a T>) -> Self {
-        let _ = AssertN::<N>::NE_0;
-        assert!(!ptr.is_null());
-        // TODO(https://github.com/rust-lang/rust/issues/96284): use ptr.is_aligned.
-        assert!(ptr.align_offset(mem::align_of::<T>()) == 0);
-        Self {
-            ptr: ptr.to_owned(),
-            lifetime,
-        }
-    }
-
     /// # Safety
-    /// * `ptr` must be valid for reads of `N` elements for the lifetime of the
-    ///   `KnownSizeBufferPointer`.
-    ///
-    /// # Panics
-    /// If `*ptr` is null or unaligned for `T`.
-    pub unsafe fn new(ptr: &'a *const T) -> Self {
-        unsafe { Self::new_impl(ptr.to_owned(), PhantomData::<&'a T>) }
+    /// `ptr` must be aligned for `T` and valid for reads of `N` elements for `'a`.
+    #[inline]
+    unsafe fn new_unchecked(ptr: NonNull<T>, lifetime: PhantomData<&'a T>) -> Self {
+        let _ = AssertN::<N>::NE_0;
+        Self { ptr, lifetime }
     }
 
+    #[inline]
     pub fn ptr(self) -> *const T {
-        self.ptr
+        self.ptr.as_ptr()
     }
 
     /// Reads and returns element `i` by value without creating a Rust
@@ -358,30 +355,19 @@ impl<'a, T: 'a + Copy, const N: usize> KnownSizeBufferPointer<'a, T, N> {
     /// KnownSizeBufferPointers of length SIZE.
     ///
     /// Fails to compile if SIZE * N_PARTS != N.
+    #[inline]
     pub fn as_chunks<const SIZE: usize, const N_PARTS: usize>(
         self,
     ) -> [KnownSizeBufferPointer<'a, T, SIZE>; N_PARTS] {
         let _ = AssertN::<SIZE>::NE_0;
         let _ = AssertN::<N_PARTS>::NE_0;
         let _ = AssertN3::<SIZE, N_PARTS, N>::N1_X_N2_EQ_N3;
-        let mut out =
-            // SAFETY:
-            //  * self.ptr is valid by preconditon when self was constructed.
-            //  * asserted (indirectly) that SIZE <= N, so self.ptr is
-            //   valid for reads of SIZE.
-            [unsafe { KnownSizeBufferPointer::new_impl(self.ptr, self.lifetime) }; N_PARTS];
-        for (i, pos) in out.iter_mut().enumerate() {
-            // SAFETY:
-            //  * self.ptr is valid by preconditon when self was constructed.
-            //  * i's max value is N_PARTS - 1, so the new pointer's max value
-            //    is self.ptr + (N_PARTS - 1) * SIZE, which is valid for
-            //    reads of SIZE necause we assrted that N_PARTS * PARTSIZE
-            //    == N.
-            *pos = unsafe {
-                KnownSizeBufferPointer::new_impl(self.ptr.add(i * N / N_PARTS), self.lifetime)
-            };
-        }
-        out
+        // SAFETY: self.ptr is non-null, aligned, and valid for N == SIZE * N_PARTS
+        // elements, so each `i * SIZE` offset (`i < N_PARTS`) is aligned and valid
+        // for SIZE elements.
+        array::from_fn(|i| unsafe {
+            KnownSizeBufferPointer::new_unchecked(self.ptr.add(i * SIZE), self.lifetime)
+        })
     }
 }
 
@@ -401,6 +387,14 @@ mod tests {
     fn test_nullptr() {
         let a_ptr: *const u32 = ptr::null();
         let _a_bufptr = unsafe { BufferPointer::new(&a_ptr, 8) };
+    }
+
+    #[test]
+    #[should_panic]
+    fn test_new_unaligned() {
+        let aligned = [0u32; 2];
+        let unaligned_ptr = unsafe { aligned.as_ptr().cast::<u8>().add(1).cast::<u32>() };
+        let _a_bufptr = unsafe { BufferPointer::new(&unaligned_ptr, 1) };
     }
 
     #[test]
@@ -553,21 +547,17 @@ mod tests {
 
         let c0 = chunks.next().unwrap();
         assert_eq!(chunks.len(), 1);
-        assert_eq!(std::array::from_fn::<_, 4, _>(|i| c0.get(i)), [0, 1, 2, 3]);
+        assert_eq!(array::from_fn::<_, 4, _>(|i| c0.get(i)), [0, 1, 2, 3]);
 
         let [p0, p1] = c0.as_chunks::<2, 2>();
-        assert_eq!(std::array::from_fn::<_, 2, _>(|i| p0.get(i)), [0, 1]);
-        assert_eq!(std::array::from_fn::<_, 2, _>(|i| p1.get(i)), [2, 3]);
+        assert_eq!(array::from_fn::<_, 2, _>(|i| p0.get(i)), [0, 1]);
+        assert_eq!(array::from_fn::<_, 2, _>(|i| p1.get(i)), [2, 3]);
 
         let c1 = chunks.next().unwrap();
         assert_eq!(chunks.len(), 0);
-        assert_eq!(std::array::from_fn::<_, 4, _>(|i| c1.get(i)), [4, 5, 6, 7]);
+        assert_eq!(array::from_fn::<_, 4, _>(|i| c1.get(i)), [4, 5, 6, 7]);
         assert_eq!(chunks.next(), None);
         assert_eq!(chunks.len(), 0);
-
-        let (head, _) = a_bufptr.split_at(4);
-        let ks = head.as_known_size::<4>();
-        assert_eq!(std::array::from_fn::<_, 4, _>(|i| ks.get(i)), [0, 1, 2, 3]);
 
         // Exact-multiple length (`len == N -> 0`) and asymmetric `as_chunks`
         // (`SIZE < N_PARTS` and `SIZE > N_PARTS`).
@@ -581,13 +571,13 @@ mod tests {
         assert_eq!(exact_chunks.next(), None);
 
         let [s0, s1, s2] = c_exact.as_chunks::<2, 3>();
-        assert_eq!(std::array::from_fn::<_, 2, _>(|i| s0.get(i)), [0, 1]);
-        assert_eq!(std::array::from_fn::<_, 2, _>(|i| s1.get(i)), [2, 3]);
-        assert_eq!(std::array::from_fn::<_, 2, _>(|i| s2.get(i)), [4, 5]);
+        assert_eq!(array::from_fn::<_, 2, _>(|i| s0.get(i)), [0, 1]);
+        assert_eq!(array::from_fn::<_, 2, _>(|i| s1.get(i)), [2, 3]);
+        assert_eq!(array::from_fn::<_, 2, _>(|i| s2.get(i)), [4, 5]);
 
         let [l0, l1] = c_exact.as_chunks::<3, 2>();
-        assert_eq!(std::array::from_fn::<_, 3, _>(|i| l0.get(i)), [0, 1, 2]);
-        assert_eq!(std::array::from_fn::<_, 3, _>(|i| l1.get(i)), [3, 4, 5]);
+        assert_eq!(array::from_fn::<_, 3, _>(|i| l0.get(i)), [0, 1, 2]);
+        assert_eq!(array::from_fn::<_, 3, _>(|i| l1.get(i)), [3, 4, 5]);
     }
 
     #[test]
