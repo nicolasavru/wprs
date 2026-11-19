@@ -22,6 +22,7 @@ use enum_as_inner::EnumAsInner;
 use smithay::reexports::wayland_protocols::wp::viewporter::client::wp_viewport::WpViewport;
 use smithay::reexports::wayland_protocols::wp::viewporter::client::wp_viewporter::WpViewporter;
 use smithay_client_toolkit::compositor::CompositorState;
+use smithay_client_toolkit::compositor::FrameCallbackData;
 use smithay_client_toolkit::compositor::Surface;
 use smithay_client_toolkit::data_device_manager::DataDeviceManagerState;
 use smithay_client_toolkit::data_device_manager::WritePipe;
@@ -676,7 +677,8 @@ impl RemoteSurface {
     }
 
     pub fn frame(&self, qh: &QueueHandle<WprsClientState>) {
-        self.wl_surface().frame(qh, self.wl_surface().clone());
+        self.wl_surface()
+            .frame(qh, FrameCallbackData(self.wl_surface().clone()));
     }
 
     pub fn get_role(&self) -> Result<&Role> {

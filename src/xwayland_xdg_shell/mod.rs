@@ -125,8 +125,7 @@ impl XWaylandSurface {
         surface_bimap: &mut BiMap<CompositorObjectId, ClientObjectId>,
     ) -> Result<()> {
         let local_surface =
-            Surface::with_data(compositor_state, qh, SurfaceData::new(parent.cloned(), 1))
-                .location(loc!())?;
+            Surface::with_data(compositor_state, qh, parent.cloned(), 1, ()).location(loc!())?;
 
         surface_bimap.insert(compositor_wl_surface.id(), local_surface.wl_surface().id());
         self.local_surface = Some(local_surface);
@@ -530,7 +529,7 @@ impl WprsState {
         let (Some(compositor_surface), Some(xwayland_surface), Some(outputs)) = (
             self.compositor_surface_from_client_surface(surface),
             xsurface_from_client_surface(&self.surface_bimap, &mut self.surfaces, surface),
-            surface.data::<SurfaceData>().map(SurfaceData::outputs),
+            surface.data::<SurfaceData<()>>().map(SurfaceData::outputs),
         ) else {
             return;
         };

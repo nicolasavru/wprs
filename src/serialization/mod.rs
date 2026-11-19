@@ -319,8 +319,9 @@ where
                                 .location(loc!())?,
                         );
                         debug!("read obj: {obj:?}");
-                        output_channel.send(obj)
-                        // The error type is not Send + Sync, which anyhow requires.
+                        output_channel
+                            .send(obj)
+                            // The error type is not Send + Sync, which anyhow requires.
                             .map_err(|e| anyhow!("{e}"))
                             .location(loc!())?;
                         Ok(())
@@ -337,8 +338,9 @@ where
                     .location(loc!())?,
                 );
                 debug!("read obj: {obj:?}");
-                output_channel.send(obj)
-                // The error type is not Send + Sync, which anyhow requires.
+                output_channel
+                    .send(obj)
+                    // The error type is not Send + Sync, which anyhow requires.
                     .map_err(|e| anyhow!("{e}"))
                     .location(loc!())?;
             },

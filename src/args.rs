@@ -150,7 +150,13 @@ pub fn wayland_display() -> impl Parser<Option<String>> {
 fn socket_dir() -> PathBuf {
     env::var_os("XDG_RUNTIME_DIR")
         .map(Into::into)
-        .unwrap_or_else(|| Path::join(&env::temp_dir(), whoami::username()))
+        .unwrap_or_else(|| {
+            // Fall back to the numeric UID when `getpwuid` has no entry so
+            // `Conf::default()` never panics before CLI `--socket` overrides apply.
+            let user =
+                whoami::username().unwrap_or_else(|_| nix::unistd::Uid::effective().to_string());
+            Path::join(&env::temp_dir(), user)
+        })
 }
 
 pub fn default_socket_path() -> PathBuf {

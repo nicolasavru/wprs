@@ -516,10 +516,11 @@ impl WprsClientState {
                         let mut buf = Vec::new();
                         let bytes_read = read_pipe.read_to_end(&mut buf).location(loc!())?;
                         debug!("read selection ({bytes_read:?} bytes): {buf:?}");
-                        writer.send(SendType::Object(Event::Data(DataEvent::TransferData(
-                            source,
-                            DataToTransfer(buf),
-                        ))))
+                        writer
+                            .send(SendType::Object(Event::Data(DataEvent::TransferData(
+                                source,
+                                DataToTransfer(buf),
+                            ))))
                             // This should be infallible, writer is an
                             // InfallibleWriter, but we can't prove that to the
                             // compiler for thread lifetime reasons.

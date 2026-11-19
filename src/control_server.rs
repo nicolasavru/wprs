@@ -75,7 +75,7 @@ fn control_handler<F: Fn(&str) -> Result<String>>(stream: UnixStream, handler: F
                     .location(loc!())?;
                 writer.flush().location(loc!())?;
             },
-            Err(err) => bail!("Error reading from control stream: {}", err),
+            Err(err) => bail!("Error reading from control stream: {err}"),
         };
         input.clear();
     }

@@ -450,7 +450,7 @@ impl ShardingDecompressor {
             let mut prev_idx = 0;
             let mut output_divbufs: Vec<DivBufMut> = indices
                 .iter()
-            // The first index is 0, we don't need to split on it.
+                // The first index is 0, we don't need to split on it.
                 .skip(1)
                 .map(|idx| {
                     let buf = mut_buf.split_to(idx - prev_idx);

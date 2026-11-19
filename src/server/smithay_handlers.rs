@@ -1230,7 +1230,9 @@ impl ClientData for ClientState {
     #[instrument(skip(self), level = "debug")]
     fn disconnected(&self, client_id: ClientId, reason: DisconnectReason) {
         self.writer
-            .send(SendType::Object(Request::ClientDisconnected(client_id.into())))
+            .send(SendType::Object(Request::ClientDisconnected(
+                client_id.into(),
+            )))
             // This should be infallible, writer is an InfallibleWriter,
             // but we can't put an InfallibleWriter into ClientState
             // for ClientData trait API reasons.

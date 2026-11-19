@@ -31,7 +31,7 @@ use crate::xwayland_xdg_shell::client::XWaylandXdgToplevel;
 use crate::xwayland_xdg_shell::xsurface_from_client_surface;
 
 fn parent(surface: &WlSurface) -> Option<&WlSurface> {
-    surface.data::<SurfaceData>()?.parent_surface()
+    surface.data::<SurfaceData<()>>()?.parent_surface()
 }
 
 fn surface_tree_root(surface: &WlSurface) -> &WlSurface {
@@ -165,7 +165,7 @@ impl FramedSurface for XWaylandXdgToplevel {
         _position: (f64, f64),
     ) -> Result<()> {
         let window = &self.local_window;
-        let pointer_data = client_pointer.data::<PointerData>().unwrap();
+        let pointer_data = client_pointer.data::<PointerData<()>>().unwrap();
         let client_seat = pointer_data.seat();
         match action {
             FrameAction::Close => {

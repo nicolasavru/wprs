@@ -49,7 +49,6 @@ use smithay_client_toolkit::reexports::client::Proxy;
 use smithay_client_toolkit::reexports::client::QueueHandle;
 use smithay_client_toolkit::registry::ProvidesRegistryState;
 use smithay_client_toolkit::registry::RegistryState;
-use smithay_client_toolkit::registry::SimpleGlobal;
 use smithay_client_toolkit::registry_handlers;
 use smithay_client_toolkit::seat::keyboard::KeyEvent;
 use smithay_client_toolkit::seat::keyboard::KeyboardHandler;
@@ -108,7 +107,7 @@ impl WprsClientState {
         let Some((_, surface_id)) = self.object_bimap.get_wl_surface_id(&surface.id()) else {
             return;
         };
-        let outputs = surface.data::<SurfaceData>().map(SurfaceData::outputs);
+        let outputs = surface.data::<SurfaceData<()>>().map(SurfaceData::outputs);
 
         if let Some(outputs) = outputs {
             let outputs = outputs
@@ -377,7 +376,7 @@ impl SeatHandler for WprsClientState {
             debug!("set pointer capability");
             let themed_pointer = self
                 .seat_state
-                .get_pointer_with_theme(
+                .get_pointer_with_theme::<_, ()>(
                     qh,
                     &seat,
                     self.shm_state.wl_shm(),
@@ -999,27 +998,9 @@ impl PrimarySelectionSourceHandler for WprsClientState {
     }
 }
 
-impl AsMut<SimpleGlobal<WpViewporter, 1>> for WprsClientState {
-    fn as_mut(&mut self) -> &mut SimpleGlobal<WpViewporter, 1> {
-        // This should never panic since self.wp_viewporter is none then we will never get any events for it.
-        &mut *self.wp_viewporter.as_mut().unwrap()
-    }
-}
-
-smithay_client_toolkit::delegate_compositor!(WprsClientState);
-smithay_client_toolkit::delegate_data_device!(WprsClientState);
-smithay_client_toolkit::delegate_keyboard!(WprsClientState);
-smithay_client_toolkit::delegate_output!(WprsClientState);
-smithay_client_toolkit::delegate_pointer!(WprsClientState);
+smithay_client_toolkit::delegate_dispatch2!(WprsClientState);
 smithay_client_toolkit::delegate_registry!(WprsClientState);
-smithay_client_toolkit::delegate_seat!(WprsClientState);
-smithay_client_toolkit::delegate_shm!(WprsClientState);
-smithay_client_toolkit::delegate_subcompositor!(WprsClientState);
-smithay_client_toolkit::delegate_xdg_popup!(WprsClientState);
-smithay_client_toolkit::delegate_xdg_shell!(WprsClientState);
-smithay_client_toolkit::delegate_xdg_window!(WprsClientState);
-smithay_client_toolkit::delegate_primary_selection!(WprsClientState);
-smithay_client_toolkit::delegate_simple!(WprsClientState, WpViewporter, 1);
+smithay_client_toolkit::reexports::client::delegate_noop!(WprsClientState: WpViewporter);
 
 impl ProvidesRegistryState for WprsClientState {
     fn registry(&mut self) -> &mut RegistryState {

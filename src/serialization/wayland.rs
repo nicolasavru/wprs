@@ -125,7 +125,7 @@ impl TryFrom<SmithayBufferFormat> for BufferFormat {
         match format {
             SmithayBufferFormat::Argb8888 => Ok(Self::Argb8888),
             SmithayBufferFormat::Xrgb8888 => Ok(Self::Xrgb8888),
-            _ => bail!("invalid buffer format {:?}", format),
+            _ => bail!("invalid buffer format {format:?}"),
         }
     }
 }
@@ -136,7 +136,7 @@ impl TryFrom<SctkBufferFormat> for BufferFormat {
         match format {
             SctkBufferFormat::Argb8888 => Ok(Self::Argb8888),
             SctkBufferFormat::Xrgb8888 => Ok(Self::Xrgb8888),
-            _ => bail!("invalid buffer format {:?}", format),
+            _ => bail!("invalid buffer format {format:?}"),
         }
     }
 }

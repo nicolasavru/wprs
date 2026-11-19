@@ -41,6 +41,7 @@ use smithay::wayland::shm::BufferData;
 use smithay::xwayland::X11Surface;
 use smithay_client_toolkit::compositor::CompositorHandler;
 use smithay_client_toolkit::compositor::CompositorState;
+use smithay_client_toolkit::compositor::FrameCallbackData;
 use smithay_client_toolkit::compositor::Surface;
 use smithay_client_toolkit::data_device_manager::data_device::DataDeviceHandler;
 use smithay_client_toolkit::data_device_manager::data_offer::DataOfferHandler;
@@ -512,7 +513,7 @@ impl SeatHandler for WprsState {
             let themed_pointer = self
                 .client_state
                 .seat_state
-                .get_pointer_with_theme(
+                .get_pointer_with_theme::<_, ()>(
                     qh,
                     &seat,
                     self.client_state.shm_state.wl_shm(),
@@ -1080,7 +1081,8 @@ impl XWaylandSurface {
     }
 
     pub fn frame(&self, qh: &QueueHandle<WprsState>) {
-        self.wl_surface().frame(qh, self.wl_surface().clone());
+        self.wl_surface()
+            .frame(qh, FrameCallbackData(self.wl_surface().clone()));
     }
 
     pub fn get_role(&self) -> Result<&Role> {
@@ -1459,7 +1461,7 @@ impl XWaylandSubSurface {
             self.local_subsurface
                 .subsurface
                 .set_position(x + self.offset.x, y + self.offset.y);
-            local_wl_surface.frame(qh, local_wl_surface.clone());
+            local_wl_surface.frame(qh, FrameCallbackData(local_wl_surface.clone()));
             self.parent_surface.commit();
 
             self.pending_frame_callback = true;
@@ -1872,19 +1874,8 @@ impl PrimarySelectionSourceHandler for WprsState {
     }
 }
 
-smithay_client_toolkit::delegate_compositor!(WprsState);
-smithay_client_toolkit::delegate_data_device!(WprsState);
-smithay_client_toolkit::delegate_keyboard!(WprsState);
-smithay_client_toolkit::delegate_output!(WprsState);
-smithay_client_toolkit::delegate_pointer!(WprsState);
+smithay_client_toolkit::delegate_dispatch2!(WprsState);
 smithay_client_toolkit::delegate_registry!(WprsState);
-smithay_client_toolkit::delegate_seat!(WprsState);
-smithay_client_toolkit::delegate_shm!(WprsState);
-smithay_client_toolkit::delegate_subcompositor!(WprsState);
-smithay_client_toolkit::delegate_xdg_popup!(WprsState);
-smithay_client_toolkit::delegate_xdg_shell!(WprsState);
-smithay_client_toolkit::delegate_xdg_window!(WprsState);
-smithay_client_toolkit::delegate_primary_selection!(WprsState);
 
 impl ProvidesRegistryState for WprsState {
     fn registry(&mut self) -> &mut RegistryState {
