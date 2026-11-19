@@ -598,8 +598,8 @@ pub fn commit_inner(
         .map(|buffer| (buffer.metadata.width, buffer.metadata.height));
     let raw_damage = mem::take(&mut surface_attributes.damage);
     // Xwayland surfaces have no viewport (`viewport_state` is `None`),
-    // while `buffer_size` is still needed to invert rotating/flipping
-    // `buffer_transform`s.
+    // while `buffer_size` is still needed to clamp damage to the buffer
+    // bounds and invert rotating/flipping `buffer_transform`s.
     let mut damage = compositor_utils::damage_to_buffer_rects(
         &raw_damage,
         surface_attributes.buffer_scale,
