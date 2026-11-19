@@ -171,11 +171,9 @@ impl<'a, T: 'a + Copy> BufferPointer<'a, T> {
     }
 }
 
-// SAFETY: pointers are unsafe when they are dereferenced, not created, so it
-// makes no sense for pointers to not be Send, but that can't be changed at this
-// point for backward compatibility reasons. See
-// https://doc.rust-lang.org/nomicon/send-and-sync.html.
-unsafe impl<'a, T: 'a + Copy> Send for BufferPointer<'a, T> {}
+// SAFETY: `BufferPointer` provides read-only copy access to `T` values across
+// threads, requiring `T: Send + Sync` in addition to `Copy`.
+unsafe impl<'a, T: 'a + Copy + Send + Sync> Send for BufferPointer<'a, T> {}
 
 impl<'a, T: 'a + Copy> IntoIterator for &'a BufferPointer<'a, T> {
     type Item = T;
@@ -213,7 +211,8 @@ impl<T: Copy> Iterator for BufferPointerIter<'_, T> {
     }
 
     fn size_hint(&self) -> (usize, Option<usize>) {
-        (self.ptr.len, Some(self.ptr.len))
+        let rem = self.ptr.len - self.idx;
+        (rem, Some(rem))
     }
 }
 
@@ -264,14 +263,13 @@ impl<T: Copy> FusedIterator for Chunks<'_, T> {}
 #[must_use = "iterators are lazy and do nothing unless consumed"]
 pub struct ArrayChunks<'a, T: 'a + Copy, const N: usize> {
     ptr: BufferPointer<'a, T>,
-    rem: Option<BufferPointer<'a, T>>,
 }
 
 impl<'a, T: 'a + Copy, const N: usize> ArrayChunks<'a, T, N> {
     #[inline]
     fn new(ptr: BufferPointer<'a, T>) -> Self {
         _ = AssertN::<N>::NE_0;
-        Self { ptr, rem: None }
+        Self { ptr }
     }
 }
 
@@ -281,7 +279,6 @@ impl<'a, T: 'a + Copy, const N: usize> Iterator for ArrayChunks<'a, T, N> {
     #[inline]
     fn next(&mut self) -> Option<Self::Item> {
         if self.ptr.len < N {
-            self.rem = Some(self.ptr);
             None
         } else {
             let (fst, snd) = self.ptr.split_at(N);
@@ -292,7 +289,7 @@ impl<'a, T: 'a + Copy, const N: usize> Iterator for ArrayChunks<'a, T, N> {
 
     #[inline]
     fn size_hint(&self) -> (usize, Option<usize>) {
-        let n = utils::n_chunks(self.ptr.len, N);
+        let n = self.ptr.len / N;
         (n, Some(n))
     }
 }
@@ -353,8 +350,16 @@ impl<'a, T: 'a + Copy, const N: usize> KnownSizeBufferPointer<'a, T, N> {
         self.len() == 0
     }
 
-    pub fn get(&self, i: usize) -> &T {
-        unsafe { &*self.ptr.add(i) }
+    /// Reads and returns element `i` by value without creating a Rust
+    /// reference into potentially shared memory.
+    ///
+    /// # Panics
+    /// If `i >= N`.
+    #[inline]
+    pub fn get(&self, i: usize) -> T {
+        assert!(i < N);
+        // SAFETY: `self.ptr` is valid for reads of `N` elements and `i < N`.
+        unsafe { self.ptr.add(i).read() }
     }
 
     pub fn copy_to_array(self) -> [T; N] {
