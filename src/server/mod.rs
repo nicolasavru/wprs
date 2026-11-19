@@ -79,6 +79,7 @@ fn surface_destruction_callback(state: &mut WprsServerState, surface: &WlSurface
         })));
 
         state.object_map.remove(&surface_state.id);
+        state.dirty_sync_surfaces.remove(&surface_state.id);
     });
 }
 
@@ -114,6 +115,10 @@ pub struct WprsServerState {
     // object_map:
     // left: serialized surface id, right: local native surface id
     pub object_map: HashMap<WlSurfaceId, ObjectId>,
+    /// Tracks synchronized subsurfaces that sent a `Commit` to `wprsc` since
+    /// their desynchronized ancestor last committed, so bufferless parent sync
+    /// commits still forward `Commit(parent)` to flush them on `wprsc`.
+    pub dirty_sync_surfaces: HashSet<WlSurfaceId>,
     pub outputs: HashMap<u32, (Output, GlobalId)>,
     serial_map: SerialMap,
     pressed_keys: HashSet<u32>,
@@ -162,6 +167,7 @@ impl WprsServerState {
             // TODO: try tuning this based on the number of cpus the machine has.
             compressor: ShardingCompressor::new(NonZeroUsize::new(16).unwrap(), 1).unwrap(),
             object_map: HashMap::new(),
+            dirty_sync_surfaces: HashSet::new(),
             outputs: HashMap::new(),
             serial_map: SerialMap::new(),
             pressed_keys: HashSet::new(),

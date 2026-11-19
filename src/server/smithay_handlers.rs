@@ -13,6 +13,7 @@
 // limitations under the License.
 
 /// Handlers for events from Smithay.
+use std::collections::HashSet;
 use std::mem;
 use std::os::fd::OwnedFd;
 use std::time::Duration;
@@ -574,35 +575,32 @@ impl CompositorHandler for WprsServerState {
 
     #[instrument(skip(self), level = "debug")]
     fn commit(&mut self, surface: &WlSurface) {
-        // Send over the updated buffers from the children first so that the
-        // client already has them when the parent is comitted.
-        let children_dirty = commit_sync_children(self, surface, &commit).unwrap();
-        commit(surface, self, children_dirty, false).log_and_ignore(loc!());
+        commit(surface, self).log_and_ignore(loc!());
     }
 }
 
-#[instrument(skip(state, commit_fn), level = "debug")]
-pub(crate) fn commit_sync_children<T, F>(
-    state: &mut T,
-    surface: &WlSurface,
-    commit_fn: &F,
-) -> Result<bool>
-where
-    F: Fn(&WlSurface, &mut T, bool, bool) -> Result<bool>,
-{
-    compositor::get_children(surface)
-        .iter()
-        .filter(|child| compositor::is_sync_subsurface(child))
-        .map(|child| {
-            let children_dirty = commit_sync_children(state, child, commit_fn).location(loc!())?;
-            commit_fn(child, state, children_dirty, true).location(loc!())
-        })
-        .collect::<Result<Vec<bool>>>()
-        .location(loc!())?
-        .into_iter()
-        .reduce(|acc, elem| acc || elem)
-        .map(Ok)
-        .unwrap_or(Ok(false))
+fn take_dirty_sync_descendants<N>(
+    dirty: &mut HashSet<WlSurfaceId>,
+    surface: &N,
+    children: &impl Fn(&N) -> Vec<N>,
+    is_sync: &impl Fn(&N) -> bool,
+    id: &impl Fn(&N) -> WlSurfaceId,
+) -> Vec<WlSurfaceId> {
+    let mut taken = Vec::new();
+    for child in children(surface) {
+        let child_sync = is_sync(&child);
+        let child_id = id(&child);
+        let child_was_dirty = dirty.remove(&child_id);
+        if child_was_dirty {
+            taken.push(child_id);
+        }
+        if child_sync || child_was_dirty {
+            taken.extend(take_dirty_sync_descendants(
+                dirty, &child, children, is_sync, id,
+            ));
+        }
+    }
+    taken
 }
 
 #[instrument(ret, level = "debug")]
@@ -624,35 +622,67 @@ pub fn get_child_positions(surface: &WlSurface) -> Vec<SubsurfacePosition> {
 }
 
 #[instrument(skip_all, level = "debug")]
-pub fn commit(
-    surface: &WlSurface,
-    state: &mut WprsServerState,
-    children_dirty: bool,
-    skip_buffer: bool,
-) -> Result<bool> {
+pub fn commit(surface: &WlSurface, state: &mut WprsServerState) -> Result<()> {
     let surface_order = get_child_positions(surface);
 
     // TODO: https://github.com/Smithay/smithay/issues/538 - move into commit.
     let sync = compositor::is_sync_subsurface(surface);
     let parent = compositor::get_parent(surface);
-
-    state.insert_surface(surface).location(loc!())?;
-
-    let dirty = compositor::with_states(surface, |surface_data| {
-        commit_impl(
+    let surface_id = WlSurfaceId::new(surface);
+    // Smithay applies a desync root's effectively-sync descendants before the
+    // root (and `on_commit_buffer_handler` leaves sync subsurfaces' `NewBuffer`
+    // in place): each sync descendant sends its buffer/`Commit` and marks
+    // itself in `dirty_sync_surfaces`, and the desync root drains those marks
+    // here to force `Commit(root)` so `wprsc`'s `commit_sync_children` flushes
+    // them.
+    let taken_dirty = if sync {
+        Vec::new()
+    } else {
+        take_dirty_sync_descendants(
+            &mut state.dirty_sync_surfaces,
             surface,
-            surface_data,
-            state,
-            sync,
-            parent,
-            surface_order,
-            children_dirty,
-            skip_buffer,
+            &compositor::get_children,
+            &compositor::is_sync_subsurface,
+            &WlSurfaceId::new,
         )
-    })
-    .location(loc!())?;
+    };
+    let children_dirty = !taken_dirty.is_empty();
+
+    let res = state
+        .insert_surface(surface)
+        .location(loc!())
+        .and_then(|()| {
+            compositor::with_states(surface, |surface_data| {
+                commit_impl(
+                    surface,
+                    surface_data,
+                    state,
+                    sync,
+                    parent,
+                    surface_order,
+                    children_dirty,
+                )
+            })
+            .location(loc!())
+        });
+    let sent = match res {
+        Ok(sent) => sent,
+        Err(err) => {
+            // Restore drained descendant marks so an errored parent commit does
+            // not leave already-applied sync children unflushed.
+            state.dirty_sync_surfaces.extend(taken_dirty);
+            return Err(err);
+        },
+    };
+    if sync {
+        if sent {
+            state.dirty_sync_surfaces.insert(surface_id);
+        }
+    } else {
+        state.dirty_sync_surfaces.remove(&surface_id);
+    }
     on_commit_buffer_handler::<WprsServerState>(surface);
-    Ok(dirty)
+    Ok(())
 }
 
 // TODO: maybe make these methods on the relevant states
@@ -736,10 +766,6 @@ pub fn commit_impl(
     parent: Option<WlSurface>,
     surface_order: Vec<SubsurfacePosition>,
     children_dirty: bool,
-    // TODO: This is a hack to stop sending the same buffer over twice. The
-    // subsurface logic needs another pass overall, we shouldn be able to avoid
-    // two back-to-back commits in a better way.
-    skip_buffer: bool,
 ) -> Result<bool> {
     let surface_state = &mut surface_data
         .data_map
@@ -845,7 +871,7 @@ pub fn commit_impl(
     // TODO: make a function and dedupe with compositor.rs.
     debug!("buffer assignment: {:?}", &surface_attributes.buffer);
     match &surface_attributes.buffer {
-        Some(SmithayBufferAssignment::NewBuffer(buffer)) if !skip_buffer => {
+        Some(SmithayBufferAssignment::NewBuffer(buffer)) => {
             compositor_utils::with_buffer_contents(buffer, |data, spec| {
                 surface_state.set_buffer(&spec, data, &mut state.compressor)
             })
@@ -865,11 +891,8 @@ pub fn commit_impl(
             surface_state.buffer = None;
             surface_state_to_send.buffer = Some(BufferAssignment::Removed);
         },
-        Some(SmithayBufferAssignment::NewBuffer(_)) | None => {
+        None => {
             if (surface_state_to_send == prev_without_buffer) && !children_dirty {
-                return Ok(false);
-            }
-            if children_dirty && sync {
                 return Ok(false);
             }
         },
@@ -1239,3 +1262,58 @@ smithay::delegate_data_device!(WprsServerState);
 smithay::delegate_output!(WprsServerState);
 smithay::delegate_primary_selection!(WprsServerState);
 smithay::delegate_viewporter!(WprsServerState);
+
+#[cfg(test)]
+mod tests {
+    use std::collections::HashMap;
+
+    use super::*;
+
+    #[test]
+    fn test_take_dirty_sync_descendants() {
+        // Tree:
+        //   0 (desync root)
+        //   ├─ 1 (sync)
+        //   │  └─ 2 (sync)
+        //   └─ 3 (desync)
+        //      └─ 4 (sync)
+        let tree: HashMap<u64, Vec<u64>> =
+            HashMap::from([(0, vec![1, 3]), (1, vec![2]), (3, vec![4])]);
+        let sync_nodes: HashSet<u64> = HashSet::from([1, 2, 4]);
+
+        let cases: &[(&str, &[u64], &[u64], &[u64])] = &[
+            // (label, initial dirty, expected taken, expected remaining)
+            ("dirty sync child", &[1], &[1], &[]),
+            (
+                "clean sync child with dirty sync grandchild",
+                &[2],
+                &[2],
+                &[],
+            ),
+            ("dirty child flipped desync", &[3, 4], &[3, 4], &[]),
+            ("clean desync child with dirty grandchild", &[4], &[], &[4]),
+        ];
+
+        for &(label, initial, expected_taken, expected_remaining) in cases {
+            let mut dirty: HashSet<WlSurfaceId> =
+                initial.iter().copied().map(WlSurfaceId).collect();
+            let mut taken = take_dirty_sync_descendants(
+                &mut dirty,
+                &0,
+                &|n| tree.get(n).cloned().unwrap_or_default(),
+                &|n| sync_nodes.contains(n),
+                &|n| WlSurfaceId(*n),
+            );
+            taken.sort_unstable_by_key(|id| id.0);
+            let expected_taken: Vec<WlSurfaceId> =
+                expected_taken.iter().copied().map(WlSurfaceId).collect();
+            let expected_remaining: HashSet<WlSurfaceId> = expected_remaining
+                .iter()
+                .copied()
+                .map(WlSurfaceId)
+                .collect();
+            assert_eq!(taken, expected_taken, "{label}: taken");
+            assert_eq!(dirty, expected_remaining, "{label}: remaining");
+        }
+    }
+}
