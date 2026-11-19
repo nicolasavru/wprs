@@ -233,6 +233,7 @@ pub struct RemoteBuffer {
 impl RemoteBuffer {
     #[allow(clippy::missing_panics_doc)]
     pub fn new(buffer_msg: Buffer, pool: &mut SlotPool) -> Result<Self> {
+        buffer_msg.metadata.validate().location(loc!())?;
         let active_buffer = pool
             .create_buffer(
                 buffer_msg.metadata.width,

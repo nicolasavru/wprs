@@ -396,14 +396,15 @@ impl XdgShellHandler for WprsServerState {
             }
 
             let surface_state_to_send = surface_state.clone_without_buffer();
+            let client = surface_state_to_send.client;
+            let surface = surface_state_to_send.id;
             self.serializer
                 .writer()
-                .send(SendType::Object(Request::Surface(log_and_return!(
-                    SurfaceRequest::new(
-                        surface,
-                        SurfaceRequestPayload::Commit(surface_state_to_send),
-                    )
-                ))));
+                .send(SendType::Object(Request::Surface(SurfaceRequest {
+                    client,
+                    surface,
+                    payload: SurfaceRequestPayload::Commit(surface_state_to_send),
+                })));
         });
     }
 
@@ -896,16 +897,16 @@ pub fn commit_impl(
     );
     surface_state_to_send.damage = Some(damage);
 
+    let client = surface_state_to_send.client;
+    let surface = surface_state_to_send.id;
     state
         .serializer
         .writer()
-        .send(SendType::Object(Request::Surface(
-            SurfaceRequest::new(
-                surface,
-                SurfaceRequestPayload::Commit(surface_state_to_send),
-            )
-            .location(loc!())?,
-        )));
+        .send(SendType::Object(Request::Surface(SurfaceRequest {
+            client,
+            surface,
+            payload: SurfaceRequestPayload::Commit(surface_state_to_send),
+        })));
     Ok(true)
 }
 

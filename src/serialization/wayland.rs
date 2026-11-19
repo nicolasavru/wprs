@@ -153,16 +153,34 @@ impl From<BufferFormat> for SctkBufferFormat {
 impl BufferMetadata {
     // TODO: replace with impl From
     pub fn from_buffer_data(spec: &SmithayBufferData) -> Result<Self> {
-        Ok(Self {
+        let metadata = Self {
             width: spec.width,
             height: spec.height,
             stride: spec.stride,
             format: spec.format.try_into().location(loc!())?,
-        })
+        };
+        metadata.validate().location(loc!())?;
+        Ok(metadata)
     }
 
-    pub fn pixel_bytes(&self) -> i32 {
-        self.stride / self.width
+    pub fn validate(&self) -> Result<usize> {
+        if self.width <= 0 || self.height <= 0 {
+            bail!("invalid buffer dimensions: {}x{}", self.width, self.height);
+        }
+        if self.stride % 4 != 0 {
+            bail!("buffer stride {} is not a multiple of 4", self.stride);
+        }
+        let min_stride = self
+            .width
+            .checked_mul(4)
+            .context(loc!(), "buffer width * 4 overflow")?;
+        if self.stride < min_stride {
+            bail!("buffer stride {} < width * 4 ({min_stride})", self.stride);
+        }
+        let byte_len = (self.height as usize)
+            .checked_mul(self.stride as usize)
+            .context(loc!(), "buffer height * stride overflow")?;
+        Ok(byte_len / 4)
     }
 
     pub fn len(&self) -> usize {
@@ -901,16 +919,6 @@ pub struct SurfaceRequest {
     pub client: ClientId,
     pub surface: WlSurfaceId,
     pub payload: SurfaceRequestPayload,
-}
-
-impl SurfaceRequest {
-    pub fn new(surface: &WlSurface, payload: SurfaceRequestPayload) -> Result<Self> {
-        Ok(Self {
-            client: ClientId::new(&surface.client().location(loc!())?),
-            surface: WlSurfaceId::new(surface),
-            payload,
-        })
-    }
 }
 
 #[derive(Debug, Clone, Eq, PartialEq, Archive, Deserialize, Serialize)]
