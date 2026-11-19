@@ -497,16 +497,13 @@ fn accept_loop<ST, RT>(
             let read_thread_result = utils::join_unwrap(read_thread);
             debug!("read thread joined: {read_thread_result:?}");
             other_end_connected.store(false, Ordering::Relaxed);
+            // Shut down the socket before joining `write_thread` so a `write_all`
+            // or `flush` blocked on a full send buffer wakes immediately with
+            // `EPIPE`/`ESHUTDOWN` if the peer stopped reading. Ignore `ENOTCONN`
+            // if the peer already closed.
+            _ = stream.shutdown(Shutdown::Both);
             let write_thread_result = utils::join_unwrap(write_thread);
             debug!("write thread joined: {write_thread_result:?}");
-            // The usual reason for the read/write threads terminating will be the
-            // client disconnect and closing the socket, but they may have
-            // terminated because the client sent us bad data and we had an error
-            // when deserializaing it. In case that was the issue, shut down the
-            // stream to disconnect the client. If the client already disconnected,
-            // this should still be fine.
-            // TODO: maybe send the disconnection reason to the client.
-            stream.shutdown(Shutdown::Both).unwrap();
         }
     });
 }
