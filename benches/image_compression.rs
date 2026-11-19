@@ -28,6 +28,7 @@ use fallible_iterator::IteratorExt;
 use png::BitDepth;
 use png::ColorType;
 use png::Decoder;
+use rkyv::util::AlignedVec;
 use wprs::arc_slice::ArcSlice;
 use wprs::buffer_pointer::BufferPointer;
 use wprs::filtering;
@@ -117,10 +118,9 @@ fn compress_png(c: &mut Criterion, path: &Path) {
 }
 
 fn filter_compress_png(c: &mut Criterion, path: &Path) {
-    let mut data = read_png(path);
-    let _orig_data = data.clone();
-    let data_ptr = &data.as_ptr();
-    let buf_ptr = unsafe { BufferPointer::new(data_ptr, data.len()) };
+    let data = read_png(path);
+    let data_ptr = data.as_ptr();
+    let buf_ptr = unsafe { BufferPointer::new(&data_ptr, data.len()) };
 
     let uncompressed_size = data.len();
 
@@ -139,6 +139,8 @@ fn filter_compress_png(c: &mut Criterion, path: &Path) {
 
     let n_decompressors = NonZeroUsize::new(8).unwrap();
     let mut sharding_decompressor = ShardingDecompressor::new(n_decompressors).unwrap();
+    let mut output_buf = AlignedVec::<64>::with_capacity(uncompressed_size);
+    output_buf.resize(uncompressed_size, 0);
 
     let indices = compressed_shards.indices();
     let compressed_shards = compressed_shards
@@ -157,8 +159,7 @@ fn filter_compress_png(c: &mut Criterion, path: &Path) {
                         .decompress_to_owned(&indices, uncompressed_size, compressed_shards)
                         .unwrap();
 
-                    filtering::unfilter(&buf.into(), &mut data);
-                    // assert_eq!(data, _orig_data);
+                    filtering::unfilter(&buf.into(), &mut output_buf[..]);
                 },
                 BatchSize::SmallInput,
             )

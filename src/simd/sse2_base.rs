@@ -25,9 +25,11 @@ use std::arch::x86_64::_mm_set_epi8;
 use std::arch::x86_64::_mm_set_epi32;
 pub use std::arch::x86_64::_mm_set1_epi8;
 pub use std::arch::x86_64::_mm_setzero_si128;
+pub use std::arch::x86_64::_mm_sfence;
 use std::arch::x86_64::_mm_shuffle_ps;
 use std::arch::x86_64::_mm_slli_si128;
 pub use std::arch::x86_64::_mm_storeu_si128;
+use std::arch::x86_64::_mm_stream_si128;
 use std::arch::x86_64::_mm_sub_epi8;
 
 #[allow(non_camel_case_types)]
@@ -163,6 +165,20 @@ pub unsafe fn _mm256_storeu_si256(dst: *mut __m256i, a: __m256i) {
         let p = dst.cast::<__m128i>();
         _mm_storeu_si128(p, a.low);
         _mm_storeu_si128(p.add(1), a.high);
+    }
+}
+
+/// # Safety
+/// `dst` must be 32-byte aligned and valid for 256-bit writes.
+#[target_feature(enable = "sse2")]
+#[inline]
+pub unsafe fn _mm256_stream_si256(dst: *mut __m256i, a: __m256i) {
+    // SAFETY: caller guarantees `dst` is 32-byte aligned and valid for 32-byte
+    // writes, so both `p` and `p.add(1)` are 16-byte aligned.
+    unsafe {
+        let p = dst.cast::<__m128i>();
+        _mm_stream_si128(p, a.low);
+        _mm_stream_si128(p.add(1), a.high);
     }
 }
 

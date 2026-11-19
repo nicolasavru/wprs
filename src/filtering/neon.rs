@@ -212,6 +212,7 @@ pub(super) struct Kernel;
 impl FilterKernel for Kernel {
     type ForwardCarry = uint8x16_t;
     type InverseCarry = uint8x16_t;
+    const STREAM_ALIGN: usize = 1;
 
     fn zero_forward() -> Carry4 {
         // SAFETY: register broadcast; see module doc on #[target_feature].
@@ -244,7 +245,7 @@ impl FilterKernel for Kernel {
         )
     }
 
-    fn inverse_block(
+    unsafe fn inverse_block<const STREAM: bool>(
         in0: &[u8; 32],
         in1: &[u8; 32],
         in2: &[u8; 32],
@@ -254,6 +255,8 @@ impl FilterKernel for Kernel {
     ) -> Carry4 {
         soa_to_aos_u8_32x4(in0, in1, in2, in3, out, p0, p1, p2, p3)
     }
+
+    fn fence_stream() {}
 }
 
 #[cfg(test)]

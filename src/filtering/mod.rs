@@ -58,6 +58,7 @@ use crate::vec4u8::Vec4u8s;
 pub(crate) trait FilterKernel {
     type ForwardCarry: Copy + Send;
     type InverseCarry: Copy + Send;
+    const STREAM_ALIGN: usize;
 
     fn zero_forward() -> (
         Self::ForwardCarry,
@@ -92,7 +93,9 @@ pub(crate) trait FilterKernel {
         Self::ForwardCarry,
     );
 
-    fn inverse_block(
+    /// # Safety
+    /// When `STREAM` is `true`, `out` must be aligned to `Self::STREAM_ALIGN`.
+    unsafe fn inverse_block<const STREAM: bool>(
         in0: &[u8; 32],
         in1: &[u8; 32],
         in2: &[u8; 32],
@@ -110,6 +113,8 @@ pub(crate) trait FilterKernel {
         Self::InverseCarry,
         Self::InverseCarry,
     );
+
+    fn fence_stream();
 }
 
 // --- shared parallel pipeline ---
@@ -246,16 +251,45 @@ fn soa_to_aos_parallel<K: FilterKernel>(soa: &Vec4u8s, aos: &mut [Vec4u8]) {
                 aos.chunks_mut(thread_chunk_size)
             ) {
                 s.run(move || {
-                    for (soa0_chunk, soa1_chunk, soa2_chunk, soa3_chunk, aos_chunk) in izip!(
-                        soa0.as_chunks::<32>().0,
-                        soa1.as_chunks::<32>().0,
-                        soa2.as_chunks::<32>().0,
-                        soa3.as_chunks::<32>().0,
-                        aos.as_chunks_mut::<32>().0,
-                    ) {
-                        prev = K::inverse_block(
-                            soa0_chunk, soa1_chunk, soa2_chunk, soa3_chunk, aos_chunk, prev,
-                        );
+                    const {
+                        assert!(size_of::<[Vec4u8; 32]>().is_multiple_of(K::STREAM_ALIGN));
+                    };
+                    if (aos.as_mut_ptr() as usize).is_multiple_of(K::STREAM_ALIGN) {
+                        let mut chunks_written = false;
+                        for (soa0_chunk, soa1_chunk, soa2_chunk, soa3_chunk, aos_chunk) in izip!(
+                            soa0.as_chunks::<32>().0,
+                            soa1.as_chunks::<32>().0,
+                            soa2.as_chunks::<32>().0,
+                            soa3.as_chunks::<32>().0,
+                            aos.as_chunks_mut::<32>().0,
+                        ) {
+                            chunks_written = true;
+                            // SAFETY: `aos` is aligned to `K::STREAM_ALIGN`, and
+                            // `size_of::<[Vec4u8; 32]>()` is a multiple of `K::STREAM_ALIGN`.
+                            prev = unsafe {
+                                K::inverse_block::<true>(
+                                    soa0_chunk, soa1_chunk, soa2_chunk, soa3_chunk, aos_chunk, prev,
+                                )
+                            };
+                        }
+                        if chunks_written {
+                            K::fence_stream();
+                        }
+                    } else {
+                        for (soa0_chunk, soa1_chunk, soa2_chunk, soa3_chunk, aos_chunk) in izip!(
+                            soa0.as_chunks::<32>().0,
+                            soa1.as_chunks::<32>().0,
+                            soa2.as_chunks::<32>().0,
+                            soa3.as_chunks::<32>().0,
+                            aos.as_chunks_mut::<32>().0,
+                        ) {
+                            // SAFETY: `STREAM` is `false`.
+                            prev = unsafe {
+                                K::inverse_block::<false>(
+                                    soa0_chunk, soa1_chunk, soa2_chunk, soa3_chunk, aos_chunk, prev,
+                                )
+                            };
+                        }
                     }
                 });
             }
@@ -366,10 +400,19 @@ mod tests {
             )
             .unwrap();
 
-        let mut output = vec![0u8; data.len()];
-        unfilter(&soa.into(), &mut output);
+        let mut buf = vec![0u8; data.len() + 36];
+        let aligned_off = (32 - (buf.as_ptr() as usize & 31)) & 31;
+        unfilter(
+            &soa.clone().into(),
+            &mut buf[aligned_off..aligned_off + data.len()],
+        );
+        assert_eq!(data, &buf[aligned_off..aligned_off + data.len()]);
 
-        assert_eq!(data, &output);
+        unfilter(
+            &soa.into(),
+            &mut buf[aligned_off + 4..aligned_off + 4 + data.len()],
+        );
+        assert_eq!(data, &buf[aligned_off + 4..aligned_off + 4 + data.len()]);
     }
 
     #[test]

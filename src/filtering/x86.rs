@@ -27,6 +27,7 @@ use crate::simd::_mm_extract_epi8;
 use crate::simd::_mm_loadu_si128;
 use crate::simd::_mm_set1_epi8;
 use crate::simd::_mm_setzero_si128;
+use crate::simd::_mm_sfence;
 use crate::simd::_mm256_add_epi8;
 use crate::simd::_mm256_blend_epi32;
 use crate::simd::_mm256_castps_si256;
@@ -43,6 +44,7 @@ use crate::simd::_mm256_shuffle_epi8;
 use crate::simd::_mm256_shuffle_ps;
 use crate::simd::_mm256_slli_si256;
 use crate::simd::_mm256_storeu_si256;
+use crate::simd::_mm256_stream_si256;
 use crate::simd::_mm256_sub_epi8;
 use crate::vec4u8::Vec4u8;
 
@@ -80,11 +82,21 @@ fn store_m256i(dst: &mut [u8; 32], val: __m256i) {
     unsafe { _mm256_storeu_si256(dst.as_mut_ptr().cast::<__m256i>(), val) }
 }
 
+/// # Safety
+/// When `STREAM` is `true`, `dst` must be 32-byte aligned.
 #[inline]
-fn store_m256i_vec4u8(dst: &mut [Vec4u8; 8], val: __m256i) {
+unsafe fn store_m256i_vec4u8<const STREAM: bool>(dst: &mut [Vec4u8; 8], val: __m256i) {
+    debug_assert!(!STREAM || (dst.as_mut_ptr() as usize).is_multiple_of(32));
     // SAFETY: dst is 8 Vec4u8s, which is 32 u8s, which is 256 bits, so it is
-    // safe to write 256 bits to it.
-    unsafe { _mm256_storeu_si256(dst.as_mut_ptr().cast::<__m256i>(), val) }
+    // safe to write 256 bits to it. When STREAM is true, caller guarantees dst
+    // is 32-byte aligned.
+    unsafe {
+        if STREAM {
+            _mm256_stream_si256(dst.as_mut_ptr().cast::<__m256i>(), val);
+        } else {
+            _mm256_storeu_si256(dst.as_mut_ptr().cast::<__m256i>(), val);
+        }
+    }
 }
 
 #[inline]
@@ -351,8 +363,10 @@ fn aos_to_soa_u8_32x4(
     }
 }
 
+/// # Safety
+/// When `STREAM` is `true`, `out` must be 32-byte aligned.
 #[inline]
-fn soa_to_aos_u8_32x4(
+unsafe fn soa_to_aos_u8_32x4<const STREAM: bool>(
     input0: &[u8; 32],
     input1: &[u8; 32],
     input2: &[u8; 32],
@@ -365,7 +379,8 @@ fn soa_to_aos_u8_32x4(
 ) -> (__m128i, __m128i, __m128i, __m128i) {
     // SAFETY: simd/mod.rs exposes versions of this function for SSE2, SSSE3,
     // SSE4.1, AVX, and AVX2. Which version is used depends on compiler flags,
-    // but there is no good way to plumb that through to avoid the unsafe.
+    // but there is no good way to plumb that through to avoid the unsafe; when
+    // `STREAM` is true, the caller guarantees `out` is 32-byte aligned.
     unsafe {
         let p0 = _mm256_set_epi8(
             7, 11, 15, 3, 6, 10, 14, 2, 5, 9, 13, 1, 4, 8, 12, 0, 7, 11, 15, 3, 6, 10, 14, 2, 5, 9,
@@ -471,23 +486,23 @@ fn soa_to_aos_u8_32x4(
         // t2  6f 6e 6d 6c | 6b 6a 69 68 | 67 66 65 64 | 63 62 61 60 || 2f 2e 2d 2c | 2b 2a 29 28 | 27 26 25 24 | 23 22 21 20
         // t3  7f 7e 7d 7c | 7b 7a 79 78 | 77 76 75 74 | 73 72 71 70 || 3f 3e 3d 3c | 3b 3a 39 38 | 37 36 35 34 | 33 32 31 30
 
-        store_m256i_vec4u8(
+        store_m256i_vec4u8::<STREAM>(
             out.index_mut(0..8).try_into().unwrap(),
             _mm256_set_m128i(_mm256_castsi256_si128(t1), _mm256_castsi256_si128(t0)),
         );
-        store_m256i_vec4u8(
+        store_m256i_vec4u8::<STREAM>(
             out.index_mut(8..16).try_into().unwrap(),
             _mm256_set_m128i(_mm256_castsi256_si128(t3), _mm256_castsi256_si128(t2)),
         );
 
-        store_m256i_vec4u8(
+        store_m256i_vec4u8::<STREAM>(
             out.index_mut(16..24).try_into().unwrap(),
             _mm256_set_m128i(
                 _mm256_extracti128_si256::<1>(t1),
                 _mm256_extracti128_si256::<1>(t0),
             ),
         );
-        store_m256i_vec4u8(
+        store_m256i_vec4u8::<STREAM>(
             out.index_mut(24..32).try_into().unwrap(),
             _mm256_set_m128i(
                 _mm256_extracti128_si256::<1>(t3),
@@ -508,6 +523,7 @@ pub(super) struct Kernel;
 impl FilterKernel for Kernel {
     type ForwardCarry = u8;
     type InverseCarry = __m128i;
+    const STREAM_ALIGN: usize = 32;
 
     fn zero_forward() -> (u8, u8, u8, u8) {
         (0, 0, 0, 0)
@@ -533,7 +549,7 @@ impl FilterKernel for Kernel {
         aos_to_soa_u8_32x4(input, out0, out1, out2, out3, p0, p1, p2, p3)
     }
 
-    fn inverse_block(
+    unsafe fn inverse_block<const STREAM: bool>(
         in0: &[u8; 32],
         in1: &[u8; 32],
         in2: &[u8; 32],
@@ -541,7 +557,13 @@ impl FilterKernel for Kernel {
         out: &mut [Vec4u8; 32],
         (p0, p1, p2, p3): (__m128i, __m128i, __m128i, __m128i),
     ) -> (__m128i, __m128i, __m128i, __m128i) {
-        soa_to_aos_u8_32x4(in0, in1, in2, in3, out, p0, p1, p2, p3)
+        // SAFETY: Caller upholds 32-byte alignment on `out` when `STREAM` is `true`.
+        unsafe { soa_to_aos_u8_32x4::<STREAM>(in0, in1, in2, in3, out, p0, p1, p2, p3) }
+    }
+
+    fn fence_stream() {
+        // SAFETY: `_mm_sfence` is baseline SSE (mandatory on all x86_64 CPUs).
+        unsafe { _mm_sfence() };
     }
 }
 

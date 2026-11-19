@@ -20,6 +20,7 @@ pub use std::arch::x86_64::_mm_extract_epi8;
 pub use std::arch::x86_64::_mm_loadu_si128;
 pub use std::arch::x86_64::_mm_set1_epi8;
 pub use std::arch::x86_64::_mm_setzero_si128;
+pub use std::arch::x86_64::_mm_sfence;
 use std::arch::x86_64::_mm_shuffle_epi8;
 use std::arch::x86_64::_mm_slli_si128;
 pub use std::arch::x86_64::_mm_storeu_si128;
@@ -36,6 +37,7 @@ pub use std::arch::x86_64::_mm256_set_epi8;
 pub use std::arch::x86_64::_mm256_set_m128i;
 pub use std::arch::x86_64::_mm256_shuffle_ps;
 pub use std::arch::x86_64::_mm256_storeu_si256;
+pub use std::arch::x86_64::_mm256_stream_si256;
 
 #[target_feature(enable = "avx")]
 #[inline]
