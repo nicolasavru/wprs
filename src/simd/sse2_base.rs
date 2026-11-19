@@ -134,27 +134,35 @@ pub fn _mm256_castsi256_si128(a: __m256i) -> __m128i {
     a.low
 }
 
+/// # Safety
+/// `src` must be valid for 256-bit (32-byte) unaligned reads.
 #[target_feature(enable = "sse2")]
 #[inline]
 pub unsafe fn _mm256_loadu_si256(src: *const __m256i) -> __m256i {
-    // SAFETY: src is pointer to __m256i, so it is safe to read
-    // 256 bits from it in two rounds of 128bit each.
+    // SAFETY: caller guarantees `src` is valid for 32-byte unaligned reads.
+    // Project via `*const __m128i` without dereferencing `*src`, which may not
+    // be 32-byte aligned.
     unsafe {
+        let p = src.cast::<__m128i>();
         __m256i {
-            low: _mm_loadu_si128(&(*src).low),
-            high: _mm_loadu_si128(&(*src).high),
+            low: _mm_loadu_si128(p),
+            high: _mm_loadu_si128(p.add(1)),
         }
     }
 }
 
+/// # Safety
+/// `dst` must be valid for 256-bit (32-byte) unaligned writes.
 #[target_feature(enable = "sse2")]
 #[inline]
 pub unsafe fn _mm256_storeu_si256(dst: *mut __m256i, a: __m256i) {
-    // SAFETY: dst is pointer to __m256i, so it is safe to read
-    // 256 bits from it in two rounds of 128bit each.
+    // SAFETY: caller guarantees `dst` is valid for 32-byte unaligned writes.
+    // Project via `*mut __m128i` without dereferencing `*dst`, which may not
+    // be 32-byte aligned.
     unsafe {
-        _mm_storeu_si128(&mut (*dst).low, a.low);
-        _mm_storeu_si128(&mut (*dst).high, a.high);
+        let p = dst.cast::<__m128i>();
+        _mm_storeu_si128(p, a.low);
+        _mm_storeu_si128(p.add(1), a.high);
     }
 }
 

@@ -28,7 +28,7 @@ pub mod prelude;
 pub mod serialization;
 pub mod server;
 pub mod sharding_compression;
-pub mod simd;
+pub(crate) mod simd;
 pub mod utils;
 pub mod vec4u8;
 pub mod xwayland_xdg_shell;
