@@ -440,9 +440,9 @@ mod tests {
     #[test]
     #[should_panic]
     fn test_cast_unsaligned() {
-        let a = [0u8; 1];
-        let a_ptr = a.as_ptr();
-        let bufptr_u8 = unsafe { BufferPointer::new(&a_ptr, a.len()) };
+        let aligned = [0u32; 2];
+        let a_ptr = unsafe { aligned.as_ptr().cast::<u8>().add(1) };
+        let bufptr_u8 = unsafe { BufferPointer::new(&a_ptr, 4) };
         let _bufptr_u32: BufferPointer<u32> = unsafe { bufptr_u8.cast() };
     }
 
@@ -520,13 +520,14 @@ mod tests {
 
         let mut b = [0u32; 6];
         a_bufptr.copy_to_nonoverlapping(&mut b);
+        assert_eq!(b, [0, 1, 2, 3, 4, 0]);
     }
 
     #[test]
     #[should_panic]
     fn test_copy_to_nonoverlapping_dst_too_small() {
         let a: [u32; 5] = test_arr();
-        let a_ptr = unsafe { a.as_ptr().add(1) };
+        let a_ptr = a.as_ptr();
         let a_bufptr = unsafe { BufferPointer::new(&a_ptr, a.len()) };
 
         let mut b = [0u32; 4];
@@ -560,7 +561,68 @@ mod tests {
         let a_ptr = a.as_ptr();
         let a_bufptr = unsafe { BufferPointer::new(&a_ptr, a.len()) };
 
-        let iter = a_bufptr.into_iter();
-        assert_eq!(iter.collect::<Vec<_>>(), vec![0, 1, 2, 3, 4]);
+        let mut iter = a_bufptr.into_iter();
+        assert_eq!(iter.len(), 5);
+        assert_eq!(iter.next(), Some(0));
+        assert_eq!(iter.len(), 4);
+        assert_eq!(iter.collect::<Vec<_>>(), vec![1, 2, 3, 4]);
+    }
+
+    #[test]
+    fn test_array_chunks_and_known_size() {
+        let a: [u32; 10] = test_arr();
+        let a_ptr = a.as_ptr();
+        let a_bufptr = unsafe { BufferPointer::new(&a_ptr, a.len()) };
+
+        let mut chunks = a_bufptr.array_chunks::<4>();
+        assert_eq!(chunks.len(), 2);
+
+        let c0 = chunks.next().unwrap();
+        assert_eq!(chunks.len(), 1);
+        assert_eq!(std::array::from_fn::<_, 4, _>(|i| c0.get(i)), [0, 1, 2, 3]);
+
+        let [p0, p1] = c0.as_chunks::<2, 2>();
+        assert_eq!(std::array::from_fn::<_, 2, _>(|i| p0.get(i)), [0, 1]);
+        assert_eq!(std::array::from_fn::<_, 2, _>(|i| p1.get(i)), [2, 3]);
+
+        let c1 = chunks.next().unwrap();
+        assert_eq!(chunks.len(), 0);
+        assert_eq!(std::array::from_fn::<_, 4, _>(|i| c1.get(i)), [4, 5, 6, 7]);
+        assert_eq!(chunks.next(), None);
+        assert_eq!(chunks.len(), 0);
+
+        let (head, _) = a_bufptr.split_at(4);
+        let ks = head.as_known_size::<4>();
+        assert_eq!(std::array::from_fn::<_, 4, _>(|i| ks.get(i)), [0, 1, 2, 3]);
+
+        // Exact-multiple length (`len == N -> 0`) and asymmetric `as_chunks`
+        // (`SIZE < N_PARTS` and `SIZE > N_PARTS`).
+        let exact: [u32; 6] = test_arr();
+        let exact_ptr = exact.as_ptr();
+        let exact_bufptr = unsafe { BufferPointer::new(&exact_ptr, exact.len()) };
+        let mut exact_chunks = exact_bufptr.array_chunks::<6>();
+        assert_eq!(exact_chunks.len(), 1);
+        let c_exact = exact_chunks.next().unwrap();
+        assert_eq!(exact_chunks.len(), 0);
+        assert_eq!(exact_chunks.next(), None);
+
+        let [s0, s1, s2] = c_exact.as_chunks::<2, 3>();
+        assert_eq!(std::array::from_fn::<_, 2, _>(|i| s0.get(i)), [0, 1]);
+        assert_eq!(std::array::from_fn::<_, 2, _>(|i| s1.get(i)), [2, 3]);
+        assert_eq!(std::array::from_fn::<_, 2, _>(|i| s2.get(i)), [4, 5]);
+
+        let [l0, l1] = c_exact.as_chunks::<3, 2>();
+        assert_eq!(std::array::from_fn::<_, 3, _>(|i| l0.get(i)), [0, 1, 2]);
+        assert_eq!(std::array::from_fn::<_, 3, _>(|i| l1.get(i)), [3, 4, 5]);
+    }
+
+    #[test]
+    #[should_panic]
+    fn test_known_size_get_out_of_bounds() {
+        let a: [u32; 4] = test_arr();
+        let a_ptr = a.as_ptr();
+        let a_bufptr = unsafe { BufferPointer::new(&a_ptr, a.len()) };
+        let c0 = a_bufptr.array_chunks::<4>().next().unwrap();
+        let _ = c0.get(4);
     }
 }
