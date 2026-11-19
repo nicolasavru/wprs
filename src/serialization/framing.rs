@@ -102,8 +102,17 @@ impl Framed for Vec<u8> {
 
     fn framed_read<R: Read>(stream: &mut R) -> Result<Self> {
         let len = u32::framed_read(stream).location(loc!())?;
-        let mut buf = vec![0; len as usize];
-        stream.read_exact(&mut buf).location(loc!())?;
+        // Cap initial capacity to 64 KiB so a truncated/corrupt length prefix
+        // cannot trigger a multi-GiB upfront allocation before reading bytes,
+        // and read via `take().read_to_end` to avoid zero-initializing `buf`.
+        let mut buf = Self::with_capacity((len as usize).min(64 * 1024));
+        let read = stream
+            .take(len as u64)
+            .read_to_end(&mut buf)
+            .location(loc!())?;
+        if read != len as usize {
+            bail!("unexpected EOF reading framed Vec<u8>: expected {len} bytes, got {read}");
+        }
         Ok(buf)
     }
 }
@@ -148,6 +157,16 @@ mod tests {
             ((u32::MAX as usize) + 1)
                 .framed_write(&mut Vec::new())
                 .is_err()
+        );
+    }
+
+    #[test]
+    fn test_vec_u8_framed_read_short_read_and_roundtrip() {
+        assert!(Vec::<u8>::framed_read(&mut [0u8, 0, 0, 4, 1, 2].as_slice()).is_err());
+        assert!(Vec::<u8>::framed_read(&mut [0xFFu8; 4].as_slice()).is_err());
+        assert_eq!(
+            Vec::<u8>::framed_read(&mut [0u8, 0, 0, 2, 1, 2].as_slice()).unwrap(),
+            vec![1, 2]
         );
     }
 }
