@@ -16,7 +16,6 @@ use std::convert::TryInto;
 use std::io::Read;
 use std::io::Write;
 use std::mem;
-use std::num::NonZeroUsize;
 
 use rkyv::util::AlignedVec;
 use static_assertions::const_assert;
@@ -73,23 +72,6 @@ impl Framed for usize {
 
     fn framed_read<R: Read>(stream: &mut R) -> Result<Self> {
         u32::framed_read(stream).map(|u| u.try_into().unwrap())
-    }
-}
-
-impl Framed for NonZeroUsize {
-    fn framed_write<W: Write>(&self, stream: &mut W) -> Result<()> {
-        self.get().framed_write(stream)
-    }
-
-    fn framed_read<R: Read>(stream: &mut R) -> Result<Self> {
-        Self::new(
-            u32::framed_read(stream)
-                .location(loc!())?
-                // Asserted at top of file that usize >= u32.
-                .try_into()
-                .unwrap(),
-        )
-        .context(loc!(), "data was 0")
     }
 }
 

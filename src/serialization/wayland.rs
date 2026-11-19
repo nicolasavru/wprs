@@ -196,14 +196,6 @@ impl BufferMetadata {
             })? as usize;
         Ok(byte_len / 4)
     }
-
-    pub fn len(&self) -> usize {
-        (self.height * self.stride) as usize
-    }
-
-    pub fn is_empty(&self) -> bool {
-        self.len() == 0
-    }
 }
 
 #[derive(Clone, Eq, PartialEq, Archive, Deserialize, Serialize)]

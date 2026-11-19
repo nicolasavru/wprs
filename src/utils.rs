@@ -164,7 +164,6 @@ pub struct AssertN<const N: usize>;
 
 impl<const N: usize> AssertN<N> {
     pub const NE_0: () = assert!(N != 0);
-    pub const MULTIPLE_OF_32: () = assert!(N.is_multiple_of(32));
 }
 
 pub struct AssertN3<const N1: usize, const N2: usize, const N3: usize>;

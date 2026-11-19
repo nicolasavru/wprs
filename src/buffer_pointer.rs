@@ -16,7 +16,6 @@ use std::cmp;
 use std::iter::FusedIterator;
 use std::marker::PhantomData;
 use std::mem;
-use std::mem::MaybeUninit;
 use std::ops::Range;
 
 use crate::utils;
@@ -342,14 +341,6 @@ impl<'a, T: 'a + Copy, const N: usize> KnownSizeBufferPointer<'a, T, N> {
         self.ptr
     }
 
-    pub fn len(&self) -> usize {
-        N
-    }
-
-    pub fn is_empty(&self) -> bool {
-        self.len() == 0
-    }
-
     /// Reads and returns element `i` by value without creating a Rust
     /// reference into potentially shared memory.
     ///
@@ -360,19 +351,6 @@ impl<'a, T: 'a + Copy, const N: usize> KnownSizeBufferPointer<'a, T, N> {
         assert!(i < N);
         // SAFETY: `self.ptr` is valid for reads of `N` elements and `i < N`.
         unsafe { self.ptr.add(i).read() }
-    }
-
-    pub fn copy_to_array(self) -> [T; N] {
-        let mut out = MaybeUninit::<[T; N]>::uninit();
-
-        // SAFETY: precondition for KnownSizeBufferPointer::new requires
-        // self.ptr to be valid for reads of N elements, and `out` is a fresh
-        // stack allocation of N elements that cannot overlap `self`.
-        unsafe {
-            self.ptr()
-                .copy_to_nonoverlapping(out.as_mut_ptr().cast(), self.len());
-            out.assume_init()
-        }
     }
 
     // TODO(https://github.com/rust-lang/rust/issues/76560): derive N_PARTS from
@@ -401,10 +379,7 @@ impl<'a, T: 'a + Copy, const N: usize> KnownSizeBufferPointer<'a, T, N> {
             //    reads of SIZE necause we assrted that N_PARTS * PARTSIZE
             //    == N.
             *pos = unsafe {
-                KnownSizeBufferPointer::new_impl(
-                    self.ptr.add(i * self.len() / N_PARTS),
-                    self.lifetime,
-                )
+                KnownSizeBufferPointer::new_impl(self.ptr.add(i * N / N_PARTS), self.lifetime)
             };
         }
         out
