@@ -14,7 +14,6 @@
 
 use std::collections::HashMap;
 
-use smithay_client_toolkit::reexports::client::Proxy;
 use smithay_client_toolkit::reexports::client::QueueHandle;
 use smithay_client_toolkit::reexports::protocols::xdg::shell::client::xdg_positioner;
 use smithay_client_toolkit::shell::xdg;
@@ -24,25 +23,18 @@ use smithay_client_toolkit::shell::xdg::popup;
 use smithay_client_toolkit::shell::xdg::window::Window;
 use smithay_client_toolkit::shell::xdg::window::WindowDecorations;
 
-use crate::client::ObjectBimap;
 use crate::client::RemoteSurface;
 use crate::client::Role;
 use crate::client::WprsClientState;
 use crate::prelude::*;
-use crate::serialization::ClientId;
-use crate::serialization::ObjectId;
 use crate::serialization::geometry::Size;
 use crate::serialization::wayland::SurfaceState;
 use crate::serialization::wayland::WlSurfaceId;
 use crate::serialization::xdg_shell::DecorationMode;
-use crate::serialization::xdg_shell::XdgPopupId;
 use crate::serialization::xdg_shell::XdgPositioner;
-use crate::serialization::xdg_shell::XdgToplevelId;
 
 #[derive(Debug)]
 pub struct RemoteXdgToplevel {
-    pub client: ClientId,
-    pub id: XdgToplevelId,
     pub local_window: Window,
     // TODO: add configured field to Window, have it be set before dispatching
     // first configure;
@@ -57,13 +49,11 @@ pub struct RemoteXdgToplevel {
 
 impl RemoteXdgToplevel {
     pub fn set_role(
-        client_id: ClientId,
         surface_state: &SurfaceState,
         surface_id: WlSurfaceId,
         surfaces: &mut HashMap<WlSurfaceId, RemoteSurface>,
         xdg_shell_state: &XdgShell,
         qh: &QueueHandle<WprsClientState>,
-        object_bimap: &mut ObjectBimap,
         title_prefix: &str,
     ) -> Result<()> {
         let local_surface = {
@@ -73,54 +63,39 @@ impl RemoteXdgToplevel {
             }
             surface.local_surface.take().location(loc!())?
         };
-        let toplevel_state = surface_state.xdg_toplevel()?;
+        let toplevel_state = surface_state.xdg_toplevel().location(loc!())?;
 
         let local_window =
             xdg_shell_state.create_window(local_surface, WindowDecorations::ServerDefault, qh);
 
-        {
-            let toplevel_state = surface_state
-                .role
-                .as_ref()
-                .location(loc!())?
-                .as_xdg_toplevel()
-                .location(loc!())?;
-            if let Some(id) = toplevel_state.parent {
-                local_window.set_parent(Some(
-                    &surfaces
-                        .get(&id)
-                        .location(loc!())?
-                        .xdg_toplevel()
-                        .location(loc!())?
-                        .local_window,
-                ));
-            }
+        if let Some(id) = toplevel_state.parent {
+            local_window.set_parent(Some(
+                &surfaces
+                    .get(&id)
+                    .location(loc!())?
+                    .xdg_toplevel()
+                    .location(loc!())?
+                    .local_window,
+            ));
+        }
 
-            if let Some(maximized) = toplevel_state.maximized {
-                if maximized {
-                    local_window.set_maximized();
-                } else {
-                    local_window.unset_maximized();
-                }
-            }
-
-            if let Some(fullscreen) = toplevel_state.fullscreen {
-                if fullscreen {
-                    local_window.set_fullscreen(None);
-                } else {
-                    local_window.unset_fullscreen();
-                }
+        if let Some(maximized) = toplevel_state.maximized {
+            if maximized {
+                local_window.set_maximized();
+            } else {
+                local_window.unset_maximized();
             }
         }
 
-        object_bimap.insert(
-            (client_id, ObjectId::XdgToplevel(toplevel_state.id)),
-            local_window.xdg_toplevel().id(),
-        );
+        if let Some(fullscreen) = toplevel_state.fullscreen {
+            if fullscreen {
+                local_window.set_fullscreen(None);
+            } else {
+                local_window.unset_fullscreen();
+            }
+        }
 
         let new_toplevel = Self {
-            client: client_id,
-            id: toplevel_state.id,
             local_window,
             configured: false,
             title: None,
@@ -220,23 +195,19 @@ impl RemoteXdgToplevel {
     }
 
     pub fn apply(
-        client_id: ClientId,
         surface_state: SurfaceState,
         surface_id: WlSurfaceId,
         surfaces: &mut HashMap<WlSurfaceId, RemoteSurface>,
         xdg_shell_state: &XdgShell,
         qh: &QueueHandle<WprsClientState>,
-        object_bimap: &mut ObjectBimap,
         title_prefix: &str,
     ) -> Result<()> {
         Self::set_role(
-            client_id,
             &surface_state,
             surface_id,
             surfaces,
             xdg_shell_state,
             qh,
-            object_bimap,
             title_prefix,
         )
         .location(loc!())?;
@@ -247,8 +218,6 @@ impl RemoteXdgToplevel {
 
 #[derive(Debug)]
 pub struct RemoteXdgPopup {
-    pub client: ClientId,
-    pub id: XdgPopupId,
     pub local_popup: popup::Popup,
     // TODO: add configured field to Popup, have it be set before dispatching
     // first configure;
@@ -300,13 +269,11 @@ impl RemoteXdgPopup {
     }
 
     pub fn set_role(
-        client_id: ClientId,
         surface_state: &SurfaceState,
         surface_id: WlSurfaceId,
         surfaces: &mut HashMap<WlSurfaceId, RemoteSurface>,
         xdg_shell_state: &XdgShell,
         qh: &QueueHandle<WprsClientState>,
-        object_bimap: &mut ObjectBimap,
     ) -> Result<()> {
         let local_surface = {
             let surface = surfaces.get_mut(&surface_id).location(loc!())?;
@@ -317,18 +284,10 @@ impl RemoteXdgPopup {
         };
         let popup_state = surface_state.xdg_popup().location(loc!())?;
 
-        let parent = {
-            let popup_state = surface_state
-                .role
-                .as_ref()
-                .location(loc!())?
-                .as_xdg_popup()
-                .location(loc!())?;
-            let parent_surface = surfaces
-                .get(&popup_state.parent_surface_id)
-                .location(loc!())?;
-            parent_surface.xdg_surface()
-        };
+        let parent = surfaces
+            .get(&popup_state.parent_surface_id)
+            .location(loc!())?
+            .xdg_surface();
 
         let positioner =
             Self::new_positioner(xdg_shell_state, &popup_state.positioner).location(loc!())?;
@@ -348,14 +307,7 @@ impl RemoteXdgPopup {
         //         .grab(&seat_state.seats().next().location(loc!())?, 0); // TODO: serial
         // }
 
-        object_bimap.insert(
-            (client_id, ObjectId::XdgPopup(popup_state.id)),
-            local_popup.xdg_popup().id(),
-        );
-
         let new_popup = Self {
-            client: client_id,
-            id: popup_state.id,
             local_popup,
             configured: false,
             positioner: popup_state.positioner,
@@ -393,38 +345,21 @@ impl RemoteXdgPopup {
         if remote_popup.positioner != popup_state.positioner {
             let positioner =
                 Self::new_positioner(xdg_shell_state, &popup_state.positioner).location(loc!())?;
-            surface
-                .role
-                .as_ref()
-                .location(loc!())?
-                .as_xdg_popup()
-                .location(loc!())?
-                .local_popup
-                .reposition(&positioner, 0);
+            remote_popup.local_popup.reposition(&positioner, 0);
         }
 
         Ok(())
     }
 
     pub fn apply(
-        client_id: ClientId,
         surface_state: SurfaceState,
         surface_id: WlSurfaceId,
         surfaces: &mut HashMap<WlSurfaceId, RemoteSurface>,
         xdg_shell_state: &XdgShell,
         qh: &QueueHandle<WprsClientState>,
-        object_bimap: &mut ObjectBimap,
     ) -> Result<()> {
-        Self::set_role(
-            client_id,
-            &surface_state,
-            surface_id,
-            surfaces,
-            xdg_shell_state,
-            qh,
-            object_bimap,
-        )
-        .location(loc!())?;
+        Self::set_role(&surface_state, surface_id, surfaces, xdg_shell_state, qh)
+            .location(loc!())?;
         let surface = surfaces.get_mut(&surface_id).location(loc!())?;
         Self::update(surface_state, surface, xdg_shell_state)
     }

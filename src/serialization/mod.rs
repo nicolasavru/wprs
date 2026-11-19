@@ -99,14 +99,6 @@ impl From<&backend::ClientId> for ClientId {
     }
 }
 
-#[derive(Archive, Deserialize, Serialize, Debug, Copy, Clone, Hash, Eq, PartialEq)]
-pub enum ObjectId {
-    WlSurface(wayland::WlSurfaceId),
-    XdgSurface(xdg_shell::XdgSurfaceId),
-    XdgToplevel(xdg_shell::XdgToplevelId),
-    XdgPopup(xdg_shell::XdgPopupId),
-}
-
 #[derive(Debug, Clone, Eq, PartialEq, Archive, Deserialize, Serialize, serde_derive::Serialize)]
 pub struct Capabilities {
     pub xwayland: bool,

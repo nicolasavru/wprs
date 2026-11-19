@@ -21,7 +21,6 @@ use std::thread;
 
 use smithay_client_toolkit::shell::WaylandSurface;
 
-use crate::client::RemoteCursor;
 use crate::client::RemoteSurface;
 use crate::client::RemoteXdgPopup;
 use crate::client::RemoteXdgToplevel;
@@ -147,24 +146,20 @@ impl WprsClientState {
             )
             .location(loc!())?,
             Some(wayland::Role::XdgToplevel(_)) => RemoteXdgToplevel::apply(
-                client.id,
                 surface_state,
                 surface_id,
                 surfaces,
                 &self.xdg_shell_state,
                 &self.qh,
-                &mut self.object_bimap,
                 &self.title_prefix,
             )
             .location(loc!())?,
             Some(wayland::Role::XdgPopup(_)) => RemoteXdgPopup::apply(
-                client.id,
                 surface_state,
                 surface_id,
                 surfaces,
                 &self.xdg_shell_state,
                 &self.qh,
-                &mut self.object_bimap,
             )
             .location(loc!())?,
             None => {},
@@ -190,42 +185,29 @@ impl WprsClientState {
     }
 
     #[instrument(skip(self), level = "debug")]
-    fn handle_surface_destroy(
-        &mut self,
-        client_id: ClientId,
-        surface_id: WlSurfaceId,
-    ) -> Result<()> {
-        let client = self.remote_display.client(&client_id);
-        if let Some(surface) = client.surfaces.remove(&surface_id)
-            && let Ok(Role::SubSurface(subsurface)) = surface.get_role() &&
-        // The parent surface may have already been destroyed.
-            let Some(parent) = client.surfaces.get_mut(&subsurface.parent)
+    fn handle_surface_destroy(&mut self, client_id: ClientId, surface_id: WlSurfaceId) {
+        self.object_bimap.remove_by_left(&(client_id, surface_id));
+        if let Some(client) = self.remote_display.clients.get_mut(&client_id)
+            && let Some(surface) = client.surfaces.remove(&surface_id)
+            && let Ok(Role::SubSurface(subsurface)) = surface.get_role()
+            // The parent surface may have already been destroyed.
+            && let Some(parent) = client.surfaces.get_mut(&subsurface.parent)
         {
             parent
                 .z_ordered_children
                 .retain(|child| child.id != surface.id);
         }
-        Ok(())
     }
 
     #[instrument(skip(self), level = "debug")]
     fn handle_surface(&mut self, request: SurfaceRequest) -> Result<()> {
-        if (matches!(request.payload, SurfaceRequestPayload::Destroyed)
-            && !self.remote_display.clients.contains_key(&request.client))
-        {
-            // Client already disconnected, nothing to do.
-            return Ok(());
-        }
-
-        let surface_id = request.surface;
         match request.payload {
             SurfaceRequestPayload::Commit(surface_state) => {
-                self.handle_commit(request.client, surface_id, surface_state)
+                self.handle_commit(request.client, request.surface, surface_state)
                     .location(loc!())?;
             },
             SurfaceRequestPayload::Destroyed => {
-                self.handle_surface_destroy(request.client, surface_id)
-                    .location(loc!())?;
+                self.handle_surface_destroy(request.client, request.surface);
             },
         }
         Ok(())
@@ -233,14 +215,9 @@ impl WprsClientState {
 
     #[instrument(skip(self), level = "debug")]
     fn handle_toplevel(&mut self, request: ToplevelRequest) -> Result<()> {
-        if (matches!(request.payload, ToplevelRequestPayload::Destroyed)
-            && !self.remote_display.clients.contains_key(&request.client))
-        {
-            // Client already disconnected, nothing to do.
+        let Some(client) = self.remote_display.clients.get_mut(&request.client) else {
             return Ok(());
-        }
-
-        let client = self.remote_display.client(&request.client);
+        };
         // TODO: these properties aren't in the double-buffered state in
         // smithay, but still only take affect on commit. That seems wrong. In
         // the meantime though, we can get these before the initial commit.
@@ -255,8 +232,7 @@ impl WprsClientState {
                     surface.role = None;
                     // TODO(https://github.com/wayland-transpositor/wprs/pull/114):
                     // remove this workaround.
-                    self.handle_surface_destroy(request.client, request.surface)
-                        .location(loc!())?;
+                    self.handle_surface_destroy(request.client, request.surface);
                 },
                 ToplevelRequestPayload::SetMaximized => {
                     toplevel.local_window.set_maximized();
@@ -296,22 +272,16 @@ impl WprsClientState {
 
     #[instrument(skip(self), level = "debug")]
     fn handle_popup(&mut self, request: PopupRequest) -> Result<()> {
-        if (matches!(request.payload, PopupRequestPayload::Destroyed)
-            && !self.remote_display.clients.contains_key(&request.client))
-        {
-            // Client already disconnected, nothing to do.
+        let Some(client) = self.remote_display.clients.get_mut(&request.client) else {
             return Ok(());
-        }
-
-        let client = self.remote_display.client(&request.client);
+        };
         let surface = client.surface(&request.surface).location(loc!())?;
         match request.payload {
             PopupRequestPayload::Destroyed => {
                 surface.role = None;
                 // TODO(https://github.com/wayland-transpositor/wprs/pull/114):
                 // remove this workaround.
-                self.handle_surface_destroy(request.client, request.surface)
-                    .location(loc!())?;
+                self.handle_surface_destroy(request.client, request.surface);
             },
         }
         Ok(())
@@ -358,7 +328,7 @@ impl WprsClientState {
                         )
                     })
                     .location(loc!())?;
-                RemoteCursor::set_role(client.id, remote_surface);
+                remote_surface.role = Some(Role::Cursor);
                 themed_pointer.pointer().set_cursor(
                     self.last_enter_serial,
                     Some(remote_surface.wl_surface()),
@@ -568,6 +538,7 @@ impl WprsClientState {
     #[instrument(skip(self), level = "debug")]
     fn handle_client_disconnected(&mut self, client: ClientId) -> Result<()> {
         self.remote_display.clients.remove(&client);
+        self.object_bimap.retain(|(cid, _), _| *cid != client);
         Ok(())
     }
 

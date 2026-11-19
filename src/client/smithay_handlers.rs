@@ -75,7 +75,6 @@ use tracing::Span;
 
 use crate::args;
 use crate::client::subsurface;
-use crate::client::ObjectBimapExt;
 use crate::client::Role;
 use crate::client::SeatObject;
 use crate::client::WprsClientState;
@@ -104,7 +103,7 @@ use crate::serialization::SendType;
 
 impl WprsClientState {
     fn send_surface_outputs(&self, surface: &WlSurface) {
-        let Some((_, surface_id)) = self.object_bimap.get_wl_surface_id(&surface.id()) else {
+        let Some(&(_, surface_id)) = self.object_bimap.get_by_right(&surface.id()) else {
             return;
         };
         let outputs = surface.data::<SurfaceData<()>>().map(SurfaceData::outputs);
@@ -159,14 +158,12 @@ impl CompositorHandler for WprsClientState {
         surface: &WlSurface,
         _time: u32,
     ) {
-        let Some((client_id, surface_id)) = self.object_bimap.get_wl_surface_id(&surface.id())
-        else {
-            // TODO: unwrap is wrong, can enter before surface exists. Currently
-            // we're just returning in that case, but should we create a surface
-            // instead?
+        let Some(&(client_id, surface_id)) = self.object_bimap.get_by_right(&surface.id()) else {
             return;
         };
-        let client = self.remote_display.client(&client_id);
+        let Some(client) = self.remote_display.clients.get_mut(&client_id) else {
+            return;
+        };
 
         subsurface::commit_sync_children(surface_id, &mut client.surfaces).log_and_ignore(loc!());
 
@@ -243,10 +240,10 @@ impl OutputHandler for WprsClientState {
 impl WindowHandler for WprsClientState {
     #[instrument(skip_all, level = "debug")]
     fn request_close(&mut self, _conn: &Connection, _qh: &QueueHandle<Self>, window: &Window) {
-        let (_, surface_id) = self
-            .object_bimap
-            .get_wl_surface_id(&window.wl_surface().id())
-            .expect("Object corresponding to client object id {key} not found.");
+        let Some(&(_, surface_id)) = self.object_bimap.get_by_right(&window.wl_surface().id())
+        else {
+            return;
+        };
 
         self.serializer
             .writer()
@@ -264,19 +261,21 @@ impl WindowHandler for WprsClientState {
         configure: WindowConfigure,
         _serial: u32,
     ) {
-        let (client_id, surface_id) = self
-            .object_bimap
-            .get_wl_surface_id(&window.wl_surface().id())
-            .expect("Object corresponding to client object id {key} not found.");
+        let Some(&(client_id, surface_id)) =
+            self.object_bimap.get_by_right(&window.wl_surface().id())
+        else {
+            return;
+        };
 
-        let client = self.remote_display.client(&client_id);
-        let surface = client.surface(&surface_id).unwrap();
-        let toplevel = surface
-            .role
-            .as_mut()
-            .unwrap()
-            .as_xdg_toplevel_mut()
-            .unwrap();
+        let Some(client) = self.remote_display.clients.get_mut(&client_id) else {
+            return;
+        };
+        let Ok(surface) = client.surface(&surface_id) else {
+            return;
+        };
+        let Some(toplevel) = surface.role.as_mut().and_then(Role::as_xdg_toplevel_mut) else {
+            return;
+        };
 
         if !toplevel.configured {
             toplevel.configured = true;
@@ -300,14 +299,21 @@ impl popup::PopupHandler for WprsClientState {
         popup: &popup::Popup,
         configure: popup::PopupConfigure,
     ) {
-        let (client_id, surface_id) = self
-            .object_bimap
-            .get_wl_surface_id(&popup.wl_surface().id())
-            .expect("Object corresponding to client object id {key} not found.");
+        let Some(&(client_id, surface_id)) =
+            self.object_bimap.get_by_right(&popup.wl_surface().id())
+        else {
+            return;
+        };
 
-        let client = self.remote_display.client(&client_id);
-        let surface = client.surface(&surface_id).unwrap();
-        let remote_popup = surface.role.as_mut().unwrap().as_xdg_popup_mut().unwrap();
+        let Some(client) = self.remote_display.clients.get_mut(&client_id) else {
+            return;
+        };
+        let Ok(surface) = client.surface(&surface_id) else {
+            return;
+        };
+        let Some(remote_popup) = surface.role.as_mut().and_then(Role::as_xdg_popup_mut) else {
+            return;
+        };
         if !remote_popup.configured {
             remote_popup.configured = true;
             surface.draw_buffer_send_frame(qh).log_and_ignore(loc!());
@@ -426,7 +432,7 @@ impl KeyboardHandler for WprsClientState {
         keysyms: &[Keysym],
     ) {
         self.current_focus = Some(surface.clone());
-        let Some((_, surface_id)) = self.object_bimap.get_wl_surface_id(&surface.id()) else {
+        let Some(&(_, surface_id)) = self.object_bimap.get_by_right(&surface.id()) else {
             // TODO: unwrap is wrong, we can enter before surface exists.
             // Currently we're just returning in that case, but should we create
             // a surface instead?
@@ -611,14 +617,10 @@ impl PointerHandler for WprsClientState {
         _pointer: &WlPointer,
         events: &[PointerEvent],
     ) {
-        for event in events.iter() {
-            if self
-                .object_bimap
-                .get_by_right(&event.surface.id())
-                .is_none()
-            {
-                // window was distroyed already, TODO handle consistently
-                return;
+        let mut serialized_events = Vec::with_capacity(events.len());
+        for event in events {
+            let Some(&(_, surface_id)) = self.object_bimap.get_by_right(&event.surface.id()) else {
+                continue;
             };
 
             match event.kind {
@@ -630,23 +632,14 @@ impl PointerHandler for WprsClientState {
                 },
                 _ => {},
             }
+            serialized_events.push(wayland::PointerEvent::from_smithay(&surface_id, event));
         }
 
-        self.serializer
-            .writer()
-            .send(SendType::Object(Event::PointerFrame(
-                events
-                    .iter()
-                    .map(|event| {
-                        let (_, surface_id) = self
-                            .object_bimap
-                            .get_wl_surface_id(&event.surface.id())
-                            .expect("Object corresponding to client object id {key} not found.");
-
-                        wayland::PointerEvent::from_smithay(&surface_id, event)
-                    })
-                    .collect(),
-            )));
+        if !serialized_events.is_empty() {
+            self.serializer
+                .writer()
+                .send(SendType::Object(Event::PointerFrame(serialized_events)));
+        }
     }
 }
 
@@ -674,7 +667,9 @@ impl DataDeviceHandler for WprsClientState {
             .unwrap()
             .data_device
             .data();
-        let drag_offer = data_device.drag_offer().unwrap();
+        let Some(drag_offer) = data_device.drag_offer() else {
+            return;
+        };
         debug!(
             "data offer entered x: {:.2} y: {:.2}",
             drag_offer.x, drag_offer.y
@@ -683,11 +678,11 @@ impl DataDeviceHandler for WprsClientState {
         if mime_types.contains(&"_wprs_marker".to_string()) {
             return;
         }
+        let Some(&(_, surface_id)) = self.object_bimap.get_by_right(&drag_offer.surface.id())
+        else {
+            return;
+        };
         self.dnd_offer = Some(drag_offer.clone());
-        let (_, surface_id) = self
-            .object_bimap
-            .get_wl_surface_id(&drag_offer.surface.id())
-            .expect("Object corresponding to client object id {key} not found.");
         self.serializer
             .writer()
             .send(SendType::Object(Event::Data(DataEvent::DestinationEvent(

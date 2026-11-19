@@ -61,10 +61,8 @@ use crate::prelude::*;
 use crate::serialization::Capabilities;
 use crate::serialization::ClientId;
 use crate::serialization::Event;
-use crate::serialization::ObjectId;
 use crate::serialization::Request;
 use crate::serialization::Serializer;
-use crate::serialization::geometry::Point;
 use crate::serialization::geometry::Rectangle;
 use crate::serialization::wayland::Buffer;
 use crate::serialization::wayland::BufferAssignment;
@@ -87,21 +85,7 @@ use subsurface::RemoteSubSurface;
 use xdg_shell::RemoteXdgPopup;
 use xdg_shell::RemoteXdgToplevel;
 
-type ObjectBimap = BiMap<(ClientId, ObjectId), SctkObjectId>;
-
-pub trait ObjectBimapExt {
-    fn get_wl_surface_id(&self, key: &SctkObjectId) -> Option<(ClientId, WlSurfaceId)>;
-}
-
-impl ObjectBimapExt for ObjectBimap {
-    fn get_wl_surface_id(&self, key: &SctkObjectId) -> Option<(ClientId, WlSurfaceId)> {
-        match self.get_by_right(key) {
-            Some((client_id, ObjectId::WlSurface(surface_id))) => Some((*client_id, *surface_id)),
-            None => None,
-            _ => panic!("Object corresponding to client object id {key} should be a WlSurface,"),
-        }
-    }
-}
+type ObjectBimap = BiMap<(ClientId, WlSurfaceId), SctkObjectId>;
 
 pub struct ClientOptions {
     pub title_prefix: String,
@@ -286,7 +270,7 @@ impl RemoteBuffer {
 
 #[derive(Debug, EnumAsInner)]
 pub enum Role {
-    Cursor(RemoteCursor),
+    Cursor,
     SubSurface(RemoteSubSurface),
     XdgToplevel(RemoteXdgToplevel),
     XdgPopup(RemoteXdgPopup),
@@ -295,7 +279,7 @@ pub enum Role {
 impl WaylandSurface for RemoteSurface {
     fn wl_surface(&self) -> &WlSurface {
         match &self.role {
-            None | Some(Role::Cursor(_)) => self.local_surface.as_ref().unwrap().wl_surface(),
+            None | Some(Role::Cursor) => self.local_surface.as_ref().unwrap().wl_surface(),
             Some(Role::SubSurface(remote_subsurface)) => {
                 remote_subsurface.local_surface.wl_surface()
             },
@@ -359,7 +343,7 @@ impl RemoteSurface {
         let local_surface = Some(Surface::new(compositor_state, qh).location(loc!())?);
 
         object_bimap.insert(
-            (client_id, ObjectId::WlSurface(id)),
+            (client_id, id),
             local_surface.as_ref().location(loc!())?.wl_surface().id(),
         );
 
@@ -729,23 +713,6 @@ impl Drop for RemoteSurface {
 }
 
 #[derive(Debug)]
-pub struct RemoteCursor {
-    // TODO: can we remove client?
-    pub client: ClientId,
-    pub hotspot: Point<i32>,
-}
-
-impl RemoteCursor {
-    pub fn set_role(client_id: ClientId, surface: &mut RemoteSurface) {
-        let remote_cursor = Self {
-            client: client_id,
-            hotspot: Point { x: 0, y: 0 }, // TODO
-        };
-        surface.role = Some(Role::Cursor(remote_cursor));
-    }
-}
-
-#[derive(Debug)]
 pub struct RemoteClient {
     pub id: ClientId,
     pub surfaces: HashMap<WlSurfaceId, RemoteSurface>,
@@ -756,16 +723,6 @@ impl RemoteClient {
         Self {
             id,
             surfaces: HashMap::new(),
-        }
-    }
-
-    pub fn remove_surface(&mut self, id: &WlSurfaceId, state: &mut WprsClientState) {
-        let surface = self.surfaces.remove(id);
-        if let Some(surface) = surface {
-            // self.surface_owners.remove(&surface.id);
-            state
-                .object_bimap
-                .remove_by_left(&(self.id, ObjectId::WlSurface(surface.id)));
         }
     }
 

@@ -199,7 +199,7 @@ impl XdgShellHandler for WprsServerState {
                 .0
                 .lock()
                 .unwrap();
-            surface_state.role = Some(Role::XdgToplevel(XdgToplevelState::new(&toplevel)));
+            surface_state.role = Some(Role::XdgToplevel(Default::default()));
         });
 
         toplevel.with_pending_state(|state| {

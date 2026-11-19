@@ -19,17 +19,11 @@ use rkyv::Archive;
 use rkyv::Deserialize;
 use rkyv::Serialize;
 use smithay::reexports::wayland_protocols::xdg::decoration::zv1::server::zxdg_toplevel_decoration_v1::Mode as XdgDecorationMode;
-use smithay::reexports::wayland_protocols_misc::server_decoration::server::org_kde_kwin_server_decoration::Mode as KdeDecorationMode;
-use smithay::reexports::wayland_protocols::xdg::shell::server::xdg_popup;
-use smithay::reexports::wayland_protocols::xdg::shell::server::xdg_surface;
-use smithay::reexports::wayland_protocols::xdg::shell::server::xdg_toplevel::XdgToplevel;
 use smithay::reexports::wayland_protocols::xdg::shell::server::xdg_toplevel::State;
-use smithay::reexports::wayland_server::backend;
-use smithay::reexports::wayland_server::Resource;
-use smithay::wayland::shell::xdg::ToplevelSurface;
-use smithay::wayland::shell::xdg::ToplevelStateSet;
+use smithay::reexports::wayland_protocols_misc::server_decoration::server::org_kde_kwin_server_decoration::Mode as KdeDecorationMode;
 use smithay::wayland::shell::xdg::PopupSurface;
 use smithay::wayland::shell::xdg::PositionerState;
+use smithay::wayland::shell::xdg::ToplevelStateSet;
 use smithay_client_toolkit::reexports::csd_frame::WindowState as CsdWindowState;
 use smithay_client_toolkit::shell::xdg::popup::ConfigureKind;
 use smithay_client_toolkit::shell::xdg::popup::PopupConfigure as SctkPopupConfigure;
@@ -37,57 +31,11 @@ use smithay_client_toolkit::shell::xdg::window::DecorationMode as SctkDecoration
 use smithay_client_toolkit::shell::xdg::window::WindowConfigure;
 
 use crate::prelude::*;
-use crate::serialization;
+use crate::serialization::ClientId;
 use crate::serialization::geometry::Point;
 use crate::serialization::geometry::Rectangle;
 use crate::serialization::geometry::Size;
 use crate::serialization::wayland::WlSurfaceId;
-use crate::serialization::ClientId;
-
-#[derive(Archive, Deserialize, Serialize, Debug, Copy, Clone, Hash, Eq, PartialEq)]
-pub struct XdgSurfaceId(pub u64);
-
-impl XdgSurfaceId {
-    pub fn new(xdg_surface: &xdg_surface::XdgSurface) -> Self {
-        Self(serialization::hash(&xdg_surface.id()))
-    }
-}
-
-#[derive(Archive, Deserialize, Serialize, Debug, Copy, Clone, Hash, Eq, PartialEq)]
-pub struct XdgToplevelId(pub u64);
-
-impl XdgToplevelId {
-    pub fn new(xdg_toplevel: &XdgToplevel) -> Self {
-        Self(serialization::hash(&xdg_toplevel.id()))
-    }
-}
-
-impl From<&backend::ObjectId> for XdgToplevelId {
-    fn from(object_id: &backend::ObjectId) -> Self {
-        Self(serialization::hash(object_id))
-    }
-}
-
-#[derive(Archive, Deserialize, Serialize, Debug, Copy, Clone, Hash, Eq, PartialEq)]
-pub struct XdgPopupId(pub u64);
-
-impl XdgPopupId {
-    pub fn new(xdg_popup: &xdg_popup::XdgPopup) -> Self {
-        Self(serialization::hash(&xdg_popup.id()))
-    }
-}
-
-impl From<backend::ObjectId> for XdgPopupId {
-    fn from(object_id: backend::ObjectId) -> Self {
-        Self(serialization::hash(&object_id))
-    }
-}
-
-impl From<&backend::ObjectId> for XdgPopupId {
-    fn from(object_id: &backend::ObjectId) -> Self {
-        Self(serialization::hash(object_id))
-    }
-}
 
 #[derive(Debug, Copy, Clone, Eq, PartialEq, Archive, Deserialize, Serialize)]
 pub struct XdgPositioner {
@@ -125,22 +73,6 @@ pub struct XdgSurfaceState {
     pub window_geometry: Option<Rectangle<i32>>,
     pub max_size: Size<i32>,
     pub min_size: Size<i32>,
-}
-
-impl XdgSurfaceState {
-    pub fn new() -> Self {
-        Self {
-            window_geometry: None,
-            max_size: (0, 0).into(),
-            min_size: (0, 0).into(),
-        }
-    }
-}
-
-impl Default for XdgSurfaceState {
-    fn default() -> Self {
-        Self::new()
-    }
 }
 
 #[derive(Debug, Copy, Clone, Eq, PartialEq, Archive, Deserialize, Serialize)]
@@ -198,9 +130,8 @@ impl TryFrom<KdeDecorationMode> for DecorationMode {
     }
 }
 
-#[derive(Debug, Clone, Eq, PartialEq, Archive, Deserialize, Serialize)]
+#[derive(Debug, Default, Clone, Eq, PartialEq, Archive, Deserialize, Serialize)]
 pub struct XdgToplevelState {
-    pub id: XdgToplevelId,
     pub parent: Option<WlSurfaceId>,
     pub title: Option<String>,
     pub app_id: Option<String>,
@@ -209,23 +140,8 @@ pub struct XdgToplevelState {
     pub fullscreen: Option<bool>,
 }
 
-impl XdgToplevelState {
-    pub fn new(toplevel: &ToplevelSurface) -> Self {
-        Self {
-            id: XdgToplevelId::new(toplevel.xdg_toplevel()),
-            parent: None,
-            title: None,
-            app_id: None,
-            decoration_mode: None,
-            maximized: None,
-            fullscreen: None,
-        }
-    }
-}
-
 #[derive(Debug, Copy, Clone, Eq, PartialEq, Archive, Deserialize, Serialize)]
 pub struct XdgPopupState {
-    pub id: XdgPopupId,
     pub parent_surface_id: WlSurfaceId,
     pub positioner: XdgPositioner,
     pub grab_requested: bool,
@@ -234,7 +150,6 @@ pub struct XdgPopupState {
 impl XdgPopupState {
     pub fn new(popup: &PopupSurface, positioner: &PositionerState) -> Result<Self> {
         Ok(Self {
-            id: XdgPopupId::new(popup.xdg_popup()),
             parent_surface_id: WlSurfaceId::new(&popup.get_parent_surface().location(loc!())?),
             positioner: XdgPositioner::new(positioner),
             grab_requested: false,
