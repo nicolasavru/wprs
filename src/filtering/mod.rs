@@ -263,6 +263,7 @@ pub fn unfilter(data: &Vec4u8s, output_buf: &mut [u8]) {
 
 #[cfg(test)]
 mod tests {
+    use std::cell::RefCell;
     use std::num::NonZeroUsize;
 
     use fallible_iterator::IteratorExt;
@@ -272,22 +273,43 @@ mod tests {
     use crate::sharding_compression::CompressedShard;
     use crate::sharding_compression::ShardingDecompressor;
 
-    fn test_vec(n: usize) -> Vec<u8> {
-        (0..n).map(|i| (i % 256) as u8).collect()
+    thread_local! {
+        static TEST_CODEC: RefCell<Option<(ShardingCompressor, ShardingDecompressor)>> =
+            const { RefCell::new(None) };
     }
 
-    fn test_roundtrip_impl(data: &[u8]) {
+    fn with_test_codec(f: impl FnOnce(&mut ShardingCompressor, &mut ShardingDecompressor)) {
+        TEST_CODEC.with(|cell| {
+            let mut borrow = cell.borrow_mut();
+            let (compressor, decompressor) = borrow.get_or_insert_with(|| {
+                (
+                    ShardingCompressor::new(NonZeroUsize::new(8).unwrap(), 1).unwrap(),
+                    ShardingDecompressor::new(NonZeroUsize::new(4).unwrap()).unwrap(),
+                )
+            });
+            f(compressor, decompressor);
+        });
+    }
+
+    fn test_vec(n: usize) -> Vec<u8> {
+        (0..n)
+            .map(|i| (i.wrapping_mul(37).wrapping_add(i / 17) & 0xFF) as u8)
+            .collect()
+    }
+
+    fn test_roundtrip_impl(
+        data: &[u8],
+        compressor: &mut ShardingCompressor,
+        decompressor: &mut ShardingDecompressor,
+    ) {
         assert!(data.len().is_multiple_of(4));
 
         let data_ptr = data.as_ptr();
         let buf_ptr = unsafe { BufferPointer::new(&data_ptr, data.len()) };
 
-        let mut compressor = ShardingCompressor::new(NonZeroUsize::new(16).unwrap(), 1).unwrap();
-        let shards = filter_and_compress(buf_ptr, &mut compressor);
+        let shards = filter_and_compress(buf_ptr, compressor);
 
-        let mut decompressor = ShardingDecompressor::new(NonZeroUsize::new(8).unwrap()).unwrap();
         let indices = shards.indices();
-
         let soa = decompressor
             .decompress_to_owned(
                 &indices,
@@ -309,119 +331,120 @@ mod tests {
     #[test]
     #[cfg_attr(miri, ignore)]
     fn test_roundtrip() {
-        for n in [
-            0,
-            4,
-            8,
-            12,
-            16,
-            20,
-            24,
-            28,
-            32,
-            36,
-            120,
-            124,
-            128,
-            132,
-            248,
-            252,
-            256,
-            260,
-            1016,
-            1020,
-            1024,
-            1028,
-            2040,
-            2044,
-            2048,
-            2052,
-            100,
-            1920 * 1080,
-            32768 * 4 + 4,
-            1008 * 9513 * 4,
-            1008 * 951 * 4,
-        ] {
-            test_roundtrip_impl(&test_vec(n));
-        }
+        with_test_codec(|compressor, decompressor| {
+            for n in [
+                0,
+                4,
+                8,
+                12,
+                16,
+                20,
+                24,
+                28,
+                32,
+                36,
+                120,
+                124,
+                128,
+                132,
+                248,
+                252,
+                256,
+                260,
+                1016,
+                1020,
+                1024,
+                1028,
+                2040,
+                2044,
+                2048,
+                2052,
+                100,
+                1920 * 1080,
+                32768 * 4 + 4,
+                1008 * 9513 * 4,
+                1008 * 951 * 4,
+            ] {
+                test_roundtrip_impl(&test_vec(n), compressor, decompressor);
+            }
+        });
     }
 
     proptest! {
         #[test]
         #[cfg_attr(miri, ignore)]
-        fn proptest_roundtrip(mut arr in proptest::collection::vec(0..u8::MAX, 0..1_000_000)) {
+        fn proptest_roundtrip(mut arr in proptest::collection::vec(0..=u8::MAX, 0..1_000_000)) {
             arr.truncate((arr.len() / 4) * 4);
             assert!(arr.len() % 4 == 0);
-            test_roundtrip_impl(&arr);
+            with_test_codec(|compressor, decompressor| {
+                test_roundtrip_impl(&arr, compressor, decompressor);
+            });
         }
     }
 
-    /// Verify that the filtered SoA output matches known-good values.
-    ///
-    /// This test is architecture-independent: both x86 and aarch64 must
-    /// produce identical compressed shards for the same input, since a
-    /// buffer filtered on one architecture may be unfiltered on another.
+    /// Verify that the filtered SoA output matches known-good values with
+    /// nonlinear channel correlation.
     #[test]
     #[cfg_attr(miri, ignore)]
     fn test_filtered_output_deterministic() {
-        // 128 bytes = 32 pixels = exactly one SIMD block on both architectures.
-        let data: Vec<u8> = (0..128u16).map(|i| ((i * 7 + 13) % 256) as u8).collect();
+        let n = 32usize;
+        let mut data = vec![0u8; n * 4];
+        for i in 0..n {
+            let k = i as u32;
+            data[i * 4] = ((k * k * 3 + 19) & 0xFF) as u8;
+            data[i * 4 + 1] = ((k * 17 + (k >> 2) * 41 + 5) & 0xFF) as u8;
+            data[i * 4 + 2] = ((k * k * 11 + k * 7 + 200) & 0xFF) as u8;
+            data[i * 4 + 3] = if i == 17 { 0xFE } else { 0xFF };
+        }
         let data_ptr = data.as_ptr();
         let buf_ptr = unsafe { BufferPointer::new(&data_ptr, data.len()) };
 
-        let mut compressor = ShardingCompressor::new(NonZeroUsize::new(16).unwrap(), 1).unwrap();
-        let shards = filter_and_compress(buf_ptr, &mut compressor);
+        with_test_codec(|compressor, decompressor| {
+            let shards = filter_and_compress(buf_ptr, compressor);
+            let indices = shards.indices();
+            let soa = decompressor
+                .decompress_to_owned(
+                    &indices,
+                    data.len(),
+                    shards
+                        .shards
+                        .into_iter()
+                        .map(Ok::<CompressedShard, anyhow::Error>)
+                        .transpose_into_fallible(),
+                )
+                .unwrap();
 
-        let mut decompressor = ShardingDecompressor::new(NonZeroUsize::new(8).unwrap()).unwrap();
-        let indices = shards.indices();
-        let soa = decompressor
-            .decompress_to_owned(
-                &indices,
-                data.len(),
-                shards
-                    .shards
-                    .into_iter()
-                    .map(Ok::<CompressedShard, anyhow::Error>)
-                    .transpose_into_fallible(),
-            )
-            .unwrap();
+            assert!(soa.len() >= 4 * n);
+            let s0 = &soa[0..n];
+            let s1 = &soa[n..2 * n];
+            let s2 = &soa[2 * n..3 * n];
+            let s3 = &soa[3 * n..4 * n];
 
-        // SoA layout: 4 channel arrays concatenated, each of length n_pixels.
-        let n = 32;
-        assert!(soa.len() >= 4 * n);
-        let s0 = &soa[0..n];
-        let s1 = &soa[n..2 * n];
-        let s2 = &soa[2 * n..3 * n];
-        let s3 = &soa[3 * n..4 * n];
-
-        // Compute expected values via scalar reference implementation.
-        // Forward: transpose → subtract_green → running_difference.
-        let mut expected = [vec![0u8; n], vec![0u8; n], vec![0u8; n], vec![0u8; n]];
-        for i in 0..n {
-            expected[0][i] = data[i * 4]; // channel 0
-            expected[1][i] = data[i * 4 + 1]; // channel 1 (green)
-            expected[2][i] = data[i * 4 + 2]; // channel 2
-            expected[3][i] = data[i * 4 + 3]; // channel 3
-        }
-        // subtract_green: ch0 -= ch1, ch2 -= ch1.
-        let [ch0, ch1, ch2, ..] = &mut expected;
-        for (b, (g, r)) in ch0.iter_mut().zip(ch1.iter().zip(ch2.iter_mut())) {
-            *b = b.wrapping_sub(*g);
-            *r = r.wrapping_sub(*g);
-        }
-        // running_difference per channel.
-        for ch in &mut expected {
-            let mut prev = 0u8;
-            for v in ch.iter_mut() {
-                let orig = *v;
-                *v = orig.wrapping_sub(prev);
-                prev = orig;
+            let mut expected = [vec![0u8; n], vec![0u8; n], vec![0u8; n], vec![0u8; n]];
+            for i in 0..n {
+                expected[0][i] = data[i * 4];
+                expected[1][i] = data[i * 4 + 1];
+                expected[2][i] = data[i * 4 + 2];
+                expected[3][i] = data[i * 4 + 3];
             }
-        }
+            let [ch0, ch1, ch2, ..] = &mut expected;
+            for (b, (g, r)) in ch0.iter_mut().zip(ch1.iter().zip(ch2.iter_mut())) {
+                *b = b.wrapping_sub(*g);
+                *r = r.wrapping_sub(*g);
+            }
+            for ch in &mut expected {
+                let mut prev = 0u8;
+                for v in ch.iter_mut() {
+                    let orig = *v;
+                    *v = orig.wrapping_sub(prev);
+                    prev = orig;
+                }
+            }
 
-        assert_eq!(s0, &expected[0], "channel 0 mismatch");
-        assert_eq!(s1, &expected[1], "channel 1 mismatch");
-        assert_eq!(s2, &expected[2], "channel 2 mismatch");
-        assert_eq!(s3, &expected[3], "channel 3 mismatch");
+            assert_eq!(s0, &expected[0], "channel 0 mismatch");
+            assert_eq!(s1, &expected[1], "channel 1 mismatch");
+            assert_eq!(s2, &expected[2], "channel 2 mismatch");
+            assert_eq!(s3, &expected[3], "channel 3 mismatch");
+        });
     }
 }
