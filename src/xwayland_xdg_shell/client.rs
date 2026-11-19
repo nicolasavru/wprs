@@ -123,6 +123,7 @@ use tracing::Span;
 
 use crate::args;
 use crate::buffer_pointer::BufferPointer;
+use crate::client_utils::FrameDamage;
 use crate::client_utils::SeatObject;
 use crate::prelude::*;
 use crate::serialization;
@@ -1054,12 +1055,14 @@ impl XWaylandSurface {
                         buffer.metadata, metadata
                     );
                     *buffer = XWaylandBuffer::new(metadata, pool).location(loc!())?;
+                    self.damage = FrameDamage::Full;
                     buffer
                 }
             },
             // First commit for surface with a buffer.
             None => {
                 self.buffer = Some(XWaylandBuffer::new(metadata, pool).location(loc!())?);
+                self.damage = FrameDamage::Full;
                 self.buffer.as_mut().unwrap()
             },
         };

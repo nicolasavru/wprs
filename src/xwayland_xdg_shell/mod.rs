@@ -49,11 +49,10 @@ use smithay_client_toolkit::subcompositor::SubcompositorState;
 use tracing::Span;
 
 use crate::args;
+use crate::client_utils::FrameDamage;
 use crate::compositor_utils;
-use crate::constants;
 use crate::prelude::*;
 use crate::serialization::geometry::Point;
-use crate::serialization::geometry::Rectangle;
 use crate::serialization::wayland::KeyState;
 use crate::xwayland_xdg_shell::client::XWaylandSubSurface;
 
@@ -84,7 +83,7 @@ pub struct XWaylandSurface {
     pub(crate) parent: Option<X11Parent>,
     pub(crate) children: HashSet<CompositorObjectId>,
     pub(crate) output_ids: HashSet<u32>,
-    pub(crate) damage: Option<Vec<Rectangle<i32>>>,
+    pub(crate) damage: FrameDamage,
 }
 
 impl XWaylandSurface {
@@ -112,7 +111,7 @@ impl XWaylandSurface {
             parent: None,
             children: HashSet::new(),
             output_ids: HashSet::new(),
-            damage: None,
+            damage: FrameDamage::Empty,
         })
     }
 
@@ -157,23 +156,7 @@ impl XWaylandSurface {
             // The only possible error here is AlreadyActive, which we can
             // ignore.
             _ = buffer.active_buffer.attach_to(&surface);
-            if let Some(damage_rects) = &self.damage.take() {
-                // avoid overwhelming wayland connection
-                if damage_rects.len() < constants::SENT_DAMAGE_LIMIT {
-                    for damage_rect in damage_rects {
-                        surface.damage_buffer(
-                            damage_rect.loc.x,
-                            damage_rect.loc.y,
-                            damage_rect.size.w,
-                            damage_rect.size.h,
-                        );
-                    }
-                } else {
-                    surface.damage_buffer(0, 0, i32::MAX, i32::MAX);
-                }
-            } else {
-                surface.damage_buffer(0, 0, i32::MAX, i32::MAX);
-            }
+            self.damage.apply_and_clear(&surface);
 
             self.buffer_attached = true;
         }

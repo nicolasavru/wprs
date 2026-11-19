@@ -54,8 +54,8 @@ use smithay_client_toolkit::shm::Shm;
 use smithay_client_toolkit::shm::slot::Buffer as SlotBuffer;
 use smithay_client_toolkit::shm::slot::SlotPool;
 
+use crate::client_utils::FrameDamage;
 use crate::client_utils::SeatObject;
-use crate::constants;
 use crate::filtering;
 use crate::prelude::*;
 use crate::serialization::Capabilities;
@@ -63,7 +63,6 @@ use crate::serialization::ClientId;
 use crate::serialization::Event;
 use crate::serialization::Request;
 use crate::serialization::Serializer;
-use crate::serialization::geometry::Rectangle;
 use crate::serialization::wayland::Buffer;
 use crate::serialization::wayland::BufferAssignment;
 use crate::serialization::wayland::BufferData;
@@ -327,7 +326,7 @@ pub struct RemoteSurface {
     pub input_region: Option<Region>,
     pub z_ordered_children: Vec<SubsurfacePosition>,
     pub frame_callback_completed: bool,
-    pub frame_damage: Option<Vec<Rectangle<i32>>>,
+    pub frame_damage: FrameDamage,
     pub viewport: Option<WpViewport>,
     pub current_viewport_state: Option<ViewportState>,
 }
@@ -360,7 +359,7 @@ impl RemoteSurface {
                 position: (0, 0).into(),
             }],
             frame_callback_completed: true,
-            frame_damage: None,
+            frame_damage: FrameDamage::Empty,
             viewport: None,
             current_viewport_state: None,
         })
@@ -430,12 +429,14 @@ impl RemoteSurface {
                 } else {
                     // Buffer was resized or format changed, need to
                     // create a new one.
+                    self.frame_damage = FrameDamage::Full;
                     *buffer = RemoteBuffer::new(new_buffer, pool).location(loc!())?;
                     buffer
                 }
             },
             // First commit for surface with a buffer.
             None => {
+                self.frame_damage = FrameDamage::Full;
                 self.buffer = Some(RemoteBuffer::new(new_buffer, pool).location(loc!())?);
                 self.buffer.as_mut().unwrap() // we just set this to Some
             },
@@ -451,6 +452,7 @@ impl RemoteSurface {
     fn clear_buffer(&mut self) {
         let wl_surface = self.wl_surface().clone();
         self.buffer = None;
+        self.frame_damage = FrameDamage::Empty;
         wl_surface.attach(None, 0, 0);
     }
 
@@ -502,23 +504,7 @@ impl RemoteSurface {
                 loc!(),
                 "attaching a buffer failed, this probably means we're leaking buffers",
             )?;
-            if let Some(damage_rects) = self.frame_damage.take() {
-                // avoid overwhelming wayland connection
-                if damage_rects.len() < constants::SENT_DAMAGE_LIMIT {
-                    for damage_rect in damage_rects {
-                        wl_surface.damage_buffer(
-                            damage_rect.loc.x,
-                            damage_rect.loc.y,
-                            damage_rect.size.w,
-                            damage_rect.size.h,
-                        );
-                    }
-                } else {
-                    wl_surface.damage_buffer(0, 0, i32::MAX, i32::MAX);
-                }
-            } else {
-                wl_surface.damage_buffer(0, 0, i32::MAX, i32::MAX);
-            }
+            self.frame_damage.apply_and_clear(wl_surface);
             buffer.dirty = false;
             true
         } else {

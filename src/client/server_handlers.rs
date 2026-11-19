@@ -38,6 +38,7 @@ use crate::serialization::Request;
 use crate::serialization::SendType;
 use crate::serialization::tuple::Tuple2;
 use crate::serialization::wayland;
+use crate::serialization::wayland::BufferAssignment;
 use crate::serialization::wayland::ClientSurface;
 use crate::serialization::wayland::CursorImage;
 use crate::serialization::wayland::CursorImageStatus;
@@ -66,6 +67,10 @@ impl WprsClientState {
         surface_id: WlSurfaceId,
         mut surface_state: SurfaceState,
     ) -> Result<()> {
+        let had_new_buffer = surface_state
+            .buffer
+            .as_ref()
+            .is_some_and(BufferAssignment::is_new);
         let client = self.remote_display.client(&client_id);
         let surfaces = &mut client.surfaces;
 
@@ -109,13 +114,9 @@ impl WprsClientState {
                 .set_opaque_region(surface_state.opaque_region.take(), &self.compositor_state)
                 .location(loc!())?;
 
-            if let Some(mut damage) = surface_state.damage.take() {
-                if let Some(frame_damage) = &mut remote_surface.frame_damage {
-                    frame_damage.append(damage.as_mut())
-                } else {
-                    remote_surface.frame_damage = Some(damage);
-                }
-            }
+            remote_surface
+                .frame_damage
+                .merge_commit(surface_state.damage.take(), had_new_buffer);
 
             remote_surface.frame_callback_completed
         };

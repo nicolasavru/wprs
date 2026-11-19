@@ -717,6 +717,8 @@ pub struct SurfaceState {
     pub opaque_region: Option<Region>,
     pub input_region: Option<Region>,
     pub z_ordered_children: Vec<SubsurfacePosition>,
+    /// Buffer-space damage rects; `None` or empty damage with
+    /// `BufferAssignment::New` denotes full-buffer damage.
     pub damage: Option<Vec<Rectangle<i32>>>,
     // server-side only
     pub output_ids: Vec<u32>,

@@ -75,6 +75,7 @@ use smithay_client_toolkit::reexports::protocols::xdg::shell::client::xdg_surfac
 use smithay_client_toolkit::shell::WaylandSurface;
 use smithay_client_toolkit::shell::xdg::XdgSurface;
 
+use crate::client_utils::FrameDamage;
 use crate::compositor_utils;
 use crate::fallible_entry::FallibleEntryExt;
 use crate::prelude::*;
@@ -573,6 +574,7 @@ pub fn commit_inner(
         },
         Some(BufferAssignment::Removed) => {
             xwayland_surface.buffer = None;
+            xwayland_surface.damage = FrameDamage::Empty;
             xwayland_surface.wl_surface().attach(None, 0, 0);
         },
         None => {},
@@ -600,7 +602,7 @@ pub fn commit_inner(
     // Xwayland surfaces have no viewport (`viewport_state` is `None`),
     // while `buffer_size` is still needed to clamp damage to the buffer
     // bounds and invert rotating/flipping `buffer_transform`s.
-    let mut damage = compositor_utils::damage_to_buffer_rects(
+    let damage = compositor_utils::damage_to_buffer_rects(
         &raw_damage,
         surface_attributes.buffer_scale,
         surface_attributes.buffer_transform.into(),
@@ -608,11 +610,13 @@ pub fn commit_inner(
         buffer_size,
     );
 
-    if let Some(surface_damage) = &mut xwayland_surface.damage {
-        surface_damage.append(&mut damage);
-    } else {
-        xwayland_surface.damage = Some(damage);
-    }
+    let had_new_buffer = matches!(
+        surface_attributes.buffer,
+        Some(BufferAssignment::NewBuffer(_))
+    );
+    xwayland_surface
+        .damage
+        .merge_commit(Some(damage), had_new_buffer);
 
     if xwayland_surface.ready() {
         if let Some(Role::SubSurface(subsurface)) = &mut xwayland_surface.role {
