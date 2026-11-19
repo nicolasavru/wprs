@@ -30,7 +30,21 @@
 //! suffice. The `unsafe` blocks in this module exist solely for this reason
 //! when the enclosed operations are register-to-register.
 
-use std::arch::aarch64::*;
+use std::arch::aarch64::uint8x16_t;
+use std::arch::aarch64::uint8x16x4_t;
+use std::arch::aarch64::vaddq_u8;
+use std::arch::aarch64::vdupq_laneq_u8;
+use std::arch::aarch64::vdupq_n_u8;
+use std::arch::aarch64::vextq_u8;
+use std::arch::aarch64::vld1q_u8;
+use std::arch::aarch64::vld4q_u8;
+use std::arch::aarch64::vst1q_u8;
+use std::arch::aarch64::vst4q_u8;
+use std::arch::aarch64::vsubq_u8;
+
+use crate::buffer_pointer::KnownSizeBufferPointer;
+use crate::filtering::FilterKernel;
+use crate::vec4u8::Vec4u8;
 
 // --- 16-byte primitives ---
 
@@ -190,10 +204,6 @@ fn soa_to_aos_u8_32x4(
 }
 
 // --- kernel trait impl ---
-
-use crate::buffer_pointer::KnownSizeBufferPointer;
-use crate::filtering::FilterKernel;
-use crate::vec4u8::Vec4u8;
 
 type Carry4 = (uint8x16_t, uint8x16_t, uint8x16_t, uint8x16_t);
 
