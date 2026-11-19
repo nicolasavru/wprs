@@ -16,7 +16,6 @@
 use std::collections::HashSet;
 use std::mem;
 use std::os::fd::OwnedFd;
-use std::sync::Arc;
 use std::time::Duration;
 
 use smithay::backend::renderer::utils::on_commit_buffer_handler;
@@ -869,26 +868,48 @@ pub fn commit_impl(
 
     match &surface_attributes.buffer {
         Some(SmithayBufferAssignment::NewBuffer(buffer)) => {
-            let raw_buffer_opt =
+            let mut raw_buffer_sent = false;
+            let writer = state.serializer.writer();
+            let commit_buf_res =
                 compositor_utils::with_buffer_contents(buffer, |data, spec| -> Result<_> {
                     surface_state.set_external_buffer(&spec).location(loc!())?;
                     if !connected {
-                        return Ok(None);
+                        return Ok(false);
                     }
-                    Ok(Some(Arc::new(filtering::filter_and_compress(
+                    compositor_utils::fault_probe_buffer(data);
+                    filtering::filter_and_compress_streaming(
                         data,
                         &mut state.compressor,
-                    ))))
-                })
-                .location(loc!())?
-                .location(loc!())?;
-            if let Some(raw_buffer_to_send) = raw_buffer_opt {
-                state.synced_surfaces.insert(surface_state.id);
-                buffer_to_send.clone_from(&surface_state.buffer);
-                state
-                    .serializer
-                    .writer()
-                    .send(SendType::RawBuffer(raw_buffer_to_send));
+                        |raw_buffer_to_send| {
+                            raw_buffer_sent = true;
+                            writer.send(SendType::RawBuffer(raw_buffer_to_send));
+                        },
+                    );
+                    Ok(true)
+                });
+            match commit_buf_res {
+                Ok(Ok(true)) => {
+                    state.synced_surfaces.insert(surface_state.id);
+                    buffer_to_send.clone_from(&surface_state.buffer);
+                },
+                Ok(Ok(false)) => {},
+                Ok(Err(err)) => {
+                    return Err(err).location(loc!());
+                },
+                Err(err) => {
+                    // Smithay reports SIGBUS as `Err(BadMap)` after the
+                    // closure returns, so `raw_buffer_sent` may already be
+                    // `true`.
+                    if raw_buffer_sent {
+                        warn!(
+                            "shm buffer faulted during commit ({err:?}); detaching remote surface buffer"
+                        );
+                        surface_state.buffer = None;
+                        buffer_to_send = Some(BufferAssignment::Removed);
+                    } else {
+                        return Err(err).location(loc!());
+                    }
+                },
             }
         },
         Some(SmithayBufferAssignment::Removed) => {

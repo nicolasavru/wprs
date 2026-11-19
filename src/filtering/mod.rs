@@ -37,9 +37,9 @@ mod arch;
 /// Bytes per compression shard fed to zstd. Balances parallelism granularity
 /// against zstd context-window utilisation.
 const COMPRESSION_BLOCK_SIZE: usize = 128 * 1024;
+const N_FILTER_THREADS: usize = 4;
 
 use std::cmp;
-use std::sync::Arc;
 
 use itertools::izip;
 use lagoon::ThreadPool;
@@ -49,6 +49,8 @@ use crate::buffer_pointer::KnownSizeBufferPointer;
 use crate::prelude::*;
 use crate::sharding_compression::CompressedShards;
 use crate::sharding_compression::ShardingCompressor;
+use crate::sharding_compression::ShardingCompressorSink;
+use crate::sharding_compression::StreamingCompressedShards;
 use crate::vec4u8::Vec4u8;
 use crate::vec4u8::Vec4u8s;
 
@@ -112,24 +114,53 @@ pub(crate) trait FilterKernel {
 
 // --- shared parallel pipeline ---
 
-#[instrument(skip_all, level = "debug")]
-fn aos_to_soa_parallel_compression<K: FilterKernel>(
-    aos: BufferPointer<Vec4u8>,
-    compressor: &mut ShardingCompressor,
-) -> CompressedShards {
-    if aos.is_empty() {
-        return CompressedShards::default();
+fn shard_indices_and_chunk_size(len: usize) -> (Vec<usize>, usize) {
+    if len == 0 {
+        return (Vec::new(), 32);
     }
 
-    let len = aos.len();
     let n_blocks = len / 32;
     let lim = n_blocks * 32;
     let rem = len % 32;
-    let n_threads = 4;
-    let blocks_per_thread = cmp::max(n_blocks / n_threads, 1);
+    let blocks_per_thread = cmp::max(n_blocks / N_FILTER_THREADS, 1);
     let thread_chunk_size = blocks_per_thread * 32;
 
-    let compressor = Arc::new(compressor.begin());
+    let mut base_offsets = Vec::new();
+    let mut thread_start = 0;
+    while thread_start < lim {
+        let thread_end = cmp::min(thread_start + thread_chunk_size, lim);
+        let mut idx = thread_start;
+        while idx < thread_end {
+            base_offsets.push(idx);
+            idx += cmp::min(thread_end - idx, COMPRESSION_BLOCK_SIZE);
+        }
+        thread_start = thread_end;
+    }
+    if rem > 0 {
+        base_offsets.push(lim);
+    }
+
+    let mut indices = Vec::with_capacity(base_offsets.len() * 4);
+    for ch in 0..4 {
+        let ch_offset = ch * len;
+        indices.extend(base_offsets.iter().map(|&idx| idx + ch_offset));
+    }
+    (indices, thread_chunk_size)
+}
+
+#[instrument(skip_all, level = "debug")]
+fn aos_to_soa_parallel_compression<K: FilterKernel>(
+    aos: BufferPointer<Vec4u8>,
+    thread_chunk_size: usize,
+    compressor: ShardingCompressorSink,
+) {
+    if aos.is_empty() {
+        return;
+    }
+
+    let len = aos.len();
+    let lim = (len / 32) * 32;
+    let rem = len % 32;
     let (aos_to_lim, aos_remainder) = aos.split_at(lim);
 
     debug_span!("aos_to_soa_u8_32x4_loop").in_scope(|| {
@@ -194,8 +225,6 @@ fn aos_to_soa_parallel_compression<K: FilterKernel>(
         compressor.compress_shard(3 * len - rem, rem2);
         compressor.compress_shard(4 * len - rem, rem3);
     }
-
-    Arc::into_inner(compressor).unwrap().collect_shards()
 }
 
 #[instrument(skip_all, level = "debug")]
@@ -205,8 +234,7 @@ fn soa_to_aos_parallel<K: FilterKernel>(soa: &Vec4u8s, aos: &mut [Vec4u8]) {
 
     let n_blocks = len / 32;
     let lim = n_blocks * 32;
-    let n_threads = 4;
-    let blocks_per_thread = cmp::max(n_blocks / n_threads, 1);
+    let blocks_per_thread = cmp::max(n_blocks / N_FILTER_THREADS, 1);
     let thread_chunk_size = blocks_per_thread * 32;
 
     let mut prev = K::zero_inverse();
@@ -248,13 +276,29 @@ fn soa_to_aos_parallel<K: FilterKernel>(soa: &Vec4u8s, aos: &mut [Vec4u8]) {
 
 // --- public API ---
 
+pub fn filter_and_compress_streaming(
+    data: BufferPointer<u8>,
+    compressor: &mut ShardingCompressor,
+    on_stream_ready: impl FnOnce(StreamingCompressedShards),
+) {
+    assert!(data.len().is_multiple_of(4));
+    // SAFETY: Vec4u8 is a repr(C, packed) wrapper around [u8; 4].
+    let aos = unsafe { data.cast::<Vec4u8>() };
+    let (indices, thread_chunk_size) = shard_indices_and_chunk_size(aos.len());
+    let (sink, streaming) = compressor.begin_streaming(indices, data.len());
+    on_stream_ready(streaming);
+    aos_to_soa_parallel_compression::<arch::Kernel>(aos, thread_chunk_size, sink);
+}
+
 pub fn filter_and_compress(
     data: BufferPointer<u8>,
     compressor: &mut ShardingCompressor,
 ) -> CompressedShards {
-    assert!(data.len().is_multiple_of(4));
-    // SAFETY: Vec4u8 is a repr(C, packed) wrapper around [u8; 4].
-    aos_to_soa_parallel_compression::<arch::Kernel>(unsafe { data.cast::<Vec4u8>() }, compressor)
+    let mut streaming_opt = None;
+    filter_and_compress_streaming(data, compressor, |streaming| {
+        streaming_opt = Some(streaming);
+    });
+    streaming_opt.unwrap().collect_shards()
 }
 
 pub fn unfilter(data: &Vec4u8s, output_buf: &mut [u8]) {

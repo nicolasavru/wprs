@@ -20,7 +20,6 @@ use std::io::Read;
 use std::io::Write;
 use std::mem;
 use std::os::fd::AsFd;
-use std::sync::Arc;
 use std::thread;
 
 use nix::fcntl::OFlag;
@@ -147,21 +146,26 @@ fn sync_surface_data(
     if matches!(surface_state_to_send.buffer, Some(BufferAssignment::New(_))) {
         match committed_wl_buffer(surface_data) {
             Some(wl_buffer) => {
+                let mut raw_buffer_sent = false;
+                let writer = serializer.writer();
                 let sync_res =
                     compositor_utils::with_buffer_contents(&wl_buffer, |data, spec| -> Result<_> {
                         let metadata = surface_state_to_send
                             .set_external_buffer(&spec)
                             .location(loc!())?;
-                        Ok((
-                            metadata,
-                            Arc::new(filtering::filter_and_compress(data, compressor)),
-                        ))
+                        compositor_utils::fault_probe_buffer(data);
+                        filtering::filter_and_compress_streaming(
+                            data,
+                            compressor,
+                            |raw_buffer_to_send| {
+                                raw_buffer_sent = true;
+                                writer.send(SendType::RawBuffer(raw_buffer_to_send));
+                            },
+                        );
+                        Ok(metadata)
                     });
                 match sync_res {
-                    Ok(Ok((_metadata, raw_buffer_to_send))) => {
-                        serializer
-                            .writer()
-                            .send(SendType::RawBuffer(raw_buffer_to_send));
+                    Ok(Ok(_metadata)) => {
                         synced_surfaces.insert(surface_state_to_send.id);
                     },
                     Ok(Err(err)) => {
@@ -169,8 +173,12 @@ fn sync_surface_data(
                         surface_state_to_send.buffer = None;
                     },
                     Err(err) => {
+                        // Smithay reports SIGBUS as `Err(BadMap)` after the
+                        // closure returns, so `raw_buffer_sent` may already be
+                        // `true`.
                         warn!("skipping unreadable shm buffer during surface sync: {err:?}");
-                        surface_state_to_send.buffer = None;
+                        surface_state_to_send.buffer =
+                            raw_buffer_sent.then_some(BufferAssignment::Removed);
                     },
                 }
             },

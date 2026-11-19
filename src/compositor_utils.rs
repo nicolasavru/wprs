@@ -76,6 +76,38 @@ where
     .and_then(|res| res)
 }
 
+fn fault_probe_range(data: BufferPointer<u8>, start: usize, end: usize) {
+    if start >= end {
+        return;
+    }
+    assert!(end <= data.len());
+    let base = data.ptr();
+    // Probe one byte per 4 KiB page (plus the final byte) on the main thread
+    // while Smithay's thread-local `SIGBUS_GUARD` is armed. This catches shm
+    // truncation or holes already present at probe time (Smithay's handler
+    // replaces the VMA with anonymous zero pages); truncation racing the
+    // `WorkerPool` reads afterwards still aborts `wprsd` with SIGBUS because
+    // Smithay's guard is thread-local and Smithay does not expose the pool fd
+    // for `F_SEAL_SHRINK`.
+    let mut offset = start;
+    while offset < end {
+        // SAFETY: `offset < end <= data.len()`, and `read_volatile` prevents
+        // the compiler from eliding the page-touching load.
+        unsafe {
+            std::ptr::read_volatile(base.add(offset));
+        }
+        offset = offset.saturating_add(4096);
+    }
+    // SAFETY: `start < end <= data.len()`, so `end - 1 < data.len()`.
+    unsafe {
+        std::ptr::read_volatile(base.add(end - 1));
+    }
+}
+
+pub fn fault_probe_buffer(data: BufferPointer<u8>) {
+    fault_probe_range(data, 0, data.len());
+}
+
 // Based on https://github.com/Smithay/smithay/blob/b1c682742ac7b9fa08736476df3e651489709ac2/src/desktop/wayland/utils.rs.
 #[derive(Debug, Default)]
 pub(crate) struct SurfaceFrameThrottlingState(Mutex<Option<Duration>>);
@@ -650,5 +682,29 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[test]
+    fn test_fault_probe_buffer_bounds() {
+        for len in [0usize, 1, 4096, 8195] {
+            let buf = vec![0x5Au8; len];
+            let ptr = buf.as_ptr();
+            let bp = unsafe { BufferPointer::new(&ptr, len) };
+            fault_probe_buffer(bp);
+        }
+        let buf = [0xA5u8; 64];
+        let ptr = buf.as_ptr();
+        let bp = unsafe { BufferPointer::new(&ptr, buf.len()) };
+        fault_probe_range(bp, 16, 16);
+        fault_probe_range(bp, 32, 0);
+    }
+
+    #[test]
+    #[should_panic]
+    fn test_fault_probe_buffer_out_of_bounds() {
+        let buf = [0u8; 63];
+        let ptr = buf.as_ptr();
+        let bp = unsafe { BufferPointer::new(&ptr, buf.len()) };
+        fault_probe_range(bp, 0, 64);
     }
 }

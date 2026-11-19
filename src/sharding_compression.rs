@@ -13,14 +13,11 @@
 // limitations under the License.
 
 use std::collections::HashMap;
-use std::convert::Into;
 use std::fmt;
 use std::io::Read;
 use std::io::Write;
 use std::mem;
 use std::num::NonZeroUsize;
-use std::sync::atomic::AtomicUsize;
-use std::sync::atomic::Ordering;
 use std::thread;
 
 use crossbeam_channel::Receiver;
@@ -43,6 +40,7 @@ use crate::serialization::framing::Framed;
 
 // TODO: benchmark this and pick a value based on that.
 pub const MIN_SIZE_TO_COMPRESS: usize = 4096;
+const MAX_QUEUED_UNCOMPRESSED_SHARDS: usize = 64;
 
 #[derive(Clone, Eq, PartialEq, Archive, Deserialize, Serialize)]
 pub struct CompressedShard {
@@ -220,25 +218,81 @@ impl Framed for CompressedShards {
     }
 }
 
-fn spawn_compressor(
-    compression_level: i32,
-    input_rx: Receiver<(usize, Box<dyn AsRef<[u8]> + Send + Sync + 'static>)>,
-    output_tx: Sender<CompressedShard>,
-) -> Result<()> {
+const MAX_COALESCED_SHARD_BYTES: usize = 256 * 1024;
+
+pub struct StreamingCompressedShards {
+    pub indices: Vec<usize>,
+    pub uncompressed_size: usize,
+    pub shards: Receiver<CompressedShard>,
+}
+
+impl StreamingCompressedShards {
+    pub fn framed_write<W: Write>(self, stream: &mut W) -> Result<usize> {
+        rkyv::to_bytes::<RancorError>(&self.indices)
+            .location(loc!())?
+            .framed_write(stream)
+            .location(loc!())?;
+
+        self.uncompressed_size
+            .framed_write(stream)
+            .location(loc!())?;
+
+        let mut remaining = self.indices.len();
+        let mut total_compressed_size = 0;
+
+        while remaining > 0 {
+            let shard = self
+                .shards
+                .recv()
+                .context(loc!(), "shard sender dropped before sending all shards")?;
+            let mut batch_bytes = shard.len();
+            total_compressed_size += shard.len();
+            shard.framed_write(stream).location(loc!())?;
+            remaining -= 1;
+
+            // Coalesce any shards that are already ready in the channel into the
+            // same flush, while flushing immediately as soon as the channel is
+            // empty so the client can decompress completed shards while we are
+            // still compressing subsequent ones.
+            while remaining > 0
+                && batch_bytes < MAX_COALESCED_SHARD_BYTES
+                && let Ok(shard) = self.shards.try_recv()
+            {
+                batch_bytes += shard.len();
+                total_compressed_size += shard.len();
+                shard.framed_write(stream).location(loc!())?;
+                remaining -= 1;
+            }
+
+            stream.flush().location(loc!())?;
+        }
+
+        Ok(total_compressed_size)
+    }
+
+    #[instrument(skip_all, level = "debug")]
+    pub fn collect_shards(self) -> CompressedShards {
+        let shards = CompressedShards::new(self.shards.into_iter().collect());
+        debug_assert_eq!(self.indices, shards.indices());
+        shards
+    }
+}
+
+type CompressorJob = (
+    usize,
+    Box<dyn AsRef<[u8]> + Send + Sync + 'static>,
+    Sender<CompressedShard>,
+);
+
+fn spawn_compressor(compression_level: i32, input_rx: Receiver<CompressorJob>) -> Result<()> {
     let mut compressor = Compressor::new(compression_level).location(loc!())?;
     compressor.long_distance_matching(true).location(loc!())?;
     thread::spawn(move || {
         // The iterator (and, consequently, the thread) will terminate when all
         // the input senders (which are all in the ShardingCompressor) are
         // dropped.
-        for (idx, input) in input_rx {
+        for (idx, input, output_tx) in input_rx {
             let input = (*input).as_ref();
-            // We could pre-allocate a buffer at the end of the loop, while
-            // waiting for the next input, and use compress_to_buffer, but that
-            // doesn't result in a significant speedup here.
-            //
-            // This will allocate as much space as it needs, so compression
-            // should never panic.
             let compression = input.len() > MIN_SIZE_TO_COMPRESS;
             let data = if compression {
                 compressor.compress(input).unwrap()
@@ -246,9 +300,8 @@ fn spawn_compressor(
                 input.to_vec()
             };
 
-            // This will be an error when the ShardingDecompressor is dropped,
-            // but the for loop (and consequently this thread) will terminate at
-            // the same time for the same reason.
+            // Ignores error if the receiver dropped early (e.g., on client
+            // disconnect).
             _ = output_tx.send(CompressedShard {
                 idx,
                 uncompressed_size: input.len(),
@@ -260,80 +313,71 @@ fn spawn_compressor(
     Ok(())
 }
 
+#[derive(Clone)]
+pub struct ShardingCompressorSink {
+    compressor_input: Sender<CompressorJob>,
+    shard_tx: Sender<CompressedShard>,
+}
+
+impl ShardingCompressorSink {
+    pub fn compress_shard(&self, idx: usize, data: impl AsRef<[u8]> + Send + Sync + 'static) {
+        self.compressor_input
+            .send((idx, Box::new(data), self.shard_tx.clone()))
+            .unwrap();
+    }
+}
+
 pub struct ShardingCompressor {
-    compressor_input: Sender<(usize, Box<dyn AsRef<[u8]> + Send + Sync + 'static>)>,
-    compressor_output: Receiver<CompressedShard>,
+    compressor_input: Sender<CompressorJob>,
 }
 
 impl ShardingCompressor {
     pub fn new(n_compressors: NonZeroUsize, compression_level: i32) -> Result<Self> {
-        // These channels will have at most n_shards items in them, but we only
-        // know n_shards when compress is called, not now.
-        let (compressor_input_tx, compressor_input_rx) = crossbeam_channel::unbounded();
-        let (compressor_output_tx, compressor_output_rx) = crossbeam_channel::unbounded();
+        let (compressor_input_tx, compressor_input_rx) =
+            crossbeam_channel::bounded(MAX_QUEUED_UNCOMPRESSED_SHARDS);
         for _ in 0..n_compressors.get() {
-            spawn_compressor(
-                compression_level,
-                compressor_input_rx.clone(),
-                compressor_output_tx.clone(),
-            )
-            .location(loc!())?;
+            spawn_compressor(compression_level, compressor_input_rx.clone()).location(loc!())?;
         }
 
         Ok(Self {
             compressor_input: compressor_input_tx,
-            compressor_output: compressor_output_rx,
         })
+    }
+
+    pub fn begin_streaming(
+        &self,
+        indices: Vec<usize>,
+        uncompressed_size: usize,
+    ) -> (ShardingCompressorSink, StreamingCompressedShards) {
+        let (shard_tx, shard_rx) = crossbeam_channel::unbounded();
+        (
+            ShardingCompressorSink {
+                compressor_input: self.compressor_input.clone(),
+                shard_tx,
+            },
+            StreamingCompressedShards {
+                indices,
+                uncompressed_size,
+                shards: shard_rx,
+            },
+        )
     }
 
     #[instrument(skip_all, level = "debug")]
     pub fn compress(&mut self, n_shards: NonZeroUsize, data: ArcSlice<u8>) -> CompressedShards {
-        let n_shards = n_shards.get();
         let len = data.len();
-        let chunk_size = len / n_shards;
+        if len == 0 {
+            return CompressedShards::default();
+        }
+        let chunk_size = (len / n_shards).max(1);
         debug!("chunk_size: {:?}", chunk_size);
-        let chunks = data.chunks(chunk_size);
-        let accepting_compressor = self.begin();
-        for (i, chunk) in chunks.enumerate() {
-            accepting_compressor.compress_shard(i * chunk_size, chunk);
+        let indices = (0..len).step_by(chunk_size).collect();
+        let (sink, streaming) = self.begin_streaming(indices, len);
+        for (i, chunk) in data.chunks(chunk_size).enumerate() {
+            sink.compress_shard(i * chunk_size, chunk);
         }
-        accepting_compressor.collect_shards()
-    }
-
-    // Intentionally &mut self to only allow a single session at a time. This
-    // ensures a consistent set of input and output data.
-    pub fn begin(&mut self) -> ShardingCompressorSession<'_> {
-        ShardingCompressorSession {
-            compressor: self,
-            pending_shards: 0.into(),
-        }
-    }
-}
-
-pub struct ShardingCompressorSession<'a> {
-    compressor: &'a mut ShardingCompressor,
-    pending_shards: AtomicUsize,
-}
-
-impl ShardingCompressorSession<'_> {
-    pub fn compress_shard(&self, idx: usize, data: impl AsRef<[u8]> + Send + Sync + 'static) {
-        self.compressor
-            .compressor_input
-            .send((idx, Box::new(data)))
-            .unwrap();
-        self.pending_shards.fetch_add(1, Ordering::Relaxed);
-    }
-
-    pub fn iter_shards(&self) -> impl Iterator<Item = CompressedShard> + '_ {
-        let n = self.pending_shards.swap(0, Ordering::AcqRel);
-        // Will only panic is the other end disconnected, which should never
-        // happen.
-        (0..n).map(|_| self.compressor.compressor_output.recv().unwrap())
-    }
-
-    #[instrument(skip_all, level = "debug")]
-    pub fn collect_shards(self) -> CompressedShards {
-        CompressedShards::new(self.iter_shards().collect())
+        drop(sink);
+        streaming.collect_shards()
     }
 }
 

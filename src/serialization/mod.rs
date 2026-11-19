@@ -17,6 +17,7 @@ use std::fmt;
 use std::fmt::Debug;
 use std::hash::Hash;
 use std::hash::Hasher;
+use std::io::BufReader;
 use std::io::BufWriter;
 use std::io::Read;
 use std::io::Write;
@@ -63,6 +64,7 @@ use crate::prelude::*;
 use crate::sharding_compression::CompressedShards;
 use crate::sharding_compression::ShardingCompressor;
 use crate::sharding_compression::ShardingDecompressor;
+use crate::sharding_compression::StreamingCompressedShards;
 use crate::utils;
 
 pub mod framing;
@@ -213,7 +215,7 @@ where
         + for<'a> bytecheck::CheckBytes<HighValidator<'a, RancorError>>,
 {
     Object(ST),
-    RawBuffer(Arc<CompressedShards>),
+    RawBuffer(StreamingCompressedShards),
 }
 
 impl<ST> fmt::Debug for SendType<ST>
@@ -226,7 +228,7 @@ where
         match self {
             Self::Object(obj) => write!(f, "Object({obj:?})"),
             Self::RawBuffer(shards) => {
-                write!(f, "RawBuffer([{:?}])", shards.uncompressed_size())
+                write!(f, "RawBuffer([{:?}])", shards.uncompressed_size)
             },
         }
     }
@@ -391,7 +393,7 @@ where
 
 fn read_loop<R, RT>(
     conn_id: u64,
-    mut stream: R,
+    stream: R,
     output_channel: channel::SyncSender<(u64, RecvType<RT>)>,
 ) -> Result<()>
 where
@@ -400,6 +402,8 @@ where
     RT::Archived: Deserialize<RT, HighDeserializer<RancorError>>
         + for<'a> bytecheck::CheckBytes<HighValidator<'a, RancorError>>,
 {
+    let mut stream = BufReader::with_capacity(256 * 1024, stream);
+
     // TODO: try tuning this based on the number of cpus the machine has.
     let mut decompressor =
         ShardingDecompressor::new(NonZeroUsize::new(8).unwrap()).location(loc!())?;
@@ -486,7 +490,7 @@ where
             compression_ratio = field::Empty
         )
         .entered();
-        let (compressed_shards, message_type): (Arc<CompressedShards>, MessageType) = match obj {
+        let (uncompressed_size, compressed_size) = match obj {
             SendType::Object(obj) => {
                 let serialized_data = ArcSlice::new(
                     debug_span!("serialize")
@@ -495,21 +499,27 @@ where
                 );
 
                 let shards = compressor.compress(NonZeroUsize::new(1).unwrap(), serialized_data);
-                (Arc::new(shards), MessageType::Object)
+                MessageType::Object
+                    .framed_write(&mut stream)
+                    .location(loc!())?;
+                shards.framed_write(&mut stream).location(loc!())?;
+                (shards.uncompressed_size(), shards.size())
             },
-            SendType::RawBuffer(compressed_shards) => (compressed_shards, MessageType::RawBuffer),
+            SendType::RawBuffer(streaming_shards) => {
+                let uncompressed_size = streaming_shards.uncompressed_size;
+                MessageType::RawBuffer
+                    .framed_write(&mut stream)
+                    .location(loc!())?;
+                let compressed_size = streaming_shards
+                    .framed_write(&mut stream)
+                    .location(loc!())?;
+                (uncompressed_size, compressed_size)
+            },
         };
-
-        message_type.framed_write(&mut stream).location(loc!())?;
-        compressed_shards
-            .framed_write(&mut stream)
-            .location(loc!())?;
         stream.flush().location(loc!())?;
 
         // metrics
         {
-            let uncompressed_size = compressed_shards.uncompressed_size();
-            let compressed_size = compressed_shards.size();
             let compression_ratio = uncompressed_size as f64 / compressed_size as f64;
             span.record("uncompressed_size", field::debug(uncompressed_size));
             span.record("compressed_size", compressed_size);
