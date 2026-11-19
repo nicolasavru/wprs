@@ -29,6 +29,7 @@ use smithay::utils::Rectangle;
 use smithay::utils::Size;
 use smithay::utils::Transform;
 use smithay::utils::user_data::UserDataMap;
+use smithay::wayland::compositor::Damage;
 use smithay::wayland::compositor::SurfaceAttributes;
 use smithay::wayland::shm;
 use smithay::wayland::shm::BufferAccessError;
@@ -36,6 +37,7 @@ use smithay::wayland::shm::BufferData;
 
 use crate::buffer_pointer::BufferPointer;
 use crate::prelude::*;
+use crate::serialization::geometry::Rectangle as SerRectangle;
 use crate::serialization::wayland::OutputInfo;
 use crate::serialization::wayland::ViewportState;
 
@@ -165,7 +167,7 @@ pub fn update_surface_outputs<'a, F>(
 /// buffer_scale at 1 and scales entirely through the viewport, so using
 /// buffer_scale alone makes this the identity and the damage then covers only
 /// the top-left corner of the buffer.
-pub fn surface_damage_to_buffer(
+fn surface_damage_to_buffer(
     rect: Rectangle<i32, Logical>,
     buffer_scale: i32,
     transform: Transform,
@@ -219,6 +221,29 @@ pub fn surface_damage_to_buffer(
     surface_local_rect
         .to_i32_up::<i32>()
         .to_buffer(buffer_scale, transform.invert(), &area)
+}
+
+pub fn damage_to_buffer_rects(
+    raw_damage: &[Damage],
+    buffer_scale: i32,
+    transform: Transform,
+    viewport_state: Option<&ViewportState>,
+    buffer_size: Option<(i32, i32)>,
+) -> Vec<SerRectangle<i32>> {
+    raw_damage
+        .iter()
+        .map(|damage| match damage {
+            Damage::Buffer(rect) => *rect,
+            Damage::Surface(rect) => surface_damage_to_buffer(
+                *rect,
+                buffer_scale,
+                transform,
+                viewport_state,
+                buffer_size,
+            ),
+        })
+        .map(Into::into)
+        .collect()
 }
 
 #[cfg(test)]

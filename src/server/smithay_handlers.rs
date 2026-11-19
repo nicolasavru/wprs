@@ -67,7 +67,6 @@ use smithay::wayland::compositor::BufferAssignment as SmithayBufferAssignment;
 use smithay::wayland::compositor::CompositorClientState;
 use smithay::wayland::compositor::CompositorHandler;
 use smithay::wayland::compositor::CompositorState;
-use smithay::wayland::compositor::Damage;
 use smithay::wayland::compositor::SubsurfaceCachedState;
 use smithay::wayland::compositor::SurfaceAttributes;
 use smithay::wayland::compositor::SurfaceData;
@@ -884,23 +883,17 @@ pub fn commit_impl(
         .as_ref()
         .and_then(BufferAssignment::as_new)
         .map(|buffer| (buffer.metadata.width, buffer.metadata.height));
-    let damage = mem::take(&mut surface_attributes.damage)
-        .iter()
-        .map(|damage| match damage {
-            Damage::Buffer(rect) => *rect,
-            Damage::Surface(rect) => compositor_utils::surface_damage_to_buffer(
-                *rect,
-                surface_state.buffer_scale,
-                surface_state
-                    .buffer_transform
-                    .unwrap_or(Transform::Normal)
-                    .into(),
-                surface_state.viewport_state.as_ref(),
-                buffer_size,
-            ),
-        })
-        .map(Into::into)
-        .collect();
+    let raw_damage = mem::take(&mut surface_attributes.damage);
+    let damage = compositor_utils::damage_to_buffer_rects(
+        &raw_damage,
+        surface_state.buffer_scale,
+        surface_state
+            .buffer_transform
+            .unwrap_or(Transform::Normal)
+            .into(),
+        surface_state.viewport_state.as_ref(),
+        buffer_size,
+    );
     surface_state_to_send.damage = Some(damage);
 
     state

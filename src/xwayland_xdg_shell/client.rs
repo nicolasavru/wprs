@@ -1027,13 +1027,6 @@ impl XWaylandBuffer {
 }
 
 impl XWaylandSurface {
-    pub fn write_data(&mut self, data: BufferPointer<u8>, pool: &mut SlotPool) -> Result<()> {
-        if let Some(buffer) = &mut self.buffer {
-            buffer.write_data(data, pool).location(loc!())?;
-        }
-        Ok(())
-    }
-
     #[instrument(skip(data, pool), level = "debug")]
     pub fn update_buffer(
         &mut self,

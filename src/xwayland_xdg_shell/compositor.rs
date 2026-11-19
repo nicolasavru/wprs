@@ -47,7 +47,6 @@ use smithay::wayland::compositor::BufferAssignment;
 use smithay::wayland::compositor::CompositorClientState;
 use smithay::wayland::compositor::CompositorHandler;
 use smithay::wayland::compositor::CompositorState;
-use smithay::wayland::compositor::Damage;
 use smithay::wayland::compositor::SurfaceAttributes;
 use smithay::wayland::compositor::SurfaceData;
 use smithay::wayland::output::OutputHandler;
@@ -597,27 +596,22 @@ pub fn commit_inner(
         .buffer
         .as_ref()
         .map(|buffer| (buffer.metadata.width, buffer.metadata.height));
-    let damage = &mut mem::take(&mut surface_attributes.damage)
-        .iter()
-        .map(|damage| match damage {
-            Damage::Buffer(rect) => *rect,
-            // Xwayland surfaces have no viewport, but the conversion still
-            // needs the surface size rather than the damage rect's own size.
-            Damage::Surface(rect) => compositor_utils::surface_damage_to_buffer(
-                *rect,
-                surface_attributes.buffer_scale,
-                surface_attributes.buffer_transform.into(),
-                None,
-                buffer_size,
-            ),
-        })
-        .map(Into::into)
-        .collect();
+    let raw_damage = mem::take(&mut surface_attributes.damage);
+    // Xwayland surfaces have no viewport (`viewport_state` is `None`),
+    // while `buffer_size` is still needed to invert rotating/flipping
+    // `buffer_transform`s.
+    let mut damage = compositor_utils::damage_to_buffer_rects(
+        &raw_damage,
+        surface_attributes.buffer_scale,
+        surface_attributes.buffer_transform.into(),
+        None,
+        buffer_size,
+    );
 
     if let Some(surface_damage) = &mut xwayland_surface.damage {
-        surface_damage.append(damage);
+        surface_damage.append(&mut damage);
     } else {
-        xwayland_surface.damage = Some(damage.clone());
+        xwayland_surface.damage = Some(damage);
     }
 
     if xwayland_surface.ready() {
