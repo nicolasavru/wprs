@@ -41,29 +41,39 @@ use crate::serialization::geometry::Rectangle as SerRectangle;
 use crate::serialization::wayland::OutputInfo;
 use crate::serialization::wayland::ViewportState;
 
-/// # Panics
-/// If smithay has a bug and with_buffer_contents gives us an invalid pointer.
 pub fn with_buffer_contents<F, T>(buffer: &WlBuffer, f: F) -> Result<T, BufferAccessError>
 where
     F: FnOnce(BufferPointer<u8>, BufferData) -> T,
 {
     shm::with_buffer_contents(buffer, |ptr, len, spec| {
-        assert!(!ptr.is_null());
-        let start = spec.offset as usize;
-        let buffer_len = (spec.height * spec.stride) as usize;
-        assert!(
-            start + buffer_len <= len,
-            "start = {start}, buf_len = {buffer_len}, len = {len}"
-        );
-        // SAFETY: smithay promises to give us a valid pointer and we check that
-        // our calculated start and offset are within the length given by
-        // smithay.
+        // A failed `wl_shm_pool.resize` (`mremap`) leaves Smithay's pool map
+        // null after posting `InvalidFd` to the client.
+        if ptr.is_null() {
+            return Err(BufferAccessError::BadMap);
+        }
+        // Smithay's `wl_shm_pool.create_buffer` handler already validates
+        // `offset >= 0`, `width > 0`, `height > 0`, `stride >= width * bpp`,
+        // and `offset + height * stride <= pool.size` (`<= len`), and refuses
+        // to shrink pools.
+        let start = usize::try_from(spec.offset).expect("validated by Smithay create_buffer");
+        let height = usize::try_from(spec.height).expect("validated by Smithay create_buffer");
+        let stride = usize::try_from(spec.stride).expect("validated by Smithay create_buffer");
+        let buffer_len = height
+            .checked_mul(stride)
+            .expect("validated by Smithay create_buffer");
+        let end = start
+            .checked_add(buffer_len)
+            .expect("validated by Smithay create_buffer");
+        assert!(end <= len, "shm buffer range {start}..{end} exceeds {len}");
+        // SAFETY: `ptr` is non-null and `start..end` lies within the `len`-byte
+        // mapping provided by Smithay's `shm::with_buffer_contents`.
         unsafe {
             let ptr = ptr.add(start);
             let buf = BufferPointer::new(&ptr, buffer_len);
-            f(buf, spec)
+            Ok(f(buf, spec))
         }
     })
+    .and_then(|res| res)
 }
 
 // Based on https://github.com/Smithay/smithay/blob/b1c682742ac7b9fa08736476df3e651489709ac2/src/desktop/wayland/utils.rs.
