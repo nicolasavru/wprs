@@ -319,15 +319,10 @@ impl RemoteXdgPopup {
 
     pub fn update(
         surface_state: SurfaceState,
-        surface: &RemoteSurface,
+        surface: &mut RemoteSurface,
         xdg_shell_state: &XdgShell,
     ) -> Result<()> {
-        let remote_popup = surface
-            .role
-            .as_ref()
-            .location(loc!())?
-            .as_xdg_popup()
-            .location(loc!())?;
+        let remote_popup = surface.xdg_popup_mut().location(loc!())?;
         // TODO: why isn't this always set?
         // let xdg_surface_state = surface_state.xdg_surface_state.as_ref().location(loc!())?;
         if let Some(xdg_surface_state) = surface_state.xdg_surface_state
@@ -346,6 +341,7 @@ impl RemoteXdgPopup {
             let positioner =
                 Self::new_positioner(xdg_shell_state, &popup_state.positioner).location(loc!())?;
             remote_popup.local_popup.reposition(&positioner, 0);
+            remote_popup.positioner = popup_state.positioner;
         }
 
         Ok(())
