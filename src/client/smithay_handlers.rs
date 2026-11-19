@@ -74,11 +74,14 @@ use smithay_client_toolkit::shm::ShmHandler;
 use tracing::Span;
 
 use crate::args;
-use crate::client::subsurface;
+use crate::client::RemoteClient;
 use crate::client::Role;
 use crate::client::SeatObject;
 use crate::client::WprsClientState;
+use crate::client::subsurface;
 use crate::prelude::*;
+use crate::serialization::Event;
+use crate::serialization::SendType;
 use crate::serialization::wayland;
 use crate::serialization::wayland::DataDestinationEvent;
 use crate::serialization::wayland::DataEvent;
@@ -93,13 +96,12 @@ use crate::serialization::wayland::OutputEvent;
 use crate::serialization::wayland::SourceMetadata;
 use crate::serialization::wayland::SurfaceEvent;
 use crate::serialization::wayland::SurfaceEventPayload::OutputsChanged;
+use crate::serialization::wayland::WlSurfaceId;
 use crate::serialization::xdg_shell::PopupConfigure;
 use crate::serialization::xdg_shell::PopupEvent;
 use crate::serialization::xdg_shell::ToplevelClose;
 use crate::serialization::xdg_shell::ToplevelConfigure;
 use crate::serialization::xdg_shell::ToplevelEvent;
-use crate::serialization::Event;
-use crate::serialization::SendType;
 
 impl WprsClientState {
     fn send_surface_outputs(&self, surface: &WlSurface) {
@@ -127,27 +129,39 @@ impl WprsClientState {
     }
 }
 
+fn commit_children_and_draw(
+    client: &mut RemoteClient,
+    surface_id: WlSurfaceId,
+    qh: &QueueHandle<WprsClientState>,
+) {
+    subsurface::commit_sync_children(surface_id, &mut client.surfaces).log_and_ignore(loc!());
+    client
+        .surface(&surface_id)
+        .and_then(|surface| surface.draw_buffer_send_frame(qh))
+        .log_and_ignore(loc!());
+}
+
 impl CompositorHandler for WprsClientState {
-    #[instrument(skip(self, _conn, _qh, _new_factor), level = "debug")]
+    #[instrument(skip(self, _conn, _qh, _surface, _new_factor), level = "debug")]
     fn scale_factor_changed(
         &mut self,
         _conn: &Connection,
         _qh: &QueueHandle<Self>,
-        surface: &WlSurface,
+        _surface: &WlSurface,
         _new_factor: i32,
     ) {
-        self.send_surface_outputs(surface);
+        // Surface output membership is forwarded by `surface_enter`/`surface_leave`.
     }
 
-    #[instrument(skip(self, _conn, _qh, _new_transform), level = "debug")]
+    #[instrument(skip(self, _conn, _qh, _surface, _new_transform), level = "debug")]
     fn transform_changed(
         &mut self,
         _conn: &Connection,
         _qh: &QueueHandle<Self>,
-        surface: &WlSurface,
+        _surface: &WlSurface,
         _new_transform: Transform,
     ) {
-        self.send_surface_outputs(surface);
+        // Surface output membership is forwarded by `surface_enter`/`surface_leave`.
     }
 
     #[instrument(skip(self, _conn, qh, _time), level = "debug")]
@@ -184,20 +198,20 @@ impl CompositorHandler for WprsClientState {
         &mut self,
         _conn: &Connection,
         _qh: &QueueHandle<Self>,
-        _surface: &WlSurface,
+        surface: &WlSurface,
         _output: &WlOutput,
     ) {
-        // handled by scale_factor_changed/transform_changed, which only process when the scaling actually changes.
+        self.send_surface_outputs(surface);
     }
 
     fn surface_leave(
         &mut self,
         _conn: &Connection,
         _qh: &QueueHandle<Self>,
-        _surface: &WlSurface,
+        surface: &WlSurface,
         _output: &WlOutput,
     ) {
-        // handled by scale_factor_changed/transform_changed, which only process when the scaling actually changes.
+        self.send_surface_outputs(surface);
     }
 }
 
@@ -266,7 +280,6 @@ impl WindowHandler for WprsClientState {
         else {
             return;
         };
-
         let Some(client) = self.remote_display.clients.get_mut(&client_id) else {
             return;
         };
@@ -276,10 +289,8 @@ impl WindowHandler for WprsClientState {
         let Some(toplevel) = surface.role.as_mut().and_then(Role::as_xdg_toplevel_mut) else {
             return;
         };
-
-        if !toplevel.configured {
-            toplevel.configured = true;
-            surface.draw_buffer_send_frame(qh).log_and_ignore(loc!());
+        if !std::mem::replace(&mut toplevel.configured, true) {
+            commit_children_and_draw(client, surface_id, qh);
         }
 
         self.serializer
@@ -304,7 +315,6 @@ impl popup::PopupHandler for WprsClientState {
         else {
             return;
         };
-
         let Some(client) = self.remote_display.clients.get_mut(&client_id) else {
             return;
         };
@@ -314,9 +324,8 @@ impl popup::PopupHandler for WprsClientState {
         let Some(remote_popup) = surface.role.as_mut().and_then(Role::as_xdg_popup_mut) else {
             return;
         };
-        if !remote_popup.configured {
-            remote_popup.configured = true;
-            surface.draw_buffer_send_frame(qh).log_and_ignore(loc!());
+        if !std::mem::replace(&mut remote_popup.configured, true) {
+            commit_children_and_draw(client, surface_id, qh);
         }
 
         self.serializer

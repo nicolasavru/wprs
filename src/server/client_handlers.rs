@@ -91,6 +91,7 @@ use crate::serialization::wayland::SurfaceEvent;
 use crate::serialization::wayland::SurfaceEventPayload;
 use crate::serialization::wayland::SurfaceRequest;
 use crate::serialization::wayland::SurfaceRequestPayload;
+use crate::serialization::wayland::SurfaceState;
 use crate::serialization::wayland::WlSurfaceId;
 use crate::serialization::xdg_shell::PopupConfigure;
 use crate::serialization::xdg_shell::PopupEvent;
@@ -763,11 +764,47 @@ impl WprsServerState {
         Ok(())
     }
 
+    fn for_each_mapped_surface(&self, mut f: impl FnMut(&WlSurface, &mut SurfaceState)) {
+        for surface_id in self.object_map.keys() {
+            let Ok((_, _, surface)) = self.object_client_surface_from_id(surface_id) else {
+                continue;
+            };
+            compositor::with_states(&surface, |surface_data| {
+                let mut surface_state = surface_data
+                    .data_map
+                    .get::<LockedSurfaceState>()
+                    .expect("surfaces in object_map have LockedSurfaceState")
+                    .0
+                    .lock()
+                    .unwrap();
+                f(&surface, &mut surface_state);
+            });
+        }
+    }
+
+    fn remove_output_from_surfaces(&self, output_id: u32, output: Option<&Output>) {
+        self.for_each_mapped_surface(|surface, surface_state| {
+            if let Some(output) = output {
+                output.leave(surface);
+            }
+            surface_state.output_ids.retain(|id| *id != output_id);
+        });
+    }
+
+    fn enter_surfaces_on_output(&self, output_id: u32, output: &Output) {
+        self.for_each_mapped_surface(|surface, surface_state| {
+            if surface_state.output_ids.contains(&output_id) {
+                output.enter(surface);
+            }
+        });
+    }
+
     #[instrument(skip_all, level = "debug")]
     fn handle_output(&mut self, output_event: OutputEvent) -> Result<()> {
         match output_event {
             OutputEvent::New(output) => {
-                let (local_output, _) = self.outputs.entry(output.id).or_insert_with_key(|id| {
+                let output_id = output.id;
+                let (local_output, _) = self.outputs.entry(output_id).or_insert_with_key(|id| {
                     let new_output = Output::new(
                         format!(
                             "{}_{}",
@@ -786,6 +823,10 @@ impl WprsServerState {
                 });
 
                 compositor_utils::update_output(local_output, output);
+                let local_output = local_output.clone();
+                // Host compositors with `zxdg_output_v1` can emit `wl_surface.enter`
+                // (`OutputsChanged`) before `zxdg_output_v1.done` unblocks `OutputEvent::New`.
+                self.enter_surfaces_on_output(output_id, &local_output);
             },
             OutputEvent::Update(output) => {
                 let (local_output, _) = match self.outputs.entry(output.id) {
@@ -799,7 +840,14 @@ impl WprsServerState {
                 compositor_utils::update_output(local_output, output);
             },
             OutputEvent::Destroy(output) => {
-                if let Some((_, (_, global_id))) = self.outputs.remove_entry(&output.id) {
+                let removed = self.outputs.remove(&output.id);
+                // Always prune `output.id` even if `Destroy` arrives before
+                // `zxdg_output_v1.done` unblocked `OutputEvent::New`.
+                self.remove_output_from_surfaces(
+                    output.id,
+                    removed.as_ref().map(|(local_output, _)| local_output),
+                );
+                if let Some((_, global_id)) = removed {
                     self.dh.remove_global::<Self>(global_id);
                 }
             },
@@ -810,7 +858,18 @@ impl WprsServerState {
 
     #[instrument(skip_all, level = "debug")]
     fn handle_connect(&mut self) -> Result<()> {
-        // TODO: sync client outputs
+        let old_outputs: Vec<_> = self.outputs.drain().collect();
+        // Clear all previous-session `output_ids` unconditionally (including IDs
+        // recorded by `OutputsChanged` before `OutputEvent::New` arrived).
+        self.for_each_mapped_surface(|surface, surface_state| {
+            for (_, (local_output, _)) in &old_outputs {
+                local_output.leave(surface);
+            }
+            surface_state.output_ids.clear();
+        });
+        for (_, (_, global_id)) in old_outputs {
+            self.dh.remove_global::<Self>(global_id);
+        }
         self.synced_buffers.clear();
         self.dirty_sync_surfaces.clear();
 
@@ -1142,9 +1201,9 @@ impl WprsServerState {
 
     #[instrument(skip(self), level = "debug")]
     pub fn handle_event(&mut self, conn_id: u64, event: RecvType<Event>) {
-        if let RecvType::Object(Event::WprsClientConnect) = &event {
+        if matches!(event, RecvType::Connected) {
             if !self.serializer.activate_connection(conn_id) {
-                debug!("ignoring WprsClientConnect from already-disconnected session {conn_id}");
+                debug!("ignoring Connected from already-disconnected session {conn_id}");
                 return;
             }
         } else if !self.serializer.is_active_connection(conn_id) {
@@ -1153,7 +1212,7 @@ impl WprsServerState {
         }
 
         match event {
-            RecvType::Object(Event::WprsClientConnect) => self.handle_connect(),
+            RecvType::Connected => self.handle_connect(),
             RecvType::Object(Event::Toplevel(toplevel)) => self.handle_toplevel(toplevel),
             RecvType::Object(Event::Popup(popup)) => self.handle_popup(popup),
             RecvType::Object(Event::KeyboardEvent(event)) => self.handle_keyboard_event(event),

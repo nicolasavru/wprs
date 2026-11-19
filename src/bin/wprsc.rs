@@ -14,6 +14,7 @@
 
 use std::fs;
 use std::path::PathBuf;
+use std::time::Duration;
 
 use bpaf::Parser;
 use optional_struct::optional_struct;
@@ -34,7 +35,6 @@ use wprs::client::ClientOptions;
 use wprs::client::WprsClientState;
 use wprs::control_server;
 use wprs::prelude::*;
-use wprs::serialization;
 use wprs::serialization::Serializer;
 use wprs::utils;
 
@@ -144,10 +144,6 @@ fn main() -> Result<()> {
         )
     })?;
     let reader = serializer.reader().location(loc!())?;
-    let writer = serializer.writer();
-    writer.send(serialization::SendType::Object(
-        serialization::Event::WprsClientConnect,
-    ));
 
     let options = ClientOptions {
         title_prefix: config.title_prefix,
@@ -180,7 +176,7 @@ fn main() -> Result<()> {
         control_server::start(config.control_socket, move |input: &str| {
             Ok(match input {
                 // TODO: make the input use json when we have more commands
-                "caps" => serde_json::to_string(&capabilities.get())
+                "caps" => serde_json::to_string(&capabilities.get(Duration::from_secs(5)))
                     .expect("a map with non-string keys was added to Capabilities"),
                 _ => {
                     bail!("Unknown command: {input:?}")

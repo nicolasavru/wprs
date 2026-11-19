@@ -598,16 +598,14 @@ impl WprsClientState {
 
     #[instrument(skip(self), level = "debug")]
     fn handle_capabilities(&mut self, caps: Capabilities) -> Result<()> {
-        self.capabilities
-            .set(caps)
-            .map_err(|_| anyhow!("attempted to set capabilities more than once"))
-            .location(loc!())
+        self.capabilities.set(caps).location(loc!())
     }
 
     #[instrument(skip_all, level = "debug")]
     fn handle_buffer(&mut self, buffer_stream: CompressedTileStream) -> Result<()> {
         let client_id = buffer_stream.header.client;
         let surface_id = buffer_stream.header.surface;
+
         let decode_res = (|| -> Result<()> {
             let validated = ValidatedTileStream::new(buffer_stream).location(loc!())?;
             let metadata = validated.metadata();
@@ -649,6 +647,7 @@ impl WprsClientState {
     #[instrument(skip(self), level = "debug")]
     pub fn handle_request(&mut self, request: RecvType<Request>) {
         match request {
+            RecvType::Connected => unreachable!("client never receives RecvType::Connected"),
             RecvType::Object(Request::Surface(surface)) => self.handle_surface(surface),
             RecvType::Object(Request::Toplevel(toplevel)) => self.handle_toplevel(toplevel),
             RecvType::Object(Request::Popup(popup)) => self.handle_popup(popup),

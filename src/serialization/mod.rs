@@ -114,7 +114,6 @@ pub enum Request {
 
 #[derive(Debug, Clone, PartialEq, Archive, Deserialize, Serialize)]
 pub enum Event {
-    WprsClientConnect,
     Output(wayland::OutputEvent),
     PointerFrame(Vec<wayland::PointerEvent>),
     KeyboardEvent(wayland::KeyboardEvent),
@@ -238,6 +237,7 @@ where
     RT::Archived: Deserialize<RT, HighDeserializer<RancorError>>
         + for<'a> bytecheck::CheckBytes<HighValidator<'a, RancorError>>,
 {
+    Connected,
     Object(RT),
     RawBuffer(CompressedTileStream),
 }
@@ -250,6 +250,7 @@ where
 {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
+            Self::Connected => write!(f, "Connected"),
             Self::Object(obj) => write!(f, "Object({obj:?})"),
             Self::RawBuffer(stream) => write!(f, "RawBuffer([{:?}])", stream.header),
         }
@@ -580,6 +581,17 @@ fn accept_loop<ST, RT>(
             info!("wprs client connected");
             let (conn_tx, conn_rx) = crossbeam_channel::unbounded();
             let conn_id = slot.begin_connection(conn_tx);
+            // Notify the server event loop immediately on `accept()` rather than
+            // waiting for a client-initiated packet: over `ssh -L`, OpenSSH holds
+            // client writes until remote `sshd` connects and confirms the channel,
+            // so activating on `accept()` saves a full WAN round-trip on attach.
+            if read_channel_tx
+                .send((conn_id, RecvType::Connected))
+                .is_err()
+            {
+                slot.end_connection(conn_id);
+                break;
+            }
             let (read_thread, write_thread) = spawn_rw_loops(
                 scope,
                 conn_id,
@@ -799,5 +811,84 @@ mod tests {
         assert!(!client_slot.is_active_connection(2));
         client_writer.send(SendType::Object(70));
         assert!(matches!(rx_client.try_recv(), Ok(SendType::Object(70))));
+    }
+
+    #[test]
+    #[cfg_attr(miri, ignore)]
+    fn test_server_accept_and_reconnect_teardown() {
+        let sock_path = std::env::temp_dir().join(format!(
+            "wprs_accept_test_{}_{}.sock",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let mut server: Serializer<Request, Event> = Serializer::new_server(&sock_path).unwrap();
+        let reader = server.reader().unwrap();
+
+        let mut stream = UnixStream::connect(&sock_path).unwrap();
+        stream
+            .set_read_timeout(Some(std::time::Duration::from_secs(5)))
+            .unwrap();
+        let (conn_id, msg) = reader.recv().unwrap();
+        assert_eq!(conn_id, 1);
+        assert!(matches!(msg, RecvType::Connected));
+        assert!(server.activate_connection(conn_id));
+        assert!(server.other_end_connected());
+
+        // Drain the initial handshake version frame, then exercise server
+        // `write_loop` framing + per-message `flush()` (without which this
+        // small object stays buffered in `BufWriter` and hits the read
+        // timeout).
+        assert_eq!(Version::framed_read(&mut stream).unwrap(), Version::new());
+        let expected_req = Request::ClientDisconnected(ClientId(7));
+        server.writer().send(SendType::Object(expected_req.clone()));
+        assert_eq!(
+            MessageType::framed_read(&mut stream).unwrap(),
+            MessageType::Object
+        );
+        let mut decompressor = ObjectDecompressor::new().unwrap();
+        let mut decoded_req = None;
+        decompressor
+            .read_framed_with(&mut stream, |buf| {
+                decoded_req = Some(rkyv::from_bytes::<Request, RancorError>(buf).location(loc!())?);
+                Ok(())
+            })
+            .unwrap();
+        assert_eq!(decoded_req, Some(expected_req));
+
+        // Dropping `stream` ends `read_loop`, so `write_loop` (parked in
+        // `recv()`) can only exit when `end_connection` drops the sender;
+        // `(2, Connected)` arriving below verifies `accept_loop` joined both
+        // threads and accepted the reconnect.
+        drop(stream);
+
+        let mut stream2 = UnixStream::connect(&sock_path).unwrap();
+        let (conn_id2, msg2) = reader.recv().unwrap();
+        assert_eq!(conn_id2, 2);
+        assert!(matches!(msg2, RecvType::Connected));
+        assert!(server.activate_connection(conn_id2));
+        assert!(server.other_end_connected());
+
+        // Exercise `read_loop`'s `(conn_id, Object)` path on the reconnect
+        // session so passing a stale/wrong `conn_id` to `spawn_rw_loops` fails.
+        Version::new().framed_write(&mut stream2).unwrap();
+        let expected_event = Event::Surface(wayland::SurfaceEvent {
+            surface_id: wayland::WlSurfaceId(11),
+            payload: wayland::SurfaceEventPayload::BufferResyncRequested,
+        });
+        let serialized_event = rkyv::to_bytes::<RancorError>(&expected_event).unwrap();
+        MessageType::Object.framed_write(&mut stream2).unwrap();
+        let mut compressor = ObjectCompressor::new(1).unwrap();
+        compressor
+            .write_framed(&serialized_event, &mut stream2)
+            .unwrap();
+        let (event_conn_id, event_msg) = reader.recv().unwrap();
+        assert_eq!(event_conn_id, 2);
+        assert!(matches!(event_msg, RecvType::Object(ev) if ev == expected_event));
+
+        drop(stream2);
+        _ = std::fs::remove_file(&sock_path);
     }
 }

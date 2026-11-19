@@ -16,7 +16,9 @@ use std::collections::HashMap;
 use std::collections::HashSet;
 use std::num::NonZeroUsize;
 use std::sync::Arc;
-use std::sync::OnceLock;
+use std::sync::Condvar;
+use std::sync::Mutex;
+use std::time::Duration;
 
 use bimap::BiMap;
 use enum_as_inner::EnumAsInner;
@@ -93,10 +95,37 @@ pub struct ClientOptions {
     pub title_prefix: String,
 }
 
+#[derive(Debug, Default)]
+pub struct CapabilitiesLatch {
+    state: Mutex<Option<Capabilities>>,
+    ready: Condvar,
+}
+
+impl CapabilitiesLatch {
+    pub fn set(&self, caps: Capabilities) -> Result<()> {
+        let mut guard = self.state.lock().unwrap();
+        if guard.is_some() {
+            bail!("attempted to set capabilities more than once");
+        }
+        *guard = Some(caps);
+        self.ready.notify_all();
+        Ok(())
+    }
+
+    pub fn get(&self, timeout: Duration) -> Option<Capabilities> {
+        let guard = self.state.lock().unwrap();
+        let (guard, _) = self
+            .ready
+            .wait_timeout_while(guard, timeout, |caps| caps.is_none())
+            .unwrap();
+        guard.clone()
+    }
+}
+
 pub struct WprsClientState {
     qh: QueueHandle<Self>,
     conn: Connection,
-    pub capabilities: Arc<OnceLock<Capabilities>>,
+    pub capabilities: Arc<CapabilitiesLatch>,
 
     registry_state: RegistryState,
     seat_state: SeatState,
@@ -159,7 +188,7 @@ impl WprsClientState {
         Ok(Self {
             qh: qh.clone(),
             conn,
-            capabilities: Arc::new(OnceLock::new()),
+            capabilities: Arc::default(),
             registry_state: RegistryState::new(&globals),
             seat_state: SeatState::new(&globals, &qh),
             output_state: OutputState::new(&globals, &qh),
@@ -1167,5 +1196,23 @@ mod tests {
         assert_eq!((active, slots.len(), copied, alloc), (3, 4, 0, Some(true)));
         assert_eq!(back, Some((2, None)));
         assert_eq!(slots[active], frame);
+    }
+
+    #[test]
+    fn test_capabilities_latch_single_assignment() {
+        let latch = CapabilitiesLatch::default();
+        assert_eq!(latch.get(Duration::ZERO), None);
+
+        latch.set(Capabilities { xwayland: true }).unwrap();
+        assert_eq!(
+            latch.get(Duration::ZERO),
+            Some(Capabilities { xwayland: true })
+        );
+
+        assert!(latch.set(Capabilities { xwayland: false }).is_err());
+        assert_eq!(
+            latch.get(Duration::ZERO),
+            Some(Capabilities { xwayland: true })
+        );
     }
 }
