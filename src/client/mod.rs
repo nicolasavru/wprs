@@ -493,9 +493,9 @@ impl RemoteSurface {
         Ok(())
     }
 
-    pub fn draw_buffer(&mut self) -> Result<()> {
+    fn draw_buffer_impl(&mut self, frame_qh: Option<&QueueHandle<WprsClientState>>) -> Result<()> {
         let wl_surface = &self.wl_surface().clone();
-        if let Some(buffer) = &mut self.buffer
+        let attached = if let Some(buffer) = &mut self.buffer
             && buffer.dirty
         {
             buffer.active_buffer.attach_to(wl_surface).context(
@@ -520,38 +520,24 @@ impl RemoteSurface {
                 wl_surface.damage_buffer(0, 0, i32::MAX, i32::MAX);
             }
             buffer.dirty = false;
-        }
-        self.commit();
-        Ok(())
-    }
-
-    pub fn draw_buffer_send_frame(&mut self, qh: &QueueHandle<WprsClientState>) -> Result<()> {
-        let wl_surface = &self.wl_surface().clone();
-        if let Some(buffer) = &mut self.buffer
-            && buffer.dirty
-        {
-            buffer.active_buffer.attach_to(wl_surface).context(
-                loc!(),
-                "attaching a buffer failed, this probably means we're leaking buffers",
-            )?;
-            if let Some(damage_rects) = self.frame_damage.take() {
-                for damage_rect in damage_rects {
-                    wl_surface.damage_buffer(
-                        damage_rect.loc.x,
-                        damage_rect.loc.y,
-                        damage_rect.size.w,
-                        damage_rect.size.h,
-                    );
-                }
-            } else {
-                wl_surface.damage_buffer(0, 0, i32::MAX, i32::MAX);
-            }
-            buffer.dirty = false;
+            true
+        } else {
+            false
+        };
+        if attached && let Some(qh) = frame_qh {
             self.frame(qh);
             self.frame_callback_completed = false;
         }
         self.commit();
         Ok(())
+    }
+
+    pub fn draw_buffer(&mut self) -> Result<()> {
+        self.draw_buffer_impl(None)
+    }
+
+    pub fn draw_buffer_send_frame(&mut self, qh: &QueueHandle<WprsClientState>) -> Result<()> {
+        self.draw_buffer_impl(Some(qh))
     }
 
     pub fn set_transformation(&mut self, scale: i32, transform: Option<Transform>) {
