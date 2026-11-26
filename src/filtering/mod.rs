@@ -36,17 +36,266 @@
 //!   translucent `Argb8888` tiles.
 //!
 //! Architecture-specific backends:
-//! - `x86`: native AVX-512 (512-bit), AVX2 (256-bit), and SSSE3 (128-bit) with
-//!   scalar fallback on baseline SSE2 / Miri
+//! - `x86`: `cfg`-pruned runtime dispatch across AVX-512 (512-bit), AVX2
+//!   (256-bit), SSSE3 (128-bit), and scalar fallback (pruning tiers strictly
+//!   below the compile-time target baseline, and folding away runtime dispatch
+//!   completely when compiled statically with AVX-512 or under Miri)
 //! - `neon`: AArch64 NEON structure load/store (`vld4q`/`vst3q`, `vld3q`/`vst4q`)
 
-#[cfg(target_arch = "x86_64")]
+#[cfg(all(target_arch = "x86_64", not(miri)))]
 #[path = "x86.rs"]
 mod arch;
 
-#[cfg(target_arch = "aarch64")]
+#[cfg(all(target_arch = "aarch64", not(miri)))]
 #[path = "neon.rs"]
 mod arch;
+
+#[cfg(any(miri, not(any(target_arch = "x86_64", target_arch = "aarch64"))))]
+mod arch {
+    use std::borrow::Cow;
+    use std::sync::Mutex;
+    use std::sync::atomic::AtomicBool;
+    use std::sync::atomic::AtomicUsize;
+
+    use crate::buffer_pointer::BufferPointer;
+    use crate::filtering::FrameRows;
+    use crate::filtering::ScalarKernel;
+    use crate::filtering::ScanSubBand;
+    use crate::filtering::ShadowRows;
+    use crate::prelude::*;
+    use crate::serialization::framing::AlphaChannel;
+    use crate::serialization::framing::CompressedTile;
+    use crate::serialization::framing::LeafPayload;
+    use crate::serialization::framing::TileRect;
+    use crate::sharding_compression::CompressorWorkerState;
+    use crate::sharding_compression::DecompressorWorkerState;
+    use crate::vec4u8::Vec4u8;
+
+    #[derive(Debug, Copy, Clone, Eq, PartialEq)]
+    pub(super) struct Tier;
+
+    impl Tier {
+        #[inline(always)]
+        pub(super) const fn detect() -> Self {
+            Self
+        }
+
+        #[inline(always)]
+        pub(super) fn filter_aos_zstd_leaf<const HAS_ALPHA: bool>(
+            self,
+            aos: BufferPointer<Vec4u8>,
+            stride_px: usize,
+            rect: TileRect,
+            state: &mut CompressorWorkerState,
+        ) -> LeafPayload {
+            super::filter_aos_zstd_leaf_with::<ScalarKernel, HAS_ALPHA>(
+                ScalarKernel,
+                aos,
+                stride_px,
+                rect,
+                state,
+            )
+        }
+
+        #[inline(always)]
+        pub(super) fn encode_alpha_plane(
+            self,
+            state: &mut CompressorWorkerState,
+            tw: usize,
+            th: usize,
+        ) -> AlphaChannel {
+            super::encode_alpha_plane_with(ScalarKernel, state, tw, th)
+        }
+
+        /// # Safety
+        /// Caller must uphold [`super::unfilter_tiles_worker_with`] invariants.
+        #[inline(always)]
+        pub(super) unsafe fn unfilter_tiles_worker<'a, F>(
+            self,
+            has_alpha: bool,
+            tile_rects: &[TileRect],
+            frame: &FrameRows,
+            claimed: &[AtomicBool],
+            completed: &AtomicUsize,
+            first_err: &Mutex<Option<anyhow::Error>>,
+            next_tile: &F,
+            state: &mut DecompressorWorkerState,
+        ) where
+            F: Fn() -> Option<Result<Cow<'a, CompressedTile>>> + Sync,
+        {
+            // SAFETY: Caller upholds validated-frame and disjoint-tile invariants.
+            unsafe {
+                if has_alpha {
+                    super::unfilter_tiles_worker_with::<ScalarKernel, true, F>(
+                        ScalarKernel,
+                        self,
+                        tile_rects,
+                        frame,
+                        claimed,
+                        completed,
+                        first_err,
+                        next_tile,
+                        state,
+                    );
+                } else {
+                    super::unfilter_tiles_worker_with::<ScalarKernel, false, F>(
+                        ScalarKernel,
+                        self,
+                        tile_rects,
+                        frame,
+                        claimed,
+                        completed,
+                        first_err,
+                        next_tile,
+                        state,
+                    );
+                }
+            }
+        }
+
+        /// # Safety
+        /// Caller must uphold [`super::decode_jpeg_alpha_rows_with`] invariants.
+        #[inline(always)]
+        pub(super) unsafe fn decode_jpeg_alpha_rows(
+            self,
+            a_filt: &[u8],
+            jpeg_rows: &[Vec4u8],
+            frame: &FrameRows,
+            x0: usize,
+            y0: usize,
+            tw: usize,
+            th: usize,
+            alpha_row_a: &mut Vec<u8>,
+            alpha_row_b: &mut Vec<u8>,
+        ) {
+            // SAFETY: Caller upholds validated-frame and disjoint-rect invariants.
+            unsafe {
+                super::decode_jpeg_alpha_rows_with(
+                    ScalarKernel,
+                    a_filt,
+                    jpeg_rows,
+                    frame,
+                    x0,
+                    y0,
+                    tw,
+                    th,
+                    alpha_row_a,
+                    alpha_row_b,
+                );
+            }
+        }
+
+        /// # Safety
+        /// Caller must uphold [`super::diff_and_update_worker_with`] invariants.
+        #[inline(always)]
+        pub(super) unsafe fn diff_and_update_worker(
+            self,
+            has_alpha: bool,
+            data: BufferPointer<u8>,
+            aos: BufferPointer<Vec4u8>,
+            shadow: &ShadowRows,
+            width: usize,
+            stride: usize,
+            stride_px: usize,
+            n_qx: usize,
+            sub_bands: &[ScanSubBand],
+            dirty_flags: &[AtomicBool],
+            next_sub: &AtomicUsize,
+        ) {
+            // SAFETY: Caller upholds disjoint-band shadow invariants.
+            unsafe {
+                if has_alpha {
+                    super::diff_and_update_worker_with::<ScalarKernel, true>(
+                        ScalarKernel,
+                        data,
+                        aos,
+                        shadow,
+                        width,
+                        stride,
+                        stride_px,
+                        n_qx,
+                        sub_bands,
+                        dirty_flags,
+                        next_sub,
+                    );
+                } else {
+                    super::diff_and_update_worker_with::<ScalarKernel, false>(
+                        ScalarKernel,
+                        data,
+                        aos,
+                        shadow,
+                        width,
+                        stride,
+                        stride_px,
+                        n_qx,
+                        sub_bands,
+                        dirty_flags,
+                        next_sub,
+                    );
+                }
+            }
+        }
+
+        #[cfg(test)]
+        pub(super) unsafe fn diff_and_update_strip<const HAS_ALPHA: bool>(
+            self,
+            aos: BufferPointer<Vec4u8>,
+            shadow: &ShadowRows,
+            stride_px: usize,
+            rect: TileRect,
+        ) -> bool {
+            // SAFETY: Caller upholds disjoint-rect shadow invariants.
+            unsafe {
+                super::diff_and_update_strip_with::<ScalarKernel, HAS_ALPHA>(
+                    ScalarKernel,
+                    aos,
+                    shadow,
+                    stride_px,
+                    rect,
+                )
+            }
+        }
+
+        #[cfg(test)]
+        pub(super) unsafe fn diff_and_update_row_band_2d<const HAS_ALPHA: bool>(
+            self,
+            data: BufferPointer<u8>,
+            aos: BufferPointer<Vec4u8>,
+            shadow: &ShadowRows,
+            width: usize,
+            stride: usize,
+            y0: usize,
+            y1: usize,
+            dirty_slots: &[AtomicBool],
+        ) {
+            // SAFETY: Caller upholds disjoint-row shadow invariants.
+            unsafe {
+                super::diff_and_update_row_band_2d_with::<ScalarKernel, HAS_ALPHA>(
+                    ScalarKernel,
+                    data,
+                    aos,
+                    shadow,
+                    width,
+                    stride,
+                    y0,
+                    y1,
+                    dirty_slots,
+                );
+            }
+        }
+
+        #[cfg(test)]
+        pub(super) fn supported_tiers() -> Vec<Self> {
+            vec![Self]
+        }
+    }
+
+    #[cfg(test)]
+    pub(super) fn verify_all_supported_kernels() -> Vec<Tier> {
+        super::tests::verify_kernel_matches_scalar(ScalarKernel, "scalar");
+        vec![Tier]
+    }
+}
 
 pub(crate) mod palette;
 
@@ -112,32 +361,39 @@ const MIN_JPEG_DIM: usize = 16;
 
 /// Architecture-specific row kernels operating on exact-length slices (no slack
 /// bytes required).
-pub(crate) trait RowKernel {
+///
+/// Implementors are zero-sized capability tokens (`Copy`) whose construction
+/// witnesses that the target CPU supports the corresponding ISA extension;
+/// x86 SIMD kernels are private to [`arch`] and constructed only inside
+/// runtime-verified `#[target_feature]` wrappers.
+pub(crate) trait RowKernel: Copy {
     const STREAM_ALIGN: usize;
 
     fn bgra_to_subgreen_bgr3<const HAS_ALPHA: bool>(
+        self,
         src: BufferPointer<Vec4u8>,
         dst_bgr: &mut [u8],
         dst_alpha: &mut [u8],
     );
 
-    fn sad_signed_bytes(data: &[u8]) -> u64;
+    fn sad_signed_bytes(self, data: &[u8]) -> u64;
 
-    fn row_sub3_forward_sad(src: &[u8], dst: &mut [u8]) -> u64;
+    fn row_sub3_forward_sad(self, src: &[u8], dst: &mut [u8]) -> u64;
 
-    fn row_up_forward_sad(cur: &[u8], prev: &[u8], dst: &mut [u8]) -> u64;
+    fn row_up_forward_sad(self, cur: &[u8], prev: &[u8], dst: &mut [u8]) -> u64;
 
-    fn row_subup3_forward_sad(cur: &[u8], prev: &[u8], dst: &mut [u8]) -> u64;
+    fn row_subup3_forward_sad(self, cur: &[u8], prev: &[u8], dst: &mut [u8]) -> u64;
 
-    fn row_sub3_inverse(src: &[u8], dst: &mut [u8]);
+    fn row_sub3_inverse(self, src: &[u8], dst: &mut [u8]);
 
-    fn row_up_inverse(src: &[u8], prev: &[u8], dst: &mut [u8]);
+    fn row_up_inverse(self, src: &[u8], prev: &[u8], dst: &mut [u8]);
 
-    fn row_subup3_inverse(src: &[u8], prev: &[u8], dst: &mut [u8]);
+    fn row_subup3_inverse(self, src: &[u8], prev: &[u8], dst: &mut [u8]);
 
     /// # Safety
     /// When `STREAM` is `true`, `dst.as_mut_ptr()` must be aligned to `Self::STREAM_ALIGN`.
     unsafe fn subgreen_bgr3_to_bgra<const STREAM: bool, const CONST_ALPHA: bool>(
+        self,
         src_bgr: &[u8],
         alpha_row: &[u8],
         const_alpha: u8,
@@ -146,15 +402,15 @@ pub(crate) trait RowKernel {
 
     /// # Safety
     /// When `STREAM` is `true`, `dst.as_mut_ptr()` must be aligned to `Self::STREAM_ALIGN`.
-    unsafe fn splat_row<const STREAM: bool>(dst: &mut [Vec4u8], pixel: Vec4u8);
+    unsafe fn splat_row<const STREAM: bool>(self, dst: &mut [Vec4u8], pixel: Vec4u8);
 
-    fn is_constant_plane(data: &[u8]) -> Option<u8>;
+    fn is_constant_plane(self, data: &[u8]) -> Option<u8>;
 
-    fn row_sub1_forward(src: &[u8], dst: &mut [u8]);
+    fn row_sub1_forward(self, src: &[u8], dst: &mut [u8]);
 
-    fn row_up_forward(cur: &[u8], prev: &[u8], dst: &mut [u8]);
+    fn row_up_forward(self, cur: &[u8], prev: &[u8], dst: &mut [u8]);
 
-    fn row_sub1_inverse(src: &[u8], dst: &mut [u8]);
+    fn row_sub1_inverse(self, src: &[u8], dst: &mut [u8]);
 
     /// Compares `src` (via [`BufferPointer`], never creating `&[u8]` over
     /// `wl_shm`) against `shadow` pixel-by-pixel (`BGRA` when `HAS_ALPHA`, or
@@ -162,25 +418,43 @@ pub(crate) trait RowKernel {
     /// `shadow` when all pixels match; otherwise updates the differing and
     /// subsequent pixels in `shadow` from `src` and returns `true`.
     fn diff_and_update_row<const HAS_ALPHA: bool>(
+        self,
         src: BufferPointer<Vec4u8>,
         shadow: &mut [Vec4u8],
     ) -> bool;
 
-    fn fence_stream();
+    fn fence_stream(self);
 }
 
 /// Portable scalar reference implementation of [`RowKernel`], also used as the
 /// baseline `x86-64` (SSE2-only) and Miri backend.
 #[cfg_attr(
-    not(any(test, miri, all(target_arch = "x86_64", not(target_feature = "ssse3")))),
+    not(any(
+        test,
+        miri,
+        all(
+            target_arch = "x86_64",
+            not(target_feature = "ssse3"),
+            not(target_feature = "avx2"),
+            not(all(
+                target_feature = "avx512bw",
+                target_feature = "avx512vl",
+                target_feature = "avx512vbmi",
+            )),
+        ),
+        not(any(target_arch = "x86_64", target_arch = "aarch64")),
+    )),
     allow(dead_code)
 )]
+#[derive(Copy, Clone)]
 pub(crate) struct ScalarKernel;
 
 impl RowKernel for ScalarKernel {
     const STREAM_ALIGN: usize = 1;
 
+    #[inline(always)]
     fn bgra_to_subgreen_bgr3<const HAS_ALPHA: bool>(
+        self,
         src: BufferPointer<Vec4u8>,
         dst_bgr: &mut [u8],
         dst_alpha: &mut [u8],
@@ -200,13 +474,15 @@ impl RowKernel for ScalarKernel {
         }
     }
 
-    fn sad_signed_bytes(data: &[u8]) -> u64 {
+    #[inline(always)]
+    fn sad_signed_bytes(self, data: &[u8]) -> u64 {
         data.iter()
             .map(|&b| u64::from((b as i8).unsigned_abs()))
             .sum()
     }
 
-    fn row_sub3_forward_sad(src: &[u8], dst: &mut [u8]) -> u64 {
+    #[inline(always)]
+    fn row_sub3_forward_sad(self, src: &[u8], dst: &mut [u8]) -> u64 {
         let len = src.len();
         debug_assert_eq!(dst.len(), len);
         let mut sum = 0u64;
@@ -219,7 +495,8 @@ impl RowKernel for ScalarKernel {
         sum
     }
 
-    fn row_up_forward_sad(cur: &[u8], prev: &[u8], dst: &mut [u8]) -> u64 {
+    #[inline(always)]
+    fn row_up_forward_sad(self, cur: &[u8], prev: &[u8], dst: &mut [u8]) -> u64 {
         let len = cur.len();
         debug_assert_eq!(prev.len(), len);
         debug_assert_eq!(dst.len(), len);
@@ -232,7 +509,8 @@ impl RowKernel for ScalarKernel {
         sum
     }
 
-    fn row_subup3_forward_sad(cur: &[u8], prev: &[u8], dst: &mut [u8]) -> u64 {
+    #[inline(always)]
+    fn row_subup3_forward_sad(self, cur: &[u8], prev: &[u8], dst: &mut [u8]) -> u64 {
         let len = cur.len();
         debug_assert_eq!(prev.len(), len);
         debug_assert_eq!(dst.len(), len);
@@ -251,7 +529,8 @@ impl RowKernel for ScalarKernel {
         sum
     }
 
-    fn row_sub3_inverse(src: &[u8], dst: &mut [u8]) {
+    #[inline(always)]
+    fn row_sub3_inverse(self, src: &[u8], dst: &mut [u8]) {
         let len = src.len();
         debug_assert_eq!(dst.len(), len);
         for j in 0..len {
@@ -260,7 +539,8 @@ impl RowKernel for ScalarKernel {
         }
     }
 
-    fn row_up_inverse(src: &[u8], prev: &[u8], dst: &mut [u8]) {
+    #[inline(always)]
+    fn row_up_inverse(self, src: &[u8], prev: &[u8], dst: &mut [u8]) {
         let len = src.len();
         debug_assert_eq!(prev.len(), len);
         debug_assert_eq!(dst.len(), len);
@@ -269,7 +549,8 @@ impl RowKernel for ScalarKernel {
         }
     }
 
-    fn row_subup3_inverse(src: &[u8], prev: &[u8], dst: &mut [u8]) {
+    #[inline(always)]
+    fn row_subup3_inverse(self, src: &[u8], prev: &[u8], dst: &mut [u8]) {
         let len = src.len();
         debug_assert_eq!(prev.len(), len);
         debug_assert_eq!(dst.len(), len);
@@ -282,7 +563,9 @@ impl RowKernel for ScalarKernel {
         }
     }
 
+    #[inline(always)]
     unsafe fn subgreen_bgr3_to_bgra<const STREAM: bool, const CONST_ALPHA: bool>(
+        self,
         src_bgr: &[u8],
         alpha_row: &[u8],
         const_alpha: u8,
@@ -308,16 +591,19 @@ impl RowKernel for ScalarKernel {
         }
     }
 
-    unsafe fn splat_row<const STREAM: bool>(dst: &mut [Vec4u8], pixel: Vec4u8) {
+    #[inline(always)]
+    unsafe fn splat_row<const STREAM: bool>(self, dst: &mut [Vec4u8], pixel: Vec4u8) {
         dst.fill(pixel);
     }
 
-    fn is_constant_plane(data: &[u8]) -> Option<u8> {
+    #[inline(always)]
+    fn is_constant_plane(self, data: &[u8]) -> Option<u8> {
         let first = *data.first()?;
         data[1..].iter().all(|&b| b == first).then_some(first)
     }
 
-    fn row_sub1_forward(src: &[u8], dst: &mut [u8]) {
+    #[inline(always)]
+    fn row_sub1_forward(self, src: &[u8], dst: &mut [u8]) {
         let len = src.len();
         debug_assert_eq!(dst.len(), len);
         let mut prev = 0u8;
@@ -328,7 +614,8 @@ impl RowKernel for ScalarKernel {
         }
     }
 
-    fn row_up_forward(cur: &[u8], prev: &[u8], dst: &mut [u8]) {
+    #[inline(always)]
+    fn row_up_forward(self, cur: &[u8], prev: &[u8], dst: &mut [u8]) {
         let len = cur.len();
         debug_assert_eq!(prev.len(), len);
         debug_assert_eq!(dst.len(), len);
@@ -337,7 +624,8 @@ impl RowKernel for ScalarKernel {
         }
     }
 
-    fn row_sub1_inverse(src: &[u8], dst: &mut [u8]) {
+    #[inline(always)]
+    fn row_sub1_inverse(self, src: &[u8], dst: &mut [u8]) {
         let len = src.len();
         debug_assert_eq!(dst.len(), len);
         let mut acc = 0u8;
@@ -347,7 +635,9 @@ impl RowKernel for ScalarKernel {
         }
     }
 
+    #[inline(always)]
     fn diff_and_update_row<const HAS_ALPHA: bool>(
+        self,
         src: BufferPointer<Vec4u8>,
         shadow: &mut [Vec4u8],
     ) -> bool {
@@ -376,7 +666,8 @@ impl RowKernel for ScalarKernel {
         false
     }
 
-    fn fence_stream() {}
+    #[inline(always)]
+    fn fence_stream(self) {}
 }
 
 #[inline]
@@ -397,8 +688,9 @@ fn ensure_len(buf: &mut Vec<u8>, needed: usize) {
 /// Selects the minimum-SAD row predictor (`0=None, 1=Sub, 2=Up, 3=SubUp`) for
 /// `cur_raw` (using `prev_raw` when `ry > 0`), writes the winning filtered
 /// bytes into `filt_row`, and returns the chosen 2-bit predictor tag.
-#[inline]
+#[inline(always)]
 fn select_and_filter_row<K: RowKernel>(
+    kernel: K,
     ry: usize,
     cur_raw: &[u8],
     prev_raw: &[u8],
@@ -407,7 +699,7 @@ fn select_and_filter_row<K: RowKernel>(
 ) -> u8 {
     let row_b = cur_raw.len();
     let mut best_p = 0u8;
-    let mut best_cost = K::sad_signed_bytes(cur_raw);
+    let mut best_cost = kernel.sad_signed_bytes(cur_raw);
 
     if row_b <= TILE_W * 3 {
         // Common 2D tile path (`row_b <= 768 B`): evaluate candidates in L1d
@@ -420,19 +712,20 @@ fn select_and_filter_row<K: RowKernel>(
         let mut cand_up = [0u8; TILE_W * 3];
         let mut cand_su = [0u8; TILE_W * 3];
 
-        let cost_sub = K::row_sub3_forward_sad(cur_raw, &mut cand_sub[..row_b]);
+        let cost_sub = kernel.row_sub3_forward_sad(cur_raw, &mut cand_sub[..row_b]);
         if cost_sub < best_cost {
             best_cost = cost_sub;
             best_p = 1;
         }
         if ry > 0 && best_cost > 0 {
-            let cost_up = K::row_up_forward_sad(cur_raw, prev_raw, &mut cand_up[..row_b]);
+            let cost_up = kernel.row_up_forward_sad(cur_raw, prev_raw, &mut cand_up[..row_b]);
             if cost_up < best_cost {
                 best_cost = cost_up;
                 best_p = 2;
             }
             if best_cost > 0 {
-                let cost_su = K::row_subup3_forward_sad(cur_raw, prev_raw, &mut cand_su[..row_b]);
+                let cost_su =
+                    kernel.row_subup3_forward_sad(cur_raw, prev_raw, &mut cand_su[..row_b]);
                 if cost_su < best_cost {
                     best_p = 3;
                 }
@@ -453,21 +746,21 @@ fn select_and_filter_row<K: RowKernel>(
     if best_cost == 0 {
         return 0;
     }
-    let cost_sub = K::row_sub3_forward_sad(cur_raw, &mut cand_row[..row_b]);
+    let cost_sub = kernel.row_sub3_forward_sad(cur_raw, &mut cand_row[..row_b]);
     if cost_sub < best_cost {
         best_cost = cost_sub;
         best_p = 1;
         filt_row.copy_from_slice(&cand_row[..row_b]);
     }
     if ry > 0 && best_cost > 0 {
-        let cost_up = K::row_up_forward_sad(cur_raw, prev_raw, &mut cand_row[..row_b]);
+        let cost_up = kernel.row_up_forward_sad(cur_raw, prev_raw, &mut cand_row[..row_b]);
         if cost_up < best_cost {
             best_cost = cost_up;
             best_p = 2;
             filt_row.copy_from_slice(&cand_row[..row_b]);
         }
         if best_cost > 0 {
-            let cost_su = K::row_subup3_forward_sad(cur_raw, prev_raw, &mut cand_row[..row_b]);
+            let cost_su = kernel.row_subup3_forward_sad(cur_raw, prev_raw, &mut cand_row[..row_b]);
             if cost_su < best_cost {
                 best_p = 3;
                 filt_row.copy_from_slice(&cand_row[..row_b]);
@@ -540,21 +833,23 @@ fn try_encode_palette_leaf<const HAS_ALPHA: bool>(
     })
 }
 
-fn encode_alpha_plane<K: RowKernel>(
+#[inline(always)]
+fn encode_alpha_plane_with<K: RowKernel>(
+    kernel: K,
     state: &mut CompressorWorkerState,
     tw: usize,
     th: usize,
 ) -> AlphaChannel {
     let n_px = tw * th;
     let raw_alpha = &state.raw_alpha[..n_px];
-    match K::is_constant_plane(raw_alpha) {
+    match kernel.is_constant_plane(raw_alpha) {
         Some(0xFF) => AlphaChannel::Omitted,
         Some(a) => AlphaChannel::Constant(a),
         None => {
             ensure_len(&mut state.filt_alpha, TILE_PIXELS);
-            K::row_sub1_forward(&raw_alpha[..tw], &mut state.filt_alpha[..tw]);
+            kernel.row_sub1_forward(&raw_alpha[..tw], &mut state.filt_alpha[..tw]);
             for ry in 1..th {
-                K::row_up_forward(
+                kernel.row_up_forward(
                     &raw_alpha[ry * tw..(ry + 1) * tw],
                     &raw_alpha[(ry - 1) * tw..ry * tw],
                     &mut state.filt_alpha[ry * tw..(ry + 1) * tw],
@@ -572,7 +867,9 @@ fn encode_alpha_plane<K: RowKernel>(
     }
 }
 
-fn filter_aos_zstd_leaf<K: RowKernel, const HAS_ALPHA: bool>(
+#[inline(always)]
+fn filter_aos_zstd_leaf_with<K: RowKernel, const HAS_ALPHA: bool>(
+    kernel: K,
     aos: BufferPointer<Vec4u8>,
     stride_px: usize,
     rect: TileRect,
@@ -616,18 +913,24 @@ fn filter_aos_zstd_leaf<K: RowKernel, const HAS_ALPHA: bool>(
         };
 
         if HAS_ALPHA {
-            K::bgra_to_subgreen_bgr3::<true>(
+            kernel.bgra_to_subgreen_bgr3::<true>(
                 row_ptr,
                 cur_raw,
                 &mut state.raw_alpha[ry * tw..(ry + 1) * tw],
             );
         } else {
-            K::bgra_to_subgreen_bgr3::<false>(row_ptr, cur_raw, &mut []);
+            kernel.bgra_to_subgreen_bgr3::<false>(row_ptr, cur_raw, &mut []);
         }
 
         let filt_row = &mut state.filt_bgr[ry * row_b..(ry + 1) * row_b];
-        let best_p =
-            select_and_filter_row::<K>(ry, cur_raw, prev_raw, filt_row, &mut state.cand_row);
+        let best_p = select_and_filter_row::<K>(
+            kernel,
+            ry,
+            cur_raw,
+            prev_raw,
+            filt_row,
+            &mut state.cand_row,
+        );
         predictors[ry >> 2] |= best_p << ((ry & 3) * 2);
         use_a = !use_a;
     }
@@ -638,7 +941,7 @@ fn filter_aos_zstd_leaf<K: RowKernel, const HAS_ALPHA: bool>(
         &state.filt_bgr[..total_b],
     );
     let alpha = if HAS_ALPHA {
-        encode_alpha_plane::<K>(state, tw, th)
+        encode_alpha_plane_with(kernel, state, tw, th)
     } else {
         AlphaChannel::Omitted
     };
@@ -650,7 +953,8 @@ fn filter_aos_zstd_leaf<K: RowKernel, const HAS_ALPHA: bool>(
     }
 }
 
-fn filter_lossless_leaf<K: RowKernel, const HAS_ALPHA: bool>(
+fn filter_lossless_leaf<const HAS_ALPHA: bool>(
+    tier: arch::Tier,
     aos: BufferPointer<Vec4u8>,
     stride_px: usize,
     rect: TileRect,
@@ -659,10 +963,11 @@ fn filter_lossless_leaf<K: RowKernel, const HAS_ALPHA: bool>(
     if let Some(leaf) = try_encode_palette_leaf::<HAS_ALPHA>(aos, stride_px, rect, state) {
         return leaf;
     }
-    filter_aos_zstd_leaf::<K, HAS_ALPHA>(aos, stride_px, rect, state)
+    tier.filter_aos_zstd_leaf::<HAS_ALPHA>(aos, stride_px, rect, state)
 }
 
-fn encode_jpeg_leaf<K: RowKernel, const HAS_ALPHA: bool>(
+fn encode_jpeg_leaf<const HAS_ALPHA: bool>(
+    tier: arch::Tier,
     aos: BufferPointer<Vec4u8>,
     stride_px: usize,
     rect: TileRect,
@@ -702,14 +1007,15 @@ fn encode_jpeg_leaf<K: RowKernel, const HAS_ALPHA: bool>(
         .compress_jpeg(tw, th, quality, subsamp)
         .expect("turbojpeg compression failed for valid tile");
     let alpha = if HAS_ALPHA {
-        encode_alpha_plane::<K>(state, tw, th)
+        tier.encode_alpha_plane(state, tw, th)
     } else {
         AlphaChannel::Omitted
     };
     LeafPayload::Jpeg { data, alpha }
 }
 
-fn filter_hybrid_tile<K: RowKernel, const HAS_ALPHA: bool>(
+fn filter_hybrid_tile<const HAS_ALPHA: bool>(
+    tier: arch::Tier,
     aos: BufferPointer<Vec4u8>,
     stride_px: usize,
     rect: TileRect,
@@ -723,8 +1029,8 @@ fn filter_hybrid_tile<K: RowKernel, const HAS_ALPHA: bool>(
     // Small/thin tiles (`< 16` px in either dimension, including `< 8`-row 1D
     // strips) always stay lossless where JPEG headers would bloat the payload.
     if tw < MIN_JPEG_DIM || th < MIN_JPEG_DIM {
-        return TilePayload::Leaf(filter_lossless_leaf::<K, HAS_ALPHA>(
-            aos, stride_px, rect, state,
+        return TilePayload::Leaf(filter_lossless_leaf::<HAS_ALPHA>(
+            tier, aos, stride_px, rect, state,
         ));
     }
 
@@ -744,9 +1050,9 @@ fn filter_hybrid_tile<K: RowKernel, const HAS_ALPHA: bool>(
                 .classify_text_safe(aos, stride_px, rect)
                 .is_text_safe()
             {
-                filter_aos_zstd_leaf::<K, HAS_ALPHA>(aos, stride_px, rect, state)
+                tier.filter_aos_zstd_leaf::<HAS_ALPHA>(aos, stride_px, rect, state)
             } else {
-                encode_jpeg_leaf::<K, HAS_ALPHA>(aos, stride_px, rect, quality, subsamp, state)
+                encode_jpeg_leaf::<HAS_ALPHA>(tier, aos, stride_px, rect, quality, subsamp, state)
             },
         );
     }
@@ -763,12 +1069,10 @@ fn filter_hybrid_tile<K: RowKernel, const HAS_ALPHA: bool>(
     }
 
     if text_safe_count == n_quads {
-        TilePayload::Leaf(filter_aos_zstd_leaf::<K, HAS_ALPHA>(
-            aos, stride_px, rect, state,
-        ))
+        TilePayload::Leaf(tier.filter_aos_zstd_leaf::<HAS_ALPHA>(aos, stride_px, rect, state))
     } else if text_safe_count == 0 {
-        TilePayload::Leaf(encode_jpeg_leaf::<K, HAS_ALPHA>(
-            aos, stride_px, rect, quality, subsamp, state,
+        TilePayload::Leaf(encode_jpeg_leaf::<HAS_ALPHA>(
+            tier, aos, stride_px, rect, quality, subsamp, state,
         ))
     } else {
         let mut sub_tiles = Vec::with_capacity(n_quads);
@@ -776,17 +1080,17 @@ fn filter_hybrid_tile<K: RowKernel, const HAS_ALPHA: bool>(
             let qrect = quads[q];
             let payload = match classes[q] {
                 TextSafeClass::PaletteCandidate => {
-                    filter_lossless_leaf::<K, HAS_ALPHA>(aos, stride_px, qrect, state)
+                    filter_lossless_leaf::<HAS_ALPHA>(tier, aos, stride_px, qrect, state)
                 },
                 TextSafeClass::DominantBg => {
-                    filter_aos_zstd_leaf::<K, HAS_ALPHA>(aos, stride_px, qrect, state)
+                    tier.filter_aos_zstd_leaf::<HAS_ALPHA>(aos, stride_px, qrect, state)
                 },
                 TextSafeClass::Photo => {
                     if (qrect.w as usize) < MIN_JPEG_DIM || (qrect.h as usize) < MIN_JPEG_DIM {
-                        filter_aos_zstd_leaf::<K, HAS_ALPHA>(aos, stride_px, qrect, state)
+                        tier.filter_aos_zstd_leaf::<HAS_ALPHA>(aos, stride_px, qrect, state)
                     } else {
-                        encode_jpeg_leaf::<K, HAS_ALPHA>(
-                            aos, stride_px, qrect, quality, subsamp, state,
+                        encode_jpeg_leaf::<HAS_ALPHA>(
+                            tier, aos, stride_px, qrect, quality, subsamp, state,
                         )
                     }
                 },
@@ -800,7 +1104,8 @@ fn filter_hybrid_tile<K: RowKernel, const HAS_ALPHA: bool>(
     }
 }
 
-fn filter_tile<K: RowKernel, const HAS_ALPHA: bool>(
+fn filter_tile<const HAS_ALPHA: bool>(
+    tier: arch::Tier,
     aos: BufferPointer<Vec4u8>,
     stride_px: usize,
     rect: TileRect,
@@ -808,11 +1113,11 @@ fn filter_tile<K: RowKernel, const HAS_ALPHA: bool>(
     state: &mut CompressorWorkerState,
 ) -> TilePayload {
     match mode {
-        CompressionMode::Lossless => TilePayload::Leaf(filter_lossless_leaf::<K, HAS_ALPHA>(
-            aos, stride_px, rect, state,
+        CompressionMode::Lossless => TilePayload::Leaf(filter_lossless_leaf::<HAS_ALPHA>(
+            tier, aos, stride_px, rect, state,
         )),
         CompressionMode::Hybrid { quality, subsamp } => {
-            filter_hybrid_tile::<K, HAS_ALPHA>(aos, stride_px, rect, quality, subsamp, state)
+            filter_hybrid_tile::<HAS_ALPHA>(tier, aos, stride_px, rect, quality, subsamp, state)
         },
     }
 }
@@ -913,10 +1218,56 @@ fn prepare_alpha_decode<'a, const HAS_ALPHA: bool>(
 }
 
 /// # Safety
+/// `(x0, y0, tw, th)` must be validated in-bounds within `frame` and disjoint
+/// from all other tiles being decoded concurrently.
+#[inline(always)]
+unsafe fn decode_jpeg_alpha_rows_with<K: RowKernel>(
+    kernel: K,
+    a_filt: &[u8],
+    jpeg_rows: &[Vec4u8],
+    frame: &FrameRows,
+    x0: usize,
+    y0: usize,
+    tw: usize,
+    th: usize,
+    alpha_row_a: &mut Vec<u8>,
+    alpha_row_b: &mut Vec<u8>,
+) {
+    ensure_len(alpha_row_a, tw);
+    if th > 1 {
+        ensure_len(alpha_row_b, tw);
+    }
+    let mut use_a = true;
+    for ry in 0..th {
+        let (a_cur, a_prev): (&mut [u8], &[u8]) = if use_a {
+            (
+                &mut alpha_row_a[..tw],
+                &alpha_row_b[..if ry > 0 { tw } else { 0 }],
+            )
+        } else {
+            (&mut alpha_row_b[..tw], &alpha_row_a[..tw])
+        };
+        if ry == 0 {
+            kernel.row_sub1_inverse(&a_filt[..tw], a_cur);
+        } else {
+            kernel.row_up_inverse(&a_filt[ry * tw..(ry + 1) * tw], a_prev, a_cur);
+        }
+        let src_row = &jpeg_rows[ry * tw..(ry + 1) * tw];
+        // SAFETY: Caller guarantees `(x0, y0, tw, th)` is in-bounds and disjoint.
+        let dst_row = unsafe { slice::from_raw_parts_mut(frame.row_ptr(y0 + ry, x0), tw) };
+        for ((dst, &px), &a) in dst_row.iter_mut().zip(src_row).zip(a_cur.iter()) {
+            *dst = Vec4u8(px.0, px.1, px.2, a);
+        }
+        use_a = !use_a;
+    }
+}
+
+/// # Safety
 /// `rect` must already be validated in-bounds within `frame` and disjoint from
 /// all other tiles being decoded concurrently.
 #[inline(never)]
-unsafe fn unfilter_jpeg_leaf<K: RowKernel, const HAS_ALPHA: bool>(
+unsafe fn unfilter_jpeg_leaf<const HAS_ALPHA: bool>(
+    tier: arch::Tier,
     rect: TileRect,
     data: &[u8],
     alpha: &AlphaChannel,
@@ -961,34 +1312,21 @@ unsafe fn unfilter_jpeg_leaf<K: RowKernel, const HAS_ALPHA: bool>(
                 *dst = Vec4u8(px.0, px.1, px.2, a);
             }
         }
-    } else {
+    } else if HAS_ALPHA {
         let a_filt = alpha_filt_slice.unwrap();
-        ensure_len(&mut state.alpha_row_a, tw);
-        if th > 1 {
-            ensure_len(&mut state.alpha_row_b, tw);
-        }
-        let mut use_a = true;
-        for ry in 0..th {
-            let (a_cur, a_prev): (&mut [u8], &[u8]) = if use_a {
-                (
-                    &mut state.alpha_row_a[..tw],
-                    &state.alpha_row_b[..if ry > 0 { tw } else { 0 }],
-                )
-            } else {
-                (&mut state.alpha_row_b[..tw], &state.alpha_row_a[..tw])
-            };
-            if ry == 0 {
-                K::row_sub1_inverse(&a_filt[..tw], a_cur);
-            } else {
-                K::row_up_inverse(&a_filt[ry * tw..(ry + 1) * tw], a_prev, a_cur);
-            }
-            let src_row = &jpeg_rows[ry * tw..(ry + 1) * tw];
-            // SAFETY: Caller guarantees `rect` is in-bounds and disjoint.
-            let dst_row = unsafe { slice::from_raw_parts_mut(frame.row_ptr(y0 + ry, x0), tw) };
-            for ((dst, &px), &a) in dst_row.iter_mut().zip(src_row).zip(a_cur.iter()) {
-                *dst = Vec4u8(px.0, px.1, px.2, a);
-            }
-            use_a = !use_a;
+        // SAFETY: Caller guarantees `rect` is in-bounds and disjoint.
+        unsafe {
+            tier.decode_jpeg_alpha_rows(
+                a_filt,
+                jpeg_rows,
+                frame,
+                x0,
+                y0,
+                tw,
+                th,
+                &mut state.alpha_row_a,
+                &mut state.alpha_row_b,
+            );
         }
     }
     Ok(false)
@@ -997,7 +1335,10 @@ unsafe fn unfilter_jpeg_leaf<K: RowKernel, const HAS_ALPHA: bool>(
 /// # Safety
 /// `rect` must already be validated in-bounds within `frame` and disjoint from
 /// all other tiles being decoded concurrently.
+#[inline(always)]
 unsafe fn unfilter_leaf<K: RowKernel, const HAS_ALPHA: bool>(
+    kernel: K,
+    tier: arch::Tier,
     rect: TileRect,
     payload: &LeafPayload,
     frame: &FrameRows,
@@ -1025,11 +1366,11 @@ unsafe fn unfilter_leaf<K: RowKernel, const HAS_ALPHA: bool>(
                     && (dst_row.as_mut_ptr() as usize).is_multiple_of(K::STREAM_ALIGN)
                 {
                     // SAFETY: Verified `dst_row` alignment matches `K::STREAM_ALIGN`.
-                    unsafe { K::splat_row::<true>(dst_row, pixel) };
+                    unsafe { kernel.splat_row::<true>(dst_row, pixel) };
                     streamed = true;
                 } else {
                     // SAFETY: `STREAM = false` imposes no extra alignment requirement.
-                    unsafe { K::splat_row::<false>(dst_row, pixel) };
+                    unsafe { kernel.splat_row::<false>(dst_row, pixel) };
                 }
             }
             Ok(streamed)
@@ -1142,15 +1483,15 @@ unsafe fn unfilter_leaf<K: RowKernel, const HAS_ALPHA: bool>(
                         filt_row
                     },
                     1 => {
-                        K::row_sub3_inverse(filt_row, cur_dec);
+                        kernel.row_sub3_inverse(filt_row, cur_dec);
                         cur_dec
                     },
                     2 => {
-                        K::row_up_inverse(filt_row, prev_dec, cur_dec);
+                        kernel.row_up_inverse(filt_row, prev_dec, cur_dec);
                         cur_dec
                     },
                     _ => {
-                        K::row_subup3_inverse(filt_row, prev_dec, cur_dec);
+                        kernel.row_subup3_inverse(filt_row, prev_dec, cur_dec);
                         cur_dec
                     },
                 };
@@ -1165,13 +1506,18 @@ unsafe fn unfilter_leaf<K: RowKernel, const HAS_ALPHA: bool>(
                     if use_stream {
                         // SAFETY: Verified `dst_row` alignment matches `K::STREAM_ALIGN`.
                         unsafe {
-                            K::subgreen_bgr3_to_bgra::<true, true>(decoded_bgr, &[], a, dst_row)
+                            kernel.subgreen_bgr3_to_bgra::<true, true>(decoded_bgr, &[], a, dst_row)
                         };
                         streamed = true;
                     } else {
                         // SAFETY: `STREAM = false` imposes no extra alignment requirement.
                         unsafe {
-                            K::subgreen_bgr3_to_bgra::<false, true>(decoded_bgr, &[], a, dst_row);
+                            kernel.subgreen_bgr3_to_bgra::<false, true>(
+                                decoded_bgr,
+                                &[],
+                                a,
+                                dst_row,
+                            );
                         }
                     }
                 } else {
@@ -1185,20 +1531,25 @@ unsafe fn unfilter_leaf<K: RowKernel, const HAS_ALPHA: bool>(
                         (&mut state.alpha_row_b[..tw], &state.alpha_row_a[..tw])
                     };
                     if ry == 0 {
-                        K::row_sub1_inverse(&a_filt[..tw], a_cur);
+                        kernel.row_sub1_inverse(&a_filt[..tw], a_cur);
                     } else {
-                        K::row_up_inverse(&a_filt[ry * tw..(ry + 1) * tw], a_prev, a_cur);
+                        kernel.row_up_inverse(&a_filt[ry * tw..(ry + 1) * tw], a_prev, a_cur);
                     }
                     if use_stream {
                         // SAFETY: Verified `dst_row` alignment matches `K::STREAM_ALIGN`.
                         unsafe {
-                            K::subgreen_bgr3_to_bgra::<true, false>(decoded_bgr, a_cur, 0, dst_row);
+                            kernel.subgreen_bgr3_to_bgra::<true, false>(
+                                decoded_bgr,
+                                a_cur,
+                                0,
+                                dst_row,
+                            );
                         }
                         streamed = true;
                     } else {
                         // SAFETY: `STREAM = false` imposes no extra alignment requirement.
                         unsafe {
-                            K::subgreen_bgr3_to_bgra::<false, false>(
+                            kernel.subgreen_bgr3_to_bgra::<false, false>(
                                 decoded_bgr,
                                 a_cur,
                                 0,
@@ -1214,7 +1565,7 @@ unsafe fn unfilter_leaf<K: RowKernel, const HAS_ALPHA: bool>(
         },
         LeafPayload::Jpeg { data, alpha } => {
             // SAFETY: Caller guarantees `rect` is in-bounds and disjoint.
-            unsafe { unfilter_jpeg_leaf::<K, HAS_ALPHA>(rect, data, alpha, frame, state) }
+            unsafe { unfilter_jpeg_leaf::<HAS_ALPHA>(tier, rect, data, alpha, frame, state) }
         },
     }
 }
@@ -1222,31 +1573,113 @@ unsafe fn unfilter_leaf<K: RowKernel, const HAS_ALPHA: bool>(
 /// # Safety
 /// `rect` must already be validated in-bounds within `frame` and disjoint from
 /// all other tiles being decoded concurrently.
+#[inline(always)]
 unsafe fn unfilter_tile<K: RowKernel, const HAS_ALPHA: bool>(
+    kernel: K,
+    tier: arch::Tier,
     rect: TileRect,
     payload: &TilePayload,
     frame: &FrameRows,
     state: &mut DecompressorWorkerState,
 ) -> Result<bool> {
-    match payload {
-        TilePayload::Leaf(leaf) => {
-            // SAFETY: Caller guarantees `rect` is in-bounds and disjoint.
-            unsafe { unfilter_leaf::<K, HAS_ALPHA>(rect, leaf, frame, state) }
-        },
-        TilePayload::Split(sub_tiles) => {
-            validate_split_rects(rect, sub_tiles).location(loc!())?;
-            let mut streamed = false;
-            for sub in sub_tiles {
-                // SAFETY: `validate_split_rects` verified `sub.rect` is inside
-                // `rect` (in-bounds and disjoint from other tiles) and disjoint
-                // from sibling sub-tiles (decoded sequentially on this worker).
-                streamed |= unsafe {
-                    unfilter_leaf::<K, HAS_ALPHA>(sub.rect, &sub.payload, frame, state)
-                        .location(loc!())?
+    let mut idx = 0usize;
+    let mut streamed = false;
+    loop {
+        let (leaf_rect, leaf_payload) = match payload {
+            TilePayload::Leaf(leaf) => {
+                if idx > 0 {
+                    break;
+                }
+                (rect, leaf)
+            },
+            TilePayload::Split(sub_tiles) => {
+                if idx == 0 {
+                    validate_split_rects(rect, sub_tiles).location(loc!())?;
+                }
+                let Some(sub) = sub_tiles.get(idx) else {
+                    break;
                 };
-            }
-            Ok(streamed)
-        },
+                (sub.rect, &sub.payload)
+            },
+        };
+        // SAFETY: Caller guarantees `rect` is in-bounds and disjoint; for `Split`,
+        // `validate_split_rects` verified every `sub.rect` is inside `rect` and
+        // pairwise disjoint across sequentially decoded siblings.
+        streamed |= unsafe {
+            unfilter_leaf::<K, HAS_ALPHA>(kernel, tier, leaf_rect, leaf_payload, frame, state)
+                .location(loc!())?
+        };
+        idx += 1;
+    }
+    Ok(streamed)
+}
+
+/// # Safety
+/// Caller must have validated `tile_rects` in-bounds within `frame` and
+/// pairwise disjoint.
+#[inline(always)]
+unsafe fn decode_one_tile<'a, K: RowKernel, const HAS_ALPHA: bool>(
+    kernel: K,
+    tier: arch::Tier,
+    item: Result<Cow<'a, CompressedTile>>,
+    tile_rects: &[TileRect],
+    frame: &FrameRows,
+    claimed: &[AtomicBool],
+    state: &mut DecompressorWorkerState,
+) -> Result<bool> {
+    let tile = item?;
+    let idx = tile.tile_idx as usize;
+    let Some(slot) = claimed.get(idx) else {
+        bail!("tile_idx {idx} out of range (n_tiles={})", tile_rects.len());
+    };
+    if slot.swap(true, Ordering::AcqRel) {
+        bail!("duplicate tile_idx {idx}");
+    }
+    let rect = tile_rects[idx];
+    // SAFETY: Caller validated `tile_rects` in-bounds and pairwise disjoint, and
+    // `claimed[idx]` guarantees exclusive ownership of `rect` for this worker.
+    unsafe { unfilter_tile::<K, HAS_ALPHA>(kernel, tier, rect, &tile.payload, frame, state) }
+}
+
+/// # Safety
+/// Caller must have validated `tile_rects` in-bounds within `frame` and
+/// pairwise disjoint.
+#[inline(always)]
+unsafe fn unfilter_tiles_worker_with<'a, K: RowKernel, const HAS_ALPHA: bool, F>(
+    kernel: K,
+    tier: arch::Tier,
+    tile_rects: &[TileRect],
+    frame: &FrameRows,
+    claimed: &[AtomicBool],
+    completed: &AtomicUsize,
+    first_err: &Mutex<Option<anyhow::Error>>,
+    next_tile: &F,
+    state: &mut DecompressorWorkerState,
+) where
+    F: Fn() -> Option<Result<Cow<'a, CompressedTile>>> + Sync,
+{
+    let mut streamed_any = false;
+    while let Some(item) = next_tile() {
+        // SAFETY: Caller validated `tile_rects` in-bounds and pairwise disjoint.
+        let res = unsafe {
+            decode_one_tile::<K, HAS_ALPHA>(kernel, tier, item, tile_rects, frame, claimed, state)
+        };
+        match res {
+            Ok(used_stream) => {
+                streamed_any |= used_stream;
+                completed.fetch_add(1, Ordering::Relaxed);
+            },
+            Err(err) => {
+                let mut guard = first_err.lock().unwrap();
+                if guard.is_none() {
+                    *guard = Some(err);
+                }
+                break;
+            },
+        }
+    }
+    if streamed_any {
+        kernel.fence_stream();
     }
 }
 
@@ -1518,7 +1951,9 @@ fn plan_incremental_scan(
 /// # Safety
 /// `rect` must be strictly in-bounds within `shadow` and disjoint from all
 /// regions concurrently accessed by other threads.
-unsafe fn diff_and_update_strip<const HAS_ALPHA: bool>(
+#[inline(always)]
+unsafe fn diff_and_update_strip_with<K: RowKernel, const HAS_ALPHA: bool>(
+    kernel: K,
     aos: BufferPointer<Vec4u8>,
     shadow: &ShadowRows,
     stride_px: usize,
@@ -1538,7 +1973,7 @@ unsafe fn diff_and_update_strip<const HAS_ALPHA: bool>(
         let dst_row = unsafe {
             slice::from_raw_parts_mut(shadow.row_ptr(y0 + ry, x_bytes).cast::<Vec4u8>(), w)
         };
-        if arch::Kernel::diff_and_update_row::<HAS_ALPHA>(src_row, dst_row) {
+        if kernel.diff_and_update_row::<HAS_ALPHA>(src_row, dst_row) {
             for rem_ry in (ry + 1)..h {
                 let (_, rem_after) = aos.split_at((y0 + rem_ry) * stride_px + x0);
                 let (rem_src, _) = rem_after.split_at(w);
@@ -1565,7 +2000,9 @@ unsafe fn diff_and_update_strip<const HAS_ALPHA: bool>(
 /// # Safety
 /// Rows `[y0, y1)` must be strictly in-bounds within `shadow` and disjoint from
 /// all rows concurrently accessed by other threads.
-unsafe fn diff_and_update_row_band_2d<const HAS_ALPHA: bool>(
+#[inline(always)]
+unsafe fn diff_and_update_row_band_2d_with<K: RowKernel, const HAS_ALPHA: bool>(
+    kernel: K,
     data: BufferPointer<u8>,
     aos: BufferPointer<Vec4u8>,
     shadow: &ShadowRows,
@@ -1619,7 +2056,7 @@ unsafe fn diff_and_update_row_band_2d<const HAS_ALPHA: bool>(
             let dst_chunk = &mut dst_row[x..x + cw];
             if *is_dirty {
                 src_chunk.copy_to_nonoverlapping(dst_chunk);
-            } else if arch::Kernel::diff_and_update_row::<HAS_ALPHA>(src_chunk, dst_chunk) {
+            } else if kernel.diff_and_update_row::<HAS_ALPHA>(src_chunk, dst_chunk) {
                 *is_dirty = true;
                 dirty_count += 1;
             }
@@ -1630,6 +2067,62 @@ unsafe fn diff_and_update_row_band_2d<const HAS_ALPHA: bool>(
     for (slot, &dirty) in dirty_slots.iter().zip(&qx_dirty) {
         if dirty {
             slot.store(true, Ordering::Relaxed);
+        }
+    }
+}
+
+/// Worker loop for Phase A incremental shadow diffing.
+///
+/// # Safety
+/// Every entry in `sub_bands` must cover strictly in-bounds, pairwise disjoint
+/// regions in `shadow`.
+#[inline(always)]
+unsafe fn diff_and_update_worker_with<K: RowKernel, const HAS_ALPHA: bool>(
+    kernel: K,
+    data: BufferPointer<u8>,
+    aos: BufferPointer<Vec4u8>,
+    shadow: &ShadowRows,
+    width: usize,
+    stride: usize,
+    stride_px: usize,
+    n_qx: usize,
+    sub_bands: &[ScanSubBand],
+    dirty_flags: &[AtomicBool],
+    next_sub: &AtomicUsize,
+) {
+    let n_sub = sub_bands.len();
+    loop {
+        let idx = next_sub.fetch_add(1, Ordering::Relaxed);
+        if idx >= n_sub {
+            break;
+        }
+        match sub_bands[idx] {
+            ScanSubBand::Strip1D { rect, slot_idx } => {
+                // SAFETY: `sub_bands` cover disjoint regions in `shadow`.
+                let dirty = unsafe {
+                    diff_and_update_strip_with::<K, HAS_ALPHA>(kernel, aos, shadow, stride_px, rect)
+                };
+                if dirty {
+                    dirty_flags[slot_idx].store(true, Ordering::Relaxed);
+                }
+            },
+            ScanSubBand::RowBand2D { y0, y1, slot_base } => {
+                let slots = &dirty_flags[slot_base..slot_base + n_qx];
+                // SAFETY: `sub_bands` cover disjoint row ranges in `shadow`.
+                unsafe {
+                    diff_and_update_row_band_2d_with::<K, HAS_ALPHA>(
+                        kernel,
+                        data,
+                        aos,
+                        shadow,
+                        width,
+                        stride,
+                        y0 as usize,
+                        y1 as usize,
+                        slots,
+                    );
+                }
+            },
         }
     }
 }
@@ -1692,12 +2185,8 @@ pub(crate) fn validate_tile_rects(tile_rects: &[TileRect], width: u32, height: u
 
 // --- public API ---
 
-/// Streams a full (`incremental = false`) frame covering the entire buffer.
-/// When `shadow_out` is `Some`, each worker copies its tile from `data` into
-/// `shadow_out` and encodes from that L2-hot copy so `shadow_out` always
-/// matches the transmitted pixels even if shared memory mutates concurrently.
-#[instrument(skip_all, level = "debug")]
-pub fn filter_and_compress_full_streaming(
+fn filter_and_compress_full_streaming_with_tier(
+    tier: arch::Tier,
     data: BufferPointer<u8>,
     client: ClientId,
     surface: WlSurfaceId,
@@ -1784,9 +2273,9 @@ pub fn filter_and_compress_full_streaming(
                 aos
             };
             let payload = if has_alpha {
-                filter_tile::<arch::Kernel, true>(encode_aos, stride_px, rect, mode, state)
+                filter_tile::<true>(tier, encode_aos, stride_px, rect, mode, state)
             } else {
-                filter_tile::<arch::Kernel, false>(encode_aos, stride_px, rect, mode, state)
+                filter_tile::<false>(tier, encode_aos, stride_px, rect, mode, state)
             };
 
             if tiles_tx
@@ -1806,16 +2295,36 @@ pub fn filter_and_compress_full_streaming(
     });
 }
 
-/// Diffs `data` against `shadow` across `bands` (or the full frame when `bands`
-/// is `None`), updates `shadow` for every changed `128x128` quadrant or
-/// `< 8`-row 1D strip, and streams only the dirty tiles (`incremental = true`)
-/// from `shadow`.
-///
-/// Returns the transmitted dirty [`TileRect`]s in deterministic raster order.
-/// When no pixels changed, returns an empty `Vec` without invoking
-/// `on_stream_ready`.
+/// Streams a full (`incremental = false`) frame covering the entire buffer.
+/// When `shadow_out` is `Some`, each worker copies its tile from `data` into
+/// `shadow_out` and encodes from that L2-hot copy so `shadow_out` always
+/// matches the transmitted pixels even if shared memory mutates concurrently.
 #[instrument(skip_all, level = "debug")]
-pub fn filter_and_compress_incremental_streaming(
+pub fn filter_and_compress_full_streaming(
+    data: BufferPointer<u8>,
+    client: ClientId,
+    surface: WlSurfaceId,
+    metadata: BufferMetadata,
+    mode: CompressionMode,
+    shadow_out: Option<&mut Vec<u8>>,
+    compressor: &mut ShardingCompressor,
+    on_stream_ready: impl FnOnce(StreamingCompressedTiles),
+) {
+    filter_and_compress_full_streaming_with_tier(
+        arch::Tier::detect(),
+        data,
+        client,
+        surface,
+        metadata,
+        mode,
+        shadow_out,
+        compressor,
+        on_stream_ready,
+    );
+}
+
+fn filter_and_compress_incremental_streaming_with_tier(
+    tier: arch::Tier,
     data: BufferPointer<u8>,
     client: ClientId,
     surface: WlSurfaceId,
@@ -1860,61 +2369,21 @@ pub fn filter_and_compress_incremental_streaming(
         };
         let next_sub = AtomicUsize::new(0);
         compressor.pool.execute(n_sub, |_| {
-            loop {
-                let idx = next_sub.fetch_add(1, Ordering::Relaxed);
-                if idx >= n_sub {
-                    break;
-                }
-                match sub_bands[idx] {
-                    ScanSubBand::Strip1D { rect, slot_idx } => {
-                        let dirty = if has_alpha {
-                            // SAFETY: `sub_bands` cover disjoint regions in `shadow`.
-                            unsafe {
-                                diff_and_update_strip::<true>(aos, &shadow_rows, stride_px, rect)
-                            }
-                        } else {
-                            // SAFETY: `sub_bands` cover disjoint regions in `shadow`.
-                            unsafe {
-                                diff_and_update_strip::<false>(aos, &shadow_rows, stride_px, rect)
-                            }
-                        };
-                        if dirty {
-                            dirty_flags[slot_idx].store(true, Ordering::Relaxed);
-                        }
-                    },
-                    ScanSubBand::RowBand2D { y0, y1, slot_base } => {
-                        let slots = &dirty_flags[slot_base..slot_base + n_qx];
-                        if has_alpha {
-                            // SAFETY: `sub_bands` cover disjoint row ranges in `shadow`.
-                            unsafe {
-                                diff_and_update_row_band_2d::<true>(
-                                    data,
-                                    aos,
-                                    &shadow_rows,
-                                    width,
-                                    stride,
-                                    y0 as usize,
-                                    y1 as usize,
-                                    slots,
-                                );
-                            }
-                        } else {
-                            // SAFETY: `sub_bands` cover disjoint row ranges in `shadow`.
-                            unsafe {
-                                diff_and_update_row_band_2d::<false>(
-                                    data,
-                                    aos,
-                                    &shadow_rows,
-                                    width,
-                                    stride,
-                                    y0 as usize,
-                                    y1 as usize,
-                                    slots,
-                                );
-                            }
-                        }
-                    },
-                }
+            // SAFETY: `sub_bands` cover disjoint regions in `shadow`.
+            unsafe {
+                tier.diff_and_update_worker(
+                    has_alpha,
+                    data,
+                    aos,
+                    &shadow_rows,
+                    width,
+                    stride,
+                    stride_px,
+                    n_qx,
+                    &sub_bands,
+                    &dirty_flags,
+                    &next_sub,
+                );
             }
         });
     }
@@ -1989,9 +2458,9 @@ pub fn filter_and_compress_incremental_streaming(
             }
             let rect = dirty_tiles[tile_idx];
             let payload = if has_alpha {
-                filter_tile::<arch::Kernel, true>(shadow_aos, stride_px, rect, mode, state)
+                filter_tile::<true>(tier, shadow_aos, stride_px, rect, mode, state)
             } else {
-                filter_tile::<arch::Kernel, false>(shadow_aos, stride_px, rect, mode, state)
+                filter_tile::<false>(tier, shadow_aos, stride_px, rect, mode, state)
             };
 
             if tiles_tx
@@ -2007,6 +2476,40 @@ pub fn filter_and_compress_incremental_streaming(
     });
 
     dirty_tiles
+}
+
+/// Diffs `data` against `shadow` across `bands` (or the full frame when `bands`
+/// is `None`), updates `shadow` for every changed `128x128` quadrant or
+/// `< 8`-row 1D strip, and streams only the dirty tiles (`incremental = true`)
+/// from `shadow`.
+///
+/// Returns the transmitted dirty [`TileRect`]s in deterministic raster order.
+/// When no pixels changed, returns an empty `Vec` without invoking
+/// `on_stream_ready`.
+#[instrument(skip_all, level = "debug")]
+pub fn filter_and_compress_incremental_streaming(
+    data: BufferPointer<u8>,
+    client: ClientId,
+    surface: WlSurfaceId,
+    metadata: BufferMetadata,
+    mode: CompressionMode,
+    bands: Option<&[RowBand]>,
+    shadow: &mut [u8],
+    compressor: &mut ShardingCompressor,
+    on_stream_ready: impl FnOnce(StreamingCompressedTiles),
+) -> Vec<TileRect> {
+    filter_and_compress_incremental_streaming_with_tier(
+        arch::Tier::detect(),
+        data,
+        client,
+        surface,
+        metadata,
+        mode,
+        bands,
+        shadow,
+        compressor,
+        on_stream_ready,
+    )
 }
 
 #[instrument(skip_all, level = "debug")]
@@ -2040,12 +2543,14 @@ pub fn filter_and_compress(
     }
 }
 
-/// Decodes a validated set of pairwise-disjoint `tile_rects` in parallel.
+/// Decodes a validated set of pairwise-disjoint `tile_rects` in parallel using
+/// `tier`.
 ///
 /// # Safety
 /// Caller must have validated `metadata` (`byte_len = total_pixels * 4`) and
 /// verified every rect in `tile_rects` via [`validate_tile_rects`].
-unsafe fn unfilter_tiles_parallel<'a>(
+unsafe fn unfilter_tiles_parallel_with_tier<'a>(
+    tier: arch::Tier,
     decompressor: &mut ShardingDecompressor,
     metadata: BufferMetadata,
     byte_len: usize,
@@ -2082,46 +2587,11 @@ unsafe fn unfilter_tiles_parallel<'a>(
     let first_err: Mutex<Option<anyhow::Error>> = Mutex::new(None);
 
     decompressor.pool.execute(n_tiles, |state| {
-        let mut streamed_any = false;
-        while let Some(item) = next_tile() {
-            let res = (|| -> Result<bool> {
-                let tile = item?;
-                let idx = tile.tile_idx as usize;
-                let Some(slot) = claimed.get(idx) else {
-                    bail!("tile_idx {idx} out of range (n_tiles={n_tiles})");
-                };
-                if slot.swap(true, Ordering::AcqRel) {
-                    bail!("duplicate tile_idx {idx}");
-                }
-                let rect = tile_rects[idx];
-                // SAFETY: Caller validated `tile_rects` in-bounds and pairwise
-                // disjoint, and `claimed[idx]` guarantees exclusive ownership
-                // of `rect` for this worker.
-                unsafe {
-                    if has_alpha {
-                        unfilter_tile::<arch::Kernel, true>(rect, &tile.payload, &frame, state)
-                    } else {
-                        unfilter_tile::<arch::Kernel, false>(rect, &tile.payload, &frame, state)
-                    }
-                }
-            })();
-
-            match res {
-                Ok(used_stream) => {
-                    streamed_any |= used_stream;
-                    completed.fetch_add(1, Ordering::Relaxed);
-                },
-                Err(err) => {
-                    let mut guard = first_err.lock().unwrap();
-                    if guard.is_none() {
-                        *guard = Some(err);
-                    }
-                    break;
-                },
-            }
-        }
-        if streamed_any {
-            arch::Kernel::fence_stream();
+        // SAFETY: Caller validated `tile_rects` in-bounds and pairwise disjoint.
+        unsafe {
+            tier.unfilter_tiles_worker(
+                has_alpha, tile_rects, &frame, &claimed, &completed, &first_err, &next_tile, state,
+            );
         }
     });
 
@@ -2133,6 +2603,33 @@ unsafe fn unfilter_tiles_parallel<'a>(
         bail!("received {done} tiles, expected {n_tiles}");
     }
     Ok(())
+}
+
+/// Decodes a validated set of pairwise-disjoint `tile_rects` in parallel.
+///
+/// # Safety
+/// Caller must have validated `metadata` (`byte_len = total_pixels * 4`) and
+/// verified every rect in `tile_rects` via [`validate_tile_rects`].
+unsafe fn unfilter_tiles_parallel<'a>(
+    decompressor: &mut ShardingDecompressor,
+    metadata: BufferMetadata,
+    byte_len: usize,
+    tile_rects: &[TileRect],
+    output_buf: &mut [u8],
+    next_tile: impl Fn() -> Option<Result<Cow<'a, CompressedTile>>> + Sync,
+) -> Result<()> {
+    // SAFETY: Caller upholds validated-metadata and disjoint-tile invariants.
+    unsafe {
+        unfilter_tiles_parallel_with_tier(
+            arch::Tier::detect(),
+            decompressor,
+            metadata,
+            byte_len,
+            tile_rects,
+            output_buf,
+            next_tile,
+        )
+    }
 }
 
 pub struct ValidatedTileStream {
@@ -2334,10 +2831,11 @@ mod tests {
         tiles
     }
 
-    /// Compares `arch::Kernel` bit-for-bit against [`ScalarKernel`] across all
-    /// edge widths (`1..=65`, `255`, `256`, `300`) for every row primitive.
-    #[test]
-    fn test_arch_kernel_matches_scalar_reference() {
+    /// Compares `kernel` bit-for-bit against [`ScalarKernel`] across all edge
+    /// widths (`1..=65`, `127..=129`, `255`, `256`, `300`) for every row
+    /// primitive.
+    #[inline(always)]
+    pub(super) fn verify_kernel_matches_scalar<K: RowKernel>(kernel: K, tier_name: &str) {
         let widths: Vec<usize> = (1..=65).chain([127, 128, 129, 255, 256, 300]).collect();
         for tw in widths {
             let row_b = tw * 3;
@@ -2374,73 +2872,79 @@ mod tests {
             let (mut alp0_s, mut alp0_a) = (vec![0u8; tw], vec![0u8; tw]);
             let (mut alp1_s, mut alp1_a) = (vec![0u8; tw], vec![0u8; tw]);
 
-            ScalarKernel::bgra_to_subgreen_bgr3::<true>(bp0, &mut bgr0_s, &mut alp0_s);
-            arch::Kernel::bgra_to_subgreen_bgr3::<true>(bp0, &mut bgr0_a, &mut alp0_a);
-            assert_eq!(bgr0_a, bgr0_s, "bgra_to_subgreen_bgr3<true> tw={tw}");
-            assert_eq!(alp0_a, alp0_s, "alpha extract tw={tw}");
+            ScalarKernel.bgra_to_subgreen_bgr3::<true>(bp0, &mut bgr0_s, &mut alp0_s);
+            kernel.bgra_to_subgreen_bgr3::<true>(bp0, &mut bgr0_a, &mut alp0_a);
+            assert_eq!(
+                bgr0_a, bgr0_s,
+                "[{tier_name}] bgra_to_subgreen_bgr3<true> tw={tw}"
+            );
+            assert_eq!(alp0_a, alp0_s, "[{tier_name}] alpha extract tw={tw}");
 
             let mut bgr0_noalpha = vec![0u8; row_b];
-            arch::Kernel::bgra_to_subgreen_bgr3::<false>(bp0, &mut bgr0_noalpha, &mut []);
-            assert_eq!(bgr0_noalpha, bgr0_s, "bgra_to_subgreen_bgr3<false> tw={tw}");
+            kernel.bgra_to_subgreen_bgr3::<false>(bp0, &mut bgr0_noalpha, &mut []);
+            assert_eq!(
+                bgr0_noalpha, bgr0_s,
+                "[{tier_name}] bgra_to_subgreen_bgr3<false> tw={tw}"
+            );
 
-            ScalarKernel::bgra_to_subgreen_bgr3::<true>(bp1, &mut bgr1_s, &mut alp1_s);
-            arch::Kernel::bgra_to_subgreen_bgr3::<true>(bp1, &mut bgr1_a, &mut alp1_a);
+            ScalarKernel.bgra_to_subgreen_bgr3::<true>(bp1, &mut bgr1_s, &mut alp1_s);
+            kernel.bgra_to_subgreen_bgr3::<true>(bp1, &mut bgr1_a, &mut alp1_a);
             assert_eq!(bgr1_a, bgr1_s);
 
             assert_eq!(
-                arch::Kernel::sad_signed_bytes(&bgr0_a),
-                ScalarKernel::sad_signed_bytes(&bgr0_s),
-                "sad_signed_bytes tw={tw}"
+                kernel.sad_signed_bytes(&bgr0_a),
+                ScalarKernel.sad_signed_bytes(&bgr0_s),
+                "[{tier_name}] sad_signed_bytes tw={tw}"
             );
 
             // Sub3 forward + inverse
             let (mut f_s, mut f_a) = (vec![0u8; row_b], vec![0u8; row_b]);
             assert_eq!(
-                arch::Kernel::row_sub3_forward_sad(&bgr0_a, &mut f_a),
-                ScalarKernel::row_sub3_forward_sad(&bgr0_s, &mut f_s),
-                "sub3 sad tw={tw}"
+                kernel.row_sub3_forward_sad(&bgr0_a, &mut f_a),
+                ScalarKernel.row_sub3_forward_sad(&bgr0_s, &mut f_s),
+                "[{tier_name}] sub3 sad tw={tw}"
             );
-            assert_eq!(f_a, f_s, "sub3 fwd tw={tw}");
+            assert_eq!(f_a, f_s, "[{tier_name}] sub3 fwd tw={tw}");
             let mut inv = vec![0xAAu8; row_b];
-            arch::Kernel::row_sub3_inverse(&f_a, &mut inv);
-            assert_eq!(inv, bgr0_s, "sub3 inv tw={tw}");
+            kernel.row_sub3_inverse(&f_a, &mut inv);
+            assert_eq!(inv, bgr0_s, "[{tier_name}] sub3 inv tw={tw}");
 
             // Up forward + inverse
             assert_eq!(
-                arch::Kernel::row_up_forward_sad(&bgr1_a, &bgr0_a, &mut f_a),
-                ScalarKernel::row_up_forward_sad(&bgr1_s, &bgr0_s, &mut f_s),
-                "up sad tw={tw}"
+                kernel.row_up_forward_sad(&bgr1_a, &bgr0_a, &mut f_a),
+                ScalarKernel.row_up_forward_sad(&bgr1_s, &bgr0_s, &mut f_s),
+                "[{tier_name}] up sad tw={tw}"
             );
-            assert_eq!(f_a, f_s, "up fwd tw={tw}");
+            assert_eq!(f_a, f_s, "[{tier_name}] up fwd tw={tw}");
             inv.fill(0xAA);
-            arch::Kernel::row_up_inverse(&f_a, &bgr0_a, &mut inv);
-            assert_eq!(inv, bgr1_s, "up inv tw={tw}");
+            kernel.row_up_inverse(&f_a, &bgr0_a, &mut inv);
+            assert_eq!(inv, bgr1_s, "[{tier_name}] up inv tw={tw}");
 
             // SubUp3 forward + inverse
             assert_eq!(
-                arch::Kernel::row_subup3_forward_sad(&bgr1_a, &bgr0_a, &mut f_a),
-                ScalarKernel::row_subup3_forward_sad(&bgr1_s, &bgr0_s, &mut f_s),
-                "subup3 sad tw={tw}"
+                kernel.row_subup3_forward_sad(&bgr1_a, &bgr0_a, &mut f_a),
+                ScalarKernel.row_subup3_forward_sad(&bgr1_s, &bgr0_s, &mut f_s),
+                "[{tier_name}] subup3 sad tw={tw}"
             );
-            assert_eq!(f_a, f_s, "subup3 fwd tw={tw}");
+            assert_eq!(f_a, f_s, "[{tier_name}] subup3 fwd tw={tw}");
             inv.fill(0xAA);
-            arch::Kernel::row_subup3_inverse(&f_a, &bgr0_a, &mut inv);
-            assert_eq!(inv, bgr1_s, "subup3 inv tw={tw}");
+            kernel.row_subup3_inverse(&f_a, &bgr0_a, &mut inv);
+            assert_eq!(inv, bgr1_s, "[{tier_name}] subup3 inv tw={tw}");
 
             // Sub1 & Up on alpha plane
             let (mut af_s, mut af_a) = (vec![0u8; tw], vec![0u8; tw]);
-            ScalarKernel::row_sub1_forward(&alp0_s, &mut af_s);
-            arch::Kernel::row_sub1_forward(&alp0_a, &mut af_a);
-            assert_eq!(af_a, af_s, "sub1 fwd tw={tw}");
+            ScalarKernel.row_sub1_forward(&alp0_s, &mut af_s);
+            kernel.row_sub1_forward(&alp0_a, &mut af_a);
+            assert_eq!(af_a, af_s, "[{tier_name}] sub1 fwd tw={tw}");
             let mut a_inv = vec![0xAAu8; tw];
-            arch::Kernel::row_sub1_inverse(&af_a, &mut a_inv);
-            assert_eq!(a_inv, alp0_s, "sub1 inv tw={tw}");
+            kernel.row_sub1_inverse(&af_a, &mut a_inv);
+            assert_eq!(a_inv, alp0_s, "[{tier_name}] sub1 inv tw={tw}");
 
-            ScalarKernel::row_up_forward(&alp1_s, &alp0_s, &mut af_s);
-            arch::Kernel::row_up_forward(&alp1_a, &alp0_a, &mut af_a);
-            assert_eq!(af_a, af_s, "alpha up fwd tw={tw}");
-            arch::Kernel::row_up_inverse(&af_a, &alp0_a, &mut a_inv);
-            assert_eq!(a_inv, alp1_s, "alpha up inv tw={tw}");
+            ScalarKernel.row_up_forward(&alp1_s, &alp0_s, &mut af_s);
+            kernel.row_up_forward(&alp1_a, &alp0_a, &mut af_a);
+            assert_eq!(af_a, af_s, "[{tier_name}] alpha up fwd tw={tw}");
+            kernel.row_up_inverse(&af_a, &alp0_a, &mut a_inv);
+            assert_eq!(a_inv, alp1_s, "[{tier_name}] alpha up inv tw={tw}");
 
             // Unpack BGR3 -> BGRA (constant alpha and varying alpha, both alignments)
             let mut dst_bytes = vec![0xAAu8; (tw + 17) * 4];
@@ -2450,28 +2954,24 @@ mod tests {
                     bytemuck::cast_slice_mut(&mut dst_bytes[byte_off..byte_off + tw * 4]);
                 dst.fill(Vec4u8(0, 0, 0, 0));
                 unsafe {
-                    if stream && arch::Kernel::STREAM_ALIGN > 1 {
-                        arch::Kernel::subgreen_bgr3_to_bgra::<true, false>(
-                            &bgr0_a, &alp0_a, 0, dst,
-                        );
+                    if stream && K::STREAM_ALIGN > 1 {
+                        kernel.subgreen_bgr3_to_bgra::<true, false>(&bgr0_a, &alp0_a, 0, dst);
                     } else {
-                        arch::Kernel::subgreen_bgr3_to_bgra::<false, false>(
-                            &bgr0_a, &alp0_a, 0, dst,
-                        );
+                        kernel.subgreen_bgr3_to_bgra::<false, false>(&bgr0_a, &alp0_a, 0, dst);
                     }
                 }
                 assert_eq!(
                     dst,
                     &raw0[..],
-                    "unpack varying alpha tw={tw} stream={stream}"
+                    "[{tier_name}] unpack varying alpha tw={tw} stream={stream}"
                 );
 
                 dst.fill(Vec4u8(0, 0, 0, 0));
                 unsafe {
-                    if stream && arch::Kernel::STREAM_ALIGN > 1 {
-                        arch::Kernel::subgreen_bgr3_to_bgra::<true, true>(&bgr0_a, &[], 0x7E, dst);
+                    if stream && K::STREAM_ALIGN > 1 {
+                        kernel.subgreen_bgr3_to_bgra::<true, true>(&bgr0_a, &[], 0x7E, dst);
                     } else {
-                        arch::Kernel::subgreen_bgr3_to_bgra::<false, true>(&bgr0_a, &[], 0x7E, dst);
+                        kernel.subgreen_bgr3_to_bgra::<false, true>(&bgr0_a, &[], 0x7E, dst);
                     }
                 }
                 for (got, exp) in dst.iter().zip(&raw0) {
@@ -2481,37 +2981,37 @@ mod tests {
                 // Splat row
                 let px = Vec4u8(0x11, 0x22, 0x33, 0x44);
                 unsafe {
-                    if stream && arch::Kernel::STREAM_ALIGN > 1 {
-                        arch::Kernel::splat_row::<true>(dst, px);
+                    if stream && K::STREAM_ALIGN > 1 {
+                        kernel.splat_row::<true>(dst, px);
                     } else {
-                        arch::Kernel::splat_row::<false>(dst, px);
+                        kernel.splat_row::<false>(dst, px);
                     }
                 }
                 assert!(dst.iter().all(|&p| p == px));
             }
-            arch::Kernel::fence_stream();
+            kernel.fence_stream();
 
             // `is_constant_plane` on constant + single perturbed byte at start/mid/end.
             let mut plane = vec![0x5Au8; tw];
-            assert_eq!(arch::Kernel::is_constant_plane(&plane), Some(0x5A));
+            assert_eq!(kernel.is_constant_plane(&plane), Some(0x5A));
             plane[tw - 1] ^= 1;
             assert_eq!(
-                arch::Kernel::is_constant_plane(&plane),
+                kernel.is_constant_plane(&plane),
                 if tw == 1 { Some(0x5B) } else { None }
             );
             if tw > 1 {
                 plane[tw - 1] = 0x5A;
                 plane[tw / 2] ^= 1;
-                assert_eq!(arch::Kernel::is_constant_plane(&plane), None);
+                assert_eq!(kernel.is_constant_plane(&plane), None);
             }
 
             // `diff_and_update_row` matches `ScalarKernel` on identical, alpha-only,
             // and RGB-perturbed pixels at start/mid/end.
             let mut sh_s = raw0.clone();
             let mut sh_a = raw0.clone();
-            assert!(!ScalarKernel::diff_and_update_row::<true>(bp0, &mut sh_s));
-            assert!(!arch::Kernel::diff_and_update_row::<true>(bp0, &mut sh_a));
-            assert!(!arch::Kernel::diff_and_update_row::<false>(bp0, &mut sh_a));
+            assert!(!ScalarKernel.diff_and_update_row::<true>(bp0, &mut sh_s));
+            assert!(!kernel.diff_and_update_row::<true>(bp0, &mut sh_a));
+            assert!(!kernel.diff_and_update_row::<false>(bp0, &mut sh_a));
 
             for pos in [0, tw / 2, tw - 1] {
                 let mut alt_a = raw0.clone();
@@ -2520,15 +3020,18 @@ mod tests {
                 let bpa = unsafe { BufferPointer::new(&pa, tw) };
                 sh_s.clone_from(&raw0);
                 sh_a.clone_from(&raw0);
-                assert!(!ScalarKernel::diff_and_update_row::<false>(bpa, &mut sh_s));
-                assert!(!arch::Kernel::diff_and_update_row::<false>(bpa, &mut sh_a));
+                assert!(!ScalarKernel.diff_and_update_row::<false>(bpa, &mut sh_s));
+                assert!(!kernel.diff_and_update_row::<false>(bpa, &mut sh_a));
                 assert_eq!(
                     sh_a, raw0,
-                    "xrgb alpha-only must not write tw={tw} pos={pos}"
+                    "[{tier_name}] xrgb alpha-only must not write tw={tw} pos={pos}"
                 );
-                assert!(ScalarKernel::diff_and_update_row::<true>(bpa, &mut sh_s));
-                assert!(arch::Kernel::diff_and_update_row::<true>(bpa, &mut sh_a));
-                assert_eq!(sh_a, alt_a, "argb alpha diff tw={tw} pos={pos}");
+                assert!(ScalarKernel.diff_and_update_row::<true>(bpa, &mut sh_s));
+                assert!(kernel.diff_and_update_row::<true>(bpa, &mut sh_a));
+                assert_eq!(
+                    sh_a, alt_a,
+                    "[{tier_name}] argb alpha diff tw={tw} pos={pos}"
+                );
                 assert_eq!(sh_a, sh_s);
 
                 let mut alt_rgb = raw0.clone();
@@ -2538,17 +3041,360 @@ mod tests {
                 let bpr = unsafe { BufferPointer::new(&pr, tw) };
                 sh_s.clone_from(&raw0);
                 sh_a.clone_from(&raw0);
-                assert!(ScalarKernel::diff_and_update_row::<false>(bpr, &mut sh_s));
-                assert!(arch::Kernel::diff_and_update_row::<false>(bpr, &mut sh_a));
-                assert_eq!(sh_a, alt_rgb, "xrgb rgb diff tw={tw} pos={pos}");
+                assert!(ScalarKernel.diff_and_update_row::<false>(bpr, &mut sh_s));
+                assert!(kernel.diff_and_update_row::<false>(bpr, &mut sh_a));
+                assert_eq!(
+                    sh_a, alt_rgb,
+                    "[{tier_name}] xrgb rgb diff tw={tw} pos={pos}"
+                );
                 assert_eq!(sh_a, sh_s);
             }
         }
         // `i8::MIN` (`0x80` = `-128`) unsigned abs must equal `128` across all backends
         // (covers 16B, 32B, and 64B SIMD loops plus scalar tails).
         let min_bytes = [0x80u8; 73];
-        assert_eq!(arch::Kernel::sad_signed_bytes(&min_bytes), 73 * 128);
-        assert_eq!(arch::Kernel::is_constant_plane(&[]), None);
+        assert_eq!(
+            kernel.sad_signed_bytes(&min_bytes),
+            73 * 128,
+            "[{tier_name}] i8::MIN sad"
+        );
+        assert_eq!(kernel.is_constant_plane(&[]), None);
+    }
+
+    /// Compares every compiled, host-supported backend tier bit-for-bit against
+    /// [`ScalarKernel`] across all edge widths for every row primitive.
+    #[test]
+    fn test_arch_kernel_matches_scalar_reference() {
+        let tested = arch::verify_all_supported_kernels();
+        assert_eq!(tested, arch::Tier::supported_tiers());
+        assert!(!tested.is_empty());
+    }
+
+    #[cfg(all(target_arch = "x86_64", not(miri)))]
+    #[test]
+    fn test_x86_tier_detection_and_pruning() {
+        let supported = arch::X86Tier::supported_tiers();
+        assert!(!supported.is_empty());
+
+        let mut expected = Vec::new();
+        #[cfg(all(
+            not(target_feature = "ssse3"),
+            not(target_feature = "avx2"),
+            not(all(
+                target_feature = "avx512bw",
+                target_feature = "avx512vl",
+                target_feature = "avx512vbmi",
+            )),
+        ))]
+        expected.push(arch::X86Tier::Scalar);
+
+        #[cfg(all(
+            not(target_feature = "avx2"),
+            not(all(
+                target_feature = "avx512bw",
+                target_feature = "avx512vl",
+                target_feature = "avx512vbmi",
+            )),
+        ))]
+        if std::arch::is_x86_feature_detected!("ssse3") {
+            expected.push(arch::X86Tier::Ssse3);
+        }
+
+        #[cfg(not(all(
+            target_feature = "avx512bw",
+            target_feature = "avx512vl",
+            target_feature = "avx512vbmi",
+        )))]
+        if std::arch::is_x86_feature_detected!("avx2") {
+            expected.push(arch::X86Tier::Avx2);
+        }
+
+        if std::arch::is_x86_feature_detected!("avx512bw")
+            && std::arch::is_x86_feature_detected!("avx512vl")
+            && std::arch::is_x86_feature_detected!("avx512vbmi")
+        {
+            expected.push(arch::X86Tier::Avx512);
+        }
+
+        assert_eq!(supported, expected);
+
+        let detected = arch::X86Tier::detect();
+        assert_eq!(detected, *supported.last().unwrap());
+        // Second call exercises the relaxed-atomic cache fast path.
+        assert_eq!(arch::X86Tier::detect(), detected);
+
+        #[cfg(all(
+            target_feature = "avx512bw",
+            target_feature = "avx512vl",
+            target_feature = "avx512vbmi",
+        ))]
+        assert_eq!(std::mem::size_of::<arch::X86Tier>(), 0);
+    }
+
+    fn filter_and_compress_with_tier(
+        tier: arch::Tier,
+        data: BufferPointer<u8>,
+        metadata: BufferMetadata,
+        mode: CompressionMode,
+        compressor: &mut ShardingCompressor,
+    ) -> CompressedTiles {
+        let mut streaming_opt = None;
+        filter_and_compress_full_streaming_with_tier(
+            tier,
+            data,
+            ClientId(0),
+            WlSurfaceId(0),
+            metadata,
+            mode,
+            None,
+            compressor,
+            |streaming| {
+                streaming_opt = Some(streaming);
+            },
+        );
+        let streaming = streaming_opt.unwrap();
+        let tile_rects = streaming.header.tile_rects;
+        let mut tiles: Vec<CompressedTile> = streaming.tiles.into_iter().collect();
+        tiles.sort_by_key(|t| t.tile_idx);
+        CompressedTiles {
+            metadata,
+            tile_rects,
+            tiles,
+        }
+    }
+
+    fn decompress_and_unfilter_with_tier(
+        tier: arch::Tier,
+        tiles: &CompressedTiles,
+        decompressor: &mut ShardingDecompressor,
+        output_buf: &mut [u8],
+    ) -> Result<()> {
+        let total_pixels = tiles.metadata.validate().location(loc!())?;
+        let byte_len = total_pixels
+            .checked_mul(4)
+            .context(loc!(), "pixel count overflow")?;
+        validate_tile_rects(
+            &tiles.tile_rects,
+            tiles.metadata.width as u32,
+            tiles.metadata.height as u32,
+        )
+        .location(loc!())?;
+        let n_tiles = tiles.tiles.len();
+        let next_idx = AtomicUsize::new(0);
+        // SAFETY: Validated `tiles.metadata` and `tiles.tile_rects` above.
+        unsafe {
+            unfilter_tiles_parallel_with_tier(
+                tier,
+                decompressor,
+                tiles.metadata,
+                byte_len,
+                &tiles.tile_rects,
+                output_buf,
+                || {
+                    let i = next_idx.fetch_add(1, Ordering::Relaxed);
+                    (i < n_tiles).then(|| Ok(Cow::Borrowed(&tiles.tiles[i])))
+                },
+            )
+        }
+    }
+
+    /// Exercises cross-tier encode -> decode interoperability (every compiled,
+    /// host-supported `(enc_tier, dec_tier)` pair) across lossless AoS/palette/solid
+    /// and hybrid translucent JPEG tiles, plus shadow-diff incremental parity.
+    #[test]
+    #[cfg_attr(miri, ignore)]
+    fn test_cross_tier_encode_decode_and_shadow_diff_parity() {
+        let tiers = arch::Tier::supported_tiers();
+        assert!(!tiers.is_empty());
+
+        with_test_codec(|compressor, decompressor| {
+            let tr = |x, y, w, h| TileRect { x, y, w, h };
+
+            // 1. Multi-tile `300x280` frame exercising 256x256 + clipped right/bottom
+            //    edge tiles, all 4 row predictors, solid, palette, and varying alpha.
+            let (w, h) = (300i32, 280i32);
+            let mut lossless_frame = vec![0u8; (w * h * 4) as usize];
+            for y in 0..h as usize {
+                for x in 0..w as usize {
+                    let off = (y * w as usize + x) * 4;
+                    let (b, g, r) = match (y / 32) % 4 {
+                        0 => (
+                            ((x * 131 + y * 59) & 0xFF) as u8,
+                            ((x * 97 + y * 173) & 0xFF) as u8,
+                            ((x * 61 + y * 211) & 0xFF) as u8,
+                        ),
+                        1 => ((x * 2) as u8, (x * 2 + 10) as u8, (x * 2 + 20) as u8),
+                        2 => (
+                            ((x * 37) & 0xFF) as u8,
+                            ((x * 53) & 0xFF) as u8,
+                            ((x * 71) & 0xFF) as u8,
+                        ),
+                        _ => ((x + y * 2) as u8, (x * 2 + y * 3) as u8, (x * 3 + y) as u8),
+                    };
+                    lossless_frame[off] = b;
+                    lossless_frame[off + 1] = g;
+                    lossless_frame[off + 2] = r;
+                    lossless_frame[off + 3] = ((x * 5 + y * 11) & 0xFF) as u8;
+                }
+            }
+
+            for format in [BufferFormat::Argb8888, BufferFormat::Xrgb8888] {
+                let meta = BufferMetadata {
+                    width: w,
+                    height: h,
+                    stride: w * 4,
+                    format,
+                };
+                let mut expected = lossless_frame.clone();
+                if format == BufferFormat::Xrgb8888 {
+                    for px in expected.as_chunks_mut::<4>().0 {
+                        px[3] = 0xFF;
+                    }
+                }
+                let ptr = lossless_frame.as_ptr();
+                let bp = unsafe { BufferPointer::new(&ptr, lossless_frame.len()) };
+
+                let mut encoded_by_tier = Vec::with_capacity(tiers.len());
+                for &enc_tier in &tiers {
+                    let tiles = filter_and_compress_with_tier(
+                        enc_tier,
+                        bp,
+                        meta,
+                        CompressionMode::Lossless,
+                        compressor,
+                    );
+                    encoded_by_tier.push((enc_tier, tiles));
+                }
+
+                // Every lossless tier must emit byte-identical wire payloads.
+                for (enc_tier, tiles) in &encoded_by_tier[1..] {
+                    assert_eq!(
+                        tiles, &encoded_by_tier[0].1,
+                        "lossless tile mismatch between {:?} and {enc_tier:?} ({format:?})",
+                        encoded_by_tier[0].0
+                    );
+                }
+
+                // Every `(enc_tier, dec_tier)` pair must decode bit-exact at both alignments.
+                let mut buf = vec![0xAAu8; expected.len() + 68];
+                let aligned_off = (64 - (buf.as_ptr() as usize & 63)) & 63;
+                for (enc_tier, tiles) in &encoded_by_tier {
+                    for &dec_tier in &tiers {
+                        for off in [aligned_off, aligned_off + 4] {
+                            buf.fill(0xAA);
+                            decompress_and_unfilter_with_tier(
+                                dec_tier,
+                                tiles,
+                                decompressor,
+                                &mut buf[off..off + expected.len()],
+                            )
+                            .unwrap();
+                            assert_eq!(
+                                &buf[off..off + expected.len()],
+                                expected.as_slice(),
+                                "cross-tier decode mismatch enc={enc_tier:?} dec={dec_tier:?} off={off} ({format:?})"
+                            );
+                        }
+                    }
+                }
+            }
+
+            // 2. Hybrid translucent `256x256` mixed text/photo frame with varying alpha:
+            //    cross-tier encode/decode preserves bit-exact alpha and text quadrants.
+            let meta_256 = BufferMetadata {
+                width: 256,
+                height: 256,
+                stride: 256 * 4,
+                format: BufferFormat::Argb8888,
+            };
+            let mut hybrid_frame = vec![0u8; 256 * 256 * 4];
+            fill_ui_text(&mut hybrid_frame, 256, tr(0, 0, 128, 128), true);
+            fill_smooth_photo(&mut hybrid_frame, 256, tr(128, 0, 128, 128), 0xFF);
+            fill_smooth_photo(&mut hybrid_frame, 256, tr(0, 128, 256, 128), 0xFF);
+            for y in 0..256usize {
+                for x in 0..256usize {
+                    if x >= 128 || y >= 128 {
+                        hybrid_frame[(y * 256 + x) * 4 + 3] = ((x + y * 3) & 0xFF) as u8;
+                    }
+                }
+            }
+            let hptr = hybrid_frame.as_ptr();
+            let hbp = unsafe { BufferPointer::new(&hptr, hybrid_frame.len()) };
+            for &enc_tier in &tiers {
+                let tiles = filter_and_compress_with_tier(
+                    enc_tier,
+                    hbp,
+                    meta_256,
+                    CompressionMode::hybrid_default(),
+                    compressor,
+                );
+                for &dec_tier in &tiers {
+                    let mut out = vec![0x55u8; hybrid_frame.len()];
+                    decompress_and_unfilter_with_tier(dec_tier, &tiles, decompressor, &mut out)
+                        .unwrap();
+                    assert!(
+                        rect_psnr_rgb(&hybrid_frame, &out, 256, tr(0, 0, 128, 128)).is_infinite(),
+                        "hybrid text quadrant mismatch enc={enc_tier:?} dec={dec_tier:?}"
+                    );
+                    for (i, (got, exp)) in out
+                        .as_chunks::<4>()
+                        .0
+                        .iter()
+                        .zip(hybrid_frame.as_chunks::<4>().0.iter())
+                        .enumerate()
+                    {
+                        assert_eq!(
+                            got[3], exp[3],
+                            "hybrid alpha mismatch at px {i} enc={enc_tier:?} dec={dec_tier:?}"
+                        );
+                    }
+                }
+            }
+
+            // 3. Incremental shadow diff + encode parity across all tiers.
+            let inc_meta = BufferMetadata {
+                width: 300,
+                height: 280,
+                stride: 300 * 4,
+                format: BufferFormat::Argb8888,
+            };
+            let mut edited = lossless_frame.clone();
+            edited[(10 * 300 + 20) * 4 + 3] ^= 0x40; // alpha-only change in TL quadrant
+            edited[(200 * 300 + 270) * 4] ^= 0x33; // RGB change in right clipped quadrant
+            let eptr = edited.as_ptr();
+            let ebp = unsafe { BufferPointer::new(&eptr, edited.len()) };
+
+            let mut ref_dirty = None;
+            let mut ref_shadow = None;
+            for &tier in &tiers {
+                let mut shadow = lossless_frame.clone();
+                let mut streaming = None;
+                let dirty = filter_and_compress_incremental_streaming_with_tier(
+                    tier,
+                    ebp,
+                    ClientId(1),
+                    WlSurfaceId(2),
+                    inc_meta,
+                    CompressionMode::Lossless,
+                    None,
+                    &mut shadow,
+                    compressor,
+                    |s| streaming = Some(s),
+                );
+                assert!(streaming.is_some());
+                assert_eq!(shadow, edited, "shadow sync mismatch for {tier:?}");
+                if let Some(prev_dirty) = &ref_dirty {
+                    assert_eq!(&dirty, prev_dirty, "dirty rects mismatch for {tier:?}");
+                } else {
+                    ref_dirty = Some(dirty);
+                }
+                if let Some(prev_shadow) = &ref_shadow {
+                    assert_eq!(&shadow, prev_shadow, "shadow parity mismatch for {tier:?}");
+                } else {
+                    ref_shadow = Some(shadow);
+                }
+            }
+        });
     }
 
     #[test]
@@ -2815,152 +3661,155 @@ mod tests {
     #[test]
     fn test_shadow_diff_and_copy_miri_safe() {
         // Exercises `copy_rect_to_shadow`, `diff_and_update_strip`, and
-        // `diff_and_update_row_band_2d` (both packed and padded strides,
-        // partial-dirty and bulk-all-dirty fast paths, Xrgb vs Argb).
-        for pad_bytes in [0usize, 12usize] {
-            let width = 160usize;
-            let height = 20usize;
-            let stride = width * 4 + pad_bytes;
-            let stride_px = stride / 4;
-            let len = stride * height;
+        // `diff_and_update_row_band_2d` across every compiled, host-supported
+        // tier (both packed and padded strides, partial-dirty and bulk-all-dirty
+        // fast paths, Xrgb vs Argb).
+        for tier in arch::Tier::supported_tiers() {
+            for pad_bytes in [0usize, 12usize] {
+                let width = 160usize;
+                let height = 20usize;
+                let stride = width * 4 + pad_bytes;
+                let stride_px = stride / 4;
+                let len = stride * height;
 
-            let mut src = test_vec(len);
-            let mut shadow = vec![0xAAu8; len];
+                let mut src = test_vec(len);
+                let mut shadow = vec![0xAAu8; len];
 
-            let src_ptr = src.as_ptr();
-            let bp = unsafe { BufferPointer::new(&src_ptr, len) };
-            let aos = unsafe { bp.cast::<Vec4u8>() };
-            let shadow_rows = ShadowRows {
-                base: shadow.as_mut_ptr(),
-                stride,
-            };
-            let rect_band = TileRect {
-                x: 0,
-                y: 0,
-                w: width as u32,
-                h: 12,
-            };
-            let rect_strip = TileRect {
-                x: 0,
-                y: 12,
-                w: width as u32,
-                h: 4,
-            };
-
-            unsafe {
-                copy_rect_to_shadow(bp, &shadow_rows, stride, rect_band);
-                copy_rect_to_shadow(bp, &shadow_rows, stride, rect_strip);
-                assert!(!diff_and_update_strip::<true>(
-                    aos,
-                    &shadow_rows,
-                    stride_px,
-                    rect_strip
-                ));
-                assert!(!diff_and_update_strip::<false>(
-                    aos,
-                    &shadow_rows,
-                    stride_px,
-                    rect_strip
-                ));
-            }
-
-            // Flip only byte 3 (X/alpha) in quadrant 0 of `[0..12)` -> ignored
-            // on Xrgb, caught on Argb.
-            let a_off = 5 * stride + 10 * 4 + 3;
-            src[a_off] ^= 0xFF;
-            let src_ptr = src.as_ptr();
-            let bp = unsafe { BufferPointer::new(&src_ptr, len) };
-            let aos = unsafe { bp.cast::<Vec4u8>() };
-            let slots_xrgb = [AtomicBool::new(false), AtomicBool::new(false)];
-            unsafe {
-                diff_and_update_row_band_2d::<false>(
-                    bp,
-                    aos,
-                    &shadow_rows,
-                    width,
+                let src_ptr = src.as_ptr();
+                let bp = unsafe { BufferPointer::new(&src_ptr, len) };
+                let aos = unsafe { bp.cast::<Vec4u8>() };
+                let shadow_rows = ShadowRows {
+                    base: shadow.as_mut_ptr(),
                     stride,
-                    0,
-                    12,
-                    &slots_xrgb,
-                );
-            }
-            assert!(!slots_xrgb[0].load(Ordering::Relaxed));
-            assert!(!slots_xrgb[1].load(Ordering::Relaxed));
-            assert_ne!(shadow[a_off], src[a_off]);
+                };
+                let rect_band = TileRect {
+                    x: 0,
+                    y: 0,
+                    w: width as u32,
+                    h: 12,
+                };
+                let rect_strip = TileRect {
+                    x: 0,
+                    y: 12,
+                    w: width as u32,
+                    h: 4,
+                };
 
-            let slots_argb = [AtomicBool::new(false), AtomicBool::new(false)];
-            unsafe {
-                diff_and_update_row_band_2d::<true>(
-                    bp,
-                    aos,
-                    &shadow_rows,
-                    width,
-                    stride,
-                    0,
-                    12,
-                    &slots_argb,
-                );
-            }
-            assert!(slots_argb[0].load(Ordering::Relaxed));
-            assert!(!slots_argb[1].load(Ordering::Relaxed));
-            assert_eq!(shadow[a_off], src[a_off]);
+                unsafe {
+                    copy_rect_to_shadow(bp, &shadow_rows, stride, rect_band);
+                    copy_rect_to_shadow(bp, &shadow_rows, stride, rect_strip);
+                    assert!(!tier.diff_and_update_strip::<true>(
+                        aos,
+                        &shadow_rows,
+                        stride_px,
+                        rect_strip
+                    ));
+                    assert!(!tier.diff_and_update_strip::<false>(
+                        aos,
+                        &shadow_rows,
+                        stride_px,
+                        rect_strip
+                    ));
+                }
 
-            // Flip RGB in BOTH quadrants on row 0 AND another pixel on row 11
-            // to exercise the all-quadrants-dirty bulk copy fast path.
-            let q0_off = 2 * 4;
-            let q1_off = 140 * 4;
-            let last_off = 11 * stride + 150 * 4;
-            src[q0_off] ^= 0x11;
-            src[q1_off] ^= 0x22;
-            src[last_off] ^= 0x33;
-            let src_ptr = src.as_ptr();
-            let bp = unsafe { BufferPointer::new(&src_ptr, len) };
-            let aos = unsafe { bp.cast::<Vec4u8>() };
-            let slots_all = [AtomicBool::new(false), AtomicBool::new(false)];
-            unsafe {
-                diff_and_update_row_band_2d::<false>(
-                    bp,
-                    aos,
-                    &shadow_rows,
-                    width,
-                    stride,
-                    0,
-                    12,
-                    &slots_all,
-                );
-            }
-            assert!(slots_all[0].load(Ordering::Relaxed));
-            assert!(slots_all[1].load(Ordering::Relaxed));
-            assert_eq!(shadow[q0_off], src[q0_off]);
-            assert_eq!(shadow[q1_off], src[q1_off]);
-            assert_eq!(shadow[last_off], src[last_off]);
-
-            // Flip RGB in `rect_strip` (row 13 + trailing row 15).
-            let strip_off = 13 * stride + 150 * 4;
-            let strip_last = 15 * stride + 10 * 4;
-            src[strip_off] ^= 0x5A;
-            src[strip_last] ^= 0x3C;
-            let src_ptr = src.as_ptr();
-            let bp = unsafe { BufferPointer::new(&src_ptr, len) };
-            let aos = unsafe { bp.cast::<Vec4u8>() };
-            unsafe {
-                assert!(diff_and_update_strip::<false>(
-                    aos,
-                    &shadow_rows,
-                    stride_px,
-                    rect_strip
-                ));
-            }
-            assert_eq!(shadow[strip_off], src[strip_off]);
-            assert_eq!(shadow[strip_last], src[strip_last]);
-
-            // Stride padding on every row must stay untouched (`0xAA`).
-            if pad_bytes > 0 {
-                for y in 0..height {
-                    assert_eq!(
-                        &shadow[y * stride + width * 4..(y + 1) * stride],
-                        &vec![0xAAu8; pad_bytes][..]
+                // Flip only byte 3 (X/alpha) in quadrant 0 of `[0..12)` -> ignored
+                // on Xrgb, caught on Argb.
+                let a_off = 5 * stride + 10 * 4 + 3;
+                src[a_off] ^= 0xFF;
+                let src_ptr = src.as_ptr();
+                let bp = unsafe { BufferPointer::new(&src_ptr, len) };
+                let aos = unsafe { bp.cast::<Vec4u8>() };
+                let slots_xrgb = [AtomicBool::new(false), AtomicBool::new(false)];
+                unsafe {
+                    tier.diff_and_update_row_band_2d::<false>(
+                        bp,
+                        aos,
+                        &shadow_rows,
+                        width,
+                        stride,
+                        0,
+                        12,
+                        &slots_xrgb,
                     );
+                }
+                assert!(!slots_xrgb[0].load(Ordering::Relaxed));
+                assert!(!slots_xrgb[1].load(Ordering::Relaxed));
+                assert_ne!(shadow[a_off], src[a_off]);
+
+                let slots_argb = [AtomicBool::new(false), AtomicBool::new(false)];
+                unsafe {
+                    tier.diff_and_update_row_band_2d::<true>(
+                        bp,
+                        aos,
+                        &shadow_rows,
+                        width,
+                        stride,
+                        0,
+                        12,
+                        &slots_argb,
+                    );
+                }
+                assert!(slots_argb[0].load(Ordering::Relaxed));
+                assert!(!slots_argb[1].load(Ordering::Relaxed));
+                assert_eq!(shadow[a_off], src[a_off]);
+
+                // Flip RGB in BOTH quadrants on row 0 AND another pixel on row 11
+                // to exercise the all-quadrants-dirty bulk copy fast path.
+                let q0_off = 2 * 4;
+                let q1_off = 140 * 4;
+                let last_off = 11 * stride + 150 * 4;
+                src[q0_off] ^= 0x11;
+                src[q1_off] ^= 0x22;
+                src[last_off] ^= 0x33;
+                let src_ptr = src.as_ptr();
+                let bp = unsafe { BufferPointer::new(&src_ptr, len) };
+                let aos = unsafe { bp.cast::<Vec4u8>() };
+                let slots_all = [AtomicBool::new(false), AtomicBool::new(false)];
+                unsafe {
+                    tier.diff_and_update_row_band_2d::<false>(
+                        bp,
+                        aos,
+                        &shadow_rows,
+                        width,
+                        stride,
+                        0,
+                        12,
+                        &slots_all,
+                    );
+                }
+                assert!(slots_all[0].load(Ordering::Relaxed));
+                assert!(slots_all[1].load(Ordering::Relaxed));
+                assert_eq!(shadow[q0_off], src[q0_off]);
+                assert_eq!(shadow[q1_off], src[q1_off]);
+                assert_eq!(shadow[last_off], src[last_off]);
+
+                // Flip RGB in `rect_strip` (row 13 + trailing row 15).
+                let strip_off = 13 * stride + 150 * 4;
+                let strip_last = 15 * stride + 10 * 4;
+                src[strip_off] ^= 0x5A;
+                src[strip_last] ^= 0x3C;
+                let src_ptr = src.as_ptr();
+                let bp = unsafe { BufferPointer::new(&src_ptr, len) };
+                let aos = unsafe { bp.cast::<Vec4u8>() };
+                unsafe {
+                    assert!(tier.diff_and_update_strip::<false>(
+                        aos,
+                        &shadow_rows,
+                        stride_px,
+                        rect_strip
+                    ));
+                }
+                assert_eq!(shadow[strip_off], src[strip_off]);
+                assert_eq!(shadow[strip_last], src[strip_last]);
+
+                // Stride padding on every row must stay untouched (`0xAA`).
+                if pad_bytes > 0 {
+                    for y in 0..height {
+                        assert_eq!(
+                            &shadow[y * stride + width * 4..(y + 1) * stride],
+                            &vec![0xAAu8; pad_bytes][..]
+                        );
+                    }
                 }
             }
         }

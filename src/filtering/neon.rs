@@ -53,9 +53,23 @@ use std::arch::aarch64::vst1q_u8;
 use std::arch::aarch64::vst3q_u8;
 use std::arch::aarch64::vst4q_u8;
 use std::arch::aarch64::vsubq_u8;
+use std::borrow::Cow;
+use std::sync::Mutex;
+use std::sync::atomic::AtomicBool;
+use std::sync::atomic::AtomicUsize;
 
 use crate::buffer_pointer::BufferPointer;
+use crate::filtering::FrameRows;
 use crate::filtering::RowKernel;
+use crate::filtering::ScanSubBand;
+use crate::filtering::ShadowRows;
+use crate::prelude::*;
+use crate::serialization::framing::AlphaChannel;
+use crate::serialization::framing::CompressedTile;
+use crate::serialization::framing::LeafPayload;
+use crate::serialization::framing::TileRect;
+use crate::sharding_compression::CompressorWorkerState;
+use crate::sharding_compression::DecompressorWorkerState;
 use crate::vec4u8::Vec4u8;
 
 /// Table indices repeating pixel 3 (`bytes 9, 10, 11`) across all four 3-byte
@@ -73,13 +87,15 @@ fn abs_signed_u8(v: uint8x16_t) -> uint8x16_t {
     unsafe { vreinterpretq_u8_s8(vabsq_s8(vreinterpretq_s8_u8(v))) }
 }
 
-pub(super) struct Kernel;
+#[derive(Copy, Clone)]
+struct Kernel;
 
 impl RowKernel for Kernel {
     const STREAM_ALIGN: usize = 1;
 
-    #[inline]
+    #[inline(always)]
     fn bgra_to_subgreen_bgr3<const HAS_ALPHA: bool>(
+        self,
         src: BufferPointer<Vec4u8>,
         dst_bgr: &mut [u8],
         dst_alpha: &mut [u8],
@@ -124,8 +140,8 @@ impl RowKernel for Kernel {
         }
     }
 
-    #[inline]
-    fn sad_signed_bytes(data: &[u8]) -> u64 {
+    #[inline(always)]
+    fn sad_signed_bytes(self, data: &[u8]) -> u64 {
         let mut sum = 0u64;
         for block in data.chunks(SAD_CHUNK_BYTES) {
             let lim = (block.len() / 16) * 16;
@@ -147,8 +163,8 @@ impl RowKernel for Kernel {
         sum
     }
 
-    #[inline]
-    fn row_sub3_forward_sad(src: &[u8], dst: &mut [u8]) -> u64 {
+    #[inline(always)]
+    fn row_sub3_forward_sad(self, src: &[u8], dst: &mut [u8]) -> u64 {
         let len = src.len();
         debug_assert_eq!(dst.len(), len);
         let lim = (len / 16) * 16;
@@ -181,8 +197,8 @@ impl RowKernel for Kernel {
         sum
     }
 
-    #[inline]
-    fn row_up_forward_sad(cur: &[u8], prev: &[u8], dst: &mut [u8]) -> u64 {
+    #[inline(always)]
+    fn row_up_forward_sad(self, cur: &[u8], prev: &[u8], dst: &mut [u8]) -> u64 {
         let len = cur.len();
         debug_assert_eq!(prev.len(), len);
         debug_assert_eq!(dst.len(), len);
@@ -213,8 +229,8 @@ impl RowKernel for Kernel {
         sum
     }
 
-    #[inline]
-    fn row_subup3_forward_sad(cur: &[u8], prev: &[u8], dst: &mut [u8]) -> u64 {
+    #[inline(always)]
+    fn row_subup3_forward_sad(self, cur: &[u8], prev: &[u8], dst: &mut [u8]) -> u64 {
         let len = cur.len();
         debug_assert_eq!(prev.len(), len);
         debug_assert_eq!(dst.len(), len);
@@ -255,8 +271,8 @@ impl RowKernel for Kernel {
         sum
     }
 
-    #[inline]
-    fn row_sub3_inverse(src: &[u8], dst: &mut [u8]) {
+    #[inline(always)]
+    fn row_sub3_inverse(self, src: &[u8], dst: &mut [u8]) {
         let len = src.len();
         debug_assert_eq!(dst.len(), len);
         let lim = if len >= 16 { ((len - 4) / 12) * 12 } else { 0 };
@@ -282,8 +298,8 @@ impl RowKernel for Kernel {
         }
     }
 
-    #[inline]
-    fn row_up_inverse(src: &[u8], prev: &[u8], dst: &mut [u8]) {
+    #[inline(always)]
+    fn row_up_inverse(self, src: &[u8], prev: &[u8], dst: &mut [u8]) {
         let len = src.len();
         debug_assert_eq!(prev.len(), len);
         debug_assert_eq!(dst.len(), len);
@@ -303,8 +319,8 @@ impl RowKernel for Kernel {
         }
     }
 
-    #[inline]
-    fn row_subup3_inverse(src: &[u8], prev: &[u8], dst: &mut [u8]) {
+    #[inline(always)]
+    fn row_subup3_inverse(self, src: &[u8], prev: &[u8], dst: &mut [u8]) {
         let len = src.len();
         debug_assert_eq!(prev.len(), len);
         debug_assert_eq!(dst.len(), len);
@@ -340,8 +356,9 @@ impl RowKernel for Kernel {
         }
     }
 
-    #[inline]
+    #[inline(always)]
     unsafe fn subgreen_bgr3_to_bgra<const STREAM: bool, const CONST_ALPHA: bool>(
+        self,
         src_bgr: &[u8],
         alpha_row: &[u8],
         const_alpha: u8,
@@ -390,8 +407,8 @@ impl RowKernel for Kernel {
         }
     }
 
-    #[inline]
-    unsafe fn splat_row<const STREAM: bool>(dst: &mut [Vec4u8], pixel: Vec4u8) {
+    #[inline(always)]
+    unsafe fn splat_row<const STREAM: bool>(self, dst: &mut [Vec4u8], pixel: Vec4u8) {
         let lim = (dst.len() / 4) * 4;
         // SAFETY: `x + 4 <= dst.len()`, so `vst1q_u8` writes 16 bytes in bounds.
         unsafe {
@@ -407,8 +424,8 @@ impl RowKernel for Kernel {
         dst[lim..].fill(pixel);
     }
 
-    #[inline]
-    fn is_constant_plane(data: &[u8]) -> Option<u8> {
+    #[inline(always)]
+    fn is_constant_plane(self, data: &[u8]) -> Option<u8> {
         let first = *data.first()?;
         let lim = (data.len() / 16) * 16;
         // SAFETY: NEON is mandatory on AArch64 and `i + 16 <= data.len()`.
@@ -426,8 +443,8 @@ impl RowKernel for Kernel {
         data[lim..].iter().all(|&b| b == first).then_some(first)
     }
 
-    #[inline]
-    fn row_sub1_forward(src: &[u8], dst: &mut [u8]) {
+    #[inline(always)]
+    fn row_sub1_forward(self, src: &[u8], dst: &mut [u8]) {
         let len = src.len();
         debug_assert_eq!(dst.len(), len);
         let lim = (len / 16) * 16;
@@ -451,8 +468,8 @@ impl RowKernel for Kernel {
         }
     }
 
-    #[inline]
-    fn row_up_forward(cur: &[u8], prev: &[u8], dst: &mut [u8]) {
+    #[inline(always)]
+    fn row_up_forward(self, cur: &[u8], prev: &[u8], dst: &mut [u8]) {
         let len = cur.len();
         debug_assert_eq!(prev.len(), len);
         debug_assert_eq!(dst.len(), len);
@@ -472,8 +489,8 @@ impl RowKernel for Kernel {
         }
     }
 
-    #[inline]
-    fn row_sub1_inverse(src: &[u8], dst: &mut [u8]) {
+    #[inline(always)]
+    fn row_sub1_inverse(self, src: &[u8], dst: &mut [u8]) {
         let len = src.len();
         debug_assert_eq!(dst.len(), len);
         let lim = (len / 16) * 16;
@@ -501,8 +518,9 @@ impl RowKernel for Kernel {
         }
     }
 
-    #[inline]
+    #[inline(always)]
     fn diff_and_update_row<const HAS_ALPHA: bool>(
+        self,
         src: BufferPointer<Vec4u8>,
         shadow: &mut [Vec4u8],
     ) -> bool {
@@ -558,6 +576,207 @@ impl RowKernel for Kernel {
         false
     }
 
-    #[inline]
-    fn fence_stream() {}
+    #[inline(always)]
+    fn fence_stream(self) {}
+}
+
+#[derive(Debug, Copy, Clone, Eq, PartialEq)]
+pub(super) struct Tier;
+
+impl Tier {
+    #[inline(always)]
+    pub(super) const fn detect() -> Self {
+        Self
+    }
+
+    #[inline(always)]
+    pub(super) fn filter_aos_zstd_leaf<const HAS_ALPHA: bool>(
+        self,
+        aos: BufferPointer<Vec4u8>,
+        stride_px: usize,
+        rect: TileRect,
+        state: &mut CompressorWorkerState,
+    ) -> LeafPayload {
+        super::filter_aos_zstd_leaf_with::<Kernel, HAS_ALPHA>(Kernel, aos, stride_px, rect, state)
+    }
+
+    #[inline(always)]
+    pub(super) fn encode_alpha_plane(
+        self,
+        state: &mut CompressorWorkerState,
+        tw: usize,
+        th: usize,
+    ) -> AlphaChannel {
+        super::encode_alpha_plane_with(Kernel, state, tw, th)
+    }
+
+    /// # Safety
+    /// Caller must uphold [`super::unfilter_tiles_worker_with`] invariants.
+    #[inline(always)]
+    pub(super) unsafe fn unfilter_tiles_worker<'a, F>(
+        self,
+        has_alpha: bool,
+        tile_rects: &[TileRect],
+        frame: &FrameRows,
+        claimed: &[AtomicBool],
+        completed: &AtomicUsize,
+        first_err: &Mutex<Option<anyhow::Error>>,
+        next_tile: &F,
+        state: &mut DecompressorWorkerState,
+    ) where
+        F: Fn() -> Option<Result<Cow<'a, CompressedTile>>> + Sync,
+    {
+        // SAFETY: Caller upholds validated-frame and disjoint-tile invariants.
+        unsafe {
+            if has_alpha {
+                super::unfilter_tiles_worker_with::<Kernel, true, F>(
+                    Kernel, self, tile_rects, frame, claimed, completed, first_err, next_tile,
+                    state,
+                );
+            } else {
+                super::unfilter_tiles_worker_with::<Kernel, false, F>(
+                    Kernel, self, tile_rects, frame, claimed, completed, first_err, next_tile,
+                    state,
+                );
+            }
+        }
+    }
+
+    /// # Safety
+    /// Caller must uphold [`super::decode_jpeg_alpha_rows_with`] invariants.
+    #[inline(always)]
+    pub(super) unsafe fn decode_jpeg_alpha_rows(
+        self,
+        a_filt: &[u8],
+        jpeg_rows: &[Vec4u8],
+        frame: &FrameRows,
+        x0: usize,
+        y0: usize,
+        tw: usize,
+        th: usize,
+        alpha_row_a: &mut Vec<u8>,
+        alpha_row_b: &mut Vec<u8>,
+    ) {
+        // SAFETY: Caller upholds validated-frame and disjoint-rect invariants.
+        unsafe {
+            super::decode_jpeg_alpha_rows_with(
+                Kernel,
+                a_filt,
+                jpeg_rows,
+                frame,
+                x0,
+                y0,
+                tw,
+                th,
+                alpha_row_a,
+                alpha_row_b,
+            );
+        }
+    }
+
+    /// # Safety
+    /// Caller must uphold [`super::diff_and_update_worker_with`] invariants.
+    #[inline(always)]
+    pub(super) unsafe fn diff_and_update_worker(
+        self,
+        has_alpha: bool,
+        data: BufferPointer<u8>,
+        aos: BufferPointer<Vec4u8>,
+        shadow: &ShadowRows,
+        width: usize,
+        stride: usize,
+        stride_px: usize,
+        n_qx: usize,
+        sub_bands: &[ScanSubBand],
+        dirty_flags: &[AtomicBool],
+        next_sub: &AtomicUsize,
+    ) {
+        // SAFETY: Caller upholds disjoint-band shadow invariants.
+        unsafe {
+            if has_alpha {
+                super::diff_and_update_worker_with::<Kernel, true>(
+                    Kernel,
+                    data,
+                    aos,
+                    shadow,
+                    width,
+                    stride,
+                    stride_px,
+                    n_qx,
+                    sub_bands,
+                    dirty_flags,
+                    next_sub,
+                );
+            } else {
+                super::diff_and_update_worker_with::<Kernel, false>(
+                    Kernel,
+                    data,
+                    aos,
+                    shadow,
+                    width,
+                    stride,
+                    stride_px,
+                    n_qx,
+                    sub_bands,
+                    dirty_flags,
+                    next_sub,
+                );
+            }
+        }
+    }
+
+    #[cfg(test)]
+    pub(super) unsafe fn diff_and_update_strip<const HAS_ALPHA: bool>(
+        self,
+        aos: BufferPointer<Vec4u8>,
+        shadow: &ShadowRows,
+        stride_px: usize,
+        rect: TileRect,
+    ) -> bool {
+        // SAFETY: Caller upholds disjoint-rect shadow invariants.
+        unsafe {
+            super::diff_and_update_strip_with::<Kernel, HAS_ALPHA>(
+                Kernel, aos, shadow, stride_px, rect,
+            )
+        }
+    }
+
+    #[cfg(test)]
+    pub(super) unsafe fn diff_and_update_row_band_2d<const HAS_ALPHA: bool>(
+        self,
+        data: BufferPointer<u8>,
+        aos: BufferPointer<Vec4u8>,
+        shadow: &ShadowRows,
+        width: usize,
+        stride: usize,
+        y0: usize,
+        y1: usize,
+        dirty_slots: &[AtomicBool],
+    ) {
+        // SAFETY: Caller upholds disjoint-row shadow invariants.
+        unsafe {
+            super::diff_and_update_row_band_2d_with::<Kernel, HAS_ALPHA>(
+                Kernel,
+                data,
+                aos,
+                shadow,
+                width,
+                stride,
+                y0,
+                y1,
+                dirty_slots,
+            );
+        }
+    }
+
+    #[cfg(test)]
+    pub(super) fn supported_tiers() -> Vec<Self> {
+        vec![Self]
+    }
+}
+
+#[cfg(test)]
+pub(super) fn verify_all_supported_kernels() -> Vec<Tier> {
+    super::tests::verify_kernel_matches_scalar(Kernel, "neon");
+    vec![Tier]
 }
