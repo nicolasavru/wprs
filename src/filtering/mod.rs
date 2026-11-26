@@ -36,8 +36,8 @@
 //!   translucent `Argb8888` tiles.
 //!
 //! Architecture-specific backends:
-//! - `x86`: native AVX2 (256-bit) and SSSE3 (128-bit) with scalar fallback on
-//!   baseline SSE2 / Miri
+//! - `x86`: native AVX-512 (512-bit), AVX2 (256-bit), and SSSE3 (128-bit) with
+//!   scalar fallback on baseline SSE2 / Miri
 //! - `neon`: AArch64 NEON structure load/store (`vld4q`/`vst3q`, `vld3q`/`vst4q`)
 
 #[cfg(target_arch = "x86_64")]
@@ -2280,8 +2280,8 @@ mod tests {
         expected: &[u8],
         decompressor: &mut ShardingDecompressor,
     ) {
-        let mut buf = vec![0xAAu8; expected.len() + 36];
-        let aligned_off = (32 - (buf.as_ptr() as usize & 31)) & 31;
+        let mut buf = vec![0xAAu8; expected.len() + 68];
+        let aligned_off = (64 - (buf.as_ptr() as usize & 63)) & 63;
         decompress_and_unfilter(
             tiles,
             decompressor,
@@ -2443,10 +2443,11 @@ mod tests {
             assert_eq!(a_inv, alp1_s, "alpha up inv tw={tw}");
 
             // Unpack BGR3 -> BGRA (constant alpha and varying alpha, both alignments)
-            let mut dst_buf = vec![Vec4u8(0xAA, 0xAA, 0xAA, 0xAA); tw + 8];
-            let aligned_off = ((32 - (dst_buf.as_ptr() as usize & 31)) & 31) / 4;
-            for (stream, off) in [(true, aligned_off), (false, aligned_off + 1)] {
-                let dst = &mut dst_buf[off..off + tw];
+            let mut dst_bytes = vec![0xAAu8; (tw + 17) * 4];
+            let aligned_off = (64 - (dst_bytes.as_ptr() as usize & 63)) & 63;
+            for (stream, byte_off) in [(true, aligned_off), (false, aligned_off + 4)] {
+                let dst: &mut [Vec4u8] =
+                    bytemuck::cast_slice_mut(&mut dst_bytes[byte_off..byte_off + tw * 4]);
                 dst.fill(Vec4u8(0, 0, 0, 0));
                 unsafe {
                     if stream && arch::Kernel::STREAM_ALIGN > 1 {
@@ -2543,9 +2544,10 @@ mod tests {
                 assert_eq!(sh_a, sh_s);
             }
         }
-        // `i8::MIN` (`0x80` = `-128`) unsigned abs must equal `128` across all backends.
-        let min_bytes = [0x80u8; 41];
-        assert_eq!(arch::Kernel::sad_signed_bytes(&min_bytes), 41 * 128);
+        // `i8::MIN` (`0x80` = `-128`) unsigned abs must equal `128` across all backends
+        // (covers 16B, 32B, and 64B SIMD loops plus scalar tails).
+        let min_bytes = [0x80u8; 73];
+        assert_eq!(arch::Kernel::sad_signed_bytes(&min_bytes), 73 * 128);
         assert_eq!(arch::Kernel::is_constant_plane(&[]), None);
     }
 
