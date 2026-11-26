@@ -24,7 +24,6 @@ bimap = "0.6.3"
 bpaf = "0.9.29"
 bytemuck = "1.25.2"
 calloop = { version = "0.14.5", features = ["signals"] }
-cfg-if = "1.0.5"
 crossbeam-channel = "0.5.17"
 enum-as-inner = "0.7.0"
 home = "0.5.12"

@@ -2431,7 +2431,6 @@ dependencies = [
  "bpaf",
  "bytemuck",
  "calloop",
- "cfg-if",
  "criterion",
  "crossbeam-channel",
  "enum-as-inner 0.7.0",

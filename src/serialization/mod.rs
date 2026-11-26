@@ -738,6 +738,8 @@ where
 
 #[cfg(test)]
 mod tests {
+    use std::assert_matches;
+
     use crossbeam_channel::TryRecvError;
 
     use super::*;
@@ -759,11 +761,11 @@ mod tests {
         assert!(!slot.is_connected());
         assert!(!slot.is_active_connection(c1));
         writer.send(SendType::Object(20));
-        assert!(matches!(rx1.try_recv(), Err(TryRecvError::Empty)));
+        assert_matches!(rx1.try_recv(), Err(TryRecvError::Empty));
 
         // 3. Ending a pending connection before activation drops sender and rejects late activation.
         slot.end_connection(c1);
-        assert!(matches!(rx1.try_recv(), Err(TryRecvError::Disconnected)));
+        assert_matches!(rx1.try_recv(), Err(TryRecvError::Disconnected));
         assert!(!slot.activate_connection(c1));
         assert!(!slot.is_connected());
 
@@ -776,7 +778,7 @@ mod tests {
         assert!(slot.is_connected());
         assert!(slot.is_active_connection(c2));
         writer.send(SendType::Object(30));
-        assert!(matches!(rx2.try_recv(), Ok(SendType::Object(30))));
+        assert_matches!(rx2.try_recv(), Ok(SendType::Object(30)));
 
         // 5. Rapid reconnect `c3` immediately closes `rx2`, ignores stale `c2`
         // calls, and buffers nothing until `c3` activates.
@@ -785,9 +787,9 @@ mod tests {
         assert_eq!(c3, 3);
         assert!(!slot.is_connected());
         assert!(!slot.is_active_connection(c2));
-        assert!(matches!(rx2.try_recv(), Err(TryRecvError::Disconnected)));
+        assert_matches!(rx2.try_recv(), Err(TryRecvError::Disconnected));
         writer.send(SendType::Object(40));
-        assert!(matches!(rx3.try_recv(), Err(TryRecvError::Empty)));
+        assert_matches!(rx3.try_recv(), Err(TryRecvError::Empty));
         slot.end_connection(c2);
         assert!(!slot.activate_connection(c2));
         assert!(slot.activate_connection(c3));
@@ -796,13 +798,13 @@ mod tests {
         assert!(slot.is_connected());
         assert!(slot.is_active_connection(c3));
         writer.send(SendType::Object(50));
-        assert!(matches!(rx3.try_recv(), Ok(SendType::Object(50))));
+        assert_matches!(rx3.try_recv(), Ok(SendType::Object(50)));
 
         // 6. Ending `c3` drops `tx3` and leaves `writer.send` a safe no-op.
         slot.end_connection(c3);
         assert!(!slot.is_connected());
         assert!(!slot.is_active_connection(c3));
-        assert!(matches!(rx3.try_recv(), Err(TryRecvError::Disconnected)));
+        assert_matches!(rx3.try_recv(), Err(TryRecvError::Disconnected));
         writer.send(SendType::Object(60));
 
         // 7. Client slot starts active immediately.
@@ -813,7 +815,7 @@ mod tests {
         assert!(client_slot.is_active_connection(1));
         assert!(!client_slot.is_active_connection(2));
         client_writer.send(SendType::Object(70));
-        assert!(matches!(rx_client.try_recv(), Ok(SendType::Object(70))));
+        assert_matches!(rx_client.try_recv(), Ok(SendType::Object(70)));
     }
 
     #[test]
@@ -836,7 +838,7 @@ mod tests {
             .unwrap();
         let (conn_id, msg) = reader.recv().unwrap();
         assert_eq!(conn_id, 1);
-        assert!(matches!(msg, RecvType::Connected));
+        assert_matches!(msg, RecvType::Connected);
         assert!(server.activate_connection(conn_id));
         assert!(server.other_end_connected());
 
@@ -870,7 +872,7 @@ mod tests {
         let mut stream2 = UnixStream::connect(&sock_path).unwrap();
         let (conn_id2, msg2) = reader.recv().unwrap();
         assert_eq!(conn_id2, 2);
-        assert!(matches!(msg2, RecvType::Connected));
+        assert_matches!(msg2, RecvType::Connected);
         assert!(server.activate_connection(conn_id2));
         assert!(server.other_end_connected());
 
@@ -889,7 +891,7 @@ mod tests {
             .unwrap();
         let (event_conn_id, event_msg) = reader.recv().unwrap();
         assert_eq!(event_conn_id, 2);
-        assert!(matches!(event_msg, RecvType::Object(ev) if ev == expected_event));
+        assert_matches!(event_msg, RecvType::Object(ev) if ev == expected_event);
 
         drop(stream2);
         _ = std::fs::remove_file(&sock_path);

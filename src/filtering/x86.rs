@@ -14,17 +14,15 @@
 
 //! x86_64 row kernels for direct 3-byte `SubGreen(BGR)` AoS filtering.
 //!
-//! Dispatches statically at compile time via `cfg_if!`:
+//! Dispatches statically at compile time via `cfg_select!`:
 //! - `avx2` (`x86-64-v3` default): 256-bit AVX2 + 128-bit SSSE3 3-byte prefix
 //!   sum + 32-byte-aligned `_mm256_stream_si256` non-temporal stores.
 //! - `ssse3` (`+ssse3`, `x86-64-v2`, `+avx`): 128-bit native SSSE3 + 16-byte
 //!   `_mm_stream_si128` non-temporal stores.
 //! - `sse2` (`x86-64` baseline) and Miri: portable [`crate::filtering::ScalarKernel`].
 
-use cfg_if::cfg_if;
-
-cfg_if! {
-    if #[cfg(all(target_feature = "avx2", not(miri)))] {
+cfg_select! {
+    all(target_feature = "avx2", not(miri)) => {
         mod imp {
             use std::arch::x86_64::__m128i;
             use std::arch::x86_64::__m256i;
@@ -108,8 +106,8 @@ cfg_if! {
                             13, -1, 9, -1, 9, -1, 5, -1, 5, -1, 1, -1, 1,
                         );
                         let pack12 = _mm256_set_epi8(
-                            -1, -1, -1, -1, 14, 13, 12, 10, 9, 8, 6, 5, 4, 2, 1, 0, -1, -1, -1,
-                            -1, 14, 13, 12, 10, 9, 8, 6, 5, 4, 2, 1, 0,
+                            -1, -1, -1, -1, 14, 13, 12, 10, 9, 8, 6, 5, 4, 2, 1, 0, -1, -1, -1, -1,
+                            14, 13, 12, 10, 9, 8, 6, 5, 4, 2, 1, 0,
                         );
                         let shuf_a = _mm256_set_epi8(
                             -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, 15, 11, 7, 3, -1, -1,
@@ -142,7 +140,12 @@ cfg_if! {
                         }
                     }
 
-                    for (off, bgr) in dst_bgr[lim * 3..].as_chunks_mut::<3>().0.iter_mut().enumerate() {
+                    for (off, bgr) in dst_bgr[lim * 3..]
+                        .as_chunks_mut::<3>()
+                        .0
+                        .iter_mut()
+                        .enumerate()
+                    {
                         let i = lim + off;
                         // SAFETY: `i < tw == src.len()`.
                         let px = unsafe { src.ptr().add(i).read() };
@@ -197,7 +200,8 @@ cfg_if! {
                             let diff = _mm256_sub_epi8(v, shifted);
                             prev = v;
                             _mm256_storeu_si256(dst.as_mut_ptr().add(i).cast::<__m256i>(), diff);
-                            acc = _mm256_add_epi64(acc, _mm256_sad_epu8(_mm256_abs_epi8(diff), zero));
+                            acc =
+                                _mm256_add_epi64(acc, _mm256_sad_epu8(_mm256_abs_epi8(diff), zero));
                             i += 32;
                         }
                         sum += hsum_epi64(acc);
@@ -228,7 +232,8 @@ cfg_if! {
                             let u = _mm256_loadu_si256(prev.as_ptr().add(i).cast::<__m256i>());
                             let diff = _mm256_sub_epi8(c, u);
                             _mm256_storeu_si256(dst.as_mut_ptr().add(i).cast::<__m256i>(), diff);
-                            acc = _mm256_add_epi64(acc, _mm256_sad_epu8(_mm256_abs_epi8(diff), zero));
+                            acc =
+                                _mm256_add_epi64(acc, _mm256_sad_epu8(_mm256_abs_epi8(diff), zero));
                             i += 32;
                         }
                         sum += hsum_epi64(acc);
@@ -263,7 +268,8 @@ cfg_if! {
                             let diff = _mm256_sub_epi8(up, shifted);
                             prev_up = up;
                             _mm256_storeu_si256(dst.as_mut_ptr().add(i).cast::<__m256i>(), diff);
-                            acc = _mm256_add_epi64(acc, _mm256_sad_epu8(_mm256_abs_epi8(diff), zero));
+                            acc =
+                                _mm256_add_epi64(acc, _mm256_sad_epu8(_mm256_abs_epi8(diff), zero));
                             i += 32;
                         }
                         sum += hsum_epi64(acc);
@@ -407,10 +413,12 @@ cfg_if! {
                         );
                         let const_alpha_vec =
                             _mm256_set1_epi32((u32::from(const_alpha) << 24) as i32);
-                        let shuf_a_lo =
-                            _mm_set_epi8(3, -1, -1, -1, 2, -1, -1, -1, 1, -1, -1, -1, 0, -1, -1, -1);
-                        let shuf_a_hi =
-                            _mm_set_epi8(7, -1, -1, -1, 6, -1, -1, -1, 5, -1, -1, -1, 4, -1, -1, -1);
+                        let shuf_a_lo = _mm_set_epi8(
+                            3, -1, -1, -1, 2, -1, -1, -1, 1, -1, -1, -1, 0, -1, -1, -1,
+                        );
+                        let shuf_a_hi = _mm_set_epi8(
+                            7, -1, -1, -1, 6, -1, -1, -1, 5, -1, -1, -1, 4, -1, -1, -1,
+                        );
 
                         while x < lim {
                             let lo = _mm_loadu_si128(src_bgr.as_ptr().add(si).cast::<__m128i>());
@@ -480,7 +488,12 @@ cfg_if! {
                         } else {
                             alpha_row[i]
                         };
-                        dst[i] = Vec4u8(src_bgr[s].wrapping_add(g), g, src_bgr[s + 2].wrapping_add(g), a);
+                        dst[i] = Vec4u8(
+                            src_bgr[s].wrapping_add(g),
+                            g,
+                            src_bgr[s + 2].wrapping_add(g),
+                            a,
+                        );
                     }
                 }
 
@@ -680,7 +693,8 @@ cfg_if! {
             }
         }
         pub(super) use imp::Kernel;
-    } else if #[cfg(all(target_feature = "ssse3", not(miri)))] {
+    },
+    all(target_feature = "ssse3", not(miri)) => {
         mod imp {
             use std::arch::x86_64::__m128i;
             use std::arch::x86_64::_mm_abs_epi8;
@@ -749,8 +763,9 @@ cfg_if! {
                             _mm_set_epi8(-1, 13, -1, 13, -1, 9, -1, 9, -1, 5, -1, 5, -1, 1, -1, 1);
                         let pack12 =
                             _mm_set_epi8(-1, -1, -1, -1, 14, 13, 12, 10, 9, 8, 6, 5, 4, 2, 1, 0);
-                        let shuf_a =
-                            _mm_set_epi8(-1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, 15, 11, 7, 3);
+                        let shuf_a = _mm_set_epi8(
+                            -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, 15, 11, 7, 3,
+                        );
 
                         while x < lim {
                             let v = _mm_loadu_si128(src.ptr().add(x).cast::<__m128i>());
@@ -767,7 +782,12 @@ cfg_if! {
                         }
                     }
 
-                    for (off, bgr) in dst_bgr[lim * 3..].as_chunks_mut::<3>().0.iter_mut().enumerate() {
+                    for (off, bgr) in dst_bgr[lim * 3..]
+                        .as_chunks_mut::<3>()
+                        .0
+                        .iter_mut()
+                        .enumerate()
+                    {
                         let i = lim + off;
                         // SAFETY: `i < tw == src.len()`.
                         let px = unsafe { src.ptr().add(i).read() };
@@ -1022,8 +1042,9 @@ cfg_if! {
                         let unpack12 =
                             _mm_set_epi8(-1, 11, 10, 9, -1, 8, 7, 6, -1, 5, 4, 3, -1, 2, 1, 0);
                         let const_alpha_vec = _mm_set1_epi32((u32::from(const_alpha) << 24) as i32);
-                        let shuf_a =
-                            _mm_set_epi8(3, -1, -1, -1, 2, -1, -1, -1, 1, -1, -1, -1, 0, -1, -1, -1);
+                        let shuf_a = _mm_set_epi8(
+                            3, -1, -1, -1, 2, -1, -1, -1, 1, -1, -1, -1, 0, -1, -1, -1,
+                        );
 
                         while x < lim {
                             let v = _mm_loadu_si128(src_bgr.as_ptr().add(si).cast::<__m128i>());
@@ -1079,7 +1100,12 @@ cfg_if! {
                         } else {
                             alpha_row[i]
                         };
-                        dst[i] = Vec4u8(src_bgr[s].wrapping_add(g), g, src_bgr[s + 2].wrapping_add(g), a);
+                        dst[i] = Vec4u8(
+                            src_bgr[s].wrapping_add(g),
+                            g,
+                            src_bgr[s + 2].wrapping_add(g),
+                            a,
+                        );
                     }
                 }
 
@@ -1272,7 +1298,8 @@ cfg_if! {
             }
         }
         pub(super) use imp::Kernel;
-    } else {
+    },
+    _ => {
         pub(super) use crate::filtering::ScalarKernel as Kernel;
-    }
+    },
 }

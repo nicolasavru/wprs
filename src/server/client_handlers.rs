@@ -1257,6 +1257,7 @@ impl WprsServerState {
 
 #[cfg(test)]
 mod tests {
+    use std::assert_matches;
     use std::os::unix::net::UnixStream;
     use std::time::Duration;
 
@@ -1295,7 +1296,7 @@ mod tests {
         // Client 1 connects -> activates session -> sets Hybrid mode.
         let client1 = UnixStream::connect(&sock_path).unwrap();
         let (conn1, msg1) = reader.recv().unwrap();
-        assert!(matches!(msg1, RecvType::Connected));
+        assert_matches!(msg1, RecvType::Connected);
         state.handle_event(conn1, msg1);
         assert_eq!(state.compression_mode, CompressionMode::Lossless);
 
@@ -1321,7 +1322,7 @@ mod tests {
         drop(client1);
         let client2 = UnixStream::connect(&sock_path).unwrap();
         let (conn2, msg2) = reader.recv().unwrap();
-        assert!(matches!(msg2, RecvType::Connected));
+        assert_matches!(msg2, RecvType::Connected);
         state.handle_event(conn2, msg2);
         assert_eq!(state.compression_mode, CompressionMode::Lossless);
 

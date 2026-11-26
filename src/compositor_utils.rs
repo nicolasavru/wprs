@@ -74,7 +74,7 @@ where
             Ok(f(buf, spec))
         }
     })
-    .and_then(|res| res)
+    .flatten()
 }
 
 fn fault_probe_range(data: BufferPointer<u8>, start: usize, end: usize) {

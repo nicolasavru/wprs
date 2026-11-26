@@ -2242,6 +2242,7 @@ pub fn decompress_and_unfilter(
 
 #[cfg(test)]
 mod tests {
+    use std::assert_matches;
     use std::cell::RefCell;
     use std::num::NonZeroUsize;
 
@@ -2560,7 +2561,7 @@ mod tests {
         let (full_subs, full, _) = plan_incremental_scan(&meta, None).unwrap();
         assert_eq!(full_subs.len(), 17);
         assert_eq!(full.len(), 15 * 9);
-        assert!(matches!(
+        assert_matches!(
             full[0],
             BaseScanEntry::Tile2D {
                 rect: TileRect {
@@ -2572,8 +2573,8 @@ mod tests {
                 n_quads: 4,
                 ..
             }
-        ));
-        assert!(matches!(
+        );
+        assert_matches!(
             *full.last().unwrap(),
             BaseScanEntry::Tile2D {
                 rect: TileRect {
@@ -2585,7 +2586,7 @@ mod tests {
                 n_quads: 2,
                 ..
             }
-        ));
+        );
 
         // Partial `< 8`-row bands emit 1 full-width 1D strip each.
         for h in [1u32, 7] {
@@ -2615,7 +2616,7 @@ mod tests {
         let (_, band8, _) =
             plan_incremental_scan(&meta, Some(&[RowBand { y0: 100, y1: 108 }])).unwrap();
         assert_eq!(band8.len(), 15);
-        assert!(matches!(
+        assert_matches!(
             band8[0],
             BaseScanEntry::Tile2D {
                 rect: TileRect {
@@ -2627,7 +2628,7 @@ mod tests {
                 n_quads: 2,
                 ..
             }
-        ));
+        );
 
         // Ultra-wide thin strip (`width = 20000, h = 7` -> `140,000 > TILE_PIXELS`) splits cleanly
         // so every tile remains `<= TILE_PIXELS`.
@@ -3068,13 +3069,13 @@ mod tests {
                     compressor,
                     decompressor,
                 );
-                assert!(matches!(
+                assert_matches!(
                     tiles.tiles[0].payload,
                     TilePayload::Leaf(LeafPayload::Palette {
                         has_alpha,
                         ..
                     }) if has_alpha == translucent
-                ));
+                );
                 test_roundtrip_2d(
                     &data,
                     w,
@@ -3125,13 +3126,13 @@ mod tests {
                 compressor,
                 decompressor,
             );
-            assert!(matches!(
+            assert_matches!(
                 t_opaque_argb.tiles[0].payload,
                 TilePayload::Leaf(LeafPayload::AosZstd {
                     alpha: AlphaChannel::Omitted,
                     ..
                 })
-            ));
+            );
 
             let mut const_a = rich.clone();
             for px in const_a.as_chunks_mut::<4>().0 {
@@ -3145,13 +3146,13 @@ mod tests {
                 compressor,
                 decompressor,
             );
-            assert!(matches!(
+            assert_matches!(
                 t_const_a.tiles[0].payload,
                 TilePayload::Leaf(LeafPayload::AosZstd {
                     alpha: AlphaChannel::Constant(0x80),
                     ..
                 })
-            ));
+            );
 
             let mut var_a = rich;
             for (i, px) in var_a.as_chunks_mut::<4>().0.iter_mut().enumerate() {
@@ -3165,13 +3166,13 @@ mod tests {
                 compressor,
                 decompressor,
             );
-            assert!(matches!(
+            assert_matches!(
                 t_var_a.tiles[0].payload,
                 TilePayload::Leaf(LeafPayload::AosZstd {
                     alpha: AlphaChannel::Uncompressed(_) | AlphaChannel::Zstd(_),
                     ..
                 })
-            ));
+            );
             test_roundtrip_2d(
                 &var_a,
                 w,
@@ -4036,15 +4037,15 @@ mod tests {
                 let tiles = filter_and_compress(bp, meta_256, hybrid_444, compressor);
                 assert_eq!(tiles.tiles.len(), 1);
                 if cleartype {
-                    assert!(matches!(
+                    assert_matches!(
                         tiles.tiles[0].payload,
                         TilePayload::Leaf(LeafPayload::AosZstd { .. })
-                    ));
+                    );
                 } else {
-                    assert!(matches!(
+                    assert_matches!(
                         tiles.tiles[0].payload,
                         TilePayload::Leaf(LeafPayload::Palette { .. })
-                    ));
+                    );
                 }
                 assert_decodes_at_both_alignments(&tiles, &text_buf, decompressor);
             }
@@ -4066,13 +4067,13 @@ mod tests {
                 let bp = unsafe { BufferPointer::new(&ptr, photo_buf.len()) };
                 let tiles = filter_and_compress(bp, meta_256, mode, compressor);
                 assert_eq!(tiles.tiles.len(), 1);
-                assert!(matches!(
+                assert_matches!(
                     tiles.tiles[0].payload,
                     TilePayload::Leaf(LeafPayload::Jpeg {
                         alpha: AlphaChannel::Omitted,
                         ..
                     })
-                ));
+                );
                 let mut out = vec![0x33u8; photo_buf.len()];
                 decompress_and_unfilter(&tiles, decompressor, &mut out).unwrap();
                 assert!(
@@ -4134,10 +4135,10 @@ mod tests {
                 panic!("expected TilePayload::Split for mixed 256x256 tile");
             };
             assert_eq!(subs.len(), 4);
-            assert!(matches!(subs[0].payload, LeafPayload::Palette { .. }));
-            assert!(matches!(subs[1].payload, LeafPayload::AosZstd { .. }));
-            assert!(matches!(subs[2].payload, LeafPayload::Jpeg { .. }));
-            assert!(matches!(subs[3].payload, LeafPayload::Jpeg { .. }));
+            assert_matches!(subs[0].payload, LeafPayload::Palette { .. });
+            assert_matches!(subs[1].payload, LeafPayload::AosZstd { .. });
+            assert_matches!(subs[2].payload, LeafPayload::Jpeg { .. });
+            assert_matches!(subs[3].payload, LeafPayload::Jpeg { .. });
 
             let mut mixed_out = vec![0x55u8; mixed.len()];
             decompress_and_unfilter(
@@ -4201,8 +4202,8 @@ mod tests {
                 panic!("expected Split for mixed 256x132 tile");
             };
             assert_eq!(edge_subs.len(), 4);
-            assert!(matches!(edge_subs[0].payload, LeafPayload::Palette { .. }));
-            assert!(matches!(edge_subs[1].payload, LeafPayload::Jpeg { .. }));
+            assert_matches!(edge_subs[0].payload, LeafPayload::Palette { .. });
+            assert_matches!(edge_subs[1].payload, LeafPayload::Jpeg { .. });
             assert!(!matches!(edge_subs[2].payload, LeafPayload::Jpeg { .. }));
             assert!(!matches!(edge_subs[3].payload, LeafPayload::Jpeg { .. }));
         });
@@ -4236,13 +4237,13 @@ mod tests {
             let ptr = const_a.as_ptr();
             let bp = unsafe { BufferPointer::new(&ptr, const_a.len()) };
             let tiles = filter_and_compress(bp, meta, mode, compressor);
-            assert!(matches!(
+            assert_matches!(
                 tiles.tiles[0].payload,
                 TilePayload::Leaf(LeafPayload::Jpeg {
                     alpha: AlphaChannel::Constant(0x77),
                     ..
                 })
-            ));
+            );
             let mut out = vec![0u8; const_a.len()];
             decompress_and_unfilter(&tiles, decompressor, &mut out).unwrap();
             assert!(out.as_chunks::<4>().0.iter().all(|px| px[3] == 0x77));
@@ -4270,13 +4271,13 @@ mod tests {
             let ptr = var_a.as_ptr();
             let bp = unsafe { BufferPointer::new(&ptr, var_a.len()) };
             let tiles = filter_and_compress(bp, meta, mode, compressor);
-            assert!(matches!(
+            assert_matches!(
                 tiles.tiles[0].payload,
                 TilePayload::Leaf(LeafPayload::Jpeg {
                     alpha: AlphaChannel::Uncompressed(_) | AlphaChannel::Zstd(_),
                     ..
                 })
-            ));
+            );
             out.fill(0);
             decompress_and_unfilter(&tiles, decompressor, &mut out).unwrap();
             for (i, (got, exp)) in out
