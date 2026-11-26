@@ -336,8 +336,14 @@ impl popup::PopupHandler for WprsClientState {
             ))));
     }
 
-    fn done(&mut self, _conn: &Connection, _qh: &QueueHandle<Self>, _popup: &popup::Popup) {
-        // TODO?
+    fn done(&mut self, _conn: &Connection, _qh: &QueueHandle<Self>, popup: &popup::Popup) {
+        let Some(&(_, surface_id)) = self.object_bimap.get_by_right(&popup.wl_surface().id())
+        else {
+            return;
+        };
+        self.serializer
+            .writer()
+            .send(SendType::Object(Event::Popup(PopupEvent::Done(surface_id))));
     }
 }
 

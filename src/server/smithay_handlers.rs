@@ -294,11 +294,6 @@ impl XdgShellHandler for WprsServerState {
             tracked.has_committed = false;
             tracked.dirty = true;
         });
-
-        // TODO: this sometimes sends duplicate configures and causes "The popup
-        // positioner is not reactive" errors, but without this popups break
-        // completely.
-        popup.send_configure().log_and_ignore(loc!());
     }
 
     #[instrument(skip(self), level = "debug")]
@@ -431,7 +426,10 @@ impl XdgShellHandler for WprsServerState {
     }
 
     fn reposition_request(&mut self, popup: PopupSurface, positioner: PositionerState, token: u32) {
-        popup.send_repositioned(token);
+        popup.with_pending_state(|state| {
+            state.positioner = positioner;
+            state.geometry = positioner.get_geometry();
+        });
 
         let surface = popup.wl_surface();
         let surface_id = WlSurfaceId::new(surface);
@@ -448,6 +446,7 @@ impl XdgShellHandler for WprsServerState {
 
             if let Some(Role::XdgPopup(popup_state)) = &mut tracked.state.role {
                 popup_state.positioner = xdg_positioner;
+                popup_state.reposition_token = Some(token);
             } else {
                 error!("reposition called on surface that wasn't a popup");
                 return;
@@ -472,6 +471,10 @@ impl XdgShellHandler for WprsServerState {
                 tracked.dirty = true;
             }
         });
+
+        if !is_committed {
+            popup.send_repositioned(token);
+        }
     }
 
     // TODO: show_window_menu
@@ -686,19 +689,28 @@ pub fn commit(surface: &WlSurface, state: &mut WprsServerState) -> Result<()> {
     }
     on_commit_buffer_handler::<WprsServerState>(surface);
     // When no `wprsc` is connected to supply a host configure, answer the
-    // initial (or post-unmap remap) toplevel commit directly so applications
-    // receive both `zxdg_toplevel_decoration_v1.configure` and
-    // `xdg_surface.configure` instead of blocking indefinitely.
-    if !state.serializer.other_end_connected()
-        && let Some(toplevel) = state
+    // initial (or post-unmap remap) xdg-shell commit directly so applications
+    // receive their initial configure instead of blocking indefinitely.
+    if !state.serializer.other_end_connected() {
+        if let Some(toplevel) = state
             .xdg_shell_state
             .toplevel_surfaces()
             .iter()
             .find(|t| t.wl_surface() == surface)
             .cloned()
-        && !toplevel.is_initial_configure_sent()
-    {
-        state.send_detached_toplevel_configure(&toplevel);
+            && !toplevel.is_initial_configure_sent()
+        {
+            state.send_detached_toplevel_configure(&toplevel);
+        } else if let Some(popup) = state
+            .xdg_shell_state
+            .popup_surfaces()
+            .iter()
+            .find(|p| p.wl_surface() == surface)
+            .cloned()
+            && !popup.is_initial_configure_sent()
+        {
+            popup.send_configure().log_and_ignore(loc!());
+        }
     }
     Ok(())
 }
@@ -1307,6 +1319,8 @@ mod tests {
     use smithay_client_toolkit::reexports::client::protocol::wl_surface::WlSurface as ClientWlSurface;
     use smithay_client_toolkit::reexports::protocols::xdg::decoration::zv1::client::zxdg_decoration_manager_v1::ZxdgDecorationManagerV1;
     use smithay_client_toolkit::reexports::protocols::xdg::decoration::zv1::client::zxdg_toplevel_decoration_v1;
+    use smithay_client_toolkit::reexports::protocols::xdg::shell::client::xdg_popup;
+    use smithay_client_toolkit::reexports::protocols::xdg::shell::client::xdg_positioner;
     use smithay_client_toolkit::reexports::protocols::xdg::shell::client::xdg_surface;
     use smithay_client_toolkit::reexports::protocols::xdg::shell::client::xdg_toplevel;
     use smithay_client_toolkit::reexports::protocols::xdg::shell::client::xdg_wm_base::XdgWmBase;
@@ -1330,6 +1344,14 @@ mod tests {
             maximized: bool,
             activated: bool,
         },
+        Popup {
+            x: i32,
+            y: i32,
+            width: i32,
+            height: i32,
+        },
+        PopupRepositioned(u32),
+        PopupDone,
         SurfaceConfigure,
     }
 
@@ -1574,6 +1596,54 @@ mod tests {
                     maximized,
                     activated,
                 });
+            }
+        }
+    }
+
+    impl Dispatch<xdg_positioner::XdgPositioner, ()> for WireClientData {
+        fn event(
+            _state: &mut Self,
+            _proxy: &xdg_positioner::XdgPositioner,
+            _event: xdg_positioner::Event,
+            _data: &(),
+            _conn: &Connection,
+            _qh: &QueueHandle<Self>,
+        ) {
+        }
+    }
+
+    impl Dispatch<xdg_popup::XdgPopup, ()> for WireClientData {
+        fn event(
+            state: &mut Self,
+            _proxy: &xdg_popup::XdgPopup,
+            event: xdg_popup::Event,
+            _data: &(),
+            _conn: &Connection,
+            _qh: &QueueHandle<Self>,
+        ) {
+            match event {
+                xdg_popup::Event::Configure {
+                    x,
+                    y,
+                    width,
+                    height,
+                } => {
+                    state.configures.push(ClientConfigureEvent::Popup {
+                        x,
+                        y,
+                        width,
+                        height,
+                    });
+                },
+                xdg_popup::Event::Repositioned { token } => {
+                    state
+                        .configures
+                        .push(ClientConfigureEvent::PopupRepositioned(token));
+                },
+                xdg_popup::Event::PopupDone => {
+                    state.configures.push(ClientConfigureEvent::PopupDone);
+                },
+                _ => {},
             }
         }
     }
@@ -2690,6 +2760,228 @@ mod tests {
                 .output_snapshots
                 .values()
                 .all(|snap| snap.wl_name.as_deref() != Some("2_DP-2"))
+        );
+    }
+
+    #[test]
+    #[cfg_attr(miri, ignore)]
+    fn test_connected_popup_defers_configure_and_forwards_reposition_and_done_wire() {
+        use crate::serialization::xdg_shell::PopupConfigure;
+        use crate::serialization::xdg_shell::PopupConfigureKind;
+        use crate::serialization::xdg_shell::PopupEvent;
+
+        let mut h = WaylandTestHarness::new(true);
+        let conn_id = h.conn_id.unwrap();
+        let compositor = h.client_data.compositor.clone().unwrap();
+        let wm_base = h.client_data.xdg_wm_base.clone().unwrap();
+
+        let parent_surface = compositor.create_surface(&h.qh, ());
+        let parent_xdg = wm_base.get_xdg_surface(&parent_surface, &h.qh, ());
+        let _parent_toplevel = parent_xdg.get_toplevel(&h.qh, ());
+        parent_surface.commit();
+        h.roundtrip();
+        h.drain_requests();
+        h.client_data.configures.clear();
+
+        // Create a non-reactive popup with slide/flip constraints.
+        let popup_surface = compositor.create_surface(&h.qh, ());
+        let popup_xdg = wm_base.get_xdg_surface(&popup_surface, &h.qh, ());
+        let pos = wm_base.create_positioner(&h.qh, ());
+        pos.set_size(200, 150);
+        pos.set_anchor_rect(100, 100, 1, 1);
+        pos.set_anchor(xdg_positioner::Anchor::TopLeft);
+        pos.set_gravity(xdg_positioner::Gravity::BottomRight);
+        let constraints = xdg_positioner::ConstraintAdjustment::SlideX
+            | xdg_positioner::ConstraintAdjustment::SlideY
+            | xdg_positioner::ConstraintAdjustment::FlipX
+            | xdg_positioner::ConstraintAdjustment::FlipY;
+        pos.set_constraint_adjustment(constraints);
+        let popup = popup_xdg.get_popup(Some(&parent_xdg), &pos, &h.qh, ());
+        h.roundtrip();
+
+        // No premature configure before initial commit or host response.
+        assert!(h.client_data.configures.is_empty());
+
+        popup_surface.commit();
+        h.roundtrip();
+        assert!(
+            h.client_data.configures.is_empty(),
+            "connected popup must wait for host compositor configure"
+        );
+        let popup_sid = h.server_surface_id(&popup_surface);
+        let reqs = h.drain_requests();
+        let popup_state = reqs
+            .iter()
+            .find_map(|req| match req {
+                Request::Surface(SurfaceRequest {
+                    surface,
+                    payload: SurfaceRequestPayload::Commit(state),
+                    ..
+                }) if *surface == popup_sid => state.xdg_popup().ok().copied(),
+                _ => None,
+            })
+            .expect("popup commit must be forwarded to wprsc");
+        assert_eq!(
+            popup_state.positioner.constraint_adjustment,
+            constraints.bits()
+        );
+        assert_eq!(popup_state.reposition_token, None);
+
+        // Host compositor replies with slid/flipped coordinates. Because no
+        // premature configure was sent, this succeeds even though the popup is
+        // not reactive.
+        h.state.handle_event(
+            conn_id,
+            RecvType::Object(Event::Popup(PopupEvent::Configure(PopupConfigure {
+                surface_id: popup_sid,
+                position: (40, 20).into(),
+                width: 200,
+                height: 150,
+                kind: PopupConfigureKind::Initial,
+            }))),
+        );
+        h.roundtrip();
+        assert_eq!(
+            h.client_data.configures,
+            vec![
+                ClientConfigureEvent::Popup {
+                    x: 40,
+                    y: 20,
+                    width: 200,
+                    height: 150,
+                },
+                ClientConfigureEvent::SurfaceConfigure,
+            ]
+        );
+        h.client_data.configures.clear();
+
+        // Reposition request forwards the token and waits for host reply.
+        let pos2 = wm_base.create_positioner(&h.qh, ());
+        pos2.set_size(220, 160);
+        pos2.set_anchor_rect(120, 80, 1, 1);
+        pos2.set_anchor(xdg_positioner::Anchor::TopLeft);
+        pos2.set_gravity(xdg_positioner::Gravity::BottomRight);
+        popup.reposition(&pos2, 42);
+        h.roundtrip();
+        assert!(
+            h.client_data.configures.is_empty(),
+            "connected reposition must wait for host constrained configure"
+        );
+        let reqs = h.drain_requests();
+        let repositioned_state = reqs
+            .iter()
+            .find_map(|req| match req {
+                Request::Surface(SurfaceRequest {
+                    surface,
+                    payload: SurfaceRequestPayload::Commit(state),
+                    ..
+                }) if *surface == popup_sid => state.xdg_popup().ok().copied(),
+                _ => None,
+            })
+            .expect("reposition must forward updated XdgPopupState");
+        assert_eq!(repositioned_state.reposition_token, Some(42));
+        assert_eq!(repositioned_state.positioner.width, 220);
+        assert_eq!(repositioned_state.positioner.height, 160);
+
+        h.state.handle_event(
+            conn_id,
+            RecvType::Object(Event::Popup(PopupEvent::Configure(PopupConfigure {
+                surface_id: popup_sid,
+                position: (10, 15).into(),
+                width: 220,
+                height: 160,
+                kind: PopupConfigureKind::Reposition { token: 42 },
+            }))),
+        );
+        h.roundtrip();
+        assert_eq!(
+            h.client_data.configures,
+            vec![
+                ClientConfigureEvent::PopupRepositioned(42),
+                ClientConfigureEvent::Popup {
+                    x: 10,
+                    y: 15,
+                    width: 220,
+                    height: 160,
+                },
+                ClientConfigureEvent::SurfaceConfigure,
+            ]
+        );
+        h.client_data.configures.clear();
+
+        // Host dismissal forwards `xdg_popup.popup_done`.
+        h.state.handle_event(
+            conn_id,
+            RecvType::Object(Event::Popup(PopupEvent::Done(popup_sid))),
+        );
+        h.roundtrip();
+        assert_eq!(
+            h.client_data.configures,
+            vec![ClientConfigureEvent::PopupDone]
+        );
+    }
+
+    #[test]
+    #[cfg_attr(miri, ignore)]
+    fn test_detached_popup_initial_and_reposition_configures_wire() {
+        let mut h = WaylandTestHarness::new(false);
+        let compositor = h.client_data.compositor.clone().unwrap();
+        let wm_base = h.client_data.xdg_wm_base.clone().unwrap();
+
+        let parent_surface = compositor.create_surface(&h.qh, ());
+        let parent_xdg = wm_base.get_xdg_surface(&parent_surface, &h.qh, ());
+        let _parent_toplevel = parent_xdg.get_toplevel(&h.qh, ());
+        parent_surface.commit();
+        h.roundtrip();
+        h.client_data.configures.clear();
+
+        let popup_surface = compositor.create_surface(&h.qh, ());
+        let popup_xdg = wm_base.get_xdg_surface(&popup_surface, &h.qh, ());
+        let pos = wm_base.create_positioner(&h.qh, ());
+        pos.set_size(180, 90);
+        pos.set_anchor_rect(50, 60, 1, 1);
+        pos.set_anchor(xdg_positioner::Anchor::TopLeft);
+        pos.set_gravity(xdg_positioner::Gravity::BottomRight);
+        let popup = popup_xdg.get_popup(Some(&parent_xdg), &pos, &h.qh, ());
+        h.roundtrip();
+        assert!(h.client_data.configures.is_empty());
+
+        popup_surface.commit();
+        h.roundtrip();
+        assert_eq!(
+            h.client_data.configures,
+            vec![
+                ClientConfigureEvent::Popup {
+                    x: 50,
+                    y: 60,
+                    width: 180,
+                    height: 90,
+                },
+                ClientConfigureEvent::SurfaceConfigure,
+            ]
+        );
+        h.client_data.configures.clear();
+
+        // Detached reposition immediately answers with the UPDATED geometry.
+        let pos2 = wm_base.create_positioner(&h.qh, ());
+        pos2.set_size(240, 120);
+        pos2.set_anchor_rect(75, 85, 1, 1);
+        pos2.set_anchor(xdg_positioner::Anchor::TopLeft);
+        pos2.set_gravity(xdg_positioner::Gravity::BottomRight);
+        popup.reposition(&pos2, 7);
+        h.roundtrip();
+        assert_eq!(
+            h.client_data.configures,
+            vec![
+                ClientConfigureEvent::PopupRepositioned(7),
+                ClientConfigureEvent::Popup {
+                    x: 75,
+                    y: 85,
+                    width: 240,
+                    height: 120,
+                },
+                ClientConfigureEvent::SurfaceConfigure,
+            ]
         );
     }
 }

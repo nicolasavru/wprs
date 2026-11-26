@@ -263,6 +263,7 @@ pub struct RemoteXdgPopup {
     // first configure;
     pub configured: bool,
     pub positioner: XdgPositioner,
+    pub last_reposition_token: Option<u32>,
 }
 
 impl RemoteXdgPopup {
@@ -360,6 +361,7 @@ impl RemoteXdgPopup {
             local_popup,
             configured: false,
             positioner: popup_state.positioner,
+            last_reposition_token: popup_state.reposition_token,
         };
         let surface = surfaces.get_mut(&surface_id).location(loc!())?;
         surface.role = Some(Role::XdgPopup(new_popup));
@@ -386,11 +388,17 @@ impl RemoteXdgPopup {
         }
 
         let popup_state = surface_state.xdg_popup().location(loc!())?;
-        if remote_popup.positioner != popup_state.positioner {
+        let reposition_changed = remote_popup.positioner != popup_state.positioner
+            || (popup_state.reposition_token.is_some()
+                && remote_popup.last_reposition_token != popup_state.reposition_token);
+        if reposition_changed {
             let positioner =
                 Self::new_positioner(xdg_shell_state, &popup_state.positioner).location(loc!())?;
-            remote_popup.local_popup.reposition(&positioner, 0);
+            remote_popup
+                .local_popup
+                .reposition(&positioner, popup_state.reposition_token.unwrap_or(0));
             remote_popup.positioner = popup_state.positioner;
+            remote_popup.last_reposition_token = popup_state.reposition_token;
         }
 
         Ok(())

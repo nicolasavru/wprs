@@ -145,6 +145,7 @@ pub struct XdgPopupState {
     pub parent_surface_id: WlSurfaceId,
     pub positioner: XdgPositioner,
     pub grab_requested: bool,
+    pub reposition_token: Option<u32>,
 }
 
 impl XdgPopupState {
@@ -153,6 +154,7 @@ impl XdgPopupState {
             parent_surface_id: WlSurfaceId::new(&popup.get_parent_surface().location(loc!())?),
             positioner: XdgPositioner::new(positioner),
             grab_requested: false,
+            reposition_token: None,
         })
     }
 }
@@ -218,7 +220,6 @@ pub struct ToplevelClose {
     pub surface_id: WlSurfaceId,
 }
 
-// TODO: do we need this? We're never reading it.
 #[derive(Debug, Copy, Clone, Eq, PartialEq, Archive, Deserialize, Serialize)]
 pub enum PopupConfigureKind {
     Initial,
@@ -321,4 +322,5 @@ pub struct PopupRequest {
 #[derive(Debug, Copy, Clone, Eq, PartialEq, Archive, Deserialize, Serialize)]
 pub enum PopupEvent {
     Configure(PopupConfigure),
+    Done(WlSurfaceId),
 }

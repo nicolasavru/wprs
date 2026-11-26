@@ -93,6 +93,7 @@ use crate::serialization::wayland::SurfaceRequestPayload;
 use crate::serialization::wayland::SurfaceState;
 use crate::serialization::wayland::WlSurfaceId;
 use crate::serialization::xdg_shell::PopupConfigure;
+use crate::serialization::xdg_shell::PopupConfigureKind;
 use crate::serialization::xdg_shell::PopupEvent;
 use crate::serialization::xdg_shell::ToplevelConfigure;
 use crate::serialization::xdg_shell::ToplevelEvent;
@@ -787,13 +788,20 @@ impl WprsServerState {
             .map(|surface| {
                 let surface_id = WlSurfaceId::new(surface.wl_surface());
                 debug!("matched surface {surface_id:?}");
-                surface.with_pending_state(|ref mut state| {
+                surface.with_pending_state(|state| {
                     state.geometry = Rectangle::new(
                         configure.position.into(),
                         (configure.width, configure.height).into(),
                     );
                 });
-                surface.send_configure().log_and_ignore(loc!());
+                match configure.kind {
+                    PopupConfigureKind::Reposition { token } => {
+                        surface.send_repositioned(token);
+                    },
+                    PopupConfigureKind::Initial | PopupConfigureKind::Reactive => {
+                        surface.send_configure().log_and_ignore(loc!());
+                    },
+                }
             })
             .location(loc!())?;
 
@@ -805,6 +813,16 @@ impl WprsServerState {
         match &popup {
             PopupEvent::Configure(configure) => {
                 self.handle_popup_configure(configure).location(loc!())?;
+            },
+            PopupEvent::Done(surface_id) => {
+                if let Some(surface) = self
+                    .xdg_shell_state
+                    .popup_surfaces()
+                    .iter()
+                    .find(|surface| WlSurfaceId::new(surface.wl_surface()) == *surface_id)
+                {
+                    surface.send_popup_done();
+                }
             },
         }
         Ok(())
