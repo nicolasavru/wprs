@@ -737,6 +737,34 @@ where
 }
 
 #[cfg(test)]
+impl<ST, RT> Serializer<ST, RT>
+where
+    ST: Serializable,
+    ST::Archived: Deserialize<ST, HighDeserializer<RancorError>>
+        + for<'a> bytecheck::CheckBytes<HighValidator<'a, RancorError>>,
+    RT: Serializable,
+    RT::Archived: Deserialize<RT, HighDeserializer<RancorError>>
+        + for<'a> bytecheck::CheckBytes<HighValidator<'a, RancorError>>,
+{
+    pub(crate) fn new_test_server() -> Self {
+        Self {
+            read_handle: None,
+            slot: ConnectionSlot::new_server(),
+        }
+    }
+
+    pub(crate) fn connect_test_client(&mut self) -> (u64, Receiver<SendType<ST>>) {
+        let (tx, rx) = crossbeam_channel::unbounded();
+        let conn_id = self.slot.begin_connection(tx);
+        (conn_id, rx)
+    }
+
+    pub(crate) fn disconnect_test_client(&mut self, conn_id: u64) {
+        self.slot.end_connection(conn_id);
+    }
+}
+
+#[cfg(test)]
 mod tests {
     use std::assert_matches;
 

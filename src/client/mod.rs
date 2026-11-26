@@ -535,6 +535,53 @@ impl XdgSurface for RemoteXdgPopup {
     }
 }
 
+fn reorder_children_list(
+    self_id: WlSurfaceId,
+    z_ordered_children: &mut Vec<SubsurfacePosition>,
+    new_order: &[SubsurfacePosition],
+) -> Vec<(WlSurfaceId, WlSurfaceId)> {
+    let mut moves = Vec::new();
+
+    let mut new_order = new_order.to_vec();
+    new_order.reverse();
+
+    debug!(
+        "REORDER_CHILDREN, {:?}, {:?}, {:?}",
+        &self_id, &z_ordered_children, &new_order
+    );
+
+    let z_ordered_children_set: HashSet<WlSurfaceId> =
+        z_ordered_children.iter().map(|c| c.id).collect();
+    let mut seen = HashSet::with_capacity(new_order.len());
+
+    let new_order: Vec<SubsurfacePosition> = new_order
+        .into_iter()
+        .filter(|elem| z_ordered_children_set.contains(&elem.id) && seen.insert(elem.id))
+        .collect();
+
+    for (idx, elem) in new_order.iter().enumerate() {
+        let current_elem = z_ordered_children[idx];
+        if current_elem.id == elem.id {
+            z_ordered_children[idx] = *elem; // position may have changed
+            continue;
+        }
+
+        let current_idx = z_ordered_children
+            .iter()
+            .position(|x| x.id == elem.id)
+            .unwrap(); // we already filtered and deduplicated present elements
+
+        z_ordered_children.remove(current_idx);
+        // Insert elem instead of child because position may have changed.
+        z_ordered_children.insert(idx, *elem);
+        if elem.id != self_id {
+            moves.push((elem.id, current_elem.id));
+        }
+    }
+
+    moves
+}
+
 #[derive(Debug)]
 pub struct RemoteSurface {
     pub client: ClientId,
@@ -590,45 +637,7 @@ impl RemoteSurface {
         &mut self,
         new_order: &[SubsurfacePosition],
     ) -> Vec<(WlSurfaceId, WlSurfaceId)> {
-        let mut moves = Vec::new();
-
-        let mut new_order = new_order.to_vec();
-        new_order.reverse();
-
-        debug!(
-            "REORDER_CHILDREN, {:?}, {:?}, {:?}",
-            &self.id, &self.z_ordered_children, &new_order
-        );
-
-        let z_ordered_children_set: HashSet<WlSurfaceId> =
-            self.z_ordered_children.iter().map(|c| c.id).collect();
-
-        let new_order: Vec<SubsurfacePosition> = new_order
-            .iter()
-            .filter(|elem| z_ordered_children_set.contains(&elem.id))
-            .cloned()
-            .collect();
-
-        for (idx, elem) in new_order.iter().enumerate() {
-            let current_elem = self.z_ordered_children[idx];
-            if current_elem.id == elem.id {
-                self.z_ordered_children[idx] = *elem; // position may have changed
-                continue;
-            }
-
-            let current_idx = self
-                .z_ordered_children
-                .iter()
-                .position(|x| x.id == elem.id)
-                .unwrap(); // we already filtered out non-present elements
-
-            self.z_ordered_children.remove(current_idx);
-            // Insert elem instead of child because position may have changed.
-            self.z_ordered_children.insert(idx, *elem);
-            moves.push((elem.id, current_elem.id));
-        }
-
-        moves
+        reorder_children_list(self.id, &mut self.z_ordered_children, new_order)
     }
 
     fn has_in_flight_buffer(&self) -> bool {
@@ -1317,6 +1326,38 @@ mod tests {
         assert_eq!((active, slots.len(), copied, alloc), (3, 4, 0, Some(true)));
         assert_eq!(back, Some((2, None)));
         assert_visible_eq(&slots[active], &frame, width, height, stride);
+    }
+
+    #[test]
+    fn test_reorder_children_list_deduplicates_and_never_moves_self() {
+        let p = WlSurfaceId(1);
+        let c1 = WlSurfaceId(2);
+        let c2 = WlSurfaceId(3);
+        let pos = |id, x, y| SubsurfacePosition {
+            id,
+            position: (x, y).into(),
+        };
+
+        // Even if `p` isn't at index 0 and `new_order` contains duplicate IDs
+        // or unknown IDs, `reorder_children_list` deduplicates cleanly and
+        // never emits `p` itself as a `wl_subsurface` move target.
+        let mut current = vec![pos(c1, 0, 0), pos(p, 0, 0), pos(c2, 0, 0)];
+        let moves = reorder_children_list(
+            p,
+            &mut current,
+            &[
+                pos(c1, 10, 20),
+                pos(c2, 30, 40),
+                pos(c2, 99, 99),
+                pos(WlSurfaceId(999), 0, 0),
+                pos(p, 0, 0),
+            ],
+        );
+        assert!(moves.iter().all(|&(moved, _)| moved != p));
+        assert_eq!(
+            current,
+            vec![pos(p, 0, 0), pos(c2, 99, 99), pos(c1, 10, 20)]
+        );
     }
 
     #[test]

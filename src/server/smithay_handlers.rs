@@ -382,6 +382,7 @@ impl XdgShellHandler for WprsServerState {
 
         let surface = popup.wl_surface();
         let xdg_positioner = XdgPositioner::new(&positioner);
+        let surface_order = get_surface_z_order(surface);
         compositor::with_states(surface, |surface_data| {
             let locked_state = surface_data
                 .data_map
@@ -395,6 +396,7 @@ impl XdgShellHandler for WprsServerState {
                 error!("reposition called on surface that wasn't a popup");
                 return;
             }
+            surface_state.z_ordered_children = surface_order;
 
             let surface_state_to_send = surface_state.clone_without_buffer();
             let client = surface_state_to_send.client;
@@ -623,13 +625,55 @@ pub fn get_child_positions(surface: &WlSurface) -> Vec<SubsurfacePosition> {
         .collect()
 }
 
+pub(crate) fn get_surface_z_order(surface: &WlSurface) -> Vec<SubsurfacePosition> {
+    let mut surface_order = get_child_positions(surface);
+    // TODO: get actual surface position, for now put it at the end
+    surface_order.push(SubsurfacePosition {
+        id: WlSurfaceId::new(surface),
+        position: (0, 0).into(),
+    });
+    surface_order
+}
+
+pub(crate) fn sync_subsurface_role(
+    surface_state: &mut SurfaceState,
+    is_subsurface_role: bool,
+    parent_id: Option<WlSurfaceId>,
+) {
+    if !is_subsurface_role {
+        return;
+    }
+
+    match parent_id {
+        Some(parent_id) => match &mut surface_state.role {
+            Some(Role::SubSurface(subsurface_state)) => {
+                subsurface_state.parent = parent_id;
+            },
+            _ => {
+                surface_state.role = Some(Role::SubSurface(SubSurfaceState {
+                    parent: parent_id,
+                    location: (0, 0).into(),
+                    sync: true,
+                }));
+            },
+        },
+        None => {
+            debug!("NO PARENT FOR SUBSURFACE {:?}", surface_state);
+            surface_state.role = None;
+        },
+    }
+}
+
 #[instrument(skip_all, level = "debug")]
 pub fn commit(surface: &WlSurface, state: &mut WprsServerState) -> Result<()> {
-    let surface_order = get_child_positions(surface);
+    let surface_order = get_surface_z_order(surface);
 
     // TODO: https://github.com/Smithay/smithay/issues/538 - move into commit.
-    let sync = compositor::is_sync_subsurface(surface);
     let parent = compositor::get_parent(surface);
+    // Smithay resets `SubsurfaceState::sync` to `true` when `wl_subsurface` is
+    // destroyed while clearing `parent`; a parentless surface has no ancestor
+    // to flush it.
+    let sync = parent.is_some() && compositor::is_sync_subsurface(surface);
     let surface_id = WlSurfaceId::new(surface);
     // Smithay applies a desync root's effectively-sync descendants before the
     // root (and `on_commit_buffer_handler` leaves sync subsurfaces' `NewBuffer`
@@ -779,24 +823,13 @@ pub fn commit_impl(
     let connected = state.serializer.other_end_connected();
     let prev_without_buffer = connected.then(|| surface_state.clone_without_buffer());
 
-    if matches!(surface_data.role, Some("subsurface")) && surface_state.role.is_none() {
-        // TODO: figure out why some subsurfaces don't have parents. Probably a
-        // race condition related to commits and other events.
-        // let parent = parent.unwrap();  // every subsurface has a parent
-        if let Some(parent) = parent {
-            surface_state.role = Some(Role::SubSurface(SubSurfaceState::new(&parent)));
-        } else {
-            debug!("NO PARENT FOR SUBSURFACE {:?}", surface_state)
-        }
-    }
+    sync_subsurface_role(
+        surface_state,
+        matches!(surface_data.role, Some("subsurface")),
+        parent.as_ref().map(WlSurfaceId::new),
+    );
 
     surface_state.z_ordered_children = surface_order;
-
-    // TODO: get actual surface position, for now put it at the end
-    surface_state.z_ordered_children.push(SubsurfacePosition {
-        id: WlSurfaceId::new(surface),
-        position: (0, 0).into(),
-    });
 
     let mut guard = surface_data.cached_state.get::<ViewportCachedState>();
     let viewport_state = guard.current();
@@ -1358,8 +1391,500 @@ smithay::delegate_viewporter!(WprsServerState);
 #[cfg(test)]
 mod tests {
     use std::collections::HashMap;
+    use std::os::unix::net::UnixStream;
+    use std::sync::Arc;
+    use std::sync::atomic::AtomicBool;
+    use std::sync::atomic::Ordering;
+
+    use crossbeam_channel::Receiver;
+    use smithay::reexports::calloop::EventLoop;
+    use smithay::reexports::wayland_server::Display;
+    use smithay_client_toolkit::reexports::client::Connection;
+    use smithay_client_toolkit::reexports::client::Dispatch;
+    use smithay_client_toolkit::reexports::client::EventQueue;
+    use smithay_client_toolkit::reexports::client::Proxy;
+    use smithay_client_toolkit::reexports::client::QueueHandle;
+    use smithay_client_toolkit::reexports::client::protocol::wl_callback;
+    use smithay_client_toolkit::reexports::client::protocol::wl_compositor::WlCompositor;
+    use smithay_client_toolkit::reexports::client::protocol::wl_registry;
+    use smithay_client_toolkit::reexports::client::protocol::wl_subcompositor::WlSubcompositor;
+    use smithay_client_toolkit::reexports::client::protocol::wl_subsurface::WlSubsurface;
+    use smithay_client_toolkit::reexports::client::protocol::wl_surface::WlSurface as ClientWlSurface;
+    use smithay_client_toolkit::reexports::protocols::xdg::shell::client::xdg_surface;
+    use smithay_client_toolkit::reexports::protocols::xdg::shell::client::xdg_toplevel;
+    use smithay_client_toolkit::reexports::protocols::xdg::shell::client::xdg_wm_base::XdgWmBase;
 
     use super::*;
+    use crate::serialization::ClientId as WireClientId;
+    use crate::serialization::Event;
+    use crate::serialization::RecvType;
+    use crate::serialization::Serializer;
+
+    #[derive(Default)]
+    struct WireClientData {
+        compositor: Option<WlCompositor>,
+        subcompositor: Option<WlSubcompositor>,
+        xdg_wm_base: Option<XdgWmBase>,
+    }
+
+    impl Dispatch<wl_registry::WlRegistry, ()> for WireClientData {
+        fn event(
+            state: &mut Self,
+            registry: &wl_registry::WlRegistry,
+            event: wl_registry::Event,
+            _data: &(),
+            _conn: &Connection,
+            qh: &QueueHandle<Self>,
+        ) {
+            if let wl_registry::Event::Global {
+                name,
+                interface,
+                version,
+            } = event
+            {
+                match interface.as_str() {
+                    "wl_compositor" => {
+                        state.compositor =
+                            Some(registry.bind::<WlCompositor, _, _>(name, version.min(6), qh, ()));
+                    },
+                    "wl_subcompositor" => {
+                        state.subcompositor = Some(registry.bind::<WlSubcompositor, _, _>(
+                            name,
+                            version.min(1),
+                            qh,
+                            (),
+                        ));
+                    },
+                    "xdg_wm_base" => {
+                        state.xdg_wm_base =
+                            Some(registry.bind::<XdgWmBase, _, _>(name, version.min(6), qh, ()));
+                    },
+                    _ => {},
+                }
+            }
+        }
+    }
+
+    impl Dispatch<wl_callback::WlCallback, Arc<AtomicBool>> for WireClientData {
+        fn event(
+            _state: &mut Self,
+            _proxy: &wl_callback::WlCallback,
+            event: wl_callback::Event,
+            done: &Arc<AtomicBool>,
+            _conn: &Connection,
+            _qh: &QueueHandle<Self>,
+        ) {
+            if matches!(event, wl_callback::Event::Done { .. }) {
+                done.store(true, Ordering::Release);
+            }
+        }
+    }
+
+    impl Dispatch<WlCompositor, ()> for WireClientData {
+        fn event(
+            _state: &mut Self,
+            _proxy: &WlCompositor,
+            _event: <WlCompositor as Proxy>::Event,
+            _data: &(),
+            _conn: &Connection,
+            _qh: &QueueHandle<Self>,
+        ) {
+        }
+    }
+
+    impl Dispatch<WlSubcompositor, ()> for WireClientData {
+        fn event(
+            _state: &mut Self,
+            _proxy: &WlSubcompositor,
+            _event: <WlSubcompositor as Proxy>::Event,
+            _data: &(),
+            _conn: &Connection,
+            _qh: &QueueHandle<Self>,
+        ) {
+        }
+    }
+
+    impl Dispatch<ClientWlSurface, ()> for WireClientData {
+        fn event(
+            _state: &mut Self,
+            _proxy: &ClientWlSurface,
+            _event: <ClientWlSurface as Proxy>::Event,
+            _data: &(),
+            _conn: &Connection,
+            _qh: &QueueHandle<Self>,
+        ) {
+        }
+    }
+
+    impl Dispatch<WlSubsurface, ()> for WireClientData {
+        fn event(
+            _state: &mut Self,
+            _proxy: &WlSubsurface,
+            _event: <WlSubsurface as Proxy>::Event,
+            _data: &(),
+            _conn: &Connection,
+            _qh: &QueueHandle<Self>,
+        ) {
+        }
+    }
+
+    impl Dispatch<XdgWmBase, ()> for WireClientData {
+        fn event(
+            _state: &mut Self,
+            wm_base: &XdgWmBase,
+            event: <XdgWmBase as Proxy>::Event,
+            _data: &(),
+            _conn: &Connection,
+            _qh: &QueueHandle<Self>,
+        ) {
+            if let smithay_client_toolkit::reexports::protocols::xdg::shell::client::xdg_wm_base::Event::Ping { serial } = event {
+                wm_base.pong(serial);
+            }
+        }
+    }
+
+    impl Dispatch<xdg_surface::XdgSurface, ()> for WireClientData {
+        fn event(
+            _state: &mut Self,
+            xdg_surface: &xdg_surface::XdgSurface,
+            event: xdg_surface::Event,
+            _data: &(),
+            _conn: &Connection,
+            _qh: &QueueHandle<Self>,
+        ) {
+            if let xdg_surface::Event::Configure { serial } = event {
+                xdg_surface.ack_configure(serial);
+            }
+        }
+    }
+
+    impl Dispatch<xdg_toplevel::XdgToplevel, ()> for WireClientData {
+        fn event(
+            _state: &mut Self,
+            _proxy: &xdg_toplevel::XdgToplevel,
+            _event: xdg_toplevel::Event,
+            _data: &(),
+            _conn: &Connection,
+            _qh: &QueueHandle<Self>,
+        ) {
+        }
+    }
+
+    struct WaylandTestHarness {
+        display: Display<WprsServerState>,
+        _event_loop: EventLoop<'static, WprsServerState>,
+        state: WprsServerState,
+        conn: Connection,
+        event_queue: EventQueue<WireClientData>,
+        qh: QueueHandle<WireClientData>,
+        client_data: WireClientData,
+        rx: Option<Receiver<SendType<Request>>>,
+        conn_id: Option<u64>,
+    }
+
+    impl WaylandTestHarness {
+        fn new(connected: bool) -> Self {
+            let serializer: Serializer<Request, Event> = Serializer::new_test_server();
+            let display: Display<WprsServerState> = Display::new().unwrap();
+            let event_loop: EventLoop<WprsServerState> = EventLoop::try_new().unwrap();
+            let state = WprsServerState::new(
+                display.handle(),
+                event_loop.handle(),
+                serializer,
+                false,
+                Duration::from_millis(16),
+                false,
+            );
+
+            let (server_sock, client_sock) = UnixStream::pair().unwrap();
+            display
+                .handle()
+                .insert_client(
+                    server_sock,
+                    Arc::new(ClientState::new(state.serializer.writer())),
+                )
+                .unwrap();
+
+            let conn = Connection::from_socket(client_sock).unwrap();
+            let event_queue: EventQueue<WireClientData> = conn.new_event_queue();
+            let qh = event_queue.handle();
+            let _registry = conn.display().get_registry(&qh, ());
+
+            let mut harness = Self {
+                display,
+                _event_loop: event_loop,
+                state,
+                conn,
+                event_queue,
+                qh,
+                client_data: WireClientData::default(),
+                rx: None,
+                conn_id: None,
+            };
+            harness.roundtrip();
+            if connected {
+                harness.connect_wprsc();
+                harness.drain_requests();
+            }
+            harness
+        }
+
+        fn connect_wprsc(&mut self) {
+            if let Some(conn_id) = self.conn_id.take() {
+                self.state.serializer.disconnect_test_client(conn_id);
+            }
+            let (conn_id, rx) = self.state.serializer.connect_test_client();
+            self.conn_id = Some(conn_id);
+            self.rx = Some(rx);
+            self.state.handle_event(conn_id, RecvType::Connected);
+        }
+
+        fn roundtrip(&mut self) {
+            let done = Arc::new(AtomicBool::new(false));
+            let _cb = self.conn.display().sync(&self.qh, Arc::clone(&done));
+            self.conn.flush().unwrap();
+            self.display.dispatch_clients(&mut self.state).unwrap();
+            self.display.flush_clients().unwrap();
+            while !done.load(Ordering::Acquire) {
+                self.event_queue
+                    .blocking_dispatch(&mut self.client_data)
+                    .unwrap();
+            }
+        }
+
+        fn drain_requests(&self) -> Vec<Request> {
+            let Some(rx) = &self.rx else {
+                return Vec::new();
+            };
+            let mut out = Vec::new();
+            while let Ok(msg) = rx.try_recv() {
+                if let SendType::Object(req) = msg {
+                    out.push(req);
+                }
+            }
+            out
+        }
+
+        fn server_surface_id(&self, surface: &ClientWlSurface) -> WlSurfaceId {
+            let protocol_id = surface.id().protocol_id();
+            *self
+                .state
+                .object_map
+                .iter()
+                .find_map(|(sid, oid)| (oid.protocol_id() == protocol_id).then_some(sid))
+                .expect("surface not registered in object_map")
+        }
+    }
+
+    fn make_surface_state(id: u64, role: Option<Role>) -> SurfaceState {
+        SurfaceState {
+            client: WireClientId(1),
+            id: WlSurfaceId(id),
+            buffer: None,
+            role,
+            buffer_scale: 1,
+            buffer_transform: None,
+            opaque_region: None,
+            input_region: None,
+            z_ordered_children: Vec::new(),
+            damage: None,
+            output_ids: Vec::new(),
+            viewport_state: None,
+            xdg_surface_state: None,
+        }
+    }
+
+    #[test]
+    fn test_sync_subsurface_role() {
+        let p1 = WlSurfaceId(10);
+        let p2 = WlSurfaceId(20);
+
+        // Initial attach creates `Role::SubSurface`.
+        let mut state = make_surface_state(1, None);
+        sync_subsurface_role(&mut state, true, Some(p1));
+        assert_eq!(
+            state.role,
+            Some(Role::SubSurface(SubSurfaceState {
+                parent: p1,
+                location: (0, 0).into(),
+                sync: true,
+            }))
+        );
+
+        // Reparenting updates `parent` in place.
+        sync_subsurface_role(&mut state, true, Some(p2));
+        assert_eq!(
+            state.role,
+            Some(Role::SubSurface(SubSurfaceState {
+                parent: p2,
+                location: (0, 0).into(),
+                sync: true,
+            }))
+        );
+
+        // Detached subsurface clears `role` to `None`.
+        sync_subsurface_role(&mut state, true, None);
+        assert_eq!(state.role, None);
+
+        // Non-subsurface roles are untouched.
+        let mut toplevel = make_surface_state(2, Some(Role::XdgToplevel(Default::default())));
+        sync_subsurface_role(&mut toplevel, false, None);
+        assert!(matches!(toplevel.role, Some(Role::XdgToplevel(_))));
+    }
+
+    #[test]
+    #[cfg_attr(miri, ignore)]
+    fn test_subsurface_reparent_and_detach_wire() {
+        let mut h = WaylandTestHarness::new(true);
+        let compositor = h.client_data.compositor.clone().unwrap();
+        let subcompositor = h.client_data.subcompositor.clone().unwrap();
+        let xdg_wm_base = h.client_data.xdg_wm_base.clone().unwrap();
+
+        let p1 = compositor.create_surface(&h.qh, ());
+        let p2 = compositor.create_surface(&h.qh, ());
+        let child = compositor.create_surface(&h.qh, ());
+
+        // Attach `child` to `p1` (desync, offset (10, 20)) and commit both.
+        let sub1 = subcompositor.get_subsurface(&child, &p1, &h.qh, ());
+        sub1.set_desync();
+        sub1.set_position(10, 20);
+        child.commit();
+        p1.commit();
+        h.roundtrip();
+
+        let p1_id = h.server_surface_id(&p1);
+        let child_id = h.server_surface_id(&child);
+        let reqs = h.drain_requests();
+        assert!(reqs.iter().any(|r| matches!(
+            r,
+            Request::Surface(SurfaceRequest {
+                surface,
+                payload: SurfaceRequestPayload::Commit(st),
+                ..
+            }) if *surface == child_id
+                && st.role == Some(Role::SubSurface(SubSurfaceState {
+                    parent: p1_id,
+                    location: (10, 20).into(),
+                    sync: false,
+                }))
+        )));
+
+        // Destroy `p1` BEFORE `sub1` (orphans `child`, leaving `child` desync
+        // and parentless): `child`'s next commit must clear `role` to `None`
+        // and must not leak `child_id` into `dirty_sync_surfaces`.
+        p1.destroy();
+        child.commit();
+        h.roundtrip();
+        let reqs = h.drain_requests();
+        assert!(reqs.iter().any(|r| matches!(
+            r,
+            Request::Surface(SurfaceRequest {
+                surface,
+                payload: SurfaceRequestPayload::Destroyed,
+                ..
+            }) if *surface == p1_id
+        )));
+        assert!(reqs.iter().any(|r| matches!(
+            r,
+            Request::Surface(SurfaceRequest {
+                surface,
+                payload: SurfaceRequestPayload::Commit(st),
+                ..
+            }) if *surface == child_id && st.role.is_none()
+        )));
+        assert!(!h.state.dirty_sync_surfaces.contains(&child_id));
+
+        // Destroy old inert `sub1` and reparent the reused `child` onto `p2`
+        // (default sync=true, offset (30, 40)), like Firefox reusing a tooltip
+        // child surface across tooltip windows.
+        sub1.destroy();
+        let sub2 = subcompositor.get_subsurface(&child, &p2, &h.qh, ());
+        sub2.set_position(30, 40);
+        child.commit();
+        p2.commit();
+        h.roundtrip();
+
+        let p2_id = h.server_surface_id(&p2);
+        let reqs = h.drain_requests();
+        assert!(reqs.iter().any(|r| matches!(
+            r,
+            Request::Surface(SurfaceRequest {
+                surface,
+                payload: SurfaceRequestPayload::Commit(st),
+                ..
+            }) if *surface == child_id
+                && st.role == Some(Role::SubSurface(SubSurfaceState {
+                    parent: p2_id,
+                    location: (30, 40).into(),
+                    sync: true,
+                }))
+        )));
+        assert!(reqs.iter().any(|r| matches!(
+            r,
+            Request::Surface(SurfaceRequest {
+                surface,
+                payload: SurfaceRequestPayload::Commit(st),
+                ..
+            }) if *surface == p2_id
+                && st.z_ordered_children.contains(&SubsurfacePosition {
+                    id: child_id,
+                    position: (30, 40).into(),
+                })
+        )));
+
+        // Direct reparent from live `p2` to toplevel `p3` without an
+        // intermediate detached commit on `child` must update `parent` to `p3`
+        // and survive reconnect `sync_surface_tree`.
+        let p3 = compositor.create_surface(&h.qh, ());
+        let p3_xdg = xdg_wm_base.get_xdg_surface(&p3, &h.qh, ());
+        let _p3_toplevel = p3_xdg.get_toplevel(&h.qh, ());
+        sub2.destroy();
+        let _sub3 = subcompositor.get_subsurface(&child, &p3, &h.qh, ());
+        child.commit();
+        p3.commit();
+        h.roundtrip();
+
+        let p3_id = h.server_surface_id(&p3);
+        let reqs = h.drain_requests();
+        assert!(reqs.iter().any(|r| matches!(
+            r,
+            Request::Surface(SurfaceRequest {
+                surface,
+                payload: SurfaceRequestPayload::Commit(st),
+                ..
+            }) if *surface == child_id
+                && matches!(
+                    st.role,
+                    Some(Role::SubSurface(SubSurfaceState { parent, .. })) if parent == p3_id
+                )
+        )));
+
+        // Reconnect: `sync_surface_tree` must send live `parent == p3_id` and
+        // live `z_ordered_children` without deadlocking `PrivateSurfaceData`.
+        h.connect_wprsc();
+        let sync_reqs = h.drain_requests();
+        assert!(sync_reqs.iter().any(|r| matches!(
+            r,
+            Request::Surface(SurfaceRequest {
+                surface,
+                payload: SurfaceRequestPayload::Commit(st),
+                ..
+            }) if *surface == p3_id
+                && st.z_ordered_children.iter().any(|c| c.id == child_id)
+        )));
+        assert!(sync_reqs.iter().any(|r| matches!(
+            r,
+            Request::Surface(SurfaceRequest {
+                surface,
+                payload: SurfaceRequestPayload::Commit(st),
+                ..
+            }) if *surface == child_id
+                && matches!(
+                    st.role,
+                    Some(Role::SubSurface(SubSurfaceState { parent, .. })) if parent == p3_id
+                )
+        )));
+    }
 
     #[test]
     fn test_take_dirty_sync_descendants() {

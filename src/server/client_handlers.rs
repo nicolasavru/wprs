@@ -49,6 +49,7 @@ use smithay::utils::SERIAL_COUNTER;
 use smithay::utils::Serial;
 use smithay::wayland::compositor;
 use smithay::wayland::compositor::BufferAssignment as SmithayBufferAssignment;
+use smithay::wayland::compositor::SubsurfaceCachedState;
 use smithay::wayland::compositor::SurfaceAttributes;
 use smithay::wayland::compositor::SurfaceData;
 use smithay::wayland::compositor::TraversalAction;
@@ -85,6 +86,7 @@ use crate::serialization::wayland::PointerEvent;
 use crate::serialization::wayland::PointerEventKind;
 use crate::serialization::wayland::RepeatInfo;
 use crate::serialization::wayland::Role;
+use crate::serialization::wayland::SubsurfacePosition;
 use crate::serialization::wayland::SurfaceEvent;
 use crate::serialization::wayland::SurfaceEventPayload;
 use crate::serialization::wayland::SurfaceRequest;
@@ -99,6 +101,8 @@ use crate::server::LockedSurfaceState;
 use crate::server::SyncedSurfaceBuffer;
 use crate::server::WprsServerState;
 use crate::server::smithay_handlers::DndGrab;
+use crate::server::smithay_handlers::get_surface_z_order;
+use crate::server::smithay_handlers::sync_subsurface_role;
 use crate::sharding_compression::ShardingCompressor;
 
 enum UnknownSurfaceErr {
@@ -135,6 +139,9 @@ fn sync_surface_data(
     compression_mode: CompressionMode,
     synced_buffers: &mut HashMap<WlSurfaceId, SyncedSurfaceBuffer>,
     surface_data: &SurfaceData,
+    parent_id: Option<WlSurfaceId>,
+    sync: bool,
+    z_ordered_children: Vec<SubsurfacePosition>,
 ) {
     // Uncommitted child subsurfaces visited by `with_surface_tree_downward` do
     // not have `LockedSurfaceState` yet and will sync on their first commit.
@@ -142,6 +149,21 @@ fn sync_surface_data(
         return;
     };
     let mut surface_state_to_send = locked_state.0.lock().unwrap().clone();
+    sync_subsurface_role(
+        &mut surface_state_to_send,
+        matches!(surface_data.role, Some("subsurface")),
+        parent_id,
+    );
+    if let Some(Role::SubSurface(subsurface_state)) = &mut surface_state_to_send.role {
+        subsurface_state.sync = sync;
+        subsurface_state.location = surface_data
+            .cached_state
+            .get::<SubsurfaceCachedState>()
+            .pending()
+            .location
+            .into();
+    }
+    surface_state_to_send.z_ordered_children = z_ordered_children;
     // `wprsc` treats `damage: None` + `BufferAssignment::New` as full damage
     // (`FrameDamage::merge_commit`).
     surface_state_to_send.damage = None;
@@ -221,21 +243,36 @@ fn sync_surface_data(
 
 impl WprsServerState {
     fn sync_surface_tree(&mut self, root: &WlSurface) {
+        // Collect the tree first so `get_parent` and `get_surface_z_order`
+        // never re-lock `PrivateSurfaceData` while `with_surface_tree_downward`
+        // holds ancestor mutexes.
+        let mut surfaces = Vec::new();
         compositor::with_surface_tree_downward(
             root,
             (),
             |_, _, _| TraversalAction::DoChildren(()),
-            |_, surface_data, _| {
+            |surface, _, _| surfaces.push(surface.clone()),
+            |_, _, _| true,
+        );
+        for surface in &surfaces {
+            let parent_id = compositor::get_parent(surface)
+                .as_ref()
+                .map(WlSurfaceId::new);
+            let sync = parent_id.is_some() && compositor::is_sync_subsurface(surface);
+            let z_ordered_children = get_surface_z_order(surface);
+            compositor::with_states(surface, |surface_data| {
                 sync_surface_data(
                     &self.serializer,
                     &mut self.compressor,
                     self.compression_mode,
                     &mut self.synced_buffers,
                     surface_data,
+                    parent_id,
+                    sync,
+                    z_ordered_children,
                 );
-            },
-            |_, _, _| true,
-        );
+            });
+        }
     }
 
     pub(crate) fn sync_surface_if_unsynced(&mut self, surface: &WlSurface) {

@@ -147,6 +147,7 @@ impl WprsClientState {
         subsurface::populate_subsurfaces(
             client.id,
             surface_id,
+            &surface_state.z_ordered_children,
             surfaces,
             &self.compositor_state,
             &self.subcompositor,
@@ -186,7 +187,9 @@ impl WprsClientState {
                 &self.qh,
             )
             .location(loc!())?,
-            None => {},
+            None => {
+                subsurface::detach_subsurface(surface_id, surfaces);
+            },
         }
 
         if frame_callback_completed {
@@ -219,15 +222,8 @@ impl WprsClientState {
             )
         });
         self.object_bimap.remove_by_left(&(client_id, surface_id));
-        if let Some(client) = self.remote_display.clients.get_mut(&client_id)
-            && let Some(surface) = client.surfaces.remove(&surface_id)
-            && let Ok(Role::SubSurface(subsurface)) = surface.get_role()
-            // The parent surface may have already been destroyed.
-            && let Some(parent) = client.surfaces.get_mut(&subsurface.parent)
-        {
-            parent
-                .z_ordered_children
-                .retain(|child| child.id != surface.id);
+        if let Some(client) = self.remote_display.clients.get_mut(&client_id) {
+            subsurface::destroy_surface(surface_id, &mut client.surfaces);
         }
     }
 
@@ -247,6 +243,16 @@ impl WprsClientState {
 
     #[instrument(skip(self), level = "debug")]
     fn handle_toplevel(&mut self, request: ToplevelRequest) -> Result<()> {
+        if matches!(request.payload, ToplevelRequestPayload::Destroyed) {
+            // TODO(https://github.com/wayland-transpositor/wprs/pull/114):
+            // remove this workaround once sctk allows destroying `Window`
+            // without destroying its underlying `WlSurface`. Do not drop
+            // `surface.role` before `handle_surface_destroy`: child
+            // `wl_subsurface`s must be destroyed before the parent `wl_surface`.
+            self.handle_surface_destroy(request.client, request.surface);
+            return Ok(());
+        }
+
         let Some(client) = self.remote_display.clients.get_mut(&request.client) else {
             return Ok(());
         };
@@ -260,12 +266,7 @@ impl WprsClientState {
 
         if let Some(Role::XdgToplevel(toplevel)) = &surface.role {
             match request.payload {
-                ToplevelRequestPayload::Destroyed => {
-                    surface.role = None;
-                    // TODO(https://github.com/wayland-transpositor/wprs/pull/114):
-                    // remove this workaround.
-                    self.handle_surface_destroy(request.client, request.surface);
-                },
+                ToplevelRequestPayload::Destroyed => unreachable!(),
                 ToplevelRequestPayload::SetMaximized => {
                     toplevel.local_window.set_maximized();
                 },
@@ -304,15 +305,13 @@ impl WprsClientState {
 
     #[instrument(skip(self), level = "debug")]
     fn handle_popup(&mut self, request: PopupRequest) -> Result<()> {
-        let Some(client) = self.remote_display.clients.get_mut(&request.client) else {
-            return Ok(());
-        };
-        let surface = client.surface(&request.surface).location(loc!())?;
         match request.payload {
             PopupRequestPayload::Destroyed => {
-                surface.role = None;
                 // TODO(https://github.com/wayland-transpositor/wprs/pull/114):
-                // remove this workaround.
+                // remove this workaround once sctk allows destroying `Popup`
+                // without destroying its underlying `WlSurface`. Do not drop
+                // `surface.role` before `handle_surface_destroy`: child
+                // `wl_subsurface`s must be destroyed before the parent `wl_surface`.
                 self.handle_surface_destroy(request.client, request.surface);
             },
         }
@@ -591,7 +590,9 @@ impl WprsClientState {
                     if client_surface.client == client
             )
         });
-        self.remote_display.clients.remove(&client);
+        if let Some(mut remote_client) = self.remote_display.clients.remove(&client) {
+            subsurface::detach_all_subsurfaces(&mut remote_client.surfaces);
+        }
         self.object_bimap.retain(|(cid, _), _| *cid != client);
         Ok(())
     }
