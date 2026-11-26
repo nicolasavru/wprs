@@ -753,6 +753,17 @@ where
         }
     }
 
+    pub(crate) fn new_test_client() -> (Self, Receiver<SendType<ST>>) {
+        let (tx, rx) = crossbeam_channel::unbounded();
+        (
+            Self {
+                read_handle: None,
+                slot: ConnectionSlot::new_client(tx),
+            },
+            rx,
+        )
+    }
+
     pub(crate) fn connect_test_client(&mut self) -> (u64, Receiver<SendType<ST>>) {
         let (tx, rx) = crossbeam_channel::unbounded();
         let conn_id = self.slot.begin_connection(tx);

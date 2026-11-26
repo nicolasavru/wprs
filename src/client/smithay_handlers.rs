@@ -87,6 +87,7 @@ use crate::serialization::wayland::DataDestinationEvent;
 use crate::serialization::wayland::DataEvent;
 use crate::serialization::wayland::DataSource;
 use crate::serialization::wayland::DataSourceEvent;
+use crate::serialization::wayland::DataTransferTarget;
 use crate::serialization::wayland::DragEnter;
 use crate::serialization::wayland::KeyInner;
 use crate::serialization::wayland::KeyState;
@@ -438,7 +439,6 @@ impl KeyboardHandler for WprsClientState {
         raw: &[u32],
         keysyms: &[Keysym],
     ) {
-        self.current_focus = Some(surface.clone());
         let Some(&(_, surface_id)) = self.object_bimap.get_by_right(&surface.id()) else {
             // TODO: unwrap is wrong, we can enter before surface exists.
             // Currently we're just returning in that case, but should we create
@@ -467,7 +467,6 @@ impl KeyboardHandler for WprsClientState {
         surface: &WlSurface,
         serial: u32,
     ) {
-        self.current_focus = None;
         self.serializer
             .writer()
             .send(SendType::Object(Event::KeyboardEvent(
@@ -624,6 +623,9 @@ impl PointerHandler for WprsClientState {
         _pointer: &WlPointer,
         events: &[PointerEvent],
     ) {
+        let has_enter = events
+            .iter()
+            .any(|event| matches!(event.kind, PointerEventKind::Enter { .. }));
         let mut serialized_events = Vec::with_capacity(events.len());
         for event in events {
             let Some(&(_, surface_id)) = self.object_bimap.get_by_right(&event.surface.id()) else {
@@ -635,8 +637,30 @@ impl PointerHandler for WprsClientState {
                     self.last_enter_serial = serial;
                     self.apply_current_cursor_image().log_and_ignore(loc!());
                 },
-                PointerEventKind::Press { serial, .. } => {
+                PointerEventKind::Leave { .. } => {
+                    if self.dnd_source.is_none() && !has_enter {
+                        self.pressed_buttons.clear();
+                    }
+                },
+                PointerEventKind::Press { button, serial, .. } => {
                     self.last_mouse_down_serial = Some(serial);
+                    self.pressed_buttons.insert(button);
+                },
+                PointerEventKind::Release { button, .. } => {
+                    self.pressed_buttons.remove(&button);
+                    // A host compositor accepting `start_drag` grabs the
+                    // pointer and sends `wl_pointer.leave` instead of button
+                    // release events. Seeing the final release while
+                    // `dnd_source` is undropped means the host denied
+                    // `start_drag` (e.g., button released in flight).
+                    if self.pressed_buttons.is_empty()
+                        && !self.dnd_source_dropped
+                        && let Some((source_id, _)) = self.dnd_source.take()
+                    {
+                        self.serializer.writer().send(SendType::Object(Event::Data(
+                            DataEvent::SourceEvent(DataSourceEvent::DnDCancelled { source_id }),
+                        )));
+                    }
                 },
                 _ => {},
             }
@@ -668,6 +692,16 @@ impl DataDeviceHandler for WprsClientState {
         _y: f64,
         _wl_surface: &WlSurface,
     ) {
+        if let Some((old_offer_id, _)) = self.active_dnd_offer.take() {
+            self.serializer.writer().send(SendType::Object(Event::Data(
+                DataEvent::DestinationEvent(DataDestinationEvent::DnDLeave {
+                    offer_id: old_offer_id,
+                }),
+            )));
+        }
+        // SCTK destroys any previous `drag_offer` when handling `Event::Enter`.
+        self.dropped_dnd_offers.clear();
+
         let data_device = &self
             .seat_objects
             .iter()
@@ -683,18 +717,18 @@ impl DataDeviceHandler for WprsClientState {
             drag_offer.x, drag_offer.y
         );
         let mime_types = drag_offer.with_mime_types(<[String]>::to_vec);
-        if mime_types.contains(&"_wprs_marker".to_string()) {
-            return;
-        }
         let Some(&(_, surface_id)) = self.object_bimap.get_by_right(&drag_offer.surface.id())
         else {
             return;
         };
-        self.dnd_offer = Some(drag_offer.clone());
+        let offer_id = self.next_dnd_offer_id;
+        self.next_dnd_offer_id += 1;
+        self.active_dnd_offer = Some((offer_id, drag_offer.clone()));
         self.serializer
             .writer()
             .send(SendType::Object(Event::Data(DataEvent::DestinationEvent(
                 DataDestinationEvent::DnDEnter(DragEnter {
+                    offer_id,
                     serial: drag_offer.serial,
                     surface: surface_id,
                     loc: (drag_offer.x, drag_offer.y).into(),
@@ -708,6 +742,11 @@ impl DataDeviceHandler for WprsClientState {
     #[instrument(skip_all, level = "debug")]
     fn leave(&mut self, _conn: &Connection, _qh: &QueueHandle<Self>, _data_device: &WlDataDevice) {
         debug!("data offer left");
+        if let Some((offer_id, _)) = self.active_dnd_offer.take() {
+            self.serializer.writer().send(SendType::Object(Event::Data(
+                DataEvent::DestinationEvent(DataDestinationEvent::DnDLeave { offer_id }),
+            )));
+        }
     }
 
     #[instrument(skip_all, level = "debug")]
@@ -715,28 +754,21 @@ impl DataDeviceHandler for WprsClientState {
         &mut self,
         _conn: &Connection,
         _qh: &QueueHandle<Self>,
-        data_device: &WlDataDevice,
-        _x: f64,
-        _y: f64,
+        _data_device: &WlDataDevice,
+        x: f64,
+        y: f64,
     ) {
-        let data_device = &self
-            .seat_objects
-            .iter()
-            .find(|seat| seat.data_device.inner() == data_device)
-            .unwrap()
-            .data_device
-            .data();
-        let Some(drag_offer) = data_device.drag_offer() else {
+        let Some((offer_id, _)) = &self.active_dnd_offer else {
             return;
         };
-        debug!(
-            "data offer motion x: {:.2} y: {:.2}",
-            drag_offer.x, drag_offer.y
-        );
+        debug!("data offer motion x: {:.2} y: {:.2}", x, y);
         self.serializer
             .writer()
             .send(SendType::Object(Event::Data(DataEvent::DestinationEvent(
-                DataDestinationEvent::DnDMotion((drag_offer.x, drag_offer.y).into()),
+                DataDestinationEvent::DnDMotion {
+                    offer_id: *offer_id,
+                    loc: (x, y).into(),
+                },
             ))));
     }
 
@@ -777,41 +809,65 @@ impl DataDeviceHandler for WprsClientState {
         &mut self,
         _conn: &Connection,
         _qh: &QueueHandle<Self>,
-        _data_device: &WlDataDevice,
+        data_device: &WlDataDevice,
     ) {
+        let Some((offer_id, mut offer)) = self.active_dnd_offer.take() else {
+            return;
+        };
+        if let Some(updated) = self
+            .seat_objects
+            .iter()
+            .find(|seat| seat.data_device.inner() == data_device)
+            .and_then(|seat| seat.data_device.data().drag_offer())
+        {
+            offer = updated;
+        } else {
+            offer.dropped = true;
+        }
+        self.dropped_dnd_offers.insert(offer_id, offer);
         self.serializer
             .writer()
             .send(SendType::Object(Event::Data(DataEvent::DestinationEvent(
-                DataDestinationEvent::DnDDrop,
+                DataDestinationEvent::DnDDrop { offer_id },
             ))));
     }
 }
 
 impl DataOfferHandler for WprsClientState {
-    #[instrument(skip(self, _conn, _qh, _offer), level = "debug")]
+    #[instrument(skip(self, _conn, _qh, offer), level = "debug")]
     fn source_actions(
         &mut self,
         _conn: &Connection,
         _qh: &QueueHandle<Self>,
-        _offer: &mut DragOffer,
+        offer: &mut DragOffer,
         actions: DndAction,
     ) {
-        // TODO
+        if let Some(offer_id) = self.dnd_offer_id_for(offer) {
+            self.serializer.writer().send(SendType::Object(Event::Data(
+                DataEvent::DestinationEvent(DataDestinationEvent::DnDSourceActions {
+                    offer_id,
+                    actions: actions.into(),
+                }),
+            )));
+        }
     }
 
-    #[instrument(skip(self, _conn, _qh, _offer), level = "debug")]
+    #[instrument(skip(self, _conn, _qh, offer), level = "debug")]
     fn selected_action(
         &mut self,
         _conn: &Connection,
         _qh: &QueueHandle<Self>,
-        _offer: &mut DragOffer,
+        offer: &mut DragOffer,
         actions: DndAction,
     ) {
-        self.serializer
-            .writer()
-            .send(SendType::Object(Event::Data(DataEvent::DestinationEvent(
-                DataDestinationEvent::DnDActionSelected(actions.into()),
-            ))));
+        if let Some(offer_id) = self.dnd_offer_id_for(offer) {
+            self.serializer.writer().send(SendType::Object(Event::Data(
+                DataEvent::DestinationEvent(DataDestinationEvent::DnDActionSelected {
+                    offer_id,
+                    action: actions.into(),
+                }),
+            )));
+        }
     }
 }
 
@@ -824,11 +880,18 @@ impl DataSourceHandler for WprsClientState {
         source: &WlDataSource,
         mime: Option<String>,
     ) {
-        self.serializer
-            .writer()
-            .send(SendType::Object(Event::Data(DataEvent::SourceEvent(
-                DataSourceEvent::DnDMimeTypeAcceptedByDestination(mime),
-            ))));
+        if let Some((source_id, dnd_source)) = &self.dnd_source
+            && source == dnd_source.inner()
+        {
+            self.serializer
+                .writer()
+                .send(SendType::Object(Event::Data(DataEvent::SourceEvent(
+                    DataSourceEvent::DnDMimeTypeAcceptedByDestination {
+                        source_id: *source_id,
+                        mime_type: mime,
+                    },
+                ))));
+        }
     }
 
     #[instrument(skip(self, _conn, _qh), level = "debug")]
@@ -840,90 +903,113 @@ impl DataSourceHandler for WprsClientState {
         mime: String,
         write_pipe: WritePipe,
     ) {
-        match (source, &self.selection_source, &self.dnd_source) {
-            (source, Some(selection_source), _) if source == selection_source.inner() => {
-                self.selection_pipe = Some(write_pipe);
-                self.serializer.writer().send(SendType::Object(Event::Data(
-                    DataEvent::SourceEvent(DataSourceEvent::MimeTypeSendRequestedByDestination(
-                        DataSource::Selection,
-                        mime,
-                    )),
-                )));
+        let target = match (&self.selection_source, &self.dnd_source) {
+            (Some(selection_source), _) if source == selection_source.inner() => {
+                DataTransferTarget::Selection
             },
-            (source, _, Some(dnd_source)) if source == dnd_source.inner() => {
-                self.dnd_pipe = Some(write_pipe);
-                self.serializer.writer().send(SendType::Object(Event::Data(
-                    DataEvent::SourceEvent(DataSourceEvent::MimeTypeSendRequestedByDestination(
-                        DataSource::DnD,
-                        mime,
-                    )),
-                )));
+            (_, Some((source_id, dnd_source))) if source == dnd_source.inner() => {
+                DataTransferTarget::DnD(*source_id)
             },
             _ => {
                 warn!("request for unknown source");
+                return;
             },
-        }
+        };
+        let transfer_id = self.allocate_transfer_id();
+        self.pending_send_pipes.insert(transfer_id, write_pipe);
+        self.serializer
+            .writer()
+            .send(SendType::Object(Event::Data(DataEvent::SourceEvent(
+                DataSourceEvent::MimeTypeSendRequestedByDestination {
+                    target,
+                    mime_type: mime,
+                    transfer_id,
+                },
+            ))));
     }
 
     #[instrument(skip(self, _conn, _qh), level = "debug")]
     fn cancelled(&mut self, _conn: &Connection, _qh: &QueueHandle<Self>, source: &WlDataSource) {
-        match (source, &self.selection_source, &self.dnd_source) {
-            (source, Some(selection_source), _) if source == selection_source.inner() => {
-                self.selection_pipe = None;
-                // self.serializer.writer().send(SendType::Object(Event::Data(DataSourceEvent::SelectionCancelled));
-            },
-            (source, _, Some(dnd_source)) if source == dnd_source.inner() => {
-                self.dnd_source = None;
-                self.dnd_pipe = None;
-                self.serializer.writer().send(SendType::Object(Event::Data(
-                    DataEvent::SourceEvent(DataSourceEvent::DnDCancelled),
-                )));
-            },
-            _ => {
-                warn!("cancellation for unknown source");
-            },
+        if self
+            .selection_source
+            .as_ref()
+            .is_some_and(|s| s.inner() == source)
+        {
+            // Dropping `CopyPasteSource` destroys the underlying `WlDataSource`.
+            self.selection_source = None;
+        } else if self
+            .dnd_source
+            .as_ref()
+            .is_some_and(|(_, s)| s.inner() == source)
+        {
+            let (source_id, _) = self.dnd_source.take().unwrap();
+            self.dnd_source_dropped = false;
+            self.pressed_buttons.clear();
+            self.serializer
+                .writer()
+                .send(SendType::Object(Event::Data(DataEvent::SourceEvent(
+                    DataSourceEvent::DnDCancelled { source_id },
+                ))));
+        } else {
+            warn!("cancellation for unknown source");
+            source.destroy();
         }
-        source.destroy();
     }
 
     #[instrument(skip_all, level = "debug")]
-    fn dnd_dropped(&mut self, _conn: &Connection, _qh: &QueueHandle<Self>, _source: &WlDataSource) {
-        self.serializer
-            .writer()
-            .send(SendType::Object(Event::Data(DataEvent::SourceEvent(
-                DataSourceEvent::DnDDropPerformed,
-            ))));
+    fn dnd_dropped(&mut self, _conn: &Connection, _qh: &QueueHandle<Self>, source: &WlDataSource) {
+        if let Some((source_id, dnd_source)) = &self.dnd_source
+            && source == dnd_source.inner()
+        {
+            let source_id = *source_id;
+            self.dnd_source_dropped = true;
+            self.pressed_buttons.clear();
+            self.serializer
+                .writer()
+                .send(SendType::Object(Event::Data(DataEvent::SourceEvent(
+                    DataSourceEvent::DnDDropPerformed { source_id },
+                ))));
+        }
     }
 
     #[instrument(skip_all, level = "debug")]
-    fn dnd_finished(
-        &mut self,
-        _conn: &Connection,
-        _qh: &QueueHandle<Self>,
-        _source: &WlDataSource,
-    ) {
-        self.dnd_source = None;
-        self.dnd_pipe = None;
-        self.serializer
-            .writer()
-            .send(SendType::Object(Event::Data(DataEvent::SourceEvent(
-                DataSourceEvent::DnDFinished,
-            ))));
+    fn dnd_finished(&mut self, _conn: &Connection, _qh: &QueueHandle<Self>, source: &WlDataSource) {
+        if self
+            .dnd_source
+            .as_ref()
+            .is_some_and(|(_, s)| s.inner() == source)
+        {
+            let (source_id, _) = self.dnd_source.take().unwrap();
+            self.dnd_source_dropped = false;
+            self.pressed_buttons.clear();
+            self.serializer
+                .writer()
+                .send(SendType::Object(Event::Data(DataEvent::SourceEvent(
+                    DataSourceEvent::DnDFinished { source_id },
+                ))));
+        }
     }
 
-    #[instrument(skip(self, _conn, _qh, _source), level = "debug")]
+    #[instrument(skip(self, _conn, _qh, source), level = "debug")]
     fn action(
         &mut self,
         _conn: &Connection,
         _qh: &QueueHandle<Self>,
-        _source: &WlDataSource,
+        source: &WlDataSource,
         action: DndAction,
     ) {
-        self.serializer
-            .writer()
-            .send(SendType::Object(Event::Data(DataEvent::SourceEvent(
-                DataSourceEvent::DnDActionSelected(action.into()),
-            ))));
+        if let Some((source_id, dnd_source)) = &self.dnd_source
+            && source == dnd_source.inner()
+        {
+            self.serializer
+                .writer()
+                .send(SendType::Object(Event::Data(DataEvent::SourceEvent(
+                    DataSourceEvent::DnDActionSelected {
+                        source_id: *source_id,
+                        action: action.into(),
+                    },
+                ))));
+        }
     }
 }
 
@@ -974,30 +1060,41 @@ impl PrimarySelectionSourceHandler for WprsClientState {
         mime: String,
         write_pipe: WritePipe,
     ) {
-        match &self.primary_selection_source {
-            Some(primary_selection_source) if source == primary_selection_source.inner() => {
-                self.primary_selection_pipe = Some(write_pipe);
-                self.serializer.writer().send(SendType::Object(Event::Data(
-                    DataEvent::SourceEvent(DataSourceEvent::MimeTypeSendRequestedByDestination(
-                        DataSource::Primary,
-                        mime,
-                    )),
-                )));
-            },
-            _ => {
-                warn!("request for unknown source");
-            },
-        };
+        if self
+            .primary_selection_source
+            .as_ref()
+            .is_some_and(|s| s.inner() == source)
+        {
+            let transfer_id = self.allocate_transfer_id();
+            self.pending_send_pipes.insert(transfer_id, write_pipe);
+            self.serializer
+                .writer()
+                .send(SendType::Object(Event::Data(DataEvent::SourceEvent(
+                    DataSourceEvent::MimeTypeSendRequestedByDestination {
+                        target: DataTransferTarget::Primary,
+                        mime_type: mime,
+                        transfer_id,
+                    },
+                ))));
+        } else {
+            warn!("request for unknown source");
+        }
     }
 
-    #[instrument(skip(self, _conn, _qh, _source), level = "debug")]
+    #[instrument(skip(self, _conn, _qh, source), level = "debug")]
     fn cancelled(
         &mut self,
         _conn: &Connection,
         _qh: &QueueHandle<Self>,
-        _source: &ZwpPrimarySelectionSourceV1,
+        source: &ZwpPrimarySelectionSourceV1,
     ) {
-        self.primary_selection_pipe = None;
+        if self
+            .primary_selection_source
+            .as_ref()
+            .is_some_and(|s| s.inner() == source)
+        {
+            self.primary_selection_source = None;
+        }
     }
 }
 

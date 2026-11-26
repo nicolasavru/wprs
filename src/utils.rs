@@ -119,6 +119,10 @@ impl SerialMap {
         self.last_serial.into()
     }
 
+    pub fn get(&self, server_serial: Serial) -> Option<u32> {
+        self.map.get(&server_serial.into()).copied()
+    }
+
     pub fn remove(&mut self, server_serial: Serial) -> Option<u32> {
         self.map.remove(&server_serial.into())
     }
@@ -154,4 +158,22 @@ pub struct AssertN3<const N1: usize, const N2: usize, const N3: usize>;
 
 impl<const N1: usize, const N2: usize, const N3: usize> AssertN3<N1, N2, N3> {
     pub const N1_X_N2_EQ_N3: () = assert!(N1.checked_mul(N2).unwrap() == N3);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_serial_map_get_is_nondestructive() {
+        let mut map = SerialMap::new();
+        let s1 = map.insert(42);
+        let s2 = map.insert(99);
+        assert_eq!(map.get(s1), Some(42));
+        assert_eq!(map.get(s1), Some(42));
+        assert_eq!(map.get(s2), Some(99));
+        assert_eq!(map.remove(s1), Some(42));
+        assert_eq!(map.get(s1), None);
+        assert_eq!(map.get(s2), Some(99));
+    }
 }

@@ -27,13 +27,11 @@ use smithay::output::Output;
 use smithay::reexports::calloop::LoopHandle;
 use smithay::reexports::wayland_server::backend::GlobalId;
 use smithay::reexports::wayland_server::backend::ObjectId;
-use smithay::reexports::wayland_server::protocol::wl_data_source::WlDataSource;
 use smithay::reexports::wayland_server::protocol::wl_surface::WlSurface;
 use smithay::reexports::wayland_server::DisplayHandle;
 use smithay::reexports::wayland_server::Resource;
 use smithay::wayland::compositor;
 use smithay::wayland::compositor::CompositorState;
-use smithay::wayland::selection::data_device::DataDeviceState;
 use smithay::wayland::selection::primary_selection::PrimarySelectionState;
 use smithay::wayland::shell::kde::decoration::KdeDecorationState;
 use smithay::wayland::shell::xdg::XdgShellState;
@@ -57,7 +55,10 @@ use crate::sharding_compression::ShardingCompressor;
 use crate::utils::SerialMap;
 
 pub mod client_handlers;
+pub mod data_device;
 pub mod smithay_handlers;
+
+use data_device::WprsDataDeviceState;
 
 pub(crate) struct TrackedSurfaceState {
     pub(crate) state: SurfaceState,
@@ -112,6 +113,7 @@ fn surface_destruction_callback(state: &mut WprsServerState, surface: &WlSurface
             state.cursor_status = None;
         }
     });
+    state.on_dnd_surface_destroyed(surface);
 }
 
 pub struct WprsServerState {
@@ -129,7 +131,7 @@ pub struct WprsServerState {
     pub kde_decoration_state: KdeDecorationState,
     pub shm_state: ShmState,
     pub seat_state: SeatState<Self>,
-    pub data_device_state: DataDeviceState,
+    pub data_device_state: WprsDataDeviceState,
     pub primary_selection_state: PrimarySelectionState,
     pub viewporter_state: ViewporterState,
 
@@ -166,10 +168,8 @@ pub struct WprsServerState {
     pressed_keys: HashSet<u32>,
     pressed_buttons: HashSet<u32>,
 
-    selection_pipe: Option<OwnedFd>,
-    dnd_source: Option<WlDataSource>,
-    dnd_pipe: Option<OwnedFd>,
-    primary_selection_pipe: Option<OwnedFd>,
+    next_transfer_id: u64,
+    pending_receive_pipes: HashMap<u64, OwnedFd>,
 }
 
 impl WprsServerState {
@@ -201,7 +201,7 @@ impl WprsServerState {
             kde_decoration_state: KdeDecorationState::new::<Self>(&dh, kde_default_decoration_mode),
             shm_state: ShmState::new::<Self>(&dh, Vec::new()),
             seat_state,
-            data_device_state: DataDeviceState::new::<Self>(&dh),
+            data_device_state: WprsDataDeviceState::new(&dh),
             primary_selection_state: PrimarySelectionState::new::<Self>(&dh),
             viewporter_state: ViewporterState::new::<Self>(&dh),
             seat,
@@ -218,10 +218,8 @@ impl WprsServerState {
             serial_map: SerialMap::new(),
             pressed_keys: HashSet::new(),
             pressed_buttons: HashSet::new(),
-            selection_pipe: None,
-            dnd_source: None,
-            dnd_pipe: None,
-            primary_selection_pipe: None,
+            next_transfer_id: 1,
+            pending_receive_pipes: HashMap::new(),
         }
     }
 

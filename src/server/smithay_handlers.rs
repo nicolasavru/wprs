@@ -19,22 +19,7 @@ use std::os::fd::OwnedFd;
 use std::time::Duration;
 
 use smithay::backend::renderer::utils::on_commit_buffer_handler;
-use smithay::input::pointer::AxisFrame;
-use smithay::input::pointer::ButtonEvent;
 use smithay::input::pointer::CursorImageStatus as SmithayCursorImageStatus;
-use smithay::input::pointer::GestureHoldBeginEvent;
-use smithay::input::pointer::GestureHoldEndEvent;
-use smithay::input::pointer::GesturePinchBeginEvent;
-use smithay::input::pointer::GesturePinchEndEvent;
-use smithay::input::pointer::GesturePinchUpdateEvent;
-use smithay::input::pointer::GestureSwipeBeginEvent;
-use smithay::input::pointer::GestureSwipeEndEvent;
-use smithay::input::pointer::GestureSwipeUpdateEvent;
-use smithay::input::pointer::GrabStartData;
-use smithay::input::pointer::MotionEvent;
-use smithay::input::pointer::PointerGrab;
-use smithay::input::pointer::PointerInnerHandle;
-use smithay::input::pointer::RelativeMotionEvent;
 use smithay::input::Seat;
 use smithay::input::SeatHandler;
 use smithay::input::SeatState;
@@ -48,8 +33,6 @@ use smithay::reexports::wayland_server::backend::ClientData;
 use smithay::reexports::wayland_server::backend::ClientId;
 use smithay::reexports::wayland_server::backend::DisconnectReason;
 use smithay::reexports::wayland_server::protocol::wl_buffer;
-use smithay::reexports::wayland_server::protocol::wl_data_device_manager::DndAction;
-use smithay::reexports::wayland_server::protocol::wl_data_source::WlDataSource;
 use smithay::reexports::wayland_server::protocol::wl_output;
 use smithay::reexports::wayland_server::protocol::wl_seat;
 use smithay::reexports::wayland_server::protocol::wl_surface;
@@ -57,8 +40,6 @@ use smithay::reexports::wayland_server::protocol::wl_surface::WlSurface;
 use smithay::reexports::wayland_server::Client;
 use smithay::reexports::wayland_server::Resource;
 use smithay::reexports::wayland_server::WEnum;
-use smithay::utils::Logical;
-use smithay::utils::Point;
 use smithay::utils::Serial;
 use smithay::wayland::buffer::BufferHandler;
 use smithay::wayland::compositor;
@@ -70,11 +51,6 @@ use smithay::wayland::compositor::SubsurfaceCachedState;
 use smithay::wayland::compositor::SurfaceAttributes;
 use smithay::wayland::compositor::SurfaceData;
 use smithay::wayland::output::OutputHandler;
-use smithay::wayland::selection::data_device::with_source_metadata;
-use smithay::wayland::selection::data_device::ClientDndGrabHandler;
-use smithay::wayland::selection::data_device::DataDeviceHandler;
-use smithay::wayland::selection::data_device::DataDeviceState;
-use smithay::wayland::selection::data_device::ServerDndGrabHandler;
 use smithay::wayland::selection::SelectionHandler;
 use smithay::wayland::selection::SelectionSource;
 use smithay::wayland::selection::SelectionTarget;
@@ -106,11 +82,10 @@ use crate::serialization::SerializerWriter;
 use crate::serialization::geometry::Rectangle;
 use crate::serialization::wayland::BufferAssignment;
 use crate::serialization::wayland::BufferMetadata;
-use crate::serialization::wayland::ClientSurface;
-use crate::serialization::wayland::DataDestinationRequest;
 use crate::serialization::wayland::DataRequest;
 use crate::serialization::wayland::DataSource;
 use crate::serialization::wayland::DataSourceRequest;
+use crate::serialization::wayland::DataTransferTarget;
 use crate::serialization::wayland::Role;
 use crate::serialization::wayland::SourceMetadata;
 use crate::serialization::wayland::SubSurfaceState;
@@ -536,123 +511,17 @@ impl SelectionHandler for WprsServerState {
         _seat: Seat<Self>,
         _user_data: &Self::SelectionUserData,
     ) {
-        let data_source = match ty {
-            SelectionTarget::Clipboard => {
-                self.selection_pipe = Some(fd);
-
-                DataSource::Selection
-            },
-            SelectionTarget::Primary => {
-                self.primary_selection_pipe = Some(fd);
-
-                DataSource::Primary
-            },
+        let target = match ty {
+            SelectionTarget::Clipboard => DataTransferTarget::Selection,
+            SelectionTarget::Primary => DataTransferTarget::Primary,
         };
-
-        self.serializer
-            .writer()
-            .send(SendType::Object(Request::Data(
-                DataRequest::DestinationRequest(DataDestinationRequest::RequestDataTransfer(
-                    data_source,
-                    mime_type,
-                )),
-            )));
-    }
-}
-
-impl DataDeviceHandler for WprsServerState {
-    fn data_device_state(&self) -> &DataDeviceState {
-        &self.data_device_state
+        self.request_host_data_transfer(target, mime_type, fd);
     }
 }
 
 impl PrimarySelectionHandler for WprsServerState {
     fn primary_selection_state(&self) -> &PrimarySelectionState {
         &self.primary_selection_state
-    }
-}
-
-impl ClientDndGrabHandler for WprsServerState {
-    #[instrument(skip(self, _seat), level = "debug")]
-    fn started(
-        &mut self,
-        source: Option<WlDataSource>,
-        icon: Option<WlSurface>,
-        _seat: Seat<Self>,
-    ) {
-        let icon_surface = icon.as_ref().and_then(|surface| {
-            let client_surface = ClientSurface::new(surface).log(loc!()).ok()?;
-            self.insert_surface(surface).log(loc!()).ok()?;
-            self.sync_surface_if_unsynced(surface);
-            Some(client_surface)
-        });
-        self.dnd_source = source;
-        if let Some(source) = &self.dnd_source {
-            with_source_metadata(source, |source_metadata| {
-                debug!("START DRAG: {source:?}, {source_metadata:?}");
-                self.serializer
-                    .writer()
-                    .send(SendType::Object(Request::Data(DataRequest::SourceRequest(
-                        DataSourceRequest::StartDrag(source_metadata.clone().into(), icon_surface),
-                    ))));
-            })
-            .log_and_ignore(loc!());
-        }
-    }
-
-    #[instrument(skip(self, _target, _validated, _seat), level = "debug")]
-    fn dropped(&mut self, _target: Option<WlSurface>, _validated: bool, _seat: Seat<Self>) {}
-}
-
-impl ServerDndGrabHandler for WprsServerState {
-    #[instrument(skip(self, _seat), level = "debug")]
-    fn accept(&mut self, mime_type: Option<String>, _seat: Seat<Self>) {
-        self.serializer
-            .writer()
-            .send(SendType::Object(Request::Data(
-                DataRequest::DestinationRequest(DataDestinationRequest::DnDAcceptMimeType(
-                    mime_type,
-                )),
-            )));
-    }
-
-    #[instrument(skip(self, _seat), level = "debug")]
-    fn action(&mut self, action: DndAction, _seat: Seat<Self>) {
-        self.serializer
-            .writer()
-            .send(SendType::Object(Request::Data(
-                DataRequest::DestinationRequest(DataDestinationRequest::DnDSetDestinationActions(
-                    action.into(),
-                )),
-            )));
-    }
-
-    #[instrument(skip(self, _seat), level = "debug")]
-    fn dropped(&mut self, _seat: Seat<Self>) {}
-
-    #[instrument(skip(self, _seat), level = "debug")]
-    fn cancelled(&mut self, _seat: Seat<Self>) {}
-
-    #[instrument(skip(self, _seat), level = "debug")]
-    fn send(&mut self, mime_type: String, fd: OwnedFd, _seat: Seat<Self>) {
-        self.dnd_pipe = Some(fd);
-        self.serializer
-            .writer()
-            .send(SendType::Object(Request::Data(
-                DataRequest::DestinationRequest(DataDestinationRequest::RequestDataTransfer(
-                    DataSource::DnD,
-                    mime_type,
-                )),
-            )));
-    }
-
-    #[instrument(skip(self, _seat), level = "debug")]
-    fn finished(&mut self, _seat: Seat<Self>) {
-        self.serializer
-            .writer()
-            .send(SendType::Object(Request::Data(
-                DataRequest::DestinationRequest(DataDestinationRequest::DnDFinish),
-            )));
     }
 }
 
@@ -1370,162 +1239,6 @@ impl KdeDecorationHandler for WprsServerState {
     }
 }
 
-pub(crate) struct DndGrab {
-    start_data: GrabStartData<WprsServerState>,
-}
-
-impl DndGrab {
-    pub fn new(
-        focus: Option<(
-            <WprsServerState as SeatHandler>::PointerFocus,
-            Point<f64, Logical>,
-        )>,
-        button: u32,
-        location: (f64, f64),
-    ) -> Self {
-        Self {
-            start_data: GrabStartData {
-                focus,
-                button,
-                location: location.into(),
-            },
-        }
-    }
-}
-
-impl PointerGrab<WprsServerState> for DndGrab {
-    fn start_data(&self) -> &GrabStartData<WprsServerState> {
-        &self.start_data
-    }
-
-    #[instrument(skip(self, _data, _handle), level = "debug")]
-    fn motion(
-        &mut self,
-        _data: &mut WprsServerState,
-        _handle: &mut PointerInnerHandle<'_, WprsServerState>,
-        focus: Option<(
-            <WprsServerState as SeatHandler>::PointerFocus,
-            Point<f64, Logical>,
-        )>,
-        event: &MotionEvent,
-    ) {
-    }
-
-    #[instrument(skip(self, _data, _handle), level = "debug")]
-    fn relative_motion(
-        &mut self,
-        _data: &mut WprsServerState,
-        _handle: &mut PointerInnerHandle<'_, WprsServerState>,
-        focus: Option<(
-            <WprsServerState as SeatHandler>::PointerFocus,
-            Point<f64, Logical>,
-        )>,
-        event: &RelativeMotionEvent,
-    ) {
-    }
-
-    #[instrument(skip(self, _data, _handle), level = "debug")]
-    fn button(
-        &mut self,
-        _data: &mut WprsServerState,
-        _handle: &mut PointerInnerHandle<'_, WprsServerState>,
-        event: &ButtonEvent,
-    ) {
-    }
-
-    #[instrument(skip(self, _data, _handle), level = "debug")]
-    fn axis(
-        &mut self,
-        _data: &mut WprsServerState,
-        _handle: &mut PointerInnerHandle<'_, WprsServerState>,
-        details: AxisFrame,
-    ) {
-    }
-
-    #[instrument(skip(self, _data, _handle), level = "debug")]
-    fn frame(
-        &mut self,
-        _data: &mut WprsServerState,
-        _handle: &mut PointerInnerHandle<'_, WprsServerState>,
-    ) {
-    }
-
-    #[instrument(skip(self, _data, _handle), level = "debug")]
-    fn gesture_swipe_begin(
-        &mut self,
-        _data: &mut WprsServerState,
-        _handle: &mut PointerInnerHandle<'_, WprsServerState>,
-        event: &GestureSwipeBeginEvent,
-    ) {
-    }
-
-    #[instrument(skip(self, _data, _handle), level = "debug")]
-    fn gesture_swipe_update(
-        &mut self,
-        _data: &mut WprsServerState,
-        _handle: &mut PointerInnerHandle<'_, WprsServerState>,
-        event: &GestureSwipeUpdateEvent,
-    ) {
-    }
-
-    #[instrument(skip(self, _data, _handle), level = "debug")]
-    fn gesture_swipe_end(
-        &mut self,
-        _data: &mut WprsServerState,
-        _handle: &mut PointerInnerHandle<'_, WprsServerState>,
-        event: &GestureSwipeEndEvent,
-    ) {
-    }
-
-    #[instrument(skip(self, _data, _handle), level = "debug")]
-    fn gesture_pinch_begin(
-        &mut self,
-        _data: &mut WprsServerState,
-        _handle: &mut PointerInnerHandle<'_, WprsServerState>,
-        event: &GesturePinchBeginEvent,
-    ) {
-    }
-
-    #[instrument(skip(self, _data, _handle), level = "debug")]
-    fn gesture_pinch_update(
-        &mut self,
-        _data: &mut WprsServerState,
-        _handle: &mut PointerInnerHandle<'_, WprsServerState>,
-        event: &GesturePinchUpdateEvent,
-    ) {
-    }
-
-    #[instrument(skip(self, _data, _handle), level = "debug")]
-    fn gesture_pinch_end(
-        &mut self,
-        _data: &mut WprsServerState,
-        _handle: &mut PointerInnerHandle<'_, WprsServerState>,
-        event: &GesturePinchEndEvent,
-    ) {
-    }
-
-    #[instrument(skip(self, _data, _handle), level = "debug")]
-    fn gesture_hold_begin(
-        &mut self,
-        _data: &mut WprsServerState,
-        _handle: &mut PointerInnerHandle<'_, WprsServerState>,
-        event: &GestureHoldBeginEvent,
-    ) {
-    }
-
-    #[instrument(skip(self, _data, _handle), level = "debug")]
-    fn gesture_hold_end(
-        &mut self,
-        _data: &mut WprsServerState,
-        _handle: &mut PointerInnerHandle<'_, WprsServerState>,
-        event: &GestureHoldEndEvent,
-    ) {
-    }
-
-    #[instrument(skip(self, _data), level = "debug")]
-    fn unset(&mut self, _data: &mut WprsServerState) {}
-}
-
 pub struct ClientState {
     compositor_state: CompositorClientState,
     pub writer: SerializerWriter<Request>,
@@ -1561,7 +1274,6 @@ smithay::delegate_xdg_decoration!(WprsServerState);
 smithay::delegate_kde_decoration!(WprsServerState);
 smithay::delegate_shm!(WprsServerState);
 smithay::delegate_seat!(WprsServerState);
-smithay::delegate_data_device!(WprsServerState);
 smithay::delegate_output!(WprsServerState);
 smithay::delegate_primary_selection!(WprsServerState);
 smithay::delegate_viewporter!(WprsServerState);

@@ -32,14 +32,12 @@ use smithay::reexports::wayland_server::protocol::wl_surface::WlSurface;
 use smithay::utils::Transform as SmithayTransform;
 use smithay::wayland::compositor::RectangleKind as SmithayRectangleKind;
 use smithay::wayland::compositor::RegionAttributes;
-use smithay::wayland::selection::data_device::SourceMetadata as SmithaySourceMetadata;
 use smithay::wayland::shm::BufferData as SmithayBufferData;
 use smithay::wayland::viewporter::ViewportCachedState;
 use smithay_client_toolkit::compositor::CompositorState;
 use smithay_client_toolkit::compositor::Region as SctkRegion;
 use smithay_client_toolkit::output::Mode as SctkMode;
 use smithay_client_toolkit::output::OutputInfo as SctkOutputInfo;
-use smithay_client_toolkit::reexports::client::protocol::wl_data_device_manager::DndAction as SctkWlDndAction;
 use smithay_client_toolkit::reexports::client::protocol::wl_output::Subpixel as SctkSubpixel;
 use smithay_client_toolkit::reexports::client::protocol::wl_output::Transform as SctkTransform;
 use smithay_client_toolkit::reexports::client::protocol::wl_pointer::AxisRelativeDirection as SctkAxisRelativeDirection;
@@ -857,33 +855,35 @@ impl SourceMetadata {
             dnd_actions: 0,
         }
     }
-
-    pub fn from_dnd_actions(dnd_actions: SctkWlDndAction) -> Self {
-        Self {
-            mime_types: Vec::new(),
-            dnd_actions: dnd_actions.into(),
-        }
-    }
-}
-
-impl From<SmithaySourceMetadata> for SourceMetadata {
-    fn from(source_metadata: SmithaySourceMetadata) -> Self {
-        Self {
-            mime_types: source_metadata.mime_types,
-            dnd_actions: source_metadata.dnd_action.into(),
-        }
-    }
 }
 
 #[derive(Debug, Copy, Clone, Eq, PartialEq, Archive, Deserialize, Serialize)]
 pub enum DataSource {
     Selection,
-    DnD,
     Primary,
+}
+
+/// Identifies the source or offer of a data transfer request: clipboard
+/// selection, primary selection, or a specific DnD offer/source by ID.
+#[derive(Debug, Copy, Clone, Eq, PartialEq, Archive, Deserialize, Serialize)]
+pub enum DataTransferTarget {
+    Selection,
+    Primary,
+    DnD(u64),
+}
+
+#[derive(Debug, Clone, Eq, PartialEq, Archive, Deserialize, Serialize)]
+pub struct StartDrag {
+    pub source_id: u64,
+    pub source: SourceMetadata,
+    pub origin: ClientSurface,
+    pub icon: Option<ClientSurface>,
+    pub serial: u32,
 }
 
 #[derive(Debug, Clone, PartialEq, Archive, Deserialize, Serialize)]
 pub struct DragEnter {
+    pub offer_id: u64,
     pub serial: u32,
     pub surface: WlSurfaceId,
     pub loc: Point<f64>,
@@ -912,97 +912,94 @@ impl fmt::Debug for DataToTransfer {
 
 #[derive(Debug, Clone, Eq, PartialEq, Archive, Deserialize, Serialize)]
 pub enum DataSourceRequest {
-    // wl_data_source requests
-    // DnDSetSourceActions(u32),
-
     // wl_data_device requests
-    StartDrag(SourceMetadata, Option<ClientSurface>),
+    StartDrag(StartDrag),
+    CancelDrag(u64),
     SetSelection(DataSource, SourceMetadata),
 }
 
 #[derive(Debug, Clone, Eq, PartialEq, Archive, Deserialize, Serialize)]
 pub enum DataSourceEvent {
     // wl_data_source events
-    DnDMimeTypeAcceptedByDestination(Option<String>),
-    MimeTypeSendRequestedByDestination(DataSource, String),
-    DnDActionSelected(u32),
-    DnDDropPerformed,
-    DnDCancelled,
-    DnDFinished,
+    DnDMimeTypeAcceptedByDestination {
+        source_id: u64,
+        mime_type: Option<String>,
+    },
+    MimeTypeSendRequestedByDestination {
+        target: DataTransferTarget,
+        mime_type: String,
+        transfer_id: u64,
+    },
+    DnDActionSelected {
+        source_id: u64,
+        action: u32,
+    },
+    DnDDropPerformed {
+        source_id: u64,
+    },
+    DnDCancelled {
+        source_id: u64,
+    },
+    DnDFinished {
+        source_id: u64,
+    },
 }
 
 #[derive(Debug, Clone, Eq, PartialEq, Archive, Deserialize, Serialize)]
 pub enum DataDestinationRequest {
     // wl_data_offer requests
-    DnDAcceptMimeType(Option<String>),
-    RequestDataTransfer(DataSource, String),
-    DnDFinish,
-    DnDSetDestinationActions(u32),
+    DnDAcceptMimeType {
+        offer_id: u64,
+        mime_type: Option<String>,
+    },
+    RequestDataTransfer {
+        target: DataTransferTarget,
+        mime_type: String,
+        transfer_id: u64,
+    },
+    DnDFinish {
+        offer_id: u64,
+    },
+    DnDCancel {
+        offer_id: u64,
+    },
+    DnDSetDestinationActions {
+        offer_id: u64,
+        dnd_actions: u32,
+        preferred_action: u32,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq, Archive, Deserialize, Serialize)]
 pub enum DataDestinationEvent {
     // wl_data_offer events
-    // DnDActionsOfferedBySource(u32),
-    DnDActionSelected(u32),
+    DnDSourceActions { offer_id: u64, actions: u32 },
+    DnDActionSelected { offer_id: u64, action: u32 },
 
     // wl_data_device events
     DnDEnter(DragEnter),
-    DnDLeave,
-    DnDMotion(Point<f64>),
-    DnDDrop,
+    DnDLeave { offer_id: u64 },
+    DnDMotion { offer_id: u64, loc: Point<f64> },
+    DnDDrop { offer_id: u64 },
     SelectionSet(DataSource, SourceMetadata),
 }
 
 #[derive(Debug, Clone, Eq, PartialEq, Archive, Deserialize, Serialize)]
 pub enum DataRequest {
-    // source is remote application, destination is local application
-    // Requests from remote source application to local compositor.
-    // E.g.: set the selection, start a dnd.
+    // Requests from remote source application to host compositor.
     SourceRequest(DataSourceRequest),
-
-    // // source -is local application, destination is remote application
-    // // Feedback from wprsd compositor to local source application.
-    // // E.g.: destination accepted a mime type, destination requested data transfer.
-    // SourceEvent(DataSourceEvent),
-
-    // source is remote application, destination is local application Not needed
-    // because wprsd forwards the source events to the local compositor and lets
-    // it interpret them and generate events for the local destination.
-    // DestinationEvent(DataDestinationEvent),
-
-    // source is local application, destination is remote application
-    // Feedback from remote destination to local compositor.
-    // E.g.: accept mime type, request data transfer.
+    // Requests from remote destination application to host compositor.
     DestinationRequest(DataDestinationRequest),
-
-    TransferData(DataSource, DataToTransfer),
+    TransferData(u64, DataToTransfer),
 }
 
 #[derive(Debug, Clone, PartialEq, Archive, Deserialize, Serialize)]
 pub enum DataEvent {
-    // source is remote application, destination is local application
-    // Feedback from local compositor to remote source application.
-    // E.g., destination accepted a mime type, destination requested data transfer.
+    // Feedback from host compositor to remote source application.
     SourceEvent(DataSourceEvent),
-
-    // // source -is local application, destination is remote application
-    // // Events from local compositor to wprsd as remote compositor.
-    // //
-    // // E.g., a selection was set so set one for remote clients, a dnd was
-    // // started, so tart one for remote clients.
-    // SourceRequest(DataSourceRequest),
-
-    // source is local application, destination is remote application
-    // Events for remote data destination.
-    // E.g.: a selection was set, dnd motion over dest's surface.
+    // Events from host compositor for remote data destination.
     DestinationEvent(DataDestinationEvent),
-
-    // // source is remote application, destination is local application
-    // // Feedback from local destination to wprsd as remote compositor.
-    // // E.g.: accept mime type, request data transfer.
-    // DestinationRequest(DataDestinationRequest),
-    TransferData(DataSource, DataToTransfer),
+    TransferData(u64, DataToTransfer),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Archive, Deserialize, Serialize)]
@@ -1213,5 +1210,102 @@ mod tests {
         let bytes = rkyv::to_bytes::<rkyv::rancor::Error>(&event).unwrap();
         let decoded = rkyv::from_bytes::<PointerEventKind, rkyv::rancor::Error>(&bytes).unwrap();
         assert_eq!(decoded, event);
+    }
+
+    #[test]
+    fn test_dnd_wire_roundtrip() {
+        let requests = vec![
+            DataRequest::SourceRequest(DataSourceRequest::StartDrag(StartDrag {
+                source_id: 7,
+                source: SourceMetadata {
+                    mime_types: vec!["text/plain".to_string(), "text/uri-list".to_string()],
+                    dnd_actions: 0b111,
+                },
+                origin: ClientSurface {
+                    client: ClientId(1),
+                    surface: WlSurfaceId(2),
+                },
+                icon: Some(ClientSurface {
+                    client: ClientId(1),
+                    surface: WlSurfaceId(3),
+                }),
+                serial: 42,
+            })),
+            DataRequest::SourceRequest(DataSourceRequest::CancelDrag(7)),
+            DataRequest::SourceRequest(DataSourceRequest::SetSelection(
+                DataSource::Selection,
+                SourceMetadata::from_mime_types(vec!["text/plain".to_string()]),
+            )),
+            DataRequest::DestinationRequest(DataDestinationRequest::DnDAcceptMimeType {
+                offer_id: 9,
+                mime_type: Some("text/plain".to_string()),
+            }),
+            DataRequest::DestinationRequest(DataDestinationRequest::RequestDataTransfer {
+                target: DataTransferTarget::DnD(9),
+                mime_type: "text/plain".to_string(),
+                transfer_id: 11,
+            }),
+            DataRequest::DestinationRequest(DataDestinationRequest::DnDSetDestinationActions {
+                offer_id: 9,
+                dnd_actions: 0b11,
+                preferred_action: 0b10,
+            }),
+            DataRequest::DestinationRequest(DataDestinationRequest::DnDFinish { offer_id: 9 }),
+            DataRequest::DestinationRequest(DataDestinationRequest::DnDCancel { offer_id: 9 }),
+            DataRequest::TransferData(11, DataToTransfer(b"hello".to_vec())),
+        ];
+        let bytes = rkyv::to_bytes::<rkyv::rancor::Error>(&requests).unwrap();
+        let decoded = rkyv::from_bytes::<Vec<DataRequest>, rkyv::rancor::Error>(&bytes).unwrap();
+        assert_eq!(decoded, requests);
+
+        let events = vec![
+            DataEvent::SourceEvent(DataSourceEvent::DnDMimeTypeAcceptedByDestination {
+                source_id: 7,
+                mime_type: Some("text/plain".to_string()),
+            }),
+            DataEvent::SourceEvent(DataSourceEvent::MimeTypeSendRequestedByDestination {
+                target: DataTransferTarget::DnD(7),
+                mime_type: "text/plain".to_string(),
+                transfer_id: 12,
+            }),
+            DataEvent::SourceEvent(DataSourceEvent::DnDActionSelected {
+                source_id: 7,
+                action: 2,
+            }),
+            DataEvent::SourceEvent(DataSourceEvent::DnDDropPerformed { source_id: 7 }),
+            DataEvent::SourceEvent(DataSourceEvent::DnDFinished { source_id: 7 }),
+            DataEvent::SourceEvent(DataSourceEvent::DnDCancelled { source_id: 7 }),
+            DataEvent::DestinationEvent(DataDestinationEvent::DnDEnter(DragEnter {
+                offer_id: 9,
+                serial: 99,
+                surface: WlSurfaceId(4),
+                loc: (12.5, 34.25).into(),
+                source_actions: 0b111,
+                selected_action: 0b100,
+                mime_types: vec!["text/uri-list".to_string()],
+            })),
+            DataEvent::DestinationEvent(DataDestinationEvent::DnDMotion {
+                offer_id: 9,
+                loc: (20.0, 40.0).into(),
+            }),
+            DataEvent::DestinationEvent(DataDestinationEvent::DnDSourceActions {
+                offer_id: 9,
+                actions: 0b11,
+            }),
+            DataEvent::DestinationEvent(DataDestinationEvent::DnDActionSelected {
+                offer_id: 9,
+                action: 0b10,
+            }),
+            DataEvent::DestinationEvent(DataDestinationEvent::DnDDrop { offer_id: 9 }),
+            DataEvent::DestinationEvent(DataDestinationEvent::DnDLeave { offer_id: 9 }),
+            DataEvent::DestinationEvent(DataDestinationEvent::SelectionSet(
+                DataSource::Primary,
+                SourceMetadata::from_mime_types(vec!["text/plain".to_string()]),
+            )),
+            DataEvent::TransferData(12, DataToTransfer(b"world".to_vec())),
+        ];
+        let bytes = rkyv::to_bytes::<rkyv::rancor::Error>(&events).unwrap();
+        let decoded = rkyv::from_bytes::<Vec<DataEvent>, rkyv::rancor::Error>(&bytes).unwrap();
+        assert_eq!(decoded, events);
     }
 }

@@ -20,7 +20,7 @@ use std::fs::File;
 use std::io::Read;
 use std::io::Write;
 use std::mem;
-use std::os::fd::AsFd;
+use std::os::fd::OwnedFd;
 use std::thread;
 
 use nix::fcntl::OFlag;
@@ -36,7 +36,6 @@ use smithay::input::keyboard::XkbContext;
 use smithay::input::pointer::ButtonEvent;
 use smithay::input::pointer::CursorImageStatus as SmithayCursorImageStatus;
 use smithay::input::pointer::CursorImageSurfaceData;
-use smithay::input::pointer::Focus;
 use smithay::input::pointer::MotionEvent;
 use smithay::output::Output;
 use smithay::output::PhysicalProperties;
@@ -53,8 +52,6 @@ use smithay::wayland::compositor::SubsurfaceCachedState;
 use smithay::wayland::compositor::SurfaceAttributes;
 use smithay::wayland::compositor::SurfaceData;
 use smithay::wayland::compositor::TraversalAction;
-use smithay::wayland::selection::data_device;
-use smithay::wayland::selection::data_device::SourceMetadata;
 use smithay::wayland::selection::primary_selection;
 
 use crate::args;
@@ -73,11 +70,13 @@ use crate::serialization::wayland::ClientSurface;
 use crate::serialization::wayland::CursorImage;
 use crate::serialization::wayland::CursorImageStatus;
 use crate::serialization::wayland::DataDestinationEvent;
+use crate::serialization::wayland::DataDestinationRequest;
 use crate::serialization::wayland::DataEvent;
 use crate::serialization::wayland::DataRequest;
 use crate::serialization::wayland::DataSource;
 use crate::serialization::wayland::DataSourceEvent;
 use crate::serialization::wayland::DataToTransfer;
+use crate::serialization::wayland::DataTransferTarget;
 use crate::serialization::wayland::KeyInner;
 use crate::serialization::wayland::KeyState;
 use crate::serialization::wayland::KeyboardEvent;
@@ -100,7 +99,6 @@ use crate::serialization::xdg_shell::ToplevelEvent;
 use crate::server::LockedSurfaceState;
 use crate::server::SyncedSurfaceBuffer;
 use crate::server::WprsServerState;
-use crate::server::smithay_handlers::DndGrab;
 use crate::server::smithay_handlers::get_surface_z_order;
 use crate::server::smithay_handlers::sync_subsurface_role;
 use crate::sharding_compression::ShardingCompressor;
@@ -411,10 +409,11 @@ impl WprsServerState {
                 PointerEventKind::Leave { serial } => {
                     debug!("pointer left");
 
-                    // During drag/drop, we will stop receiving pointer events (i.e. we will get a pointer leave)
-                    // and get data_device events instead. To prevent dropping early, we shouldn't release
-                    // these keys yet.
-                    if self.dnd_source.is_none() {
+                    // During a proxied drag/drop, the host compositor sends
+                    // `wl_pointer.leave` and drives the session via
+                    // `wl_data_device` events instead, so keep pressed buttons
+                    // until the drag grab ends.
+                    if !self.data_device_state.is_proxy_dnd_grab_active() {
                         let pressed_buttons: HashSet<u32> = mem::take(&mut self.pressed_buttons);
                         for button in pressed_buttons {
                             debug!("releasing button {}", button);
@@ -633,13 +632,14 @@ impl WprsServerState {
 
                 debug!("setting keyboard focus to surface {surface:?}");
                 keyboard.set_focus(self, Some(surface), serial);
-                data_device::set_data_device_focus(&self.dh, &self.seat, Some(client.clone()));
+                self.data_device_state
+                    .set_clipboard_focus(&self.dh, Some(client.clone()));
                 primary_selection::set_primary_focus(&self.dh, &self.seat, Some(client));
             },
             KeyboardEvent::Leave { serial } => {
                 let serial = self.serial_map.insert(serial);
                 keyboard.set_focus(self, None, serial);
-                data_device::set_data_device_focus(&self.dh, &self.seat, None);
+                self.data_device_state.set_clipboard_focus(&self.dh, None);
                 primary_selection::set_primary_focus(&self.dh, &self.seat, None);
 
                 for keycode in self.pressed_keys.clone() {
@@ -904,6 +904,7 @@ impl WprsServerState {
 
     #[instrument(skip_all, level = "debug")]
     fn handle_connect(&mut self) -> Result<()> {
+        self.reset_dnd_state();
         let old_outputs: Vec<_> = self.outputs.drain().collect();
         // Clear all previous-session `output_ids` unconditionally (including IDs
         // recorded by `OutputsChanged` before `OutputEvent::New` arrived).
@@ -952,123 +953,121 @@ impl WprsServerState {
         Ok(())
     }
 
+    pub(crate) fn request_host_data_transfer(
+        &mut self,
+        target: DataTransferTarget,
+        mime_type: String,
+        fd: OwnedFd,
+    ) {
+        if !self.serializer.other_end_connected() {
+            return;
+        }
+        let transfer_id = self.next_transfer_id;
+        self.next_transfer_id += 1;
+        self.pending_receive_pipes.insert(transfer_id, fd);
+        self.serializer
+            .writer()
+            .send(SendType::Object(Request::Data(
+                DataRequest::DestinationRequest(DataDestinationRequest::RequestDataTransfer {
+                    target,
+                    mime_type,
+                    transfer_id,
+                }),
+            )));
+    }
+
     #[allow(clippy::verbose_file_reads)]
     #[instrument(skip_all, level = "debug")]
     fn handle_data_event(&mut self, data_event: DataEvent) -> Result<()> {
         match data_event {
-            DataEvent::SourceEvent(DataSourceEvent::DnDMimeTypeAcceptedByDestination(
+            DataEvent::SourceEvent(DataSourceEvent::DnDMimeTypeAcceptedByDestination {
+                source_id,
                 mime_type,
-            )) => {
-                if let Some(source) = &self.dnd_source {
-                    source.target(mime_type);
-                }
+            }) => {
+                self.handle_dnd_source_target(source_id, mime_type);
             },
-            DataEvent::SourceEvent(DataSourceEvent::MimeTypeSendRequestedByDestination(
-                source,
-                mime,
-            )) => {
-                let (recv_fd, send_fd) = unistd::pipe2(OFlag::O_CLOEXEC).location(loc!())?; // TODO: handle error
-                let mut f = File::from(recv_fd);
-
-                {
-                    let writer = self.serializer.writer();
-                    // The data source application will write to the other end
-                    // of read_pipe at its convenience and then close the file
-                    // descriptor, so spawn off a thread to perform that read
-                    // and send the data to the client whenever the read is
-                    // completed. The thread will then terminate.
-                    thread::spawn(move || {
-                        debug!("in receive read thread");
-                        let mut buf = Vec::new();
-                        let bytes_read = f.read_to_end(&mut buf);
-                        debug!("read selection ({bytes_read:?} bytes): {buf:?}");
+            DataEvent::SourceEvent(DataSourceEvent::MimeTypeSendRequestedByDestination {
+                target,
+                mime_type,
+                transfer_id,
+            }) => {
+                let writer = self.serializer.writer();
+                let pipe_res = unistd::pipe2(OFlag::O_CLOEXEC).location(loc!());
+                let (recv_fd, send_fd) = match pipe_res {
+                    Ok(fds) => fds,
+                    Err(err) => {
                         writer.send(SendType::Object(Request::Data(DataRequest::TransferData(
-                            source,
-                            DataToTransfer(buf),
+                            transfer_id,
+                            DataToTransfer(Vec::new()),
                         ))));
-                    });
-                }
-
-                match source {
-                    DataSource::Selection => {
-                        data_device::request_data_device_client_selection(
-                            &self.seat, mime, send_fd,
-                        )
-                        .location(loc!())?;
+                        return Err(err);
                     },
-                    DataSource::Primary => {
+                };
+
+                let send_res = match target {
+                    DataTransferTarget::Selection => self
+                        .data_device_state
+                        .request_client_clipboard(mime_type, send_fd),
+                    DataTransferTarget::Primary => {
                         primary_selection::request_primary_client_selection(
-                            &self.seat, mime, send_fd,
+                            &self.seat, mime_type, send_fd,
                         )
-                        .location(loc!())?;
+                        .location(loc!())
                     },
-                    DataSource::DnD => {
-                        // TODO: unwrap is wrong, need to check for none at the top
-                        self.dnd_source
-                            .as_ref()
-                            .location(loc!())?
-                            .send(mime, send_fd.as_fd());
-                    },
+                    DataTransferTarget::DnD(source_id) => self
+                        .data_device_state
+                        .request_client_dnd_send(source_id, mime_type, send_fd),
+                };
+                if let Err(err) = send_res {
+                    writer.send(SendType::Object(Request::Data(DataRequest::TransferData(
+                        transfer_id,
+                        DataToTransfer(Vec::new()),
+                    ))));
+                    return Err(err);
                 }
-            },
-            DataEvent::SourceEvent(DataSourceEvent::DnDActionSelected(action)) => {
-                if let Some(source) = &self.dnd_source {
-                    source.action(
-                        action
-                            .try_into()
-                            // The error type is (). :(
-                            .map_err(|_| anyhow!("invalid dnd source action"))
-                            .location(loc!())?,
-                    );
-                }
-            },
-            DataEvent::SourceEvent(DataSourceEvent::DnDDropPerformed) => {
-                if let Some(source) = &self.dnd_source {
-                    source.dnd_drop_performed();
-                }
-            },
-            DataEvent::SourceEvent(
-                DataSourceEvent::DnDFinished | DataSourceEvent::DnDCancelled,
-            ) => {
-                if let Some(source) = self.dnd_source.take() {
-                    if data_event == DataEvent::SourceEvent(DataSourceEvent::DnDFinished) {
-                        source.dnd_finished();
-                    }
 
-                    let time = self.start_time.elapsed().as_millis() as u32;
-                    let pointer = self.seat.get_pointer().location(loc!())?;
-
-                    // unfocus window so we don't re-enter it while releasing buttons
-                    pointer.motion(
-                        self,
-                        None,
-                        &MotionEvent {
-                            location: (0.0, 0.0).into(),
-                            serial: 0.into(), // unused
-                            time,
-                        },
-                    );
-                    let pressed_buttons: HashSet<u32> = mem::take(&mut self.pressed_buttons);
-                    for button in pressed_buttons {
-                        debug!("releasing button {}", button);
-                        pointer.button(
-                            self,
-                            &ButtonEvent {
-                                time,
-                                button,
-                                serial: SERIAL_COUNTER.next_serial(),
-                                state: ButtonState::Released,
-                            },
-                        );
-                    }
-                }
+                let mut f = File::from(recv_fd);
+                // The data source application will write to the other end of
+                // the pipe at its convenience and then close the file
+                // descriptor, so spawn a thread to read until EOF and forward
+                // the bytes back to `wprsc`.
+                thread::spawn(move || {
+                    debug!("in receive read thread for transfer {transfer_id}");
+                    let mut buf = Vec::new();
+                    let bytes_read = f.read_to_end(&mut buf);
+                    debug!("read selection ({bytes_read:?} bytes): {buf:?}");
+                    writer.send(SendType::Object(Request::Data(DataRequest::TransferData(
+                        transfer_id,
+                        DataToTransfer(buf),
+                    ))));
+                });
             },
-            // TODO: remove? after taking another pass at data device code.
-            // DestinationEvent(DnDActionsOfferedBySource(_)) => {
-            //     // handled by start_dnd
-            // },
-            DataEvent::DestinationEvent(DataDestinationEvent::DnDActionSelected(_action)) => {
-                // TODO: remove? after taking another pass at data device code.
+            DataEvent::SourceEvent(DataSourceEvent::DnDActionSelected { source_id, action }) => {
+                self.handle_dnd_source_action(source_id, action)
+                    .location(loc!())?;
+            },
+            DataEvent::SourceEvent(DataSourceEvent::DnDDropPerformed { source_id }) => {
+                self.handle_dnd_source_drop_performed(source_id);
+            },
+            DataEvent::SourceEvent(DataSourceEvent::DnDFinished { source_id }) => {
+                self.handle_dnd_source_finished_or_cancelled(source_id, true);
+            },
+            DataEvent::SourceEvent(DataSourceEvent::DnDCancelled { source_id }) => {
+                self.handle_dnd_source_finished_or_cancelled(source_id, false);
+            },
+            DataEvent::DestinationEvent(DataDestinationEvent::DnDSourceActions {
+                offer_id,
+                actions,
+            }) => {
+                self.handle_dnd_offer_source_actions(offer_id, actions)
+                    .location(loc!())?;
+            },
+            DataEvent::DestinationEvent(DataDestinationEvent::DnDActionSelected {
+                offer_id,
+                action,
+            }) => {
+                self.handle_dnd_offer_selected_action(offer_id, action)
+                    .location(loc!())?;
             },
             DataEvent::DestinationEvent(DataDestinationEvent::DnDEnter(drag_enter)) => {
                 let (_, _, surface) = self
@@ -1085,108 +1084,42 @@ impl WprsServerState {
                         },
                     })
                     .warn(loc!())?;
-
-                let serial = self.serial_map.insert(drag_enter.serial);
-                let pointer = self.seat.get_pointer().location(loc!())?;
-                let grab = DndGrab::new(
-                    Some((surface, (0 as f64, 0 as f64).into())),
-                    0,
-                    drag_enter.loc.into(),
-                );
-                pointer.set_grab(self, grab, serial, Focus::Keep);
-                let drag_start_data = pointer.grab_start_data();
-                debug!("DRAG GRAB: pointer.grab_start_data {:?}", drag_start_data);
-
-                data_device::start_dnd(
-                    &self.dh.clone(),
-                    &self.seat.clone(),
-                    self,
-                    serial,
-                    drag_start_data,
-                    None,
-                    SourceMetadata {
-                        mime_types: drag_enter.mime_types,
-                        dnd_action: drag_enter
-                            .source_actions
-                            .try_into()
-                            // The error type is (). :(
-                            .map_err(|_| anyhow!("invalid dnd source actions"))
-                            .location(loc!())?,
-                    },
-                );
+                self.handle_dnd_enter(drag_enter, surface)
+                    .location(loc!())?;
             },
-            DataEvent::DestinationEvent(DataDestinationEvent::DnDLeave) => {
-                let pointer = self.seat.get_pointer().location(loc!())?;
-                debug!("drag leave");
-                if let Some(_grab_start_data) = pointer.grab_start_data() {
-                    pointer.motion(
-                        self,
-                        None,
-                        &MotionEvent {
-                            location: (0.0, 0.0).into(),
-                            serial: 0.into(), // unused
-                            time: self.start_time.elapsed().as_millis() as u32,
-                        },
-                    );
-                }
+            DataEvent::DestinationEvent(DataDestinationEvent::DnDLeave { offer_id }) => {
+                debug!("drag leave {offer_id}");
+                self.handle_dnd_leave(offer_id);
             },
-            DataEvent::DestinationEvent(DataDestinationEvent::DnDMotion(drag_motion)) => {
-                let pointer = self.seat.get_pointer().location(loc!())?;
-                debug!("drag moved to {:?}", drag_motion);
-                if let Some(grab_start_data) = pointer.grab_start_data() {
-                    pointer.motion(
-                        self,
-                        Some((
-                            grab_start_data.focus.location(loc!())?.0,
-                            (0 as f64, 0 as f64).into(),
-                        )),
-                        &MotionEvent {
-                            location: drag_motion.into(),
-                            serial: 0.into(), // unused
-                            time: self.start_time.elapsed().as_millis() as u32,
-                        },
-                    );
-                }
+            DataEvent::DestinationEvent(DataDestinationEvent::DnDMotion { offer_id, loc }) => {
+                debug!("drag moved to {loc:?} for offer {offer_id}");
+                self.handle_dnd_motion(offer_id, loc.x, loc.y);
             },
-            DataEvent::DestinationEvent(DataDestinationEvent::DnDDrop) => {
-                let pointer = self.seat.get_pointer().location(loc!())?;
-                debug!("drag dropped");
-                let serial = SERIAL_COUNTER.next_serial();
-                let time = self.start_time.elapsed().as_millis() as u32;
-                pointer.unset_grab(self, serial, time);
-                pointer.button(
-                    self,
-                    &ButtonEvent {
-                        time,
-                        button: 0,
-                        serial,
-                        state: ButtonState::Released,
-                    },
-                );
+            DataEvent::DestinationEvent(DataDestinationEvent::DnDDrop { offer_id }) => {
+                debug!("drag dropped for offer {offer_id}");
+                self.handle_dnd_drop(offer_id);
             },
             DataEvent::DestinationEvent(DataDestinationEvent::SelectionSet(source, metadata)) => {
                 match source {
-                    DataSource::Selection => data_device::set_data_device_selection(
-                        &self.dh,
-                        &self.seat,
-                        metadata.mime_types,
-                        (),
-                    ),
+                    DataSource::Selection => self
+                        .data_device_state
+                        .set_host_clipboard_selection(&self.dh, metadata.mime_types),
                     DataSource::Primary => primary_selection::set_primary_selection(
                         &self.dh,
                         &self.seat,
                         metadata.mime_types,
                         (),
                     ),
-                    DataSource::DnD => {},
                 };
             },
-            DataEvent::TransferData(source, data) => {
-                let fd = match source {
-                    DataSource::Selection => self.selection_pipe.take().location(loc!())?,
-                    DataSource::Primary => self.primary_selection_pipe.take().location(loc!())?,
-                    DataSource::DnD => self.dnd_pipe.take().location(loc!())?,
-                };
+            DataEvent::TransferData(transfer_id, data) => {
+                let fd = self
+                    .pending_receive_pipes
+                    .remove(&transfer_id)
+                    .location(loc!())?;
+                if data.0.is_empty() {
+                    return Ok(());
+                }
                 let mut f = File::from(fd);
                 // If data is large, the write may block if the reader (the
                 // application requesting the data) isn't reading it quickly

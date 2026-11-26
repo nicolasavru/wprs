@@ -150,13 +150,14 @@ pub struct WprsClientState {
     seat_objects: Vec<SeatObject<ThemedPointer>>,
     selection_source: Option<CopyPasteSource>,
     selection_offer: Option<SelectionOffer>,
-    selection_pipe: Option<WritePipe>,
-    dnd_source: Option<DragSource>,
-    dnd_offer: Option<DragOffer>,
-    dnd_pipe: Option<WritePipe>,
-    dnd_accept_counter: u32,
+    dnd_source: Option<(u64, DragSource)>,
+    dnd_source_dropped: bool,
+    next_dnd_offer_id: u64,
+    active_dnd_offer: Option<(u64, DragOffer)>,
+    dropped_dnd_offers: HashMap<u64, DragOffer>,
+    next_transfer_id: u64,
+    pending_send_pipes: HashMap<u64, WritePipe>,
     primary_selection_source: Option<PrimarySelectionSource>,
-    primary_selection_pipe: Option<WritePipe>,
     primary_selection_offer: Option<PrimarySelectionOffer>,
 
     serializer: Serializer<Event, Request>,
@@ -167,7 +168,7 @@ pub struct WprsClientState {
     last_enter_serial: u32,
     last_implicit_grab_serial: Option<u32>,
     last_mouse_down_serial: Option<u32>,
-    current_focus: Option<WlSurface>,
+    pressed_buttons: HashSet<u32>,
     current_cursor_image: Option<CursorImage>,
 
     title_prefix: String,
@@ -225,14 +226,15 @@ impl WprsClientState {
             seat_objects: Vec::new(),
             selection_source: None,
             selection_offer: None,
-            selection_pipe: None,
             dnd_source: None,
-            dnd_offer: None,
-            dnd_pipe: None,
-            dnd_accept_counter: 0,
+            dnd_source_dropped: false,
+            next_dnd_offer_id: 1,
+            active_dnd_offer: None,
+            dropped_dnd_offers: HashMap::new(),
+            next_transfer_id: 1,
+            pending_send_pipes: HashMap::new(),
             primary_selection_source: None,
             primary_selection_offer: None,
-            primary_selection_pipe: None,
 
             serializer,
             remote_display: RemoteDisplay::new(),
@@ -241,7 +243,7 @@ impl WprsClientState {
             last_enter_serial: 0,
             last_implicit_grab_serial: None,
             last_mouse_down_serial: None,
-            current_focus: None,
+            pressed_buttons: HashSet::new(),
             current_cursor_image: None,
             title_prefix: options.title_prefix,
             decompressor,
@@ -254,6 +256,39 @@ impl WprsClientState {
                 options.compression_mode,
             )));
         Ok(state)
+    }
+
+    pub(crate) fn allocate_transfer_id(&mut self) -> u64 {
+        let id = self.next_transfer_id;
+        self.next_transfer_id += 1;
+        id
+    }
+
+    pub(crate) fn dnd_offer_by_id(&self, offer_id: u64) -> Option<&DragOffer> {
+        if let Some((active_id, offer)) = &self.active_dnd_offer
+            && *active_id == offer_id
+        {
+            return Some(offer);
+        }
+        self.dropped_dnd_offers.get(&offer_id)
+    }
+
+    pub(crate) fn take_dnd_offer_by_id(&mut self, offer_id: u64) -> Option<DragOffer> {
+        if let Some((_, offer)) = self.active_dnd_offer.take_if(|(id, _)| *id == offer_id) {
+            return Some(offer);
+        }
+        self.dropped_dnd_offers.remove(&offer_id)
+    }
+
+    pub(crate) fn dnd_offer_id_for(&self, offer: &DragOffer) -> Option<u64> {
+        if let Some((active_id, active_offer)) = &self.active_dnd_offer
+            && active_offer.inner() == offer.inner()
+        {
+            return Some(*active_id);
+        }
+        self.dropped_dnd_offers
+            .iter()
+            .find_map(|(&id, dropped)| (dropped.inner() == offer.inner()).then_some(id))
     }
 }
 
