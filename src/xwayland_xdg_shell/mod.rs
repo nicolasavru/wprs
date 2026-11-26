@@ -29,6 +29,7 @@ use smithay::reexports::wayland_server::DisplayHandle;
 use smithay::reexports::wayland_server::Resource;
 use smithay::reexports::wayland_server::backend::ObjectId as CompositorObjectId;
 use smithay::reexports::wayland_server::protocol::wl_surface::WlSurface as CompositorWlSurface;
+use smithay::utils::Rectangle;
 use smithay::utils::Serial;
 use smithay::xwayland::X11Surface;
 use smithay::xwayland::xwm::WmWindowType;
@@ -41,6 +42,7 @@ use smithay_client_toolkit::reexports::client::Proxy;
 use smithay_client_toolkit::reexports::client::QueueHandle;
 use smithay_client_toolkit::reexports::client::backend::ObjectId as ClientObjectId;
 use smithay_client_toolkit::reexports::client::globals::GlobalList;
+use smithay_client_toolkit::reexports::client::protocol::wl_output::Transform as SctkTransform;
 use smithay_client_toolkit::reexports::client::protocol::wl_surface::WlSurface as ClientWlSurface;
 use smithay_client_toolkit::shell::WaylandSurface;
 use smithay_client_toolkit::shell::xdg::XdgShell;
@@ -52,7 +54,6 @@ use crate::args;
 use crate::client_utils::FrameDamage;
 use crate::compositor_utils;
 use crate::prelude::*;
-use crate::serialization::geometry::Point;
 use crate::serialization::wayland::KeyState;
 use crate::xwayland_xdg_shell::client::XWaylandSubSurface;
 
@@ -72,11 +73,13 @@ use compositor::WprsCompositorState;
 use compositor::X11Parent;
 use compositor::XwaylandOptions;
 
-#[derive(Debug, Default)]
+#[derive(Debug)]
 pub struct XWaylandSurface {
     pub(crate) x11_surface: Option<X11Surface>,
     pub(crate) buffer: Option<XWaylandBuffer>,
     pub(crate) buffer_attached: bool,
+    pub(crate) buffer_scale: i32,
+    pub(crate) buffer_transform: SctkTransform,
     // None when the surface is owned by a role object (e.g., a Window).
     pub(crate) local_surface: Option<Surface>,
     pub(crate) role: Option<Role>,
@@ -84,6 +87,24 @@ pub struct XWaylandSurface {
     pub(crate) children: HashSet<CompositorObjectId>,
     pub(crate) output_ids: HashSet<u32>,
     pub(crate) damage: FrameDamage,
+}
+
+impl Default for XWaylandSurface {
+    fn default() -> Self {
+        Self {
+            x11_surface: None,
+            buffer: None,
+            buffer_attached: false,
+            buffer_scale: 1,
+            buffer_transform: SctkTransform::Normal,
+            local_surface: None,
+            role: None,
+            parent: None,
+            children: HashSet::new(),
+            output_ids: HashSet::new(),
+            damage: FrameDamage::Empty,
+        }
+    }
 }
 
 impl XWaylandSurface {
@@ -103,16 +124,40 @@ impl XWaylandSurface {
         surface_bimap.insert(compositor_wl_surface.id(), local_surface.wl_surface().id());
 
         Ok(Self {
-            x11_surface: None,
-            buffer: None,
-            buffer_attached: false,
             local_surface: Some(local_surface),
-            role: None,
-            parent: None,
-            children: HashSet::new(),
-            output_ids: HashSet::new(),
-            damage: FrameDamage::Empty,
+            ..Self::default()
         })
+    }
+
+    pub(crate) fn has_client_surface(&self) -> bool {
+        self.local_surface.is_some()
+            || matches!(
+                self.role,
+                Some(Role::XdgToplevel(_) | Role::XdgPopup(_) | Role::SubSurface(_))
+            )
+    }
+
+    pub(crate) fn sync_buffer_scale_and_transform(
+        &mut self,
+        buffer_scale: i32,
+        buffer_transform: SctkTransform,
+    ) {
+        let buffer_scale = buffer_scale.max(1);
+        let scale_changed = self.buffer_scale != buffer_scale;
+        let transform_changed = self.buffer_transform != buffer_transform;
+        self.buffer_scale = buffer_scale;
+        self.buffer_transform = buffer_transform;
+
+        if !self.has_client_surface() {
+            return;
+        }
+        let wl_surface = self.wl_surface();
+        if scale_changed {
+            wl_surface.set_buffer_scale(buffer_scale);
+        }
+        if transform_changed {
+            wl_surface.set_buffer_transform(buffer_transform);
+        }
     }
 
     fn update_local_surface(
@@ -125,6 +170,16 @@ impl XWaylandSurface {
     ) -> Result<()> {
         let local_surface =
             Surface::with_data(compositor_state, qh, parent.cloned(), 1, ()).location(loc!())?;
+        if self.buffer_scale != 1 {
+            local_surface
+                .wl_surface()
+                .set_buffer_scale(self.buffer_scale);
+        }
+        if self.buffer_transform != SctkTransform::Normal {
+            local_surface
+                .wl_surface()
+                .set_buffer_transform(self.buffer_transform);
+        }
 
         surface_bimap.insert(compositor_wl_surface.id(), local_surface.wl_surface().id());
         self.local_surface = Some(local_surface);
@@ -175,7 +230,6 @@ impl XWaylandSurface {
     fn update_x11_surface(
         &mut self,
         x11_surface: X11Surface,
-        x11_offset: Point<i32>,
         parent: Option<X11Parent>,
         fallback_parent: &Option<X11Parent>,
         xdg_shell_state: &XdgShell,
@@ -252,7 +306,6 @@ impl XWaylandSurface {
                 self.parent.clone_from(&parent_if_toplevel);
                 XWaylandXdgToplevel::set_role(
                     self,
-                    x11_offset,
                     xdg_shell_state,
                     shm_state,
                     subcompositor_state,
@@ -268,7 +321,6 @@ impl XWaylandSurface {
                 self.parent = None;
                 XWaylandXdgToplevel::set_role(
                     self,
-                    x11_offset,
                     xdg_shell_state,
                     shm_state,
                     subcompositor_state,
@@ -343,7 +395,6 @@ pub struct WprsState {
     pub compositor_state: WprsCompositorState,
     pub surface_bimap: BiMap<CompositorObjectId, ClientObjectId>,
     pub surfaces: HashMap<CompositorObjectId, XWaylandSurface>,
-    pub outputs: HashMap<u32, Output>,
 }
 
 impl WprsState {
@@ -375,7 +426,6 @@ impl WprsState {
             ),
             surface_bimap: BiMap::new(),
             surfaces: HashMap::new(),
-            outputs: HashMap::new(),
             registration_tokens,
         })
     }
@@ -489,29 +539,51 @@ impl WprsState {
         Ok(())
     }
 
+    pub(crate) fn compositor_surface_from_id(
+        &self,
+        compositor_surface_id: &CompositorObjectId,
+    ) -> Option<CompositorWlSurface> {
+        let client = self.dh.get_client(compositor_surface_id.clone()).ok()?;
+        client
+            .object_from_protocol_id(&self.dh, compositor_surface_id.protocol_id())
+            .ok()
+    }
+
     pub fn compositor_surface_from_client_surface(
         &self,
         client_surface: &ClientWlSurface,
     ) -> Option<CompositorWlSurface> {
         let compositor_surface_id = self.surface_bimap.get_by_right(&client_surface.id())?;
+        self.compositor_surface_from_id(compositor_surface_id)
+    }
 
-        let Ok(client) = self.dh.get_client(compositor_surface_id.clone()) else {
-            return None;
-        };
+    pub(crate) fn enter_surfaces_on_output(&self, output_id: u32, output: &Output) {
+        for (surface_id, xwayland_surface) in &self.surfaces {
+            if xwayland_surface.output_ids.contains(&output_id)
+                && let Some(surface) = self.compositor_surface_from_id(surface_id)
+            {
+                output.enter(&surface);
+            }
+        }
+    }
 
-        let Ok(surface) =
-            client.object_from_protocol_id(&self.dh, compositor_surface_id.protocol_id())
-        else {
-            return None;
-        };
-
-        Some(surface)
+    pub(crate) fn remove_output_from_surfaces(&mut self, output_id: u32, output: Option<&Output>) {
+        let surface_ids: Vec<_> = self.surfaces.keys().cloned().collect();
+        for surface_id in surface_ids {
+            if let Some(output) = output
+                && let Some(surface) = self.compositor_surface_from_id(&surface_id)
+            {
+                output.leave(&surface);
+            }
+            if let Some(xwayland_surface) = self.surfaces.get_mut(&surface_id) {
+                xwayland_surface.output_ids.remove(&output_id);
+            }
+        }
     }
 
     pub fn sync_surface_outputs(&mut self, surface: &ClientWlSurface) {
-        let (Some(compositor_surface), Some(xwayland_surface), Some(outputs)) = (
+        let (Some(compositor_surface), Some(outputs)) = (
             self.compositor_surface_from_client_surface(surface),
-            xsurface_from_client_surface(&self.surface_bimap, &mut self.surfaces, surface),
             surface.data::<SurfaceData<()>>().map(SurfaceData::outputs),
         ) else {
             return;
@@ -523,14 +595,52 @@ impl WprsState {
                 .map(|data| data.with_output_info(|info| info.id))
         }));
 
+        let output_rects = self.compositor_state.output_logical_rects();
+        let Some(xwayland_surface) =
+            xsurface_from_client_surface(&self.surface_bimap, &mut self.surfaces, surface)
+        else {
+            return;
+        };
+
         compositor_utils::update_surface_outputs(
             &compositor_surface,
             &new_ids,
             &xwayland_surface.output_ids,
-            |id| self.outputs.get(id),
+            |id| {
+                self.compositor_state
+                    .outputs
+                    .get(id)
+                    .map(|(output, _)| output)
+            },
         );
 
         xwayland_surface.output_ids = new_ids;
+
+        // When a configured toplevel with no active child popups/subsurfaces
+        // moves onto a different output, move its X11 geometry into that output
+        // so RandR-aware apps query the right monitor bounds.
+        if let Some(Role::XdgToplevel(toplevel)) = &xwayland_surface.role
+            && toplevel.configured
+            && xwayland_surface.children.is_empty()
+            && let Some(x11_surface) = &xwayland_surface.x11_surface
+        {
+            let geo = x11_surface.geometry();
+            if compositor::toplevel_needs_output_reposition(
+                &output_rects,
+                &xwayland_surface.output_ids,
+                geo,
+            ) {
+                let new_loc = compositor::compute_toplevel_x11_location(
+                    &output_rects,
+                    &xwayland_surface.output_ids,
+                    (geo.size.w, geo.size.h),
+                    false,
+                );
+                x11_surface
+                    .configure(Rectangle::new(new_loc.into(), geo.size))
+                    .log_and_ignore(loc!());
+            }
+        }
     }
 }
 

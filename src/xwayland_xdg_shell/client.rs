@@ -287,20 +287,20 @@ impl CompositorHandler for WprsState {
         &mut self,
         _conn: &Connection,
         _qh: &QueueHandle<Self>,
-        _surface: &WlSurface,
+        surface: &WlSurface,
         _output: &WlOutput,
     ) {
-        // handled by scale_factor_changed/transform_changed, which only process when the scaling actually changes.
+        self.sync_surface_outputs(surface);
     }
 
     fn surface_leave(
         &mut self,
         _conn: &Connection,
         _qh: &QueueHandle<Self>,
-        _surface: &WlSurface,
+        surface: &WlSurface,
         _output: &WlOutput,
     ) {
-        // handled by scale_factor_changed/transform_changed, which only process when the scaling actually changes.
+        self.sync_surface_outputs(surface);
     }
 }
 
@@ -312,7 +312,9 @@ impl OutputHandler for WprsState {
     #[instrument(skip(self, _conn, _qh), level = "debug")]
     fn new_output(&mut self, _conn: &Connection, _qh: &QueueHandle<Self>, output: WlOutput) {
         let output_info = self.output_state().info(&output).unwrap();
-        self.compositor_state.new_output(output_info.into());
+        let output_id = output_info.id;
+        let local_output = self.compositor_state.new_output(output_info.into());
+        self.enter_surfaces_on_output(output_id, &local_output);
     }
 
     #[instrument(skip(self, _conn, _qh), level = "debug")]
@@ -324,7 +326,9 @@ impl OutputHandler for WprsState {
     #[instrument(skip(self, _conn, _qh), level = "debug")]
     fn output_destroyed(&mut self, _conn: &Connection, _qh: &QueueHandle<Self>, output: WlOutput) {
         let output_info = self.output_state().info(&output).unwrap();
-        self.compositor_state.destroy_output(output_info.into());
+        let output_id = output_info.id;
+        let removed = self.compositor_state.destroy_output(output_info.into());
+        self.remove_output_from_surfaces(output_id, removed.as_ref());
     }
 }
 
@@ -355,7 +359,10 @@ impl WindowHandler for WprsState {
             return;
         };
 
+        let output_rects = self.compositor_state.output_logical_rects();
+        let maximized_or_fullscreen = configure.is_maximized() || configure.is_fullscreen();
         let xwayland_surface = self.surfaces.get_mut(compositor_surface_id).unwrap();
+        let surface_output_ids = &xwayland_surface.output_ids;
 
         let xdg_toplevel = match &mut xwayland_surface.role {
             Some(Role::XdgToplevel(xdg_toplevel)) => xdg_toplevel,
@@ -381,6 +388,14 @@ impl WindowHandler for WprsState {
                     .buffer
                     .as_ref()
                     .map(|buffer| &buffer.metadata),
+                |w, h| {
+                    crate::xwayland_xdg_shell::compositor::compute_toplevel_x11_location(
+                        &output_rects,
+                        surface_output_ids,
+                        (w, h),
+                        maximized_or_fullscreen,
+                    )
+                },
             )
             .log_and_ignore(loc!());
 
@@ -852,21 +867,22 @@ impl PointerHandler for WprsState {
                             .surface_bimap
                             .get_by_right(&event.surface.id())
                             .unwrap();
+                        let parent_loc = x11_surface.geometry().loc;
                         self.client_state.last_focused_window = Some(X11Parent {
                             surface_id: parent_id.clone(),
                             for_popup: Some(X11ParentForPopup {
                                 surface_id: parent_id.clone(),
                                 xdg_surface: toplevel.xdg_surface().clone(),
                                 x11_offset: (
-                                    toplevel.frame_offset.x + toplevel.x11_offset.x,
-                                    toplevel.frame_offset.y + toplevel.x11_offset.y,
+                                    toplevel.frame_offset.x - parent_loc.x,
+                                    toplevel.frame_offset.y - parent_loc.y,
                                 )
                                     .into(),
                                 wl_offset: toplevel.frame_offset,
                             }),
                             for_subsurface: X11ParentForSubsurface {
                                 surface: toplevel.wl_surface().clone(),
-                                x11_offset: toplevel.x11_offset,
+                                x11_offset: (-parent_loc.x, -parent_loc.y).into(),
                             },
                         });
                     }
@@ -1165,16 +1181,16 @@ pub struct XWaylandXdgToplevel {
     pub frame_offset: Point<i32>,
     pub configured: bool,
     pub decoration_behavior: DecorationBehavior,
-    pub x11_offset: Point<i32>,
 }
 
 impl XWaylandXdgToplevel {
-    #[instrument(ret, level = "debug")]
+    #[instrument(skip(x11_location), ret, level = "debug")]
     pub fn enable_decorations(
         &mut self,
         x11_surface: &X11Surface,
         configure: Option<&WindowConfigure>,
         buffer_metadata: Option<&BufferMetadata>,
+        x11_location: impl FnOnce(i32, i32) -> Point<i32>,
     ) -> Result<(i32, i32)> {
         let default_window_size = (
             NonZeroU32::new(DEFAULT_WINDOW_SIZE.0 as u32),
@@ -1219,12 +1235,13 @@ impl XWaylandXdgToplevel {
         // Everything after this wants u32s or i32s.
         let width = width.get();
         let height = height.get();
+        let loc = x11_location(width as i32, height as i32);
 
         // X11's ConfigureNotify wants the outer coordinates but the inner
         // dimensions. And don't worry about border_width. /sigh
         x11_surface
             .configure(Rectangle::new(
-                (-self.x11_offset.x, -self.x11_offset.y).into(),
+                loc.into(),
                 (width as i32, height as i32).into(),
             ))
             .location(loc!())?;
@@ -1256,6 +1273,7 @@ impl XWaylandXdgToplevel {
         x11_surface: &X11Surface,
         configure: Option<&WindowConfigure>,
         buffer_metadata: Option<&BufferMetadata>,
+        x11_location: impl FnOnce(i32, i32) -> Point<i32>,
     ) -> Result<(i32, i32)> {
         let default_window_size = DEFAULT_WINDOW_SIZE;
         let window_frame = &mut self.window_frame;
@@ -1280,11 +1298,9 @@ impl XWaylandXdgToplevel {
             },
         };
 
+        let loc = x11_location(width, height);
         x11_surface
-            .configure(Rectangle::new(
-                (-self.x11_offset.x, -self.x11_offset.y).into(),
-                (width, height).into(),
-            ))
+            .configure(Rectangle::new(loc.into(), (width, height).into()))
             .location(loc!())?;
 
         self.local_window
@@ -1299,38 +1315,53 @@ impl XWaylandXdgToplevel {
         x11_surface: &X11Surface,
         configure: Option<&WindowConfigure>,
         buffer_metadata: Option<&BufferMetadata>,
+        x11_location: impl FnOnce(i32, i32) -> Point<i32>,
     ) -> Result<(i32, i32)> {
         match self.decoration_behavior {
             DecorationBehavior::Auto if let Some(configure) = configure => {
                 match configure.decoration_mode {
                     DecorationMode::Server => {
                         // wayland compositor has drawn decorations so it doesn't need ours
-                        self.disable_decoration(x11_surface, Some(configure), buffer_metadata)
+                        self.disable_decoration(
+                            x11_surface,
+                            Some(configure),
+                            buffer_metadata,
+                            x11_location,
+                        )
                     },
                     DecorationMode::Client => {
                         // x11 app has drawn it's own decorations so it doesn't need ours
                         // TODO: if the x11_surface is decorated, but there are server-side decorations then we
                         // should request client-side decorations from the compositor
                         if x11_surface.is_decorated() {
-                            self.disable_decoration(x11_surface, Some(configure), buffer_metadata)
+                            self.disable_decoration(
+                                x11_surface,
+                                Some(configure),
+                                buffer_metadata,
+                                x11_location,
+                            )
                         } else {
-                            self.enable_decorations(x11_surface, Some(configure), buffer_metadata)
+                            self.enable_decorations(
+                                x11_surface,
+                                Some(configure),
+                                buffer_metadata,
+                                x11_location,
+                            )
                         }
                     },
                 }
             },
             DecorationBehavior::AlwaysEnabled => {
-                self.enable_decorations(x11_surface, configure, buffer_metadata)
+                self.enable_decorations(x11_surface, configure, buffer_metadata, x11_location)
             },
             DecorationBehavior::Auto | DecorationBehavior::AlwaysDisabled => {
-                self.disable_decoration(x11_surface, configure, buffer_metadata)
+                self.disable_decoration(x11_surface, configure, buffer_metadata, x11_location)
             },
         }
     }
 
     pub fn set_role(
         surface: &mut XWaylandSurface,
-        x11_offset: Point<i32>,
         xdg_shell_state: &XdgShell,
         shm_state: &Shm,
         subcompositor_state: Arc<SubcompositorState>,
@@ -1367,7 +1398,6 @@ impl XWaylandXdgToplevel {
             frame_offset: (0, 0).into(),
             configured: false,
             decoration_behavior,
-            x11_offset,
         };
         surface.role = Some(Role::XdgToplevel(new_toplevel));
         Ok(())

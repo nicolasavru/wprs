@@ -40,6 +40,9 @@ use smithay::reexports::wayland_server::backend::GlobalId;
 use smithay::reexports::wayland_server::backend::ObjectId;
 use smithay::reexports::wayland_server::protocol::wl_buffer::WlBuffer;
 use smithay::reexports::wayland_server::protocol::wl_surface::WlSurface;
+use smithay::utils::IsAlive;
+use smithay::utils::Logical;
+use smithay::utils::Rectangle;
 use smithay::wayland::buffer::BufferHandler;
 use smithay::wayland::compositor;
 use smithay::wayland::compositor::BufferAssignment;
@@ -49,6 +52,8 @@ use smithay::wayland::compositor::CompositorState;
 use smithay::wayland::compositor::SurfaceAttributes;
 use smithay::wayland::compositor::SurfaceData;
 use smithay::wayland::output::OutputHandler;
+use smithay::wayland::output::OutputManagerState;
+use smithay::wayland::output::WlOutputData;
 use smithay::wayland::selection::SelectionHandler;
 use smithay::wayland::selection::SelectionSource;
 use smithay::wayland::selection::SelectionTarget;
@@ -68,6 +73,7 @@ use smithay::xwayland::XWayland;
 use smithay::xwayland::XWaylandClientData;
 use smithay::xwayland::XWaylandEvent;
 use smithay::xwayland::xwm::XwmId;
+use smithay_client_toolkit::reexports::client::protocol::wl_output::Transform as SctkTransform;
 use smithay_client_toolkit::reexports::client::protocol::wl_surface::WlSurface as SctkWlSurface;
 use smithay_client_toolkit::reexports::csd_frame::DecorationsFrame;
 use smithay_client_toolkit::reexports::protocols::xdg::shell::client::xdg_surface;
@@ -76,10 +82,10 @@ use smithay_client_toolkit::shell::xdg::XdgSurface;
 
 use crate::client_utils::FrameDamage;
 use crate::compositor_utils;
-use crate::fallible_entry::FallibleEntryExt;
 use crate::prelude::*;
 use crate::serialization::geometry::Point;
 use crate::serialization::wayland::OutputInfo;
+use crate::serialization::wayland::Transform as SerTransform;
 use crate::utils::SerialMap;
 use crate::xwayland_xdg_shell::WprsState;
 use crate::xwayland_xdg_shell::XWaylandSurface;
@@ -104,6 +110,139 @@ where
     pub env: I,
 }
 
+/// Returns an output's logical bounding rectangle matching what Smithay
+/// advertises over `zxdg_output_v1` (position plus oriented scaled size).
+pub(crate) fn output_logical_rect(output: &Output) -> Option<Rectangle<i32, Logical>> {
+    let mode = output.current_mode()?;
+    let logical_size = output.current_transform().transform_size(
+        mode.size
+            .to_f64()
+            .to_logical(output.current_scale().fractional_scale())
+            .to_i32_round(),
+    );
+    Some(Rectangle::new(output.current_location(), logical_size))
+}
+
+/// Computes the X11 virtual screen origin shift needed to keep all outputs at
+/// non-negative X11 root coordinates.
+fn x11_screen_origin(outputs: &[(u32, Rectangle<i32, Logical>)]) -> (i32, i32) {
+    let min_x = outputs
+        .iter()
+        .map(|(_, r)| r.loc.x)
+        .min()
+        .unwrap_or(0)
+        .min(0);
+    let min_y = outputs
+        .iter()
+        .map(|(_, r)| r.loc.y)
+        .min()
+        .unwrap_or(0)
+        .min(0);
+    (min_x, min_y)
+}
+
+/// Computes an X11 root-coordinate top-left placement for a toplevel window of
+/// `window_size` on the real output layout without inflating screen dimensions.
+///
+/// Maximized/fullscreen or screen-sized windows land at the target output's
+/// origin; smaller windows are centered inside the target output so popups and
+/// pointer drags have real positive screen margin on every side.
+pub(crate) fn compute_toplevel_x11_location(
+    outputs: &[(u32, Rectangle<i32, Logical>)],
+    surface_output_ids: &HashSet<u32>,
+    window_size: (i32, i32),
+    maximized_or_fullscreen: bool,
+) -> Point<i32> {
+    if outputs.is_empty() {
+        return (0, 0).into();
+    }
+    let (min_x, min_y) = x11_screen_origin(outputs);
+    let target = outputs
+        .iter()
+        .filter(|(id, _)| surface_output_ids.contains(id))
+        .min_by_key(|(id, r)| (r.loc.x, r.loc.y, *id))
+        .or_else(|| outputs.iter().min_by_key(|(id, r)| (r.loc.x, r.loc.y, *id)))
+        .unwrap()
+        .1;
+
+    let origin_x = target.loc.x - min_x;
+    let origin_y = target.loc.y - min_y;
+    if maximized_or_fullscreen {
+        return (origin_x, origin_y).into();
+    }
+
+    let x = origin_x + (target.size.w - window_size.0).max(0) / 2;
+    let y = origin_y + (target.size.h - window_size.1).max(0) / 2;
+    (x, y).into()
+}
+
+/// Returns true when a configured toplevel's X11 geometry center no longer
+/// lies inside any of the outputs its Wayland surface currently occupies.
+pub(crate) fn toplevel_needs_output_reposition(
+    outputs: &[(u32, Rectangle<i32, Logical>)],
+    surface_output_ids: &HashSet<u32>,
+    current_geometry: Rectangle<i32, Logical>,
+) -> bool {
+    if outputs.is_empty() || surface_output_ids.is_empty() {
+        return false;
+    }
+    let (min_x, min_y) = x11_screen_origin(outputs);
+    let center_x = current_geometry.loc.x + current_geometry.size.w / 2;
+    let center_y = current_geometry.loc.y + current_geometry.size.h / 2;
+    let mut matched_any = false;
+    for (id, rect) in outputs {
+        if !surface_output_ids.contains(id) {
+            continue;
+        }
+        matched_any = true;
+        let x0 = rect.loc.x - min_x;
+        let y0 = rect.loc.y - min_y;
+        if center_x >= x0
+            && center_x < x0 + rect.size.w
+            && center_y >= y0
+            && center_y < y0 + rect.size.h
+        {
+            return false;
+        }
+    }
+    matched_any
+}
+
+fn create_or_update_output<D>(
+    outputs: &mut HashMap<u32, (Output, GlobalId)>,
+    dh: &DisplayHandle,
+    output: OutputInfo,
+) -> Output
+where
+    D: smithay::reexports::wayland_server::GlobalDispatch<
+            smithay::reexports::wayland_server::protocol::wl_output::WlOutput,
+            WlOutputData,
+        > + 'static,
+{
+    match outputs.entry(output.id) {
+        Entry::Occupied(mut entry) => {
+            let local_output = &mut entry.get_mut().0;
+            compositor_utils::update_output(local_output, output);
+            local_output.clone()
+        },
+        Entry::Vacant(entry) => {
+            let mut new_output = Output::new(
+                format!("{}_{}", output.id, output.name.as_deref().unwrap_or("None")),
+                PhysicalProperties {
+                    size: output.physical_size.into(),
+                    subpixel: output.subpixel.into(),
+                    make: output.make.clone(),
+                    model: output.model.clone(),
+                },
+            );
+            compositor_utils::update_output(&mut new_output, output);
+            let global_id = new_output.create_global::<D>(dh);
+            entry.insert((new_output.clone(), global_id));
+            new_output
+        },
+    }
+}
+
 #[derive(Debug)]
 pub struct WprsCompositorState {
     pub dh: DisplayHandle,
@@ -111,6 +250,7 @@ pub struct WprsCompositorState {
     pub start_time: Instant,
     pub shm_state: ShmState,
     pub seat_state: SeatState<WprsState>,
+    pub output_manager_state: OutputManagerState,
     pub data_device_state: DataDeviceState,
     pub xwayland_shell_state: XWaylandShellState,
     pub primary_selection_state: PrimarySelectionState,
@@ -123,8 +263,6 @@ pub struct WprsCompositorState {
     pub(crate) pressed_keys: HashSet<u32>,
 
     pub xwm: Option<X11Wm>,
-
-    pub x11_screen_offset: Option<Point<i32>>,
 
     /// unpaired x11 surfaces
     pub x11_surfaces: Vec<X11Surface>,
@@ -197,6 +335,7 @@ impl WprsCompositorState {
             start_time: Instant::now(),
             shm_state: ShmState::new::<WprsState>(&dh, Vec::new()),
             seat_state,
+            output_manager_state: OutputManagerState::new_with_xdg_output::<WprsState>(&dh),
             xwayland_shell_state: XWaylandShellState::new::<WprsState>(&dh),
             data_device_state: DataDeviceState::new::<WprsState>(&dh),
             primary_selection_state: PrimarySelectionState::new::<WprsState>(&dh),
@@ -206,46 +345,20 @@ impl WprsCompositorState {
             serial_map: SerialMap::new(),
             pressed_keys: HashSet::new(),
             xwm: None,
-            x11_screen_offset: None,
             x11_surfaces: Vec::new(),
         }
     }
 
+    pub(crate) fn output_logical_rects(&self) -> Vec<(u32, Rectangle<i32, Logical>)> {
+        self.outputs
+            .iter()
+            .filter_map(|(&id, (output, _))| Some((id, output_logical_rect(output)?)))
+            .collect()
+    }
+
     #[instrument(skip(self), level = "debug")]
-    pub(crate) fn new_output(&mut self, output: OutputInfo) {
-        let (local_output, _) = self.outputs.entry(output.id).or_insert_with_key(|id| {
-            let new_output = Output::new(
-                format!(
-                    "{}_{}",
-                    id,
-                    output.name.clone().unwrap_or("None".to_string())
-                ),
-                PhysicalProperties {
-                    size: output.physical_size.into(),
-                    subpixel: output.subpixel.into(),
-                    make: output.make.clone(),
-                    model: output.model.clone(),
-                },
-            );
-            let global_id = new_output.create_global::<WprsState>(&self.dh);
-            (new_output, global_id)
-        });
-
-        // We are lying to xwayland about the size of the display and offsetting all our x11 windows
-        // by the accordingly. This is because xwayland will not let us move cursors beyond the bounds of the
-        // screen. Since wayland surfaces do not know where they are placed, we will sometimes receive
-        // events that either enter the negative coordinate space (because the wayland window is not aligned
-        // with the topleft corner) or are beyond the size of the screen (because the window partially overlaps
-        // the edge of the screen.)
-        // However, Xwayland seems to run into performance bottlenecks as we increase the screen size,
-        // even if an app's window size doesn't change. So we want to choose the minimal size possible.
-        let mut expanded_output = output.clone();
-        expanded_output.mode.dimensions =
-            (output.mode.dimensions.w * 3, output.mode.dimensions.h * 3).into();
-        self.x11_screen_offset =
-            Some((-output.mode.dimensions.w, -output.mode.dimensions.h).into());
-
-        compositor_utils::update_output(local_output, expanded_output);
+    pub(crate) fn new_output(&mut self, output: OutputInfo) -> Output {
+        create_or_update_output::<WprsState>(&mut self.outputs, &self.dh, output)
     }
 
     #[instrument(skip(self), level = "debug")]
@@ -258,22 +371,16 @@ impl WprsCompositorState {
             },
         };
 
-        let mut expanded_output = output.clone();
-        expanded_output.mode.dimensions = (
-            expanded_output.mode.dimensions.w * 3,
-            expanded_output.mode.dimensions.h * 3,
-        )
-            .into();
-        self.x11_screen_offset =
-            Some((-output.mode.dimensions.w, -output.mode.dimensions.h).into());
-
-        compositor_utils::update_output(local_output, expanded_output);
+        compositor_utils::update_output(local_output, output);
     }
 
     #[instrument(skip(self), level = "debug")]
-    pub(crate) fn destroy_output(&mut self, output: OutputInfo) {
-        if let Some((_, (_, global_id))) = self.outputs.remove_entry(&output.id) {
+    pub(crate) fn destroy_output(&mut self, output: OutputInfo) -> Option<Output> {
+        if let Some((_, (local_output, global_id))) = self.outputs.remove_entry(&output.id) {
             self.dh.remove_global::<WprsState>(global_id);
+            Some(local_output)
+        } else {
+            None
         }
     }
 }
@@ -345,6 +452,9 @@ impl XWaylandShellHandler for WprsState {
 }
 
 fn execute_or_defer_commit(state: &mut WprsState, surface: WlSurface) -> Result<()> {
+    if !surface.alive() {
+        return Ok(());
+    }
     commit(&surface, state).location(loc!())?;
 
     let xwayland_surface = state.surfaces.get(&surface.id());
@@ -442,11 +552,7 @@ pub(crate) fn find_x11_parent(
                             -parent_geo.loc.y + toplevel.frame_offset.y,
                         )
                             .into(),
-                        wl_offset: (
-                            -parent_geo.loc.x + toplevel.frame_offset.x - toplevel.x11_offset.x,
-                            -parent_geo.loc.y + toplevel.frame_offset.y - toplevel.x11_offset.y,
-                        )
-                            .into(),
+                        wl_offset: toplevel.frame_offset,
                     }),
                     for_subsurface: X11ParentForSubsurface {
                         surface: toplevel.wl_surface().clone(),
@@ -539,22 +645,24 @@ pub fn commit_inner(
                 .location(loc!())?;
         }
 
-        if let Some(x11_offset) = state.compositor_state.x11_screen_offset {
-            xwayland_surface
-                .update_x11_surface(
-                    x11_surface,
-                    x11_offset,
-                    parent,
-                    &state.client_state.last_focused_window,
-                    &state.client_state.xdg_shell_state,
-                    &state.client_state.shm_state,
-                    state.client_state.subcompositor_state.clone(),
-                    &state.client_state.qh,
-                    state.compositor_state.decoration_behavior,
-                )
-                .location(loc!())?;
-        }
+        xwayland_surface
+            .update_x11_surface(
+                x11_surface,
+                parent,
+                &state.client_state.last_focused_window,
+                &state.client_state.xdg_shell_state,
+                &state.client_state.shm_state,
+                state.client_state.subcompositor_state.clone(),
+                &state.client_state.qh,
+                state.compositor_state.decoration_behavior,
+            )
+            .location(loc!())?;
     }
+
+    let client_transform: SctkTransform =
+        SerTransform::from(surface_attributes.buffer_transform).into();
+    xwayland_surface
+        .sync_buffer_scale_and_transform(surface_attributes.buffer_scale, client_transform);
 
     debug!("buffer assignment: {:?}", &surface_attributes.buffer);
 
@@ -592,8 +700,11 @@ pub fn commit_inner(
         Some(BufferAssignment::Removed) => {
             surface_attributes.damage.clear();
             xwayland_surface.buffer = None;
+            xwayland_surface.buffer_attached = false;
             xwayland_surface.damage = FrameDamage::Empty;
-            xwayland_surface.wl_surface().attach(None, 0, 0);
+            if xwayland_surface.has_client_surface() {
+                xwayland_surface.wl_surface().attach(None, 0, 0);
+            }
         },
         // Retain `surface_attributes.damage` across bufferless commits (bounded
         // by `cap_surface_damage`) until the next `NewBuffer` or `Removed` commit.
@@ -662,14 +773,14 @@ impl SeatHandler for WprsState {
     #[instrument(skip(self, _seat), level = "debug")]
     fn cursor_image(&mut self, _seat: &Seat<Self>, image: CursorImageStatus) {
         // TODO: support multiple seats
-        let themed_pointer = self
+        let Some(themed_pointer) = self
             .client_state
             .seat_objects
             .last()
-            .unwrap()
-            .pointer
-            .as_ref()
-            .unwrap();
+            .and_then(|seat| seat.pointer.as_ref())
+        else {
+            return;
+        };
         let pointer = themed_pointer.pointer();
 
         // TODO: move to a fn on serialization::CursorImaveStatus
@@ -678,28 +789,41 @@ impl SeatHandler for WprsState {
                 themed_pointer.hide_cursor().log_and_ignore(loc!());
             },
             CursorImageStatus::Surface(surface) => {
-                let hotspot = compositor::with_states(&surface, |surface_data| {
-                    surface_data
-                        .data_map
-                        .get::<CursorImageSurfaceData>()
-                        .unwrap()
-                        .lock()
-                        .unwrap()
-                        .hotspot
-                });
-
-                let xwayland_surface = log_and_return!(
-                    self.surfaces.entry(surface.id()).or_insert_with_result(|| {
-                        XWaylandSurface::new(
-                            &surface,
-                            &self.client_state.compositor_state,
-                            &self.client_state.qh,
-                            &mut self.surface_bimap,
+                let (hotspot, buffer_scale, buffer_transform) =
+                    compositor::with_states(&surface, |surface_data| {
+                        let hotspot = surface_data
+                            .data_map
+                            .get::<CursorImageSurfaceData>()
+                            .unwrap()
+                            .lock()
+                            .unwrap()
+                            .hotspot;
+                        let mut guard = surface_data.cached_state.get::<SurfaceAttributes>();
+                        let attrs = guard.current();
+                        (
+                            hotspot,
+                            attrs.buffer_scale,
+                            SerTransform::from(attrs.buffer_transform).into(),
                         )
-                    })
-                );
+                    });
+
+                let xwayland_surface = self.surfaces.entry(surface.id()).or_default();
+                if !xwayland_surface.has_client_surface() {
+                    log_and_return!(xwayland_surface.update_local_surface(
+                        &surface,
+                        None,
+                        &self.client_state.compositor_state,
+                        &self.client_state.qh,
+                        &mut self.surface_bimap,
+                    ));
+                }
 
                 xwayland_surface.role = Some(Role::Cursor);
+                xwayland_surface.sync_buffer_scale_and_transform(buffer_scale, buffer_transform);
+                if !xwayland_surface.buffer_attached && xwayland_surface.buffer.is_some() {
+                    xwayland_surface.try_draw_buffer();
+                    xwayland_surface.commit();
+                }
 
                 // TODO: expose serial to this function, then remove
                 // last_enter_serial on client.
@@ -728,3 +852,482 @@ smithay::delegate_data_device!(WprsState);
 smithay::delegate_output!(WprsState);
 smithay::delegate_primary_selection!(WprsState);
 smithay::delegate_xwayland_shell!(WprsState);
+
+#[cfg(test)]
+mod tests {
+    use std::os::unix::net::UnixStream;
+    use std::sync::Arc;
+    use std::sync::atomic::AtomicBool;
+    use std::sync::atomic::Ordering;
+
+    use smithay::reexports::wayland_server::Display;
+    use smithay::reexports::wayland_server::backend::ClientData;
+    use smithay::reexports::wayland_server::backend::ClientId;
+    use smithay::reexports::wayland_server::backend::DisconnectReason;
+    use smithay::reexports::wayland_server::protocol::wl_output::Transform as SmithayWlTransform;
+    use smithay_client_toolkit::reexports::client::Connection;
+    use smithay_client_toolkit::reexports::client::Dispatch;
+    use smithay_client_toolkit::reexports::client::EventQueue;
+    use smithay_client_toolkit::reexports::client::Proxy;
+    use smithay_client_toolkit::reexports::client::QueueHandle;
+    use smithay_client_toolkit::reexports::client::WEnum;
+    use smithay_client_toolkit::reexports::client::protocol::wl_callback;
+    use smithay_client_toolkit::reexports::client::protocol::wl_compositor::WlCompositor;
+    use smithay_client_toolkit::reexports::client::protocol::wl_output;
+    use smithay_client_toolkit::reexports::client::protocol::wl_registry;
+    use smithay_client_toolkit::reexports::client::protocol::wl_surface::WlSurface as ClientWlSurface;
+    use smithay_client_toolkit::reexports::protocols::xdg::xdg_output::zv1::client::zxdg_output_manager_v1::ZxdgOutputManagerV1;
+    use smithay_client_toolkit::reexports::protocols::xdg::xdg_output::zv1::client::zxdg_output_v1;
+
+    use super::*;
+    use crate::serialization::wayland::Mode as SerMode;
+    use crate::serialization::wayland::Subpixel as SerSubpixel;
+
+    fn rect(x: i32, y: i32, w: i32, h: i32) -> Rectangle<i32, Logical> {
+        Rectangle::new((x, y).into(), (w, h).into())
+    }
+
+    #[test]
+    fn test_compute_toplevel_x11_location_single_multi_negative_and_maximized() {
+        let empty: HashSet<u32> = HashSet::new();
+
+        // Detached / zero outputs still produces a valid `(0, 0)` origin.
+        assert_eq!(
+            compute_toplevel_x11_location(&[], &empty, (800, 600), false),
+            (0, 0).into()
+        );
+
+        // Single 1920x1080 monitor: floating window is centered so popups/drags
+        // have positive room on every side; maximized/full-size/oversized clamp
+        // cleanly to `(0, 0)`.
+        let single = [(1, rect(0, 0, 1920, 1080))];
+        assert_eq!(
+            compute_toplevel_x11_location(&single, &empty, (800, 600), false),
+            (560, 240).into()
+        );
+        assert_eq!(
+            compute_toplevel_x11_location(&single, &empty, (800, 600), true),
+            (0, 0).into()
+        );
+        assert_eq!(
+            compute_toplevel_x11_location(&single, &empty, (1920, 1080), false),
+            (0, 0).into()
+        );
+        assert_eq!(
+            compute_toplevel_x11_location(&single, &empty, (2400, 1400), false),
+            (0, 0).into()
+        );
+
+        // Multi-monitor: surface on monitor 2 lands on monitor 2; surface with
+        // no entered outputs picks the leftmost monitor deterministically.
+        let dual = [(2, rect(1920, 0, 2560, 1440)), (1, rect(0, 0, 1920, 1080))];
+        assert_eq!(
+            compute_toplevel_x11_location(&dual, &empty, (800, 600), false),
+            (560, 240).into()
+        );
+        let on_second = HashSet::from([2]);
+        assert_eq!(
+            compute_toplevel_x11_location(&dual, &on_second, (800, 600), false),
+            (2800, 420).into()
+        );
+        assert_eq!(
+            compute_toplevel_x11_location(&dual, &on_second, (800, 600), true),
+            (1920, 0).into()
+        );
+
+        // Negative logical position is shifted into non-negative X11 root space.
+        let negative_left = [(1, rect(-1920, 0, 1920, 1080)), (2, rect(0, 0, 2560, 1440))];
+        let on_first = HashSet::from([1]);
+        assert_eq!(
+            compute_toplevel_x11_location(&negative_left, &on_first, (800, 600), false),
+            (560, 240).into()
+        );
+        assert_eq!(
+            compute_toplevel_x11_location(&negative_left, &on_second, (800, 600), true),
+            (1920, 0).into()
+        );
+    }
+
+    #[test]
+    fn test_toplevel_needs_output_reposition() {
+        let dual = [(1, rect(0, 0, 1920, 1080)), (2, rect(1920, 0, 2560, 1440))];
+        let geo_on_m1 = rect(560, 240, 800, 600);
+        assert!(!toplevel_needs_output_reposition(
+            &dual,
+            &HashSet::new(),
+            geo_on_m1
+        ));
+        assert!(!toplevel_needs_output_reposition(
+            &dual,
+            &HashSet::from([1]),
+            geo_on_m1
+        ));
+        // Straddling both monitors still matches monitor 1: do not jump.
+        assert!(!toplevel_needs_output_reposition(
+            &dual,
+            &HashSet::from([1, 2]),
+            geo_on_m1
+        ));
+        // Strictly on monitor 2: reposition into monitor 2.
+        assert!(toplevel_needs_output_reposition(
+            &dual,
+            &HashSet::from([2]),
+            geo_on_m1
+        ));
+        // Unknown output ID does not trigger a spurious reposition.
+        assert!(!toplevel_needs_output_reposition(
+            &dual,
+            &HashSet::from([99]),
+            geo_on_m1
+        ));
+    }
+
+    #[derive(Default)]
+    struct TestClientState {
+        compositor_state: CompositorClientState,
+    }
+
+    impl ClientData for TestClientState {
+        fn initialized(&self, _client_id: ClientId) {}
+        fn disconnected(&self, _client_id: ClientId, _reason: DisconnectReason) {}
+    }
+
+    struct MiniServer {
+        compositor_state: CompositorState,
+        _output_manager_state: OutputManagerState,
+        outputs: HashMap<u32, (Output, GlobalId)>,
+        last_commit: Option<(i32, SmithayWlTransform)>,
+    }
+
+    impl CompositorHandler for MiniServer {
+        fn compositor_state(&mut self) -> &mut CompositorState {
+            &mut self.compositor_state
+        }
+
+        fn client_compositor_state<'a>(&self, client: &'a Client) -> &'a CompositorClientState {
+            &client
+                .get_data::<TestClientState>()
+                .unwrap()
+                .compositor_state
+        }
+
+        fn commit(&mut self, surface: &WlSurface) {
+            compositor::with_states(surface, |data| {
+                let mut guard = data.cached_state.get::<SurfaceAttributes>();
+                let attrs = guard.current();
+                self.last_commit = Some((attrs.buffer_scale, attrs.buffer_transform));
+            });
+        }
+    }
+
+    impl OutputHandler for MiniServer {}
+
+    smithay::delegate_compositor!(MiniServer);
+    smithay::delegate_output!(MiniServer);
+
+    #[derive(Debug, Default)]
+    struct ObservedOutput {
+        mode: Option<(i32, i32)>,
+        physical: Option<(i32, i32)>,
+        scale: Option<i32>,
+        name: Option<String>,
+        xdg_pos: Option<(i32, i32)>,
+        xdg_size: Option<(i32, i32)>,
+    }
+
+    #[derive(Default)]
+    struct MiniClient {
+        compositor: Option<WlCompositor>,
+        xdg_output_manager: Option<ZxdgOutputManagerV1>,
+        wl_outputs: HashMap<u32, wl_output::WlOutput>,
+        xdg_outputs: HashMap<u32, zxdg_output_v1::ZxdgOutputV1>,
+        observed: HashMap<u32, ObservedOutput>,
+    }
+
+    impl Dispatch<wl_registry::WlRegistry, ()> for MiniClient {
+        fn event(
+            state: &mut Self,
+            registry: &wl_registry::WlRegistry,
+            event: wl_registry::Event,
+            _data: &(),
+            _conn: &Connection,
+            qh: &QueueHandle<Self>,
+        ) {
+            if let wl_registry::Event::Global {
+                name,
+                interface,
+                version,
+            } = event
+            {
+                match interface.as_str() {
+                    "wl_compositor" => {
+                        state.compositor =
+                            Some(registry.bind::<WlCompositor, _, _>(name, version.min(6), qh, ()));
+                    },
+                    "zxdg_output_manager_v1" => {
+                        let mgr = registry.bind::<ZxdgOutputManagerV1, _, _>(
+                            name,
+                            version.min(3),
+                            qh,
+                            (),
+                        );
+                        for (&id, wl_out) in &state.wl_outputs {
+                            state
+                                .xdg_outputs
+                                .entry(id)
+                                .or_insert_with(|| mgr.get_xdg_output(wl_out, qh, id));
+                        }
+                        state.xdg_output_manager = Some(mgr);
+                    },
+                    "wl_output" => {
+                        let wl_out = registry.bind::<wl_output::WlOutput, _, _>(
+                            name,
+                            version.min(4),
+                            qh,
+                            name,
+                        );
+                        if let Some(mgr) = &state.xdg_output_manager {
+                            state
+                                .xdg_outputs
+                                .insert(name, mgr.get_xdg_output(&wl_out, qh, name));
+                        }
+                        state.wl_outputs.insert(name, wl_out);
+                        state.observed.entry(name).or_default();
+                    },
+                    _ => {},
+                }
+            }
+        }
+    }
+
+    impl Dispatch<wl_callback::WlCallback, Arc<AtomicBool>> for MiniClient {
+        fn event(
+            _state: &mut Self,
+            _proxy: &wl_callback::WlCallback,
+            event: wl_callback::Event,
+            done: &Arc<AtomicBool>,
+            _conn: &Connection,
+            _qh: &QueueHandle<Self>,
+        ) {
+            if matches!(event, wl_callback::Event::Done { .. }) {
+                done.store(true, Ordering::Release);
+            }
+        }
+    }
+
+    impl Dispatch<WlCompositor, ()> for MiniClient {
+        fn event(
+            _state: &mut Self,
+            _proxy: &WlCompositor,
+            _event: <WlCompositor as Proxy>::Event,
+            _data: &(),
+            _conn: &Connection,
+            _qh: &QueueHandle<Self>,
+        ) {
+        }
+    }
+
+    impl Dispatch<ClientWlSurface, ()> for MiniClient {
+        fn event(
+            _state: &mut Self,
+            _proxy: &ClientWlSurface,
+            _event: <ClientWlSurface as Proxy>::Event,
+            _data: &(),
+            _conn: &Connection,
+            _qh: &QueueHandle<Self>,
+        ) {
+        }
+    }
+
+    impl Dispatch<ZxdgOutputManagerV1, ()> for MiniClient {
+        fn event(
+            _state: &mut Self,
+            _proxy: &ZxdgOutputManagerV1,
+            _event: <ZxdgOutputManagerV1 as Proxy>::Event,
+            _data: &(),
+            _conn: &Connection,
+            _qh: &QueueHandle<Self>,
+        ) {
+        }
+    }
+
+    impl Dispatch<wl_output::WlOutput, u32> for MiniClient {
+        fn event(
+            state: &mut Self,
+            _proxy: &wl_output::WlOutput,
+            event: wl_output::Event,
+            id: &u32,
+            _conn: &Connection,
+            _qh: &QueueHandle<Self>,
+        ) {
+            let entry = state.observed.entry(*id).or_default();
+            match event {
+                wl_output::Event::Geometry {
+                    physical_width,
+                    physical_height,
+                    ..
+                } => {
+                    entry.physical = Some((physical_width, physical_height));
+                },
+                wl_output::Event::Mode {
+                    flags: WEnum::Value(flags),
+                    width,
+                    height,
+                    ..
+                } if flags.contains(wl_output::Mode::Current) => {
+                    entry.mode = Some((width, height));
+                },
+                wl_output::Event::Scale { factor } => entry.scale = Some(factor),
+                wl_output::Event::Name { name } => entry.name = Some(name),
+                _ => {},
+            }
+        }
+    }
+
+    impl Dispatch<zxdg_output_v1::ZxdgOutputV1, u32> for MiniClient {
+        fn event(
+            state: &mut Self,
+            _proxy: &zxdg_output_v1::ZxdgOutputV1,
+            event: zxdg_output_v1::Event,
+            id: &u32,
+            _conn: &Connection,
+            _qh: &QueueHandle<Self>,
+        ) {
+            let entry = state.observed.entry(*id).or_default();
+            match event {
+                zxdg_output_v1::Event::LogicalPosition { x, y } => entry.xdg_pos = Some((x, y)),
+                zxdg_output_v1::Event::LogicalSize { width, height } => {
+                    entry.xdg_size = Some((width, height));
+                },
+                _ => {},
+            }
+        }
+    }
+
+    fn roundtrip(
+        display: &mut Display<MiniServer>,
+        server: &mut MiniServer,
+        conn: &Connection,
+        queue: &mut EventQueue<MiniClient>,
+        client: &mut MiniClient,
+    ) {
+        let done = Arc::new(AtomicBool::new(false));
+        let _cb = conn.display().sync(&queue.handle(), Arc::clone(&done));
+        conn.flush().unwrap();
+        display.dispatch_clients(server).unwrap();
+        display.flush_clients().unwrap();
+        while !done.load(Ordering::Acquire) {
+            queue.blocking_dispatch(client).unwrap();
+        }
+    }
+
+    #[test]
+    #[cfg_attr(miri, ignore)]
+    fn test_xwayland_compositor_outputs_and_surface_scale_wire() {
+        let mut display: Display<MiniServer> = Display::new().unwrap();
+        let mut dh = display.handle();
+        let mut server = MiniServer {
+            compositor_state: CompositorState::new::<MiniServer>(&dh),
+            _output_manager_state: OutputManagerState::new_with_xdg_output::<MiniServer>(&dh),
+            outputs: HashMap::new(),
+            last_commit: None,
+        };
+
+        let (server_sock, client_sock) = UnixStream::pair().unwrap();
+        dh.insert_client(server_sock, Arc::new(TestClientState::default()))
+            .unwrap();
+        let conn = Connection::from_socket(client_sock).unwrap();
+        let mut queue: EventQueue<MiniClient> = conn.new_event_queue();
+        let qh = queue.handle();
+        let _registry = conn.display().get_registry(&qh, ());
+        let mut client = MiniClient::default();
+
+        // Advertise two real outputs (including fractional scale) through
+        // `create_or_update_output` — must NOT inflate dimensions by 3x.
+        let out_1 = OutputInfo {
+            id: 1,
+            model: "Laptop".to_string(),
+            make: "Vendor".to_string(),
+            location: (0, 0).into(),
+            physical_size: (300, 190).into(),
+            subpixel: SerSubpixel::HorizontalRgb,
+            transform: SerTransform::Normal,
+            scale_factor: 1,
+            mode: SerMode {
+                dimensions: (1920, 1200).into(),
+                refresh_rate: 60000,
+                current: true,
+                preferred: true,
+            },
+            logical_position: Some((0, 0).into()),
+            logical_size: Some((1920, 1200).into()),
+            name: Some("eDP-1".to_string()),
+            description: None,
+        };
+        let out_2 = OutputInfo {
+            id: 2,
+            model: "External4K".to_string(),
+            make: "Vendor".to_string(),
+            location: (0, 0).into(),
+            physical_size: (600, 340).into(),
+            subpixel: SerSubpixel::HorizontalRgb,
+            transform: SerTransform::Normal,
+            scale_factor: 2,
+            mode: SerMode {
+                dimensions: (3840, 2160).into(),
+                refresh_rate: 60000,
+                current: true,
+                preferred: true,
+            },
+            logical_position: Some((1920, 0).into()),
+            logical_size: Some((2560, 1440).into()),
+            name: Some("DP-1".to_string()),
+            description: None,
+        };
+        let o1 = create_or_update_output::<MiniServer>(&mut server.outputs, &dh, out_1);
+        let o2 = create_or_update_output::<MiniServer>(&mut server.outputs, &dh, out_2);
+        assert_eq!(output_logical_rect(&o1), Some(rect(0, 0, 1920, 1200)));
+        assert_eq!(output_logical_rect(&o2), Some(rect(1920, 0, 2560, 1440)));
+
+        roundtrip(&mut display, &mut server, &conn, &mut queue, &mut client);
+        roundtrip(&mut display, &mut server, &conn, &mut queue, &mut client);
+
+        assert!(client.xdg_output_manager.is_some());
+        let by_name: HashMap<String, &ObservedOutput> = client
+            .observed
+            .values()
+            .map(|o| (o.name.clone().expect("wl_output.name"), o))
+            .collect();
+        assert_eq!(by_name["1_eDP-1"].mode, Some((1920, 1200)));
+        assert_eq!(by_name["1_eDP-1"].physical, Some((300, 190)));
+        assert_eq!(by_name["1_eDP-1"].scale, Some(1));
+        assert_eq!(by_name["1_eDP-1"].xdg_pos, Some((0, 0)));
+        assert_eq!(by_name["1_eDP-1"].xdg_size, Some((1920, 1200)));
+
+        assert_eq!(by_name["2_DP-1"].mode, Some((3840, 2160)));
+        assert_eq!(by_name["2_DP-1"].physical, Some((600, 340)));
+        assert_eq!(by_name["2_DP-1"].scale, Some(2));
+        assert_eq!(by_name["2_DP-1"].xdg_pos, Some((1920, 0)));
+        assert_eq!(by_name["2_DP-1"].xdg_size, Some((2560, 1440)));
+
+        // Verify `XWaylandSurface::sync_buffer_scale_and_transform` clamps
+        // invalid scales and safely queues state while `local_surface` is None.
+        let mut pre_surface = XWaylandSurface::default();
+        assert!(!pre_surface.has_client_surface());
+        pre_surface.sync_buffer_scale_and_transform(0, SctkTransform::_90);
+        assert_eq!(pre_surface.buffer_scale, 1);
+        assert_eq!(pre_surface.buffer_transform, SctkTransform::_90);
+        pre_surface.sync_buffer_scale_and_transform(2, SctkTransform::_180);
+        assert_eq!(pre_surface.buffer_scale, 2);
+        assert_eq!(pre_surface.buffer_transform, SctkTransform::_180);
+
+        // Verify real wire transmission of scale + transform when a client
+        // surface exists.
+        let wl_surface = client.compositor.as_ref().unwrap().create_surface(&qh, ());
+        wl_surface.set_buffer_scale(pre_surface.buffer_scale);
+        wl_surface.set_buffer_transform(pre_surface.buffer_transform);
+        wl_surface.commit();
+        roundtrip(&mut display, &mut server, &conn, &mut queue, &mut client);
+        assert_eq!(server.last_commit, Some((2, SmithayWlTransform::_180)));
+    }
+}
