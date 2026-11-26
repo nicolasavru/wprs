@@ -28,6 +28,7 @@ use png::Decoder;
 use rkyv::util::AlignedVec;
 use wprs::buffer_pointer::BufferPointer;
 use wprs::filtering;
+use wprs::serialization::CompressionMode;
 use wprs::serialization::wayland::BufferFormat;
 use wprs::serialization::wayland::BufferMetadata;
 use wprs::sharding_compression::ShardingCompressor;
@@ -78,11 +79,21 @@ fn filter_compress_png(c: &mut Criterion, path: &Path) {
     let n_compressors = NonZeroUsize::new(16).unwrap();
     let mut compressor = ShardingCompressor::new(n_compressors, 1).unwrap();
 
-    let mut compressed_tiles = filtering::filter_and_compress(buf_ptr, metadata, &mut compressor);
+    let mut compressed_tiles = filtering::filter_and_compress(
+        buf_ptr,
+        metadata,
+        CompressionMode::Lossless,
+        &mut compressor,
+    );
 
     c.bench_function(&format!("filter and compress: {}", path.display()), |b| {
         b.iter(|| {
-            compressed_tiles = filtering::filter_and_compress(buf_ptr, metadata, &mut compressor);
+            compressed_tiles = filtering::filter_and_compress(
+                buf_ptr,
+                metadata,
+                CompressionMode::Lossless,
+                &mut compressor,
+            );
         })
     });
 

@@ -17,7 +17,7 @@ ARG BASE_IMAGE=debian:trixie
 FROM ${BASE_IMAGE}
 
 RUN apt update && \ 
-    apt install -y curl libxkbcommon-dev libwayland-dev devscripts pkg-config
+    apt install -y curl libxkbcommon-dev libwayland-dev devscripts pkg-config cmake nasm
 
 RUN curl --proto '=https' --tlsv1.2 -OsSf \
     https://static.rust-lang.org/rustup/archive/1.27.1/x86_64-unknown-linux-gnu/rustup-init && \

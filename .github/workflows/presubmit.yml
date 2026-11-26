@@ -15,7 +15,7 @@ jobs:
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
       - uses: moonrepo/setup-rust@abb2d32350334249b178c401e5ec5836e0cd88d3  # v1.3.0
-      - run: sudo apt-get install libwayland-dev libxkbcommon-dev
+      - run: sudo apt-get install libwayland-dev libxkbcommon-dev cmake nasm
       - run: cargo test --all-features
       - name: Test non-AVX2 x86 SIMD backends
         run: |
@@ -38,7 +38,7 @@ jobs:
         with:
           components: miri
           channel: nightly
-      - run: sudo apt-get install libwayland-dev libxkbcommon-dev
+      - run: sudo apt-get install libwayland-dev libxkbcommon-dev cmake nasm
       - run: cargo +nightly miri test
 
   rustfmt:
@@ -64,7 +64,7 @@ jobs:
           components: clippy
           bins: cargo-cranky@0.3.0
           channel: nightly
-      - run: sudo apt-get install libwayland-dev libxkbcommon-dev
+      - run: sudo apt-get install libwayland-dev libxkbcommon-dev cmake nasm
       - run: cargo +nightly cranky --all-targets -- -D warnings
       - name: Lint non-AVX2 x86 SIMD backends
         run: |
@@ -84,7 +84,7 @@ jobs:
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
       - uses: moonrepo/setup-rust@abb2d32350334249b178c401e5ec5836e0cd88d3  # v1.3.0
-      - run: sudo apt-get install libwayland-dev libxkbcommon-dev
+      - run: sudo apt-get install libwayland-dev libxkbcommon-dev cmake
       - run: cargo test --all-features
 
   cranky-aarch64:
@@ -98,7 +98,7 @@ jobs:
           components: clippy
           bins: cargo-cranky@0.3.0
           channel: nightly
-      - run: sudo apt-get install libwayland-dev libxkbcommon-dev
+      - run: sudo apt-get install libwayland-dev libxkbcommon-dev cmake
       - run: cargo +nightly cranky --all-targets -- -D warnings
 
   deny:

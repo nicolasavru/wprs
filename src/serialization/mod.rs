@@ -68,7 +68,9 @@ pub mod wayland;
 pub mod xdg_shell;
 
 use framing::CompressedTileStream;
+pub use framing::CompressionMode;
 use framing::Framed;
+pub use framing::JpegSubsamp;
 use framing::ObjectCompressor;
 use framing::ObjectDecompressor;
 use framing::StreamingCompressedTiles;
@@ -121,6 +123,7 @@ pub enum Event {
     Popup(xdg_shell::PopupEvent),
     Data(wayland::DataEvent),
     Surface(wayland::SurfaceEvent),
+    SetCompressionMode(CompressionMode),
 }
 
 // TODO: test that object ids with same value from different clients hash

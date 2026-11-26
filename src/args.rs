@@ -13,6 +13,7 @@
 // limitations under the License.
 
 use std::env;
+use std::fmt;
 use std::fmt::Debug;
 use std::fs;
 use std::path::Path;
@@ -32,6 +33,10 @@ use tracing::Level;
 use tracing::metadata::ParseLevelError;
 
 use crate::prelude::*;
+use crate::serialization::framing::DEFAULT_JPEG_QUALITY;
+use crate::serialization::framing::JpegSubsamp;
+use crate::serialization::framing::MAX_JPEG_QUALITY;
+use crate::serialization::framing::MIN_JPEG_QUALITY;
 
 pub trait Config: Debug + Default + Serialize {
     fn config_file(&self) -> PathBuf;
@@ -243,6 +248,112 @@ pub fn title_prefix() -> impl Parser<Option<String>> {
         .optional()
 }
 
+/// CLI/config selector for the frame compression mode (`lossless` vs `hybrid`).
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Deserialize, Serialize)]
+pub enum CompressionKind {
+    #[default]
+    Lossless,
+    Hybrid,
+}
+
+impl fmt::Display for CompressionKind {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(match self {
+            Self::Lossless => "lossless",
+            Self::Hybrid => "hybrid",
+        })
+    }
+}
+
+impl FromStr for CompressionKind {
+    type Err = anyhow::Error;
+
+    fn from_str(s: &str) -> Result<Self> {
+        match s {
+            "lossless" => Ok(Self::Lossless),
+            "hybrid" => Ok(Self::Hybrid),
+            _ => bail!("invalid compression mode {s:?}: expected \"lossless\" or \"hybrid\""),
+        }
+    }
+}
+
+/// Validated JPEG quality (`1..=100`, default `90`) serialized as a plain `u8`
+/// in RON config files so out-of-range values fail at both CLI and config parse time.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct JpegQuality(u8);
+
+impl JpegQuality {
+    pub fn new(value: u8) -> Result<Self> {
+        if !(MIN_JPEG_QUALITY..=MAX_JPEG_QUALITY).contains(&value) {
+            bail!("invalid JPEG quality {value}: expected {MIN_JPEG_QUALITY}..={MAX_JPEG_QUALITY}");
+        }
+        Ok(Self(value))
+    }
+
+    pub const fn get(self) -> u8 {
+        self.0
+    }
+}
+
+impl Default for JpegQuality {
+    fn default() -> Self {
+        Self(DEFAULT_JPEG_QUALITY)
+    }
+}
+
+impl fmt::Display for JpegQuality {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{}", self.0)
+    }
+}
+
+impl FromStr for JpegQuality {
+    type Err = anyhow::Error;
+
+    fn from_str(s: &str) -> Result<Self> {
+        let value = u8::from_str(s)
+            .with_context(loc!(), || format!("invalid JPEG quality {s:?}: expected integer {MIN_JPEG_QUALITY}..={MAX_JPEG_QUALITY}"))?;
+        Self::new(value)
+    }
+}
+
+impl Serialize for JpegQuality {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        serializer.serialize_u8(self.0)
+    }
+}
+
+impl<'de> Deserialize<'de> for JpegQuality {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        let value = u8::deserialize(deserializer)?;
+        Self::new(value).map_err(serde::de::Error::custom)
+    }
+}
+
+pub fn compression_mode() -> impl Parser<Option<CompressionKind>> {
+    bpaf::long("compression-mode")
+        .argument::<String>("MODE")
+        .help("Frame compression mode: lossless (default) or hybrid (TextSafe TurboJPEG).")
+        .parse(|s| CompressionKind::from_str(&s))
+        .optional()
+}
+
+pub fn jpeg_quality() -> impl Parser<Option<JpegQuality>> {
+    bpaf::long("jpeg-quality")
+        .argument::<String>("QUALITY")
+        .help("JPEG quality (1..=100, default 90) used in hybrid compression mode.")
+        .parse(|s| JpegQuality::from_str(&s))
+        .optional()
+}
+
+pub fn jpeg_subsamp() -> impl Parser<Option<JpegSubsamp>> {
+    bpaf::long("jpeg-subsamp")
+        .argument::<String>("SUBSAMP")
+        .help("JPEG chroma subsampling (444, 422, or 420; default 444) used in hybrid compression mode.")
+        .parse(|s| JpegSubsamp::from_str(&s))
+        .optional()
+}
+
 pub static LOG_PRIV_DATA: AtomicBool = AtomicBool::new(false);
 
 pub fn set_log_priv_data(val: bool) {
@@ -251,4 +362,76 @@ pub fn set_log_priv_data(val: bool) {
 
 pub fn get_log_priv_data() -> bool {
     LOG_PRIV_DATA.load(Ordering::Relaxed)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_compression_cli_and_ron_parsing() {
+        // CompressionKind Display / FromStr / RON
+        assert_eq!(CompressionKind::default(), CompressionKind::Lossless);
+        for (s, expected) in [
+            ("lossless", CompressionKind::Lossless),
+            ("hybrid", CompressionKind::Hybrid),
+        ] {
+            assert_eq!(CompressionKind::from_str(s).unwrap(), expected);
+            assert_eq!(expected.to_string(), s);
+        }
+        for bad in ["", "Lossless", "jpeg", "lossy"] {
+            assert!(CompressionKind::from_str(bad).is_err());
+        }
+
+        // JpegQuality bounds (`1..=100`), CLI parser, and RON roundtrip / rejection
+        assert_eq!(JpegQuality::default().get(), DEFAULT_JPEG_QUALITY);
+        assert_eq!(JpegQuality::from_str("1").unwrap().get(), 1);
+        assert_eq!(JpegQuality::from_str("90").unwrap().get(), 90);
+        assert_eq!(JpegQuality::from_str("100").unwrap().get(), 100);
+        assert_eq!(JpegQuality::new(85).unwrap().to_string(), "85");
+        for bad in ["0", "101", "255", "-1", "abc"] {
+            assert!(JpegQuality::from_str(bad).is_err());
+        }
+        let ron_q = ron::to_string(&JpegQuality::new(85).unwrap()).unwrap();
+        assert_eq!(ron_q, "85");
+        assert_eq!(
+            ron::from_str::<JpegQuality>(&ron_q).unwrap(),
+            JpegQuality::new(85).unwrap()
+        );
+        assert!(ron::from_str::<JpegQuality>("0").is_err());
+        assert!(ron::from_str::<JpegQuality>("101").is_err());
+
+        // bpaf parsers accept valid flags and reject out-of-range / invalid values
+        let empty: &[&str] = &[];
+        let mode_opts = compression_mode().to_options();
+        assert_eq!(mode_opts.run_inner(empty).unwrap(), None);
+        assert_eq!(
+            mode_opts
+                .run_inner(&["--compression-mode", "hybrid"][..])
+                .unwrap(),
+            Some(CompressionKind::Hybrid)
+        );
+        assert!(
+            mode_opts
+                .run_inner(&["--compression-mode", "turbo"][..])
+                .is_err()
+        );
+
+        let qual_opts = jpeg_quality().to_options();
+        assert_eq!(qual_opts.run_inner(empty).unwrap(), None);
+        assert_eq!(
+            qual_opts.run_inner(&["--jpeg-quality", "85"][..]).unwrap(),
+            Some(JpegQuality::new(85).unwrap())
+        );
+        assert!(qual_opts.run_inner(&["--jpeg-quality", "0"][..]).is_err());
+        assert!(qual_opts.run_inner(&["--jpeg-quality", "101"][..]).is_err());
+
+        let sub_opts = jpeg_subsamp().to_options();
+        assert_eq!(sub_opts.run_inner(empty).unwrap(), None);
+        assert_eq!(
+            sub_opts.run_inner(&["--jpeg-subsamp", "420"][..]).unwrap(),
+            Some(JpegSubsamp::Sub420)
+        );
+        assert!(sub_opts.run_inner(&["--jpeg-subsamp", "411"][..]).is_err());
+    }
 }

@@ -3,7 +3,7 @@ Section: unknown
 Priority: optional
 Maintainer: Nicolas Avrutin <rasputin@google.com>
 Standards-Version: 4.0.0
-Build-Depends: build-essential, debhelper-compat (= 13), pkg-config, libxkbcommon-dev, libwayland-dev
+Build-Depends: build-essential, debhelper-compat (= 13), pkg-config, libxkbcommon-dev, libwayland-dev, cmake, nasm [amd64 i386]
 Vcs-browser: https://github.com/wayland-transpositor/wprs
 Homepage: https://github.com/wayland-transpositor/wprs
 Rules-Requires-Root: no

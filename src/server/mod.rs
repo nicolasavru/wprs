@@ -48,6 +48,7 @@ use crate::serialization::wayland::SurfaceRequest;
 use crate::serialization::wayland::SurfaceRequestPayload;
 use crate::serialization::wayland::SurfaceState;
 use crate::serialization::wayland::WlSurfaceId;
+use crate::serialization::CompressionMode;
 use crate::serialization::Event;
 use crate::serialization::Request;
 use crate::serialization::SendType;
@@ -121,6 +122,7 @@ pub struct WprsServerState {
 
     pub serializer: Serializer<Request, Event>,
     pub compressor: ShardingCompressor,
+    pub compression_mode: CompressionMode,
     /// Reverse map from WlSurfaceId, which is the hash of ObjectId, back to its
     /// source ObjectId. We can't put this in SurfaceState because is
     /// serializable, while this only has meaning locally. We need this for
@@ -186,6 +188,7 @@ impl WprsServerState {
             serializer,
             // TODO: try tuning this based on the number of cpus the machine has.
             compressor: ShardingCompressor::new(NonZeroUsize::new(16).unwrap(), 1).unwrap(),
+            compression_mode: CompressionMode::Lossless,
             object_map: HashMap::new(),
             synced_buffers: HashMap::new(),
             dirty_sync_surfaces: HashSet::new(),

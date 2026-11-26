@@ -17,8 +17,12 @@ use std::fmt;
 use std::io::Read;
 use std::io::Write;
 use std::mem;
+use std::str::FromStr;
 
 use crossbeam_channel::Receiver;
+use rkyv::Archive;
+use rkyv::Deserialize;
+use rkyv::Serialize;
 use rkyv::util::AlignedVec;
 use static_assertions::const_assert;
 use zstd::bulk::Compressor;
@@ -32,6 +36,115 @@ use crate::serialization::wayland::BufferMetadata;
 use crate::serialization::wayland::WlSurfaceId;
 
 const_assert!(mem::size_of::<usize>() >= mem::size_of::<u32>());
+
+/// Minimum allowed JPEG quality for [`CompressionMode::Hybrid`].
+pub const MIN_JPEG_QUALITY: u8 = 1;
+
+/// Maximum allowed JPEG quality for [`CompressionMode::Hybrid`].
+pub const MAX_JPEG_QUALITY: u8 = 100;
+
+/// Default JPEG quality for [`CompressionMode::Hybrid`].
+pub const DEFAULT_JPEG_QUALITY: u8 = 90;
+
+/// Chroma subsampling mode for lossy TurboJPEG tiles in hybrid compression.
+#[derive(
+    Archive,
+    Deserialize,
+    Serialize,
+    serde_derive::Deserialize,
+    serde_derive::Serialize,
+    Debug,
+    Copy,
+    Clone,
+    Eq,
+    PartialEq,
+    Default,
+)]
+pub enum JpegSubsamp {
+    #[default]
+    Sub444,
+    Sub422,
+    Sub420,
+}
+
+impl From<JpegSubsamp> for turbojpeg::Subsamp {
+    fn from(subsamp: JpegSubsamp) -> Self {
+        match subsamp {
+            JpegSubsamp::Sub444 => Self::None,
+            JpegSubsamp::Sub422 => Self::Sub2x1,
+            JpegSubsamp::Sub420 => Self::Sub2x2,
+        }
+    }
+}
+
+impl fmt::Display for JpegSubsamp {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(match self {
+            Self::Sub444 => "444",
+            Self::Sub422 => "422",
+            Self::Sub420 => "420",
+        })
+    }
+}
+
+impl FromStr for JpegSubsamp {
+    type Err = anyhow::Error;
+
+    fn from_str(s: &str) -> Result<Self> {
+        match s {
+            "444" => Ok(Self::Sub444),
+            "422" => Ok(Self::Sub422),
+            "420" => Ok(Self::Sub420),
+            _ => bail!("invalid JPEG subsampling {s:?}: expected \"444\", \"422\", or \"420\""),
+        }
+    }
+}
+
+/// Client-selected frame compression mode negotiated over [`crate::serialization::Event::SetCompressionMode`].
+#[derive(
+    Archive,
+    Deserialize,
+    Serialize,
+    serde_derive::Deserialize,
+    serde_derive::Serialize,
+    Debug,
+    Copy,
+    Clone,
+    Eq,
+    PartialEq,
+    Default,
+)]
+pub enum CompressionMode {
+    #[default]
+    Lossless,
+    Hybrid {
+        quality: u8,
+        subsamp: JpegSubsamp,
+    },
+}
+
+impl CompressionMode {
+    pub const fn hybrid_default() -> Self {
+        Self::Hybrid {
+            quality: DEFAULT_JPEG_QUALITY,
+            subsamp: JpegSubsamp::Sub444,
+        }
+    }
+
+    pub fn validate(self) -> Result<()> {
+        match self {
+            Self::Lossless => Ok(()),
+            Self::Hybrid { quality, .. } => {
+                if !(MIN_JPEG_QUALITY..=MAX_JPEG_QUALITY).contains(&quality) {
+                    bail!(
+                        "invalid JPEG quality {quality}: expected {MIN_JPEG_QUALITY}..={MAX_JPEG_QUALITY}"
+                    );
+                }
+                Ok(())
+            },
+        }
+    }
+}
 
 /// Nominal 2D tile width in pixels.
 pub const TILE_W: usize = 256;
@@ -608,8 +721,80 @@ impl fmt::Debug for AlphaChannel {
     }
 }
 
+/// Upper bound on valid JPEG payload size for a tile with `pixels` pixels,
+/// enforced before allocating on wire reads (`<= 458,752 B` for a `256x256`
+/// tile, exceeding `tj3JPEGBufSize` even for Q100 4:4:4 random noise).
+#[inline]
+pub(crate) fn max_jpeg_bytes(pixels: usize) -> usize {
+    pixels * 6 + 65_536
+}
+
+/// Returns `true` iff `rect` exceeds `SUBTILE_W x SUBTILE_H` and may be
+/// subdivided into `2..=4` sub-tiles.
+#[inline]
+pub(crate) fn is_splittable_rect(rect: TileRect) -> bool {
+    rect.w > SUBTILE_W as u32 || rect.h > SUBTILE_H as u32
+}
+
+/// Validates that `sub_rect` is non-empty, strictly within `parent`, and
+/// disjoint from every rect in `prior`.
+fn validate_sub_rect_step(
+    parent: TileRect,
+    prior: &[SubTile],
+    sub_rect: TileRect,
+) -> Result<usize> {
+    let sub_px = sub_rect.checked_pixels().location(loc!())?;
+    let parent_x1 = parent
+        .x
+        .checked_add(parent.w)
+        .context(loc!(), "parent TileRect x + w overflow")?;
+    let parent_y1 = parent
+        .y
+        .checked_add(parent.h)
+        .context(loc!(), "parent TileRect y + h overflow")?;
+    let sx1 = sub_rect
+        .x
+        .checked_add(sub_rect.w)
+        .context(loc!(), "SubTile x + w overflow")?;
+    let sy1 = sub_rect
+        .y
+        .checked_add(sub_rect.h)
+        .context(loc!(), "SubTile y + h overflow")?;
+    if sub_rect.x < parent.x || sub_rect.y < parent.y || sx1 > parent_x1 || sy1 > parent_y1 {
+        bail!("SubTile {sub_rect:?} lies outside parent TileRect {parent:?}");
+    }
+    if prior.iter().any(|prev| prev.rect.overlaps(sub_rect)) {
+        bail!("SubTile {sub_rect:?} overlaps an earlier sub-tile in parent {parent:?}");
+    }
+    Ok(sub_px)
+}
+
+/// Validates that `sub_tiles` forms a strict non-overlapping partition of
+/// splittable `parent` (`2..=4` sub-tiles covering exact area `parent.w * parent.h`).
+pub(crate) fn validate_split_rects(parent: TileRect, sub_tiles: &[SubTile]) -> Result<()> {
+    if !is_splittable_rect(parent) {
+        bail!("Split payload on non-splittable tile {parent:?}");
+    }
+    if !(2..=4).contains(&sub_tiles.len()) {
+        bail!(
+            "invalid Split sub-tile count {}: expected 2..=4",
+            sub_tiles.len()
+        );
+    }
+    let parent_area = parent.checked_pixels().location(loc!())? as u64;
+    let mut covered_area = 0u64;
+    for (i, sub) in sub_tiles.iter().enumerate() {
+        let sub_px = validate_sub_rect_step(parent, &sub_tiles[..i], sub.rect).location(loc!())?;
+        covered_area += sub_px as u64;
+    }
+    if covered_area != parent_area {
+        bail!("Split sub-tiles cover {covered_area} pixels, expected {parent_area} for {parent:?}");
+    }
+    Ok(())
+}
+
 #[derive(Clone, Eq, PartialEq)]
-pub enum TilePayload {
+pub enum LeafPayload {
     Solid([u8; 4]),
     Palette {
         has_alpha: bool,
@@ -621,6 +806,22 @@ pub enum TilePayload {
         color: EncodedBytes,
         alpha: AlphaChannel,
     },
+    Jpeg {
+        data: Vec<u8>,
+        alpha: AlphaChannel,
+    },
+}
+
+#[derive(Debug, Clone, Eq, PartialEq)]
+pub struct SubTile {
+    pub rect: TileRect,
+    pub payload: LeafPayload,
+}
+
+#[derive(Clone, Eq, PartialEq)]
+pub enum TilePayload {
+    Leaf(LeafPayload),
+    Split(Vec<SubTile>),
 }
 
 const PAYLOAD_TAG_SOLID_OPAQUE: u8 = 0;
@@ -629,8 +830,11 @@ const PAYLOAD_TAG_PALETTE_OPAQUE: u8 = 2;
 const PAYLOAD_TAG_PALETTE_ALPHA: u8 = 3;
 const PAYLOAD_TAG_AOS_OPAQUE: u8 = 4;
 const PAYLOAD_TAG_AOS_ALPHA: u8 = 5;
+const PAYLOAD_TAG_JPEG_OPAQUE: u8 = 6;
+const PAYLOAD_TAG_JPEG_ALPHA: u8 = 7;
+const PAYLOAD_TAG_SPLIT: u8 = 8;
 
-impl TilePayload {
+impl LeafPayload {
     fn payload_len(&self) -> usize {
         match self {
             Self::Solid(px) => {
@@ -646,6 +850,7 @@ impl TilePayload {
                 color,
                 alpha,
             } => predictors.len() + color.len() + alpha.payload_len(),
+            Self::Jpeg { data, alpha } => data.len() + alpha.payload_len(),
         }
     }
 
@@ -736,17 +941,41 @@ impl TilePayload {
                     alpha.write_framed(pixels, stream).location(loc!())?;
                 }
             },
+            Self::Jpeg { data, alpha } => {
+                let max_bytes = max_jpeg_bytes(pixels);
+                if data.is_empty() || data.len() > max_bytes {
+                    bail!(
+                        "invalid JPEG payload len {} (expected 1..={max_bytes})",
+                        data.len()
+                    );
+                }
+                if matches!(alpha, AlphaChannel::Omitted) {
+                    PAYLOAD_TAG_JPEG_OPAQUE
+                        .framed_write(stream)
+                        .location(loc!())?;
+                    data.framed_write(stream).location(loc!())?;
+                } else {
+                    if !has_alpha {
+                        bail!("non-omitted AlphaChannel on Xrgb8888 buffer");
+                    }
+                    PAYLOAD_TAG_JPEG_ALPHA
+                        .framed_write(stream)
+                        .location(loc!())?;
+                    data.framed_write(stream).location(loc!())?;
+                    alpha.write_framed(pixels, stream).location(loc!())?;
+                }
+            },
         }
         Ok(())
     }
 
-    fn read_framed<R: Read>(
+    fn read_framed_with_tag<R: Read>(
+        tag: u8,
         rect: TileRect,
         pixels: usize,
         has_alpha: bool,
         stream: &mut R,
     ) -> Result<Self> {
-        let tag = u8::framed_read(stream).location(loc!())?;
         match tag {
             PAYLOAD_TAG_SOLID_OPAQUE => {
                 let mut bgr = [0u8; 3];
@@ -800,12 +1029,38 @@ impl TilePayload {
                     alpha,
                 })
             },
-            _ => bail!("invalid TilePayload tag: {tag}"),
+            PAYLOAD_TAG_JPEG_OPAQUE | PAYLOAD_TAG_JPEG_ALPHA => {
+                let with_alpha = tag == PAYLOAD_TAG_JPEG_ALPHA;
+                if with_alpha && !has_alpha {
+                    bail!("unexpected alpha payload on Xrgb8888 buffer");
+                }
+                let data = read_bounded_vec(stream, max_jpeg_bytes(pixels)).location(loc!())?;
+                if data.is_empty() {
+                    bail!("empty JPEG payload");
+                }
+                let alpha = if with_alpha {
+                    AlphaChannel::read_framed(pixels, stream).location(loc!())?
+                } else {
+                    AlphaChannel::Omitted
+                };
+                Ok(Self::Jpeg { data, alpha })
+            },
+            _ => bail!("invalid LeafPayload tag: {tag}"),
         }
+    }
+
+    fn read_framed<R: Read>(
+        rect: TileRect,
+        pixels: usize,
+        has_alpha: bool,
+        stream: &mut R,
+    ) -> Result<Self> {
+        let tag = u8::framed_read(stream).location(loc!())?;
+        Self::read_framed_with_tag(tag, rect, pixels, has_alpha, stream)
     }
 }
 
-impl fmt::Debug for TilePayload {
+impl fmt::Debug for LeafPayload {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::Solid(px) => write!(f, "Solid({px:?})"),
@@ -829,6 +1084,103 @@ impl fmt::Debug for TilePayload {
                 .field("color", color)
                 .field("alpha", alpha)
                 .finish(),
+            Self::Jpeg { data, alpha } => f
+                .debug_struct("Jpeg")
+                .field("bytes", &data.len())
+                .field("alpha", alpha)
+                .finish(),
+        }
+    }
+}
+
+impl TilePayload {
+    fn payload_len(&self) -> usize {
+        match self {
+            Self::Leaf(leaf) => leaf.payload_len(),
+            Self::Split(subs) => {
+                1 + subs
+                    .iter()
+                    .map(|s| TILE_RECT_LEN + 1 + s.payload.payload_len())
+                    .sum::<usize>()
+            },
+        }
+    }
+
+    fn write_framed<W: Write>(
+        &self,
+        rect: TileRect,
+        pixels: usize,
+        has_alpha: bool,
+        stream: &mut W,
+    ) -> Result<()> {
+        match self {
+            Self::Leaf(leaf) => leaf.write_framed(rect, pixels, has_alpha, stream),
+            Self::Split(sub_tiles) => {
+                validate_split_rects(rect, sub_tiles).location(loc!())?;
+                PAYLOAD_TAG_SPLIT.framed_write(stream).location(loc!())?;
+                (sub_tiles.len() as u8)
+                    .framed_write(stream)
+                    .location(loc!())?;
+                for sub in sub_tiles {
+                    let sub_px = sub.rect.checked_pixels().location(loc!())?;
+                    sub.rect.write_framed(stream).location(loc!())?;
+                    sub.payload
+                        .write_framed(sub.rect, sub_px, has_alpha, stream)
+                        .location(loc!())?;
+                }
+                Ok(())
+            },
+        }
+    }
+
+    fn read_framed<R: Read>(
+        rect: TileRect,
+        pixels: usize,
+        has_alpha: bool,
+        stream: &mut R,
+    ) -> Result<Self> {
+        let tag = u8::framed_read(stream).location(loc!())?;
+        if tag == PAYLOAD_TAG_SPLIT {
+            if !is_splittable_rect(rect) {
+                bail!("unexpected Split payload on non-splittable tile {rect:?}");
+            }
+            let n_sub = usize::from(u8::framed_read(stream).location(loc!())?);
+            if !(2..=4).contains(&n_sub) {
+                bail!("invalid Split sub-tile count {n_sub}: expected 2..=4");
+            }
+            let mut sub_tiles = Vec::with_capacity(n_sub);
+            let mut covered_area = 0u64;
+            for _ in 0..n_sub {
+                let (sub_rect, sub_px) = TileRect::read_framed(stream).location(loc!())?;
+                validate_sub_rect_step(rect, &sub_tiles, sub_rect).location(loc!())?;
+                let payload = LeafPayload::read_framed(sub_rect, sub_px, has_alpha, stream)
+                    .location(loc!())?;
+                covered_area += sub_px as u64;
+                sub_tiles.push(SubTile {
+                    rect: sub_rect,
+                    payload,
+                });
+            }
+            if covered_area != pixels as u64 {
+                bail!(
+                    "Split sub-tiles cover {covered_area} pixels, expected {pixels} for {rect:?}"
+                );
+            }
+            Ok(Self::Split(sub_tiles))
+        } else {
+            Ok(Self::Leaf(
+                LeafPayload::read_framed_with_tag(tag, rect, pixels, has_alpha, stream)
+                    .location(loc!())?,
+            ))
+        }
+    }
+}
+
+impl fmt::Debug for TilePayload {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Leaf(leaf) => fmt::Debug::fmt(leaf, f),
+            Self::Split(subs) => f.debug_tuple("Split").field(subs).finish(),
         }
     }
 }
@@ -1256,31 +1608,38 @@ mod tests {
         let opaque_tiles = [
             CompressedTile {
                 tile_idx: 0,
-                payload: TilePayload::Solid([10, 20, 30, 0xFF]),
+                payload: TilePayload::Leaf(LeafPayload::Solid([10, 20, 30, 0xFF])),
             },
             CompressedTile {
                 tile_idx: 0,
-                payload: TilePayload::Palette {
+                payload: TilePayload::Leaf(LeafPayload::Palette {
                     has_alpha: false,
                     palette: vec![1, 2, 3, 4, 5, 6],
                     data: EncodedBytes::Uncompressed(vec![0x5A, 0x05]),
-                },
+                }),
             },
             CompressedTile {
                 tile_idx: 0,
-                payload: TilePayload::Palette {
+                payload: TilePayload::Leaf(LeafPayload::Palette {
                     has_alpha: false,
                     palette: vec![1; 17 * 3],
                     data: EncodedBytes::Zstd(vec![9, 8, 7]),
-                },
+                }),
             },
             CompressedTile {
                 tile_idx: 0,
-                payload: TilePayload::AosZstd {
+                payload: TilePayload::Leaf(LeafPayload::AosZstd {
                     predictors: vec![0b00_10_01_00],
                     color: EncodedBytes::Uncompressed(vec![7u8; 4 * 3 * 3]),
                     alpha: AlphaChannel::Omitted,
-                },
+                }),
+            },
+            CompressedTile {
+                tile_idx: 0,
+                payload: TilePayload::Leaf(LeafPayload::Jpeg {
+                    data: vec![0xFF, 0xD8, 0xFF, 0xD9],
+                    alpha: AlphaChannel::Omitted,
+                }),
             },
         ];
         for tile in &opaque_tiles {
@@ -1297,39 +1656,60 @@ mod tests {
         let translucent_tiles = [
             CompressedTile {
                 tile_idx: 0,
-                payload: TilePayload::Solid([10, 20, 30, 0x80]),
+                payload: TilePayload::Leaf(LeafPayload::Solid([10, 20, 30, 0x80])),
             },
             CompressedTile {
                 tile_idx: 0,
-                payload: TilePayload::Palette {
+                payload: TilePayload::Leaf(LeafPayload::Palette {
                     has_alpha: true,
                     palette: vec![1, 2, 3, 0x40, 4, 5, 6, 0xFF],
                     data: EncodedBytes::Uncompressed(vec![0x5A, 0x05]),
-                },
+                }),
             },
             CompressedTile {
                 tile_idx: 0,
-                payload: TilePayload::AosZstd {
+                payload: TilePayload::Leaf(LeafPayload::AosZstd {
                     predictors: vec![0],
                     color: EncodedBytes::Zstd(vec![1, 2, 3, 4]),
                     alpha: AlphaChannel::Constant(0x80),
-                },
+                }),
             },
             CompressedTile {
                 tile_idx: 0,
-                payload: TilePayload::AosZstd {
+                payload: TilePayload::Leaf(LeafPayload::AosZstd {
                     predictors: vec![0],
                     color: EncodedBytes::Zstd(vec![1, 2, 3, 4]),
                     alpha: AlphaChannel::Uncompressed(vec![0x55; 12]),
-                },
+                }),
             },
             CompressedTile {
                 tile_idx: 0,
-                payload: TilePayload::AosZstd {
+                payload: TilePayload::Leaf(LeafPayload::AosZstd {
                     predictors: vec![0],
                     color: EncodedBytes::Zstd(vec![1, 2, 3, 4]),
                     alpha: AlphaChannel::Zstd(vec![5, 6]),
-                },
+                }),
+            },
+            CompressedTile {
+                tile_idx: 0,
+                payload: TilePayload::Leaf(LeafPayload::Jpeg {
+                    data: vec![0xFF, 0xD8, 0xAA, 0xFF, 0xD9],
+                    alpha: AlphaChannel::Constant(0x80),
+                }),
+            },
+            CompressedTile {
+                tile_idx: 0,
+                payload: TilePayload::Leaf(LeafPayload::Jpeg {
+                    data: vec![0xFF, 0xD8, 0xBB, 0xFF, 0xD9],
+                    alpha: AlphaChannel::Uncompressed(vec![0x42; 12]),
+                }),
+            },
+            CompressedTile {
+                tile_idx: 0,
+                payload: TilePayload::Leaf(LeafPayload::Jpeg {
+                    data: vec![0xFF, 0xD8, 0xCC, 0xFF, 0xD9],
+                    alpha: AlphaChannel::Zstd(vec![7, 8, 9]),
+                }),
             },
         ];
         for tile in &translucent_tiles {
@@ -1445,15 +1825,15 @@ mod tests {
         };
         let tile0 = CompressedTile {
             tile_idx: 0,
-            payload: TilePayload::Solid([1, 2, 3, 0xFF]),
+            payload: TilePayload::Leaf(LeafPayload::Solid([1, 2, 3, 0xFF])),
         };
         let tile1 = CompressedTile {
             tile_idx: 1,
-            payload: TilePayload::AosZstd {
+            payload: TilePayload::Leaf(LeafPayload::AosZstd {
                 predictors: vec![0, 0],
                 color: EncodedBytes::Zstd(vec![1, 2, 3, 4, 5]),
                 alpha: AlphaChannel::Omitted,
-            },
+            }),
         };
         assert_eq!(
             CompressedTiles {
@@ -1583,27 +1963,27 @@ mod tests {
         let pred_len = 256usize.div_ceil(4);
         let large0 = CompressedTile {
             tile_idx: 0,
-            payload: TilePayload::AosZstd {
+            payload: TilePayload::Leaf(LeafPayload::AosZstd {
                 predictors: vec![0; pred_len],
                 color: EncodedBytes::Zstd(vec![0xAA; half_cap - pred_len]),
                 alpha: AlphaChannel::Omitted,
-            },
+            }),
         };
         let large1 = CompressedTile {
             tile_idx: 1,
-            payload: TilePayload::AosZstd {
+            payload: TilePayload::Leaf(LeafPayload::AosZstd {
                 predictors: vec![0; pred_len],
                 color: EncodedBytes::Zstd(vec![0xBB; half_cap - pred_len]),
                 alpha: AlphaChannel::Omitted,
-            },
+            }),
         };
         let small2 = CompressedTile {
             tile_idx: 2,
-            payload: TilePayload::Solid([5, 6, 7, 0xFF]),
+            payload: TilePayload::Leaf(LeafPayload::Solid([5, 6, 7, 0xFF])),
         };
         let small3 = CompressedTile {
             tile_idx: 3,
-            payload: TilePayload::Solid([8, 9, 10, 0xFF]),
+            payload: TilePayload::Leaf(LeafPayload::Solid([8, 9, 10, 0xFF])),
         };
         assert_eq!(
             large0.compressed_len() + large1.compressed_len(),
@@ -1821,5 +2201,269 @@ mod tests {
                 .read_framed_with(&mut bad_tag.as_slice(), |_| Ok(()))
                 .is_err()
         );
+    }
+
+    #[test]
+    fn test_compression_mode_and_jpeg_subsamp() {
+        assert_eq!(JpegSubsamp::default(), JpegSubsamp::Sub444);
+        assert_eq!(CompressionMode::default(), CompressionMode::Lossless);
+        assert_eq!(
+            CompressionMode::hybrid_default(),
+            CompressionMode::Hybrid {
+                quality: 90,
+                subsamp: JpegSubsamp::Sub444,
+            }
+        );
+
+        for (s, subsamp, tj) in [
+            ("444", JpegSubsamp::Sub444, turbojpeg::Subsamp::None),
+            ("422", JpegSubsamp::Sub422, turbojpeg::Subsamp::Sub2x1),
+            ("420", JpegSubsamp::Sub420, turbojpeg::Subsamp::Sub2x2),
+        ] {
+            assert_eq!(JpegSubsamp::from_str(s).unwrap(), subsamp);
+            assert_eq!(subsamp.to_string(), s);
+            assert_eq!(turbojpeg::Subsamp::from(subsamp), tj);
+        }
+        for bad in ["", "411", "440", "gray", "Sub444"] {
+            assert!(JpegSubsamp::from_str(bad).is_err());
+        }
+
+        assert!(CompressionMode::Lossless.validate().is_ok());
+        assert!(CompressionMode::hybrid_default().validate().is_ok());
+        assert!(
+            CompressionMode::Hybrid {
+                quality: 1,
+                subsamp: JpegSubsamp::Sub420,
+            }
+            .validate()
+            .is_ok()
+        );
+        assert!(
+            CompressionMode::Hybrid {
+                quality: 100,
+                subsamp: JpegSubsamp::Sub422,
+            }
+            .validate()
+            .is_ok()
+        );
+        for bad_q in [0u8, 101, 255] {
+            assert!(
+                CompressionMode::Hybrid {
+                    quality: bad_q,
+                    subsamp: JpegSubsamp::Sub444,
+                }
+                .validate()
+                .is_err()
+            );
+        }
+    }
+
+    #[test]
+    fn test_jpeg_and_split_framing_and_bounds() {
+        let tr = |x, y, w, h| TileRect { x, y, w, h };
+        let parent_256 = tr(256, 0, 256, 256);
+        let parent_256x128 = tr(0, 256, 256, 128);
+        let small_128 = tr(0, 0, 128, 128);
+
+        // 4-quadrant Split roundtrip (mixed Solid + Palette + AosZstd + Jpeg).
+        let split4 = CompressedTile {
+            tile_idx: 0,
+            payload: TilePayload::Split(vec![
+                SubTile {
+                    rect: tr(256, 0, 128, 128),
+                    payload: LeafPayload::Solid([1, 2, 3, 0xFF]),
+                },
+                SubTile {
+                    rect: tr(384, 0, 128, 128),
+                    payload: LeafPayload::Jpeg {
+                        data: vec![0xFF, 0xD8, 0x01, 0xFF, 0xD9],
+                        alpha: AlphaChannel::Omitted,
+                    },
+                },
+                SubTile {
+                    rect: tr(256, 128, 128, 128),
+                    payload: LeafPayload::Palette {
+                        has_alpha: false,
+                        palette: vec![10, 20, 30, 40, 50, 60],
+                        data: EncodedBytes::Zstd(vec![1, 2, 3]),
+                    },
+                },
+                SubTile {
+                    rect: tr(384, 128, 128, 128),
+                    payload: LeafPayload::Jpeg {
+                        data: vec![0xFF, 0xD8, 0x02, 0xFF, 0xD9],
+                        alpha: AlphaChannel::Constant(0x80),
+                    },
+                },
+            ]),
+        };
+        let mut wire = Vec::new();
+        split4.write_framed(parent_256, true, &mut wire).unwrap();
+        // Translucent sub-tile fails on Xrgb8888 (both write and read).
+        assert!(
+            split4
+                .write_framed(parent_256, false, &mut Vec::new())
+                .is_err()
+        );
+        assert!(CompressedTile::read_framed(&[parent_256], false, &mut wire.as_slice()).is_err());
+        let decoded =
+            CompressedTile::read_framed(&[parent_256], true, &mut wire.as_slice()).unwrap();
+        assert_eq!(decoded, split4);
+
+        // 2-quadrant Split on `256x128` roundtrip.
+        let split2 = CompressedTile {
+            tile_idx: 0,
+            payload: TilePayload::Split(vec![
+                SubTile {
+                    rect: tr(0, 256, 128, 128),
+                    payload: LeafPayload::Solid([9, 8, 7, 0xFF]),
+                },
+                SubTile {
+                    rect: tr(128, 256, 128, 128),
+                    payload: LeafPayload::Jpeg {
+                        data: vec![0xFF, 0xD8, 0xFF, 0xD9],
+                        alpha: AlphaChannel::Omitted,
+                    },
+                },
+            ]),
+        };
+        let mut wire2 = Vec::new();
+        split2
+            .write_framed(parent_256x128, false, &mut wire2)
+            .unwrap();
+        assert_eq!(
+            CompressedTile::read_framed(&[parent_256x128], false, &mut wire2.as_slice()).unwrap(),
+            split2
+        );
+
+        // Oversized JPEG length (`max_jpeg_bytes + 1`) rejected BEFORE reading/allocating payload.
+        let small_px = small_128.checked_pixels().unwrap();
+        let over_jpeg = max_jpeg_bytes(small_px) + 1;
+        let mut bad_jpeg_wire = Vec::new();
+        0u32.framed_write(&mut bad_jpeg_wire).unwrap();
+        PAYLOAD_TAG_JPEG_OPAQUE
+            .framed_write(&mut bad_jpeg_wire)
+            .unwrap();
+        over_jpeg.framed_write(&mut bad_jpeg_wire).unwrap();
+        let hdr_len = bad_jpeg_wire.len();
+        bad_jpeg_wire.resize(hdr_len + 16, 0xCD);
+        let mut rdr = bad_jpeg_wire.as_slice();
+        assert!(CompressedTile::read_framed(&[small_128], false, &mut rdr).is_err());
+        assert_eq!(rdr.len(), 16);
+
+        // Empty JPEG payload rejected on both write and read.
+        let empty_jpeg = CompressedTile {
+            tile_idx: 0,
+            payload: TilePayload::Leaf(LeafPayload::Jpeg {
+                data: Vec::new(),
+                alpha: AlphaChannel::Omitted,
+            }),
+        };
+        assert!(
+            empty_jpeg
+                .write_framed(small_128, false, &mut Vec::new())
+                .is_err()
+        );
+        let mut empty_jpeg_wire = Vec::new();
+        0u32.framed_write(&mut empty_jpeg_wire).unwrap();
+        PAYLOAD_TAG_JPEG_OPAQUE
+            .framed_write(&mut empty_jpeg_wire)
+            .unwrap();
+        0u32.framed_write(&mut empty_jpeg_wire).unwrap();
+        assert!(
+            CompressedTile::read_framed(&[small_128], false, &mut empty_jpeg_wire.as_slice())
+                .is_err()
+        );
+
+        // Split on non-splittable `<= 128x128` tile rejected before reading count.
+        let mut nonsplit_wire = Vec::new();
+        0u32.framed_write(&mut nonsplit_wire).unwrap();
+        PAYLOAD_TAG_SPLIT.framed_write(&mut nonsplit_wire).unwrap();
+        2u8.framed_write(&mut nonsplit_wire).unwrap();
+        let mut rdr = nonsplit_wire.as_slice();
+        assert!(CompressedTile::read_framed(&[small_128], false, &mut rdr).is_err());
+        assert_eq!(rdr.len(), 1);
+
+        // Invalid Split count (`0`, `1`, `5`) rejected BEFORE reading sub-tiles.
+        for bad_count in [0u8, 1, 5, 255] {
+            let mut bad_cnt_wire = Vec::new();
+            0u32.framed_write(&mut bad_cnt_wire).unwrap();
+            PAYLOAD_TAG_SPLIT.framed_write(&mut bad_cnt_wire).unwrap();
+            bad_count.framed_write(&mut bad_cnt_wire).unwrap();
+            bad_cnt_wire.extend_from_slice(&[0xEE; 16]);
+            let mut rdr = bad_cnt_wire.as_slice();
+            assert!(CompressedTile::read_framed(&[parent_256], false, &mut rdr).is_err());
+            assert_eq!(rdr.len(), 16);
+        }
+
+        // Nested Split (tag `PAYLOAD_TAG_SPLIT` inside a SubTile) must fail!
+        let mut nested_wire = Vec::new();
+        0u32.framed_write(&mut nested_wire).unwrap();
+        PAYLOAD_TAG_SPLIT.framed_write(&mut nested_wire).unwrap();
+        2u8.framed_write(&mut nested_wire).unwrap();
+        tr(0, 256, 128, 128).write_framed(&mut nested_wire).unwrap();
+        PAYLOAD_TAG_SPLIT.framed_write(&mut nested_wire).unwrap();
+        assert!(
+            CompressedTile::read_framed(&[parent_256x128], false, &mut nested_wire.as_slice())
+                .is_err()
+        );
+
+        // Out-of-bounds, overlapping, and incomplete-coverage Splits must fail on read and validate.
+        for bad_subs in [
+            // Out of bounds (`x` shifted past parent right edge)
+            vec![
+                SubTile {
+                    rect: tr(0, 256, 128, 128),
+                    payload: LeafPayload::Solid([1, 2, 3, 0xFF]),
+                },
+                SubTile {
+                    rect: tr(129, 256, 128, 128),
+                    payload: LeafPayload::Solid([1, 2, 3, 0xFF]),
+                },
+            ],
+            // Overlapping sub-tiles whose summed area equals parent area (only overlap check catches this).
+            vec![
+                SubTile {
+                    rect: tr(0, 256, 160, 128),
+                    payload: LeafPayload::Solid([1, 2, 3, 0xFF]),
+                },
+                SubTile {
+                    rect: tr(64, 256, 96, 128),
+                    payload: LeafPayload::Solid([1, 2, 3, 0xFF]),
+                },
+            ],
+            // Incomplete coverage (hole in parent)
+            vec![
+                SubTile {
+                    rect: tr(0, 256, 128, 128),
+                    payload: LeafPayload::Solid([1, 2, 3, 0xFF]),
+                },
+                SubTile {
+                    rect: tr(128, 256, 127, 128),
+                    payload: LeafPayload::Solid([1, 2, 3, 0xFF]),
+                },
+            ],
+        ] {
+            assert!(validate_split_rects(parent_256x128, &bad_subs).is_err());
+            let mut bad_wire = Vec::new();
+            0u32.framed_write(&mut bad_wire).unwrap();
+            PAYLOAD_TAG_SPLIT.framed_write(&mut bad_wire).unwrap();
+            (bad_subs.len() as u8).framed_write(&mut bad_wire).unwrap();
+            for sub in &bad_subs {
+                sub.rect.write_framed(&mut bad_wire).unwrap();
+                sub.payload
+                    .write_framed(
+                        sub.rect,
+                        sub.rect.checked_pixels().unwrap(),
+                        false,
+                        &mut bad_wire,
+                    )
+                    .unwrap();
+            }
+            assert!(
+                CompressedTile::read_framed(&[parent_256x128], false, &mut bad_wire.as_slice())
+                    .is_err()
+            );
+        }
     }
 }

@@ -28,13 +28,17 @@ use smithay_client_toolkit::reexports::client::Connection;
 use smithay_client_toolkit::reexports::client::globals::registry_queue_init;
 use tracing::Level;
 use wprs::args;
+use wprs::args::CompressionKind;
 use wprs::args::Config;
+use wprs::args::JpegQuality;
 use wprs::args::OptionalConfig;
 use wprs::args::SerializableLevel;
 use wprs::client::ClientOptions;
 use wprs::client::WprsClientState;
 use wprs::control_server;
 use wprs::prelude::*;
+use wprs::serialization::CompressionMode;
+use wprs::serialization::JpegSubsamp;
 use wprs::serialization::Serializer;
 use wprs::utils;
 
@@ -56,6 +60,21 @@ pub struct WprscConfig {
     pub file_log_level: SerializableLevel,
     pub log_priv_data: bool,
     pub title_prefix: String,
+    pub compression_mode: CompressionKind,
+    pub jpeg_quality: JpegQuality,
+    pub jpeg_subsamp: JpegSubsamp,
+}
+
+impl WprscConfig {
+    pub fn resolved_compression_mode(&self) -> CompressionMode {
+        match self.compression_mode {
+            CompressionKind::Lossless => CompressionMode::Lossless,
+            CompressionKind::Hybrid => CompressionMode::Hybrid {
+                quality: self.jpeg_quality.get(),
+                subsamp: self.jpeg_subsamp,
+            },
+        }
+    }
 }
 
 impl Default for WprscConfig {
@@ -70,6 +89,9 @@ impl Default for WprscConfig {
             file_log_level: SerializableLevel(Level::TRACE),
             log_priv_data: false,
             title_prefix: String::new(),
+            compression_mode: CompressionKind::default(),
+            jpeg_quality: JpegQuality::default(),
+            jpeg_subsamp: JpegSubsamp::default(),
         }
     }
 }
@@ -80,8 +102,8 @@ impl Config for WprscConfig {
     }
 }
 
-impl OptionalConfig<WprscConfig> for OptionalWprscConfig {
-    fn parse_args() -> Self {
+impl OptionalWprscConfig {
+    fn args_parser() -> impl Parser<Self> {
         let print_default_config_and_exit = args::print_default_config_and_exit();
         let config_file = args::config_file();
         let socket = args::socket();
@@ -91,6 +113,9 @@ impl OptionalConfig<WprscConfig> for OptionalWprscConfig {
         let file_log_level = args::file_log_level();
         let log_priv_data = args::log_priv_data();
         let title_prefix = args::title_prefix();
+        let compression_mode = args::compression_mode();
+        let jpeg_quality = args::jpeg_quality();
+        let jpeg_subsamp = args::jpeg_subsamp();
         bpaf::construct!(Self {
             print_default_config_and_exit,
             config_file,
@@ -101,9 +126,16 @@ impl OptionalConfig<WprscConfig> for OptionalWprscConfig {
             file_log_level,
             log_priv_data,
             title_prefix,
+            compression_mode,
+            jpeg_quality,
+            jpeg_subsamp,
         })
-        .to_options()
-        .run()
+    }
+}
+
+impl OptionalConfig<WprscConfig> for OptionalWprscConfig {
+    fn parse_args() -> Self {
+        Self::args_parser().to_options().run()
     }
 
     fn print_default_config_and_exit(&self) -> Option<bool> {
@@ -117,6 +149,7 @@ impl OptionalConfig<WprscConfig> for OptionalWprscConfig {
 
 fn main() -> Result<()> {
     let config = args::init_config::<WprscConfig, OptionalWprscConfig>();
+    let compression_mode = config.resolved_compression_mode();
     args::set_log_priv_data(config.log_priv_data);
     utils::configure_tracing(
         config.stderr_log_level.0,
@@ -147,6 +180,7 @@ fn main() -> Result<()> {
 
     let options = ClientOptions {
         title_prefix: config.title_prefix,
+        compression_mode,
     };
     let mut state = WprsClientState::new(
         event_queue.handle(),
@@ -193,4 +227,94 @@ fn main() -> Result<()> {
     event_loop.run(None, &mut state, |_| {}).location(loc!())?;
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use optional_struct::Applicable;
+    use ron::Options;
+    use ron::extensions::Extensions;
+
+    use super::*;
+
+    #[test]
+    fn test_wprsc_config_compression_cli_and_ron() {
+        let default_cfg = WprscConfig::default();
+        assert_eq!(
+            default_cfg.resolved_compression_mode(),
+            CompressionMode::Lossless
+        );
+
+        // `--print-default-config-and-exit` output must roundtrip through `OptionalWprscConfig`.
+        let printed =
+            ron::ser::to_string_pretty(&default_cfg, ron::ser::PrettyConfig::default()).unwrap();
+        let parsed_opt: OptionalWprscConfig = Options::default()
+            .with_default_extension(Extensions::IMPLICIT_SOME)
+            .from_str(&printed)
+            .unwrap();
+        let mut applied = WprscConfig::default();
+        parsed_opt.apply_to(&mut applied);
+        assert_eq!(applied, default_cfg);
+
+        // Hybrid RON overrides apply cleanly; invalid quality fails loudly.
+        let hybrid_ron = "(compression_mode: Hybrid, jpeg_quality: 85, jpeg_subsamp: Sub420)";
+        let hybrid_opt: OptionalWprscConfig = Options::default()
+            .with_default_extension(Extensions::IMPLICIT_SOME)
+            .from_str(hybrid_ron)
+            .unwrap();
+        let mut hybrid_cfg = WprscConfig::default();
+        hybrid_opt.apply_to(&mut hybrid_cfg);
+        assert_eq!(
+            hybrid_cfg.resolved_compression_mode(),
+            CompressionMode::Hybrid {
+                quality: 85,
+                subsamp: JpegSubsamp::Sub420,
+            }
+        );
+
+        for bad_ron in ["(jpeg_quality: 0)", "(jpeg_quality: 101)"] {
+            assert!(
+                Options::default()
+                    .with_default_extension(Extensions::IMPLICIT_SOME)
+                    .from_str::<OptionalWprscConfig>(bad_ron)
+                    .is_err()
+            );
+        }
+
+        // CLI flag parsing via `OptionalWprscConfig::args_parser`.
+        let cli_opt = OptionalWprscConfig::args_parser()
+            .to_options()
+            .run_inner(
+                &[
+                    "--compression-mode",
+                    "hybrid",
+                    "--jpeg-quality",
+                    "88",
+                    "--jpeg-subsamp",
+                    "422",
+                ][..],
+            )
+            .unwrap();
+        let mut cli_cfg = WprscConfig::default();
+        cli_opt.apply_to(&mut cli_cfg);
+        assert_eq!(
+            cli_cfg.resolved_compression_mode(),
+            CompressionMode::Hybrid {
+                quality: 88,
+                subsamp: JpegSubsamp::Sub422,
+            }
+        );
+        assert!(
+            OptionalWprscConfig::args_parser()
+                .to_options()
+                .run_inner(&["--jpeg-quality", "0"][..])
+                .is_err()
+        );
+        assert!(
+            OptionalWprscConfig::args_parser()
+                .to_options()
+                .run_inner(&["--jpeg-quality", "101"][..])
+                .is_err()
+        );
+    }
 }

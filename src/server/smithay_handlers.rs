@@ -934,6 +934,7 @@ pub fn commit_impl(
                                 surface_state.client,
                                 surface_state.id,
                                 metadata,
+                                state.compression_mode,
                                 scan_bands.as_deref(),
                                 &mut synced.pixels,
                                 &mut state.compressor,
@@ -974,6 +975,7 @@ pub fn commit_impl(
                                 surface_state.client,
                                 surface_state.id,
                                 metadata,
+                                state.compression_mode,
                                 Some(&mut pixels),
                                 &mut state.compressor,
                                 |raw_buffer_to_send| {

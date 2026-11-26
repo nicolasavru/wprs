@@ -30,6 +30,7 @@ use zstd::zstd_safe;
 use crate::filtering::palette::PaletteScratch;
 use crate::prelude::*;
 use crate::serialization::framing::EncodedBytes;
+use crate::serialization::framing::JpegSubsamp;
 use crate::serialization::framing::TILE_PIXELS;
 use crate::serialization::framing::TILE_W;
 
@@ -246,6 +247,11 @@ pub(crate) struct CompressorWorkerState {
     pub(crate) raw_alpha: Vec<u8>,
     pub(crate) filt_alpha: Vec<u8>,
     pub(crate) palette: PaletteScratch,
+    jpeg_compressor: Option<turbojpeg::Compressor>,
+    jpeg_quality: u8,
+    jpeg_subsamp: JpegSubsamp,
+    pub(crate) jpeg_pixels: Vec<u8>,
+    jpeg_out: Vec<u8>,
 }
 
 impl CompressorWorkerState {
@@ -269,7 +275,55 @@ impl CompressorWorkerState {
             raw_alpha: Vec::new(),
             filt_alpha: Vec::new(),
             palette: PaletteScratch::new(),
+            jpeg_compressor: None,
+            jpeg_quality: 0,
+            jpeg_subsamp: JpegSubsamp::Sub444,
+            jpeg_pixels: Vec::new(),
+            jpeg_out: Vec::new(),
         })
+    }
+
+    /// Compresses the `width * height * 4`-byte BGRX tile stored in
+    /// `self.jpeg_pixels` into a JPEG byte vector, lazily initializing
+    /// `turbojpeg::Compressor` and reusing `self.jpeg_out` across tiles.
+    pub(crate) fn compress_jpeg(
+        &mut self,
+        width: usize,
+        height: usize,
+        quality: u8,
+        subsamp: JpegSubsamp,
+    ) -> Result<Vec<u8>> {
+        let tj_subsamp: turbojpeg::Subsamp = subsamp.into();
+        let needed = turbojpeg::compressed_buf_len(width, height, tj_subsamp).location(loc!())?;
+        if self.jpeg_out.len() < needed {
+            self.jpeg_out.resize(needed, 0);
+        }
+        let newly_created = self.jpeg_compressor.is_none();
+        let comp = match &mut self.jpeg_compressor {
+            Some(c) => c,
+            None => self
+                .jpeg_compressor
+                .insert(turbojpeg::Compressor::new().location(loc!())?),
+        };
+        if newly_created || self.jpeg_quality != quality {
+            comp.set_quality(i32::from(quality)).location(loc!())?;
+            self.jpeg_quality = quality;
+        }
+        if newly_created || self.jpeg_subsamp != subsamp {
+            comp.set_subsamp(tj_subsamp).location(loc!())?;
+            self.jpeg_subsamp = subsamp;
+        }
+        let img = turbojpeg::Image {
+            pixels: &self.jpeg_pixels[..width * height * 4],
+            width,
+            pitch: width * 4,
+            height,
+            format: turbojpeg::PixelFormat::BGRX,
+        };
+        let written = comp
+            .compress_to_slice(img, &mut self.jpeg_out[..needed])
+            .location(loc!())?;
+        Ok(self.jpeg_out[..written].to_vec())
     }
 }
 
@@ -296,6 +350,10 @@ pub(crate) fn compress_bytes(
     EncodedBytes::Uncompressed(data.to_vec())
 }
 
+/// Progressive scan limit for [`turbojpeg::Decompressor`] (baseline JPEGs use 1
+/// scan; capping prevents crafted multi-scan progressive DoS bombs).
+const MAX_JPEG_PROGRESSIVE_SCANS: u32 = 100;
+
 pub(crate) struct DecompressorWorkerState {
     pub(crate) decompressor: Decompressor<'static>,
     pub(crate) filt_bgr: Vec<u8>,
@@ -304,6 +362,8 @@ pub(crate) struct DecompressorWorkerState {
     pub(crate) alpha_filt: Vec<u8>,
     pub(crate) alpha_row_a: Vec<u8>,
     pub(crate) alpha_row_b: Vec<u8>,
+    jpeg_decompressor: Option<turbojpeg::Decompressor>,
+    pub(crate) jpeg_pixels: Vec<u8>,
 }
 
 impl DecompressorWorkerState {
@@ -316,7 +376,50 @@ impl DecompressorWorkerState {
             alpha_filt: Vec::new(),
             alpha_row_a: Vec::new(),
             alpha_row_b: Vec::new(),
+            jpeg_decompressor: None,
+            jpeg_pixels: Vec::new(),
         })
+    }
+
+    /// Validates the JPEG header matches `expected_w x expected_h` and decodes
+    /// `data` into `self.jpeg_pixels[..expected_w * expected_h * 4]` as BGRA
+    /// (byte 3 guaranteed `0xFF`).
+    pub(crate) fn decompress_jpeg(
+        &mut self,
+        data: &[u8],
+        expected_w: usize,
+        expected_h: usize,
+    ) -> Result<()> {
+        let decomp = match &mut self.jpeg_decompressor {
+            Some(d) => d,
+            None => {
+                let mut d = turbojpeg::Decompressor::new().location(loc!())?;
+                d.set_scan_limit(MAX_JPEG_PROGRESSIVE_SCANS)
+                    .location(loc!())?;
+                self.jpeg_decompressor.insert(d)
+            },
+        };
+        let header = decomp.read_header(data).location(loc!())?;
+        if header.width != expected_w || header.height != expected_h {
+            bail!(
+                "JPEG dimensions {}x{} do not match tile rect {expected_w}x{expected_h}",
+                header.width,
+                header.height
+            );
+        }
+        let byte_len = expected_w * expected_h * 4;
+        if self.jpeg_pixels.len() < byte_len {
+            self.jpeg_pixels.resize(byte_len, 0);
+        }
+        let out_img = turbojpeg::Image {
+            pixels: &mut self.jpeg_pixels[..byte_len],
+            width: expected_w,
+            pitch: expected_w * 4,
+            height: expected_h,
+            format: turbojpeg::PixelFormat::BGRA,
+        };
+        decomp.decompress(data, out_img).location(loc!())?;
+        Ok(())
     }
 }
 

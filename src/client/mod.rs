@@ -68,8 +68,10 @@ use crate::client_utils::snapshot_rect_history;
 use crate::prelude::*;
 use crate::serialization::Capabilities;
 use crate::serialization::ClientId;
+use crate::serialization::CompressionMode;
 use crate::serialization::Event;
 use crate::serialization::Request;
+use crate::serialization::SendType;
 use crate::serialization::Serializer;
 use crate::serialization::framing::TILE_PIXELS;
 use crate::serialization::framing::TileRect;
@@ -96,6 +98,7 @@ type ObjectBimap = BiMap<(ClientId, WlSurfaceId), SctkObjectId>;
 
 pub struct ClientOptions {
     pub title_prefix: String,
+    pub compression_mode: CompressionMode,
 }
 
 #[derive(Debug, Default)]
@@ -181,6 +184,7 @@ impl WprsClientState {
         serializer: Serializer<Event, Request>,
         options: ClientOptions,
     ) -> Result<Self> {
+        options.compression_mode.validate().location(loc!())?;
         let shm_state = Shm::bind(&globals, &qh).context(loc!(), "wl_shm is not available")?;
 
         // size doesn't really matter, the pool will be automatically grown as
@@ -188,7 +192,9 @@ impl WprsClientState {
         let pool =
             SlotPool::new(3840 * 2160, &shm_state).context(loc!(), "failed to create pool")?;
 
-        Ok(Self {
+        let decompressor =
+            ShardingDecompressor::new(NonZeroUsize::new(8).unwrap()).location(loc!())?;
+        let state = Self {
             qh: qh.clone(),
             conn,
             capabilities: Arc::default(),
@@ -238,10 +244,16 @@ impl WprsClientState {
             current_focus: None,
             current_cursor_image: None,
             title_prefix: options.title_prefix,
-            decompressor: ShardingDecompressor::new(NonZeroUsize::new(8).unwrap())
-                .location(loc!())?,
+            decompressor,
             slot_copy_scratch: Vec::new(),
-        })
+        };
+        state
+            .serializer
+            .writer()
+            .send(SendType::Object(Event::SetCompressionMode(
+                options.compression_mode,
+            )));
+        Ok(state)
     }
 }
 

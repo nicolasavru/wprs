@@ -21,6 +21,11 @@ The following dependencies are required for `wprsc`, `wprsd`, `xwayland-xdg-shel
 * libxkbcommon (-dev on debian)
 * libwayland (-dev on debian)
 
+Building from source also requires:
+
+* cmake
+* nasm (x86/x86-64 only, for building bundled libjpeg-turbo SIMD)
+
 The launcher (`wprs`) requires:
 
 * python3

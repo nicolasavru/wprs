@@ -12,8 +12,8 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-//! 2D tiled pixel filtering, incremental sub-tile diffing, and lossless
-//! compression/decompression.
+//! 2D tiled pixel filtering, incremental sub-tile diffing, and lossless /
+//! opt-in hybrid `TextSafe` TurboJPEG compression/decompression.
 //!
 //! Pixel buffers are partitioned into `256x256` tiles (with a full-width 1D
 //! strip fallback for thin `< 8`-row partial bands so 1-row updates avoid
@@ -21,13 +21,19 @@
 //! shadow buffer, a parallel linear horizontal-band SIMD pass skips unchanged
 //! `128x128` quadrants (coalescing all-dirty quadrants back into a `256x256`
 //! tile and omitting empty commits completely). Each dirty tile is encoded on
-//! a worker thread inside L1/L2 scratch memory as:
-//! - [`TilePayload::Solid`] for 1-color tiles,
-//! - [`TilePayload::Palette`] (1/2/4/8 bpp + Zstd) for `<= 256` unique colors,
-//! - [`TilePayload::AosZstd`] using fused 3-byte `SubGreen(B-G, G, R-G)` AoS,
+//! a worker thread inside L1/L2 scratch memory as either a single
+//! [`TilePayload::Leaf`] or (in [`CompressionMode::Hybrid`] when a splittable
+//! tile mixes text and photographic quadrants) a non-recursive
+//! [`TilePayload::Split`] of `2..=4` [`SubTile`] leaves:
+//! - [`LeafPayload::Solid`] for 1-color tiles,
+//! - [`LeafPayload::Palette`] (1/2/4/8 bpp + Zstd) for `<= 256` unique colors,
+//! - [`LeafPayload::AosZstd`] using fused 3-byte `SubGreen(B-G, G, R-G)` AoS,
 //!   per-row adaptive `{None, Sub, Up, SubUp}` prediction (2 bits/row), a
 //!   single Zstd level-1 (`MinMatch(7)`) stream, and an optional separate alpha
-//!   plane omitted completely on `Xrgb8888` and opaque `Argb8888` tiles.
+//!   plane omitted completely on `Xrgb8888` and opaque `Argb8888` tiles,
+//! - [`LeafPayload::Jpeg`] (opt-in hybrid mode only, for non-`TextSafe`
+//!   photographic regions `>= 16x16`), with lossless separate alpha on
+//!   translucent `Argb8888` tiles.
 //!
 //! Architecture-specific backends:
 //! - `x86`: native AVX2 (256-bit) and SSSE3 (128-bit) with scalar fallback on
@@ -57,6 +63,7 @@ use std::sync::atomic::Ordering;
 use zstd::bulk::Decompressor;
 
 use crate::buffer_pointer::BufferPointer;
+use crate::filtering::palette::TextSafeClass;
 use crate::filtering::palette::decode_palette_row;
 use crate::filtering::palette::prepare_palette_lut;
 use crate::prelude::*;
@@ -65,18 +72,23 @@ use crate::serialization::framing::AlphaChannel;
 use crate::serialization::framing::CompressedTile;
 use crate::serialization::framing::CompressedTileStream;
 use crate::serialization::framing::CompressedTiles;
+use crate::serialization::framing::CompressionMode;
 use crate::serialization::framing::EncodedBytes;
+use crate::serialization::framing::JpegSubsamp;
+use crate::serialization::framing::LeafPayload;
 use crate::serialization::framing::MAX_FRAME_TILES;
 use crate::serialization::framing::RawBufferHeader;
 use crate::serialization::framing::RowBand;
 use crate::serialization::framing::SUBTILE_H;
 use crate::serialization::framing::SUBTILE_W;
 use crate::serialization::framing::StreamingCompressedTiles;
+use crate::serialization::framing::SubTile;
 use crate::serialization::framing::TILE_H;
 use crate::serialization::framing::TILE_PIXELS;
 use crate::serialization::framing::TILE_W;
 use crate::serialization::framing::TilePayload;
 use crate::serialization::framing::TileRect;
+use crate::serialization::framing::validate_split_rects;
 use crate::serialization::geometry::Rectangle;
 use crate::serialization::wayland::BufferFormat;
 use crate::serialization::wayland::BufferMetadata;
@@ -92,6 +104,11 @@ use crate::vec4u8::Vec4u8;
 /// thinner than 8 rows fall back to full-width 1D strips (capped at
 /// `TILE_PIXELS`) to avoid shattering 1-row updates into many tiny tile headers.
 const MIN_2D_BAND_HEIGHT: u32 = 8;
+
+/// Minimum width and height (pixels) for a tile or sub-tile to use TurboJPEG
+/// in [`CompressionMode::Hybrid`]; smaller regions stay lossless where JPEG
+/// headers would bloat the payload.
+const MIN_JPEG_DIM: usize = 16;
 
 /// Architecture-specific row kernels operating on exact-length slices (no slack
 /// bytes required).
@@ -460,48 +477,112 @@ fn select_and_filter_row<K: RowKernel>(
     best_p
 }
 
-fn filter_tile<K: RowKernel, const HAS_ALPHA: bool>(
+/// Splits a 2D base tile (`w <= TILE_W`, `h <= TILE_H`) into 1..=4 clipped
+/// `128x128` quadrants in raster order.
+#[inline]
+fn tile_quadrants(rect: TileRect) -> ([TileRect; 4], usize) {
+    debug_assert!(rect.w <= TILE_W as u32 && rect.h <= TILE_H as u32);
+    let mut out = [rect; 4];
+    let mut n = 0;
+    let sub_w = SUBTILE_W as u32;
+    let sub_h = SUBTILE_H as u32;
+    let mut dy = 0u32;
+    while dy < rect.h {
+        let h = (rect.h - dy).min(sub_h);
+        let mut dx = 0u32;
+        while dx < rect.w {
+            let w = (rect.w - dx).min(sub_w);
+            out[n] = TileRect {
+                x: rect.x + dx,
+                y: rect.y + dy,
+                w,
+                h,
+            };
+            n += 1;
+            dx += w;
+        }
+        dy += h;
+    }
+    (out, n)
+}
+
+fn try_encode_palette_leaf<const HAS_ALPHA: bool>(
     aos: BufferPointer<Vec4u8>,
     stride_px: usize,
     rect: TileRect,
     state: &mut CompressorWorkerState,
-) -> TilePayload {
+) -> Option<LeafPayload> {
+    let (n_colors, packed_len) = state
+        .palette
+        .try_encode_2d::<HAS_ALPHA>(aos, stride_px, rect)?;
+    if n_colors == 1 {
+        return Some(LeafPayload::Solid(state.palette.palette[0].to_le_bytes()));
+    }
+    let pal_has_alpha = HAS_ALPHA
+        && state.palette.palette[..n_colors]
+            .iter()
+            .any(|&c| (c >> 24) != 0xFF);
+    let entry_bytes = if pal_has_alpha { 4 } else { 3 };
+    let mut palette_bytes = Vec::with_capacity(n_colors * entry_bytes);
+    for &c in &state.palette.palette[..n_colors] {
+        let b = c.to_le_bytes();
+        palette_bytes.extend_from_slice(if pal_has_alpha { &b[..] } else { &b[..3] });
+    }
+    let data = compress_bytes(
+        &mut state.compressor,
+        &mut state.zstd_scratch,
+        &state.palette.packed[..packed_len],
+    );
+    Some(LeafPayload::Palette {
+        has_alpha: pal_has_alpha,
+        palette: palette_bytes,
+        data,
+    })
+}
+
+fn encode_alpha_plane<K: RowKernel>(
+    state: &mut CompressorWorkerState,
+    tw: usize,
+    th: usize,
+) -> AlphaChannel {
+    let n_px = tw * th;
+    let raw_alpha = &state.raw_alpha[..n_px];
+    match K::is_constant_plane(raw_alpha) {
+        Some(0xFF) => AlphaChannel::Omitted,
+        Some(a) => AlphaChannel::Constant(a),
+        None => {
+            ensure_len(&mut state.filt_alpha, TILE_PIXELS);
+            K::row_sub1_forward(&raw_alpha[..tw], &mut state.filt_alpha[..tw]);
+            for ry in 1..th {
+                K::row_up_forward(
+                    &raw_alpha[ry * tw..(ry + 1) * tw],
+                    &raw_alpha[(ry - 1) * tw..ry * tw],
+                    &mut state.filt_alpha[ry * tw..(ry + 1) * tw],
+                );
+            }
+            match compress_bytes(
+                &mut state.compressor,
+                &mut state.zstd_scratch,
+                &state.filt_alpha[..n_px],
+            ) {
+                EncodedBytes::Uncompressed(v) => AlphaChannel::Uncompressed(v),
+                EncodedBytes::Zstd(v) => AlphaChannel::Zstd(v),
+            }
+        },
+    }
+}
+
+fn filter_aos_zstd_leaf<K: RowKernel, const HAS_ALPHA: bool>(
+    aos: BufferPointer<Vec4u8>,
+    stride_px: usize,
+    rect: TileRect,
+    state: &mut CompressorWorkerState,
+) -> LeafPayload {
     let x0 = rect.x as usize;
     let y0 = rect.y as usize;
     let tw = rect.w as usize;
     let th = rect.h as usize;
-    let n_px = tw * th;
-    debug_assert!(n_px > 0 && n_px <= TILE_PIXELS);
-
-    if let Some((n_colors, packed_len)) = state
-        .palette
-        .try_encode_2d::<HAS_ALPHA>(aos, stride_px, rect)
-    {
-        if n_colors == 1 {
-            let px = state.palette.palette[0].to_le_bytes();
-            return TilePayload::Solid(px);
-        }
-        let pal_has_alpha = HAS_ALPHA
-            && state.palette.palette[..n_colors]
-                .iter()
-                .any(|&c| (c >> 24) != 0xFF);
-        let entry_bytes = if pal_has_alpha { 4 } else { 3 };
-        let mut palette_bytes = Vec::with_capacity(n_colors * entry_bytes);
-        for &c in &state.palette.palette[..n_colors] {
-            let b = c.to_le_bytes();
-            palette_bytes.extend_from_slice(if pal_has_alpha { &b[..] } else { &b[..3] });
-        }
-        let data = compress_bytes(
-            &mut state.compressor,
-            &mut state.zstd_scratch,
-            &state.palette.packed[..packed_len],
-        );
-        return TilePayload::Palette {
-            has_alpha: pal_has_alpha,
-            palette: palette_bytes,
-            data,
-        };
-    }
+    debug_assert!(tw * th > 0 && tw * th <= TILE_PIXELS);
 
     // Direct 3-byte `SubGreen(BGR)` AoS + per-row adaptive `{None, Sub, Up, SubUp}`
     // streamed through two L1d-resident row buffers (`raw_row_a`, `raw_row_b`).
@@ -556,40 +637,183 @@ fn filter_tile<K: RowKernel, const HAS_ALPHA: bool>(
         &mut state.zstd_scratch,
         &state.filt_bgr[..total_b],
     );
-
-    let alpha = if !HAS_ALPHA {
-        AlphaChannel::Omitted
+    let alpha = if HAS_ALPHA {
+        encode_alpha_plane::<K>(state, tw, th)
     } else {
-        let raw_alpha = &state.raw_alpha[..n_px];
-        match K::is_constant_plane(raw_alpha) {
-            Some(0xFF) => AlphaChannel::Omitted,
-            Some(a) => AlphaChannel::Constant(a),
-            None => {
-                ensure_len(&mut state.filt_alpha, TILE_PIXELS);
-                K::row_sub1_forward(&raw_alpha[..tw], &mut state.filt_alpha[..tw]);
-                for ry in 1..th {
-                    K::row_up_forward(
-                        &raw_alpha[ry * tw..(ry + 1) * tw],
-                        &raw_alpha[(ry - 1) * tw..ry * tw],
-                        &mut state.filt_alpha[ry * tw..(ry + 1) * tw],
-                    );
-                }
-                match compress_bytes(
-                    &mut state.compressor,
-                    &mut state.zstd_scratch,
-                    &state.filt_alpha[..n_px],
-                ) {
-                    EncodedBytes::Uncompressed(v) => AlphaChannel::Uncompressed(v),
-                    EncodedBytes::Zstd(v) => AlphaChannel::Zstd(v),
-                }
-            },
-        }
+        AlphaChannel::Omitted
     };
 
-    TilePayload::AosZstd {
+    LeafPayload::AosZstd {
         predictors,
         color,
         alpha,
+    }
+}
+
+fn filter_lossless_leaf<K: RowKernel, const HAS_ALPHA: bool>(
+    aos: BufferPointer<Vec4u8>,
+    stride_px: usize,
+    rect: TileRect,
+    state: &mut CompressorWorkerState,
+) -> LeafPayload {
+    if let Some(leaf) = try_encode_palette_leaf::<HAS_ALPHA>(aos, stride_px, rect, state) {
+        return leaf;
+    }
+    filter_aos_zstd_leaf::<K, HAS_ALPHA>(aos, stride_px, rect, state)
+}
+
+fn encode_jpeg_leaf<K: RowKernel, const HAS_ALPHA: bool>(
+    aos: BufferPointer<Vec4u8>,
+    stride_px: usize,
+    rect: TileRect,
+    quality: u8,
+    subsamp: JpegSubsamp,
+    state: &mut CompressorWorkerState,
+) -> LeafPayload {
+    let x0 = rect.x as usize;
+    let y0 = rect.y as usize;
+    let tw = rect.w as usize;
+    let th = rect.h as usize;
+    let n_px = tw * th;
+    debug_assert!(n_px > 0 && n_px <= TILE_PIXELS);
+
+    // Copy out of `wl_shm` via `BufferPointer` into owned L2-hot worker memory
+    // before passing `&[u8]` to TurboJPEG (preserves SIGBUS / aliasing safety).
+    ensure_len(&mut state.jpeg_pixels, n_px * 4);
+    if HAS_ALPHA {
+        ensure_len(&mut state.raw_alpha, TILE_PIXELS);
+    }
+    for ry in 0..th {
+        let row_start = (y0 + ry) * stride_px + x0;
+        let (_, after_start) = aos.split_at(row_start);
+        let (row_ptr, _) = after_start.split_at(tw);
+        let dst_row: &mut [Vec4u8] =
+            bytemuck::cast_slice_mut(&mut state.jpeg_pixels[ry * tw * 4..(ry + 1) * tw * 4]);
+        row_ptr.copy_to_nonoverlapping(dst_row);
+        if HAS_ALPHA {
+            let alpha_row = &mut state.raw_alpha[ry * tw..(ry + 1) * tw];
+            for (dst_a, px) in alpha_row.iter_mut().zip(dst_row.iter()) {
+                *dst_a = px.3;
+            }
+        }
+    }
+
+    let data = state
+        .compress_jpeg(tw, th, quality, subsamp)
+        .expect("turbojpeg compression failed for valid tile");
+    let alpha = if HAS_ALPHA {
+        encode_alpha_plane::<K>(state, tw, th)
+    } else {
+        AlphaChannel::Omitted
+    };
+    LeafPayload::Jpeg { data, alpha }
+}
+
+fn filter_hybrid_tile<K: RowKernel, const HAS_ALPHA: bool>(
+    aos: BufferPointer<Vec4u8>,
+    stride_px: usize,
+    rect: TileRect,
+    quality: u8,
+    subsamp: JpegSubsamp,
+    state: &mut CompressorWorkerState,
+) -> TilePayload {
+    let tw = rect.w as usize;
+    let th = rect.h as usize;
+
+    // Small/thin tiles (`< 16` px in either dimension, including `< 8`-row 1D
+    // strips) always stay lossless where JPEG headers would bloat the payload.
+    if tw < MIN_JPEG_DIM || th < MIN_JPEG_DIM {
+        return TilePayload::Leaf(filter_lossless_leaf::<K, HAS_ALPHA>(
+            aos, stride_px, rect, state,
+        ));
+    }
+
+    // Fast path: if the whole tile fits in `<= 256` unique colors, every
+    // quadrant is guaranteed `TextSafe` — emit the encoded `Solid`/`Palette`
+    // leaf directly without re-scanning.
+    if let Some(leaf) = try_encode_palette_leaf::<HAS_ALPHA>(aos, stride_px, rect, state) {
+        return TilePayload::Leaf(leaf);
+    }
+
+    // Non-splittable (`<= 128x128`): classify directly (`try_encode_palette_leaf`
+    // already ran above, so `TextSafe` goes straight to `AosZstd`).
+    if tw <= SUBTILE_W && th <= SUBTILE_H {
+        return TilePayload::Leaf(
+            if state
+                .palette
+                .classify_text_safe(aos, stride_px, rect)
+                .is_text_safe()
+            {
+                filter_aos_zstd_leaf::<K, HAS_ALPHA>(aos, stride_px, rect, state)
+            } else {
+                encode_jpeg_leaf::<K, HAS_ALPHA>(aos, stride_px, rect, quality, subsamp, state)
+            },
+        );
+    }
+
+    // Splittable (`> 128` wide or tall): classify each `128x128` quadrant and
+    // merge uniform tiles into a single leaf or emit a non-recursive `Split`.
+    let (quads, n_quads) = tile_quadrants(rect);
+    let mut classes = [TextSafeClass::Photo; 4];
+    let mut text_safe_count = 0usize;
+    for q in 0..n_quads {
+        let cls = state.palette.classify_text_safe(aos, stride_px, quads[q]);
+        classes[q] = cls;
+        text_safe_count += usize::from(cls.is_text_safe());
+    }
+
+    if text_safe_count == n_quads {
+        TilePayload::Leaf(filter_aos_zstd_leaf::<K, HAS_ALPHA>(
+            aos, stride_px, rect, state,
+        ))
+    } else if text_safe_count == 0 {
+        TilePayload::Leaf(encode_jpeg_leaf::<K, HAS_ALPHA>(
+            aos, stride_px, rect, quality, subsamp, state,
+        ))
+    } else {
+        let mut sub_tiles = Vec::with_capacity(n_quads);
+        for q in 0..n_quads {
+            let qrect = quads[q];
+            let payload = match classes[q] {
+                TextSafeClass::PaletteCandidate => {
+                    filter_lossless_leaf::<K, HAS_ALPHA>(aos, stride_px, qrect, state)
+                },
+                TextSafeClass::DominantBg => {
+                    filter_aos_zstd_leaf::<K, HAS_ALPHA>(aos, stride_px, qrect, state)
+                },
+                TextSafeClass::Photo => {
+                    if (qrect.w as usize) < MIN_JPEG_DIM || (qrect.h as usize) < MIN_JPEG_DIM {
+                        filter_aos_zstd_leaf::<K, HAS_ALPHA>(aos, stride_px, qrect, state)
+                    } else {
+                        encode_jpeg_leaf::<K, HAS_ALPHA>(
+                            aos, stride_px, qrect, quality, subsamp, state,
+                        )
+                    }
+                },
+            };
+            sub_tiles.push(SubTile {
+                rect: qrect,
+                payload,
+            });
+        }
+        TilePayload::Split(sub_tiles)
+    }
+}
+
+fn filter_tile<K: RowKernel, const HAS_ALPHA: bool>(
+    aos: BufferPointer<Vec4u8>,
+    stride_px: usize,
+    rect: TileRect,
+    mode: CompressionMode,
+    state: &mut CompressorWorkerState,
+) -> TilePayload {
+    match mode {
+        CompressionMode::Lossless => TilePayload::Leaf(filter_lossless_leaf::<K, HAS_ALPHA>(
+            aos, stride_px, rect, state,
+        )),
+        CompressionMode::Hybrid { quality, subsamp } => {
+            filter_hybrid_tile::<K, HAS_ALPHA>(aos, stride_px, rect, quality, subsamp, state)
+        },
     }
 }
 
@@ -649,12 +873,133 @@ fn decode_encoded_bytes<'a>(
     }
 }
 
+fn prepare_alpha_decode<'a, const HAS_ALPHA: bool>(
+    alpha: &'a AlphaChannel,
+    n_px: usize,
+    alpha_filt: &'a mut Vec<u8>,
+    decompressor: &mut Decompressor<'static>,
+) -> Result<(Option<u8>, Option<&'a [u8]>)> {
+    match alpha {
+        AlphaChannel::Omitted => Ok((Some(0xFF), None)),
+        AlphaChannel::Constant(a) => {
+            if !HAS_ALPHA {
+                bail!("AlphaChannel::Constant on Xrgb8888 buffer");
+            }
+            Ok((Some(*a), None))
+        },
+        AlphaChannel::Uncompressed(bytes) => {
+            if !HAS_ALPHA {
+                bail!("AlphaChannel::Uncompressed on Xrgb8888 buffer");
+            }
+            if bytes.len() != n_px {
+                bail!("uncompressed alpha len {} != expected {n_px}", bytes.len());
+            }
+            Ok((None, Some(bytes.as_slice())))
+        },
+        AlphaChannel::Zstd(bytes) => {
+            if !HAS_ALPHA {
+                bail!("AlphaChannel::Zstd on Xrgb8888 buffer");
+            }
+            ensure_len(alpha_filt, TILE_PIXELS);
+            let written = decompressor
+                .decompress_to_buffer(bytes, &mut alpha_filt[..n_px])
+                .location(loc!())?;
+            if written != n_px {
+                bail!("decompressed alpha len {written} != expected {n_px}");
+            }
+            Ok((None, Some(&alpha_filt[..n_px])))
+        },
+    }
+}
+
 /// # Safety
 /// `rect` must already be validated in-bounds within `frame` and disjoint from
 /// all other tiles being decoded concurrently.
-unsafe fn unfilter_tile<K: RowKernel, const HAS_ALPHA: bool>(
+#[inline(never)]
+unsafe fn unfilter_jpeg_leaf<K: RowKernel, const HAS_ALPHA: bool>(
     rect: TileRect,
-    payload: &TilePayload,
+    data: &[u8],
+    alpha: &AlphaChannel,
+    frame: &FrameRows,
+    state: &mut DecompressorWorkerState,
+) -> Result<bool> {
+    let x0 = rect.x as usize;
+    let y0 = rect.y as usize;
+    let tw = rect.w as usize;
+    let th = rect.h as usize;
+    let n_px = tw * th;
+    if data.is_empty() {
+        bail!("empty JPEG payload");
+    }
+    if !HAS_ALPHA && !matches!(alpha, AlphaChannel::Omitted) {
+        bail!("non-omitted AlphaChannel on Xrgb8888 JPEG tile");
+    }
+    state.decompress_jpeg(data, tw, th).location(loc!())?;
+    let (const_alpha, alpha_filt_slice) = prepare_alpha_decode::<HAS_ALPHA>(
+        alpha,
+        n_px,
+        &mut state.alpha_filt,
+        &mut state.decompressor,
+    )
+    .location(loc!())?;
+
+    let jpeg_rows: &[Vec4u8] = bytemuck::cast_slice(&state.jpeg_pixels[..n_px * 4]);
+    if const_alpha == Some(0xFF) {
+        // `PixelFormat::BGRA` already sets byte 3 to `0xFF`.
+        for ry in 0..th {
+            let src_row = &jpeg_rows[ry * tw..(ry + 1) * tw];
+            // SAFETY: Caller guarantees `rect` is in-bounds and disjoint.
+            let dst_row = unsafe { slice::from_raw_parts_mut(frame.row_ptr(y0 + ry, x0), tw) };
+            dst_row.copy_from_slice(src_row);
+        }
+    } else if let Some(a) = const_alpha {
+        for ry in 0..th {
+            let src_row = &jpeg_rows[ry * tw..(ry + 1) * tw];
+            // SAFETY: Caller guarantees `rect` is in-bounds and disjoint.
+            let dst_row = unsafe { slice::from_raw_parts_mut(frame.row_ptr(y0 + ry, x0), tw) };
+            for (dst, &px) in dst_row.iter_mut().zip(src_row) {
+                *dst = Vec4u8(px.0, px.1, px.2, a);
+            }
+        }
+    } else {
+        let a_filt = alpha_filt_slice.unwrap();
+        ensure_len(&mut state.alpha_row_a, tw);
+        if th > 1 {
+            ensure_len(&mut state.alpha_row_b, tw);
+        }
+        let mut use_a = true;
+        for ry in 0..th {
+            let (a_cur, a_prev): (&mut [u8], &[u8]) = if use_a {
+                (
+                    &mut state.alpha_row_a[..tw],
+                    &state.alpha_row_b[..if ry > 0 { tw } else { 0 }],
+                )
+            } else {
+                (&mut state.alpha_row_b[..tw], &state.alpha_row_a[..tw])
+            };
+            if ry == 0 {
+                K::row_sub1_inverse(&a_filt[..tw], a_cur);
+            } else {
+                K::row_up_inverse(&a_filt[ry * tw..(ry + 1) * tw], a_prev, a_cur);
+            }
+            let src_row = &jpeg_rows[ry * tw..(ry + 1) * tw];
+            // SAFETY: Caller guarantees `rect` is in-bounds and disjoint.
+            let dst_row = unsafe { slice::from_raw_parts_mut(frame.row_ptr(y0 + ry, x0), tw) };
+            for ((dst, &px), &a) in dst_row.iter_mut().zip(src_row).zip(a_cur.iter()) {
+                *dst = Vec4u8(px.0, px.1, px.2, a);
+            }
+            use_a = !use_a;
+        }
+    }
+    Ok(false)
+}
+
+/// # Safety
+/// `rect` must already be validated in-bounds within `frame` and disjoint from
+/// all other tiles being decoded concurrently.
+unsafe fn unfilter_leaf<K: RowKernel, const HAS_ALPHA: bool>(
+    rect: TileRect,
+    payload: &LeafPayload,
     frame: &FrameRows,
     state: &mut DecompressorWorkerState,
 ) -> Result<bool> {
@@ -666,14 +1011,14 @@ unsafe fn unfilter_tile<K: RowKernel, const HAS_ALPHA: bool>(
     debug_assert!(n_px > 0 && n_px <= TILE_PIXELS);
 
     match payload {
-        TilePayload::Solid(px) => {
+        LeafPayload::Solid(px) => {
             if !HAS_ALPHA && px[3] != 0xFF {
                 bail!("translucent Solid tile on Xrgb8888 buffer");
             }
             let pixel = Vec4u8(px[0], px[1], px[2], px[3]);
             let mut streamed = false;
             for ry in 0..th {
-                // SAFETY: Caller guarantees `tile.rect` is in-bounds and disjoint.
+                // SAFETY: Caller guarantees `rect` is in-bounds and disjoint.
                 let dst_row = unsafe { slice::from_raw_parts_mut(frame.row_ptr(y0 + ry, x0), tw) };
                 if K::STREAM_ALIGN > 1
                     && tw.is_multiple_of(16)
@@ -689,7 +1034,7 @@ unsafe fn unfilter_tile<K: RowKernel, const HAS_ALPHA: bool>(
             }
             Ok(streamed)
         },
-        TilePayload::Palette {
+        LeafPayload::Palette {
             has_alpha: pal_alpha,
             palette,
             data,
@@ -721,13 +1066,13 @@ unsafe fn unfilter_tile<K: RowKernel, const HAS_ALPHA: bool>(
                 prepare_palette_lut(*pal_alpha, palette, packed, n_px).location(loc!())?;
             let mut idx_pos = 0usize;
             for ry in 0..th {
-                // SAFETY: Caller guarantees `tile.rect` is in-bounds and disjoint.
+                // SAFETY: Caller guarantees `rect` is in-bounds and disjoint.
                 let dst_row = unsafe { slice::from_raw_parts_mut(frame.row_ptr(y0 + ry, x0), tw) };
                 decode_palette_row(&lut, dec_n, packed, &mut idx_pos, dst_row).location(loc!())?;
             }
             Ok(false)
         },
-        TilePayload::AosZstd {
+        LeafPayload::AosZstd {
             predictors,
             color,
             alpha,
@@ -753,38 +1098,13 @@ unsafe fn unfilter_tile<K: RowKernel, const HAS_ALPHA: bool>(
                 decode_encoded_bytes(color, total_b, &mut state.filt_bgr, &mut state.decompressor)
                     .location(loc!())?;
 
-            let (const_alpha, alpha_filt_slice): (Option<u8>, Option<&[u8]>) = match alpha {
-                AlphaChannel::Omitted => (Some(0xFF), None),
-                AlphaChannel::Constant(a) => {
-                    if !HAS_ALPHA {
-                        bail!("AlphaChannel::Constant on Xrgb8888 buffer");
-                    }
-                    (Some(*a), None)
-                },
-                AlphaChannel::Uncompressed(bytes) => {
-                    if !HAS_ALPHA {
-                        bail!("AlphaChannel::Uncompressed on Xrgb8888 buffer");
-                    }
-                    if bytes.len() != n_px {
-                        bail!("uncompressed alpha len {} != expected {n_px}", bytes.len());
-                    }
-                    (None, Some(bytes.as_slice()))
-                },
-                AlphaChannel::Zstd(bytes) => {
-                    if !HAS_ALPHA {
-                        bail!("AlphaChannel::Zstd on Xrgb8888 buffer");
-                    }
-                    ensure_len(&mut state.alpha_filt, TILE_PIXELS);
-                    let written = state
-                        .decompressor
-                        .decompress_to_buffer(bytes, &mut state.alpha_filt[..n_px])
-                        .location(loc!())?;
-                    if written != n_px {
-                        bail!("decompressed alpha len {written} != expected {n_px}");
-                    }
-                    (None, Some(&state.alpha_filt[..n_px]))
-                },
-            };
+            let (const_alpha, alpha_filt_slice) = prepare_alpha_decode::<HAS_ALPHA>(
+                alpha,
+                n_px,
+                &mut state.alpha_filt,
+                &mut state.decompressor,
+            )
+            .location(loc!())?;
 
             ensure_len(&mut state.dec_row_a, row_b);
             if th > 1 {
@@ -835,7 +1155,7 @@ unsafe fn unfilter_tile<K: RowKernel, const HAS_ALPHA: bool>(
                     },
                 };
 
-                // SAFETY: Caller guarantees `tile.rect` is in-bounds and disjoint.
+                // SAFETY: Caller guarantees `rect` is in-bounds and disjoint.
                 let dst_row = unsafe { slice::from_raw_parts_mut(frame.row_ptr(y0 + ry, x0), tw) };
                 let use_stream = K::STREAM_ALIGN > 1
                     && tw.is_multiple_of(16)
@@ -890,6 +1210,41 @@ unsafe fn unfilter_tile<K: RowKernel, const HAS_ALPHA: bool>(
                 use_a = !use_a;
             }
 
+            Ok(streamed)
+        },
+        LeafPayload::Jpeg { data, alpha } => {
+            // SAFETY: Caller guarantees `rect` is in-bounds and disjoint.
+            unsafe { unfilter_jpeg_leaf::<K, HAS_ALPHA>(rect, data, alpha, frame, state) }
+        },
+    }
+}
+
+/// # Safety
+/// `rect` must already be validated in-bounds within `frame` and disjoint from
+/// all other tiles being decoded concurrently.
+unsafe fn unfilter_tile<K: RowKernel, const HAS_ALPHA: bool>(
+    rect: TileRect,
+    payload: &TilePayload,
+    frame: &FrameRows,
+    state: &mut DecompressorWorkerState,
+) -> Result<bool> {
+    match payload {
+        TilePayload::Leaf(leaf) => {
+            // SAFETY: Caller guarantees `rect` is in-bounds and disjoint.
+            unsafe { unfilter_leaf::<K, HAS_ALPHA>(rect, leaf, frame, state) }
+        },
+        TilePayload::Split(sub_tiles) => {
+            validate_split_rects(rect, sub_tiles).location(loc!())?;
+            let mut streamed = false;
+            for sub in sub_tiles {
+                // SAFETY: `validate_split_rects` verified `sub.rect` is inside
+                // `rect` (in-bounds and disjoint from other tiles) and disjoint
+                // from sibling sub-tiles (decoded sequentially on this worker).
+                streamed |= unsafe {
+                    unfilter_leaf::<K, HAS_ALPHA>(sub.rect, &sub.payload, frame, state)
+                        .location(loc!())?
+                };
+            }
             Ok(streamed)
         },
     }
@@ -958,35 +1313,6 @@ pub fn compute_partial_row_bands(
     }
 
     merge_row_bands(bands, height)
-}
-
-/// Splits a 2D base tile (`w <= TILE_W`, `h <= TILE_H`) into 1..=4 clipped
-/// `128x128` quadrants in raster order.
-#[inline]
-fn tile_quadrants(rect: TileRect) -> ([TileRect; 4], usize) {
-    debug_assert!(rect.w <= TILE_W as u32 && rect.h <= TILE_H as u32);
-    let mut out = [rect; 4];
-    let mut n = 0;
-    let sub_w = SUBTILE_W as u32;
-    let sub_h = SUBTILE_H as u32;
-    let mut dy = 0u32;
-    while dy < rect.h {
-        let h = (rect.h - dy).min(sub_h);
-        let mut dx = 0u32;
-        while dx < rect.w {
-            let w = (rect.w - dx).min(sub_w);
-            out[n] = TileRect {
-                x: rect.x + dx,
-                y: rect.y + dy,
-                w,
-                h,
-            };
-            n += 1;
-            dx += w;
-        }
-        dy += h;
-    }
-    (out, n)
 }
 
 /// Raw pointer handle to the server's per-surface shadow pixel buffer
@@ -1376,6 +1702,7 @@ pub fn filter_and_compress_full_streaming(
     client: ClientId,
     surface: WlSurfaceId,
     metadata: BufferMetadata,
+    mode: CompressionMode,
     shadow_out: Option<&mut Vec<u8>>,
     compressor: &mut ShardingCompressor,
     on_stream_ready: impl FnOnce(StreamingCompressedTiles),
@@ -1384,6 +1711,8 @@ pub fn filter_and_compress_full_streaming(
     let total_pixels = metadata
         .validate()
         .expect("server passed invalid BufferMetadata");
+    mode.validate()
+        .expect("server passed invalid CompressionMode");
     let byte_len = total_pixels * 4;
     assert!(data.len() >= byte_len);
 
@@ -1455,9 +1784,9 @@ pub fn filter_and_compress_full_streaming(
                 aos
             };
             let payload = if has_alpha {
-                filter_tile::<arch::Kernel, true>(encode_aos, stride_px, rect, state)
+                filter_tile::<arch::Kernel, true>(encode_aos, stride_px, rect, mode, state)
             } else {
-                filter_tile::<arch::Kernel, false>(encode_aos, stride_px, rect, state)
+                filter_tile::<arch::Kernel, false>(encode_aos, stride_px, rect, mode, state)
             };
 
             if tiles_tx
@@ -1491,6 +1820,7 @@ pub fn filter_and_compress_incremental_streaming(
     client: ClientId,
     surface: WlSurfaceId,
     metadata: BufferMetadata,
+    mode: CompressionMode,
     bands: Option<&[RowBand]>,
     shadow: &mut [u8],
     compressor: &mut ShardingCompressor,
@@ -1500,6 +1830,8 @@ pub fn filter_and_compress_incremental_streaming(
     let total_pixels = metadata
         .validate()
         .expect("server passed invalid BufferMetadata");
+    mode.validate()
+        .expect("server passed invalid CompressionMode");
     let byte_len = total_pixels * 4;
     assert!(data.len() >= byte_len);
     assert!(shadow.len() >= byte_len);
@@ -1657,9 +1989,9 @@ pub fn filter_and_compress_incremental_streaming(
             }
             let rect = dirty_tiles[tile_idx];
             let payload = if has_alpha {
-                filter_tile::<arch::Kernel, true>(shadow_aos, stride_px, rect, state)
+                filter_tile::<arch::Kernel, true>(shadow_aos, stride_px, rect, mode, state)
             } else {
-                filter_tile::<arch::Kernel, false>(shadow_aos, stride_px, rect, state)
+                filter_tile::<arch::Kernel, false>(shadow_aos, stride_px, rect, mode, state)
             };
 
             if tiles_tx
@@ -1681,6 +2013,7 @@ pub fn filter_and_compress_incremental_streaming(
 pub fn filter_and_compress(
     data: BufferPointer<u8>,
     metadata: BufferMetadata,
+    mode: CompressionMode,
     compressor: &mut ShardingCompressor,
 ) -> CompressedTiles {
     let mut streaming_opt = None;
@@ -1689,6 +2022,7 @@ pub fn filter_and_compress(
         ClientId(0),
         WlSurfaceId(0),
         metadata,
+        mode,
         None,
         compressor,
         |streaming| {
@@ -1988,7 +2322,7 @@ mod tests {
         let data_ptr = data.as_ptr();
         let buf_ptr = unsafe { BufferPointer::new(&data_ptr, data.len()) };
 
-        let tiles = filter_and_compress(buf_ptr, metadata, compressor);
+        let tiles = filter_and_compress(buf_ptr, metadata, CompressionMode::Lossless, compressor);
         let mut expected = data.to_vec();
         if format == BufferFormat::Xrgb8888 {
             for px in expected.as_chunks_mut::<4>().0 {
@@ -2676,12 +3010,10 @@ mod tests {
                 compressor,
                 decompressor,
             );
-            assert!(
-                t_solid
-                    .tiles
-                    .iter()
-                    .all(|t| matches!(t.payload, TilePayload::Solid([0x20, 0x70, 0xD0, 0xFF])))
-            );
+            assert!(t_solid.tiles.iter().all(|t| matches!(
+                t.payload,
+                TilePayload::Leaf(LeafPayload::Solid([0x20, 0x70, 0xD0, 0xFF]))
+            )));
             test_roundtrip_2d(
                 &solid_opaque,
                 300,
@@ -2700,12 +3032,10 @@ mod tests {
                 compressor,
                 decompressor,
             );
-            assert!(
-                t_trans
-                    .tiles
-                    .iter()
-                    .all(|t| matches!(t.payload, TilePayload::Solid([0x20, 0x70, 0xD0, 0x80])))
-            );
+            assert!(t_trans.tiles.iter().all(|t| matches!(
+                t.payload,
+                TilePayload::Leaf(LeafPayload::Solid([0x20, 0x70, 0xD0, 0x80]))
+            )));
             test_roundtrip_2d(
                 &solid_trans,
                 300,
@@ -2740,10 +3070,10 @@ mod tests {
                 );
                 assert!(matches!(
                     tiles.tiles[0].payload,
-                    TilePayload::Palette {
+                    TilePayload::Leaf(LeafPayload::Palette {
                         has_alpha,
                         ..
-                    } if has_alpha == translucent
+                    }) if has_alpha == translucent
                 ));
                 test_roundtrip_2d(
                     &data,
@@ -2797,10 +3127,10 @@ mod tests {
             );
             assert!(matches!(
                 t_opaque_argb.tiles[0].payload,
-                TilePayload::AosZstd {
+                TilePayload::Leaf(LeafPayload::AosZstd {
                     alpha: AlphaChannel::Omitted,
                     ..
-                }
+                })
             ));
 
             let mut const_a = rich.clone();
@@ -2817,10 +3147,10 @@ mod tests {
             );
             assert!(matches!(
                 t_const_a.tiles[0].payload,
-                TilePayload::AosZstd {
+                TilePayload::Leaf(LeafPayload::AosZstd {
                     alpha: AlphaChannel::Constant(0x80),
                     ..
-                }
+                })
             ));
 
             let mut var_a = rich;
@@ -2837,10 +3167,10 @@ mod tests {
             );
             assert!(matches!(
                 t_var_a.tiles[0].payload,
-                TilePayload::AosZstd {
+                TilePayload::Leaf(LeafPayload::AosZstd {
                     alpha: AlphaChannel::Uncompressed(_) | AlphaChannel::Zstd(_),
                     ..
-                }
+                })
             ));
             test_roundtrip_2d(
                 &var_a,
@@ -3032,6 +3362,7 @@ mod tests {
                             ClientId(1),
                             WlSurfaceId(2),
                             metadata,
+                            CompressionMode::Lossless,
                             Some(&mut shadow),
                             compressor,
                             |s| streaming = Some(s),
@@ -3050,6 +3381,7 @@ mod tests {
                             ClientId(1),
                             WlSurfaceId(2),
                             metadata,
+                            CompressionMode::Lossless,
                             None,
                             &mut shadow,
                             compressor,
@@ -3071,6 +3403,7 @@ mod tests {
                             ClientId(1),
                             WlSurfaceId(2),
                             metadata,
+                            CompressionMode::Lossless,
                             None,
                             &mut shadow,
                             compressor,
@@ -3101,6 +3434,7 @@ mod tests {
                             ClientId(1),
                             WlSurfaceId(2),
                             metadata,
+                            CompressionMode::Lossless,
                             None,
                             &mut shadow,
                             compressor,
@@ -3137,6 +3471,7 @@ mod tests {
                             ClientId(1),
                             WlSurfaceId(2),
                             metadata,
+                            CompressionMode::Lossless,
                             None,
                             &mut shadow,
                             compressor,
@@ -3158,6 +3493,7 @@ mod tests {
                             ClientId(1),
                             WlSurfaceId(2),
                             metadata,
+                            CompressionMode::Lossless,
                             Some(&thin_band),
                             &mut shadow,
                             compressor,
@@ -3175,6 +3511,7 @@ mod tests {
                             ClientId(1),
                             WlSurfaceId(2),
                             metadata,
+                            CompressionMode::Lossless,
                             Some(&thin_band),
                             &mut shadow,
                             compressor,
@@ -3195,6 +3532,7 @@ mod tests {
                             ClientId(1),
                             WlSurfaceId(2),
                             metadata,
+                            CompressionMode::Lossless,
                             None,
                             &mut shadow,
                             compressor,
@@ -3212,6 +3550,7 @@ mod tests {
                             ClientId(1),
                             WlSurfaceId(2),
                             metadata,
+                            CompressionMode::Lossless,
                             Some(&[]),
                             &mut shadow,
                             compressor,
@@ -3256,11 +3595,11 @@ mod tests {
                 tiles: vec![
                     CompressedTile {
                         tile_idx: 0,
-                        payload: TilePayload::Solid([1, 2, 3, 0xFF]),
+                        payload: TilePayload::Leaf(LeafPayload::Solid([1, 2, 3, 0xFF])),
                     },
                     CompressedTile {
                         tile_idx: 1,
-                        payload: TilePayload::Solid([4, 5, 6, 0xFF]),
+                        payload: TilePayload::Leaf(LeafPayload::Solid([4, 5, 6, 0xFF])),
                     },
                 ],
             };
@@ -3286,11 +3625,11 @@ mod tests {
                 tiles: vec![
                     CompressedTile {
                         tile_idx: 0,
-                        payload: TilePayload::Solid([1, 2, 3, 0xFF]),
+                        payload: TilePayload::Leaf(LeafPayload::Solid([1, 2, 3, 0xFF])),
                     },
                     CompressedTile {
                         tile_idx: 0,
-                        payload: TilePayload::Solid([4, 5, 6, 0xFF]),
+                        payload: TilePayload::Leaf(LeafPayload::Solid([4, 5, 6, 0xFF])),
                     },
                 ],
             };
@@ -3306,7 +3645,7 @@ mod tests {
                 }],
                 tiles: vec![CompressedTile {
                     tile_idx: 1,
-                    payload: TilePayload::Solid([1, 2, 3, 0xFF]),
+                    payload: TilePayload::Leaf(LeafPayload::Solid([1, 2, 3, 0xFF])),
                 }],
             };
             assert!(decompress_and_unfilter(&oob_idx, decompressor, &mut out).is_err());
@@ -3337,7 +3676,7 @@ mod tests {
                     tile_rects: vec![bad_rect],
                     tiles: vec![CompressedTile {
                         tile_idx: 0,
-                        payload: TilePayload::Solid([1, 2, 3, 0xFF]),
+                        payload: TilePayload::Leaf(LeafPayload::Solid([1, 2, 3, 0xFF])),
                     }],
                 };
                 assert!(decompress_and_unfilter(&bad, decompressor, &mut out).is_err());
@@ -3352,42 +3691,42 @@ mod tests {
                 h: 3,
             };
             for bad_payload in [
-                TilePayload::AosZstd {
+                LeafPayload::AosZstd {
                     predictors: vec![2], // Up on row 0
                     color: EncodedBytes::Uncompressed(vec![0u8; 4 * 3 * 3]),
                     alpha: AlphaChannel::Omitted,
                 },
-                TilePayload::AosZstd {
+                LeafPayload::AosZstd {
                     predictors: vec![3], // SubUp on row 0
                     color: EncodedBytes::Uncompressed(vec![0u8; 4 * 3 * 3]),
                     alpha: AlphaChannel::Omitted,
                 },
-                TilePayload::AosZstd {
+                LeafPayload::AosZstd {
                     predictors: vec![0, 0], // wrong len (expected 1)
                     color: EncodedBytes::Uncompressed(vec![0u8; 4 * 3 * 3]),
                     alpha: AlphaChannel::Omitted,
                 },
-                TilePayload::AosZstd {
+                LeafPayload::AosZstd {
                     predictors: vec![0b01_00_00_00], // non-zero padding bits for h=3
                     color: EncodedBytes::Uncompressed(vec![0u8; 4 * 3 * 3]),
                     alpha: AlphaChannel::Omitted,
                 },
-                TilePayload::AosZstd {
+                LeafPayload::AosZstd {
                     predictors: vec![0],
                     color: EncodedBytes::Uncompressed(vec![0u8; 35]), // != 36
                     alpha: AlphaChannel::Omitted,
                 },
-                TilePayload::AosZstd {
+                LeafPayload::AosZstd {
                     predictors: vec![0],
                     color: EncodedBytes::Zstd(vec![0xFF, 0x00, 0x01]),
                     alpha: AlphaChannel::Omitted,
                 },
-                TilePayload::AosZstd {
+                LeafPayload::AosZstd {
                     predictors: vec![0],
                     color: EncodedBytes::Uncompressed(vec![0u8; 36]),
                     alpha: AlphaChannel::Uncompressed(vec![0u8; 11]), // != 12
                 },
-                TilePayload::Palette {
+                LeafPayload::Palette {
                     has_alpha: false,
                     palette: vec![1, 2, 3, 4, 5, 6, 7, 8, 9],
                     data: EncodedBytes::Uncompressed(vec![0b11, 0, 0]), // index 3 >= 3
@@ -3398,7 +3737,7 @@ mod tests {
                     tile_rects: vec![r4x3],
                     tiles: vec![CompressedTile {
                         tile_idx: 0,
-                        payload: bad_payload,
+                        payload: TilePayload::Leaf(bad_payload),
                     }],
                 };
                 assert!(decompress_and_unfilter(&bad, decompressor, &mut out).is_err());
@@ -3410,15 +3749,19 @@ mod tests {
                 ..meta
             };
             for bad_xrgb in [
-                TilePayload::Solid([1, 2, 3, 0x80]),
-                TilePayload::Palette {
+                LeafPayload::Solid([1, 2, 3, 0x80]),
+                LeafPayload::Palette {
                     has_alpha: true,
                     palette: vec![1, 2, 3, 0x80, 4, 5, 6, 0xFF],
                     data: EncodedBytes::Uncompressed(vec![0, 0]),
                 },
-                TilePayload::AosZstd {
+                LeafPayload::AosZstd {
                     predictors: vec![0],
                     color: EncodedBytes::Uncompressed(vec![0u8; 36]),
+                    alpha: AlphaChannel::Constant(0x80),
+                },
+                LeafPayload::Jpeg {
+                    data: vec![0xFF, 0xD8, 0xFF, 0xD9],
                     alpha: AlphaChannel::Constant(0x80),
                 },
             ] {
@@ -3427,7 +3770,7 @@ mod tests {
                     tile_rects: vec![r4x3],
                     tiles: vec![CompressedTile {
                         tile_idx: 0,
-                        payload: bad_xrgb,
+                        payload: TilePayload::Leaf(bad_xrgb),
                     }],
                 };
                 assert!(decompress_and_unfilter(&bad, decompressor, &mut out).is_err());
@@ -3451,6 +3794,7 @@ mod tests {
                 ClientId(1),
                 WlSurfaceId(1),
                 meta_2,
+                CompressionMode::Lossless,
                 None,
                 compressor,
                 drop,
@@ -3461,6 +3805,7 @@ mod tests {
                 ClientId(1),
                 WlSurfaceId(1),
                 meta_2,
+                CompressionMode::Lossless,
                 Some(&mut shadow_dropped),
                 compressor,
                 drop,
@@ -3468,7 +3813,8 @@ mod tests {
             // Shadow must still be fully populated even when stream receiver dropped early.
             assert_eq!(shadow_dropped, data_2);
 
-            let mut two_tiles = filter_and_compress(bp_2, meta_2, compressor);
+            let mut two_tiles =
+                filter_and_compress(bp_2, meta_2, CompressionMode::Lossless, compressor);
             assert_eq!(two_tiles.tiles.len(), 2);
             two_tiles.tiles.reverse();
             let mut reversed_out = vec![0u8; data_2.len()];
@@ -3600,6 +3946,646 @@ mod tests {
                 assert!(
                     ValidatedTileStream::new(CompressedTileStream { header, tiles: rx }).is_err()
                 );
+            }
+        });
+    }
+
+    fn fill_smooth_photo(buf: &mut [u8], stride_px: usize, rect: TileRect, alpha: u8) {
+        for ry in 0..rect.h as usize {
+            for rx in 0..rect.w as usize {
+                let x = rect.x as usize + rx;
+                let y = rect.y as usize + ry;
+                let off = (y * stride_px + x) * 4;
+                // Smooth low-frequency RGB surface (> 10k unique colors, no 35% dominant color).
+                let fx = rx as f64 / rect.w as f64;
+                let fy = ry as f64 / rect.h as f64;
+                let b = (30.0 + 180.0 * fx + 25.0 * (fy * std::f64::consts::TAU).sin())
+                    .clamp(0.0, 255.0) as u8;
+                let g = (40.0 + 160.0 * fy + 30.0 * (fx * std::f64::consts::TAU).cos())
+                    .clamp(0.0, 255.0) as u8;
+                let r = (120.0 + 110.0 * ((fx + fy) * std::f64::consts::PI).sin()).clamp(0.0, 255.0)
+                    as u8;
+                buf[off] = b;
+                buf[off + 1] = g;
+                buf[off + 2] = r;
+                buf[off + 3] = alpha;
+            }
+        }
+    }
+
+    fn fill_ui_text(buf: &mut [u8], stride_px: usize, rect: TileRect, cleartype: bool) {
+        for ry in 0..rect.h as usize {
+            for rx in 0..rect.w as usize {
+                let x = rect.x as usize + rx;
+                let y = rect.y as usize + ry;
+                let off = (y * stride_px + x) * 4;
+                // Solid white background on >= 60% of pixels + crisp dark glyph strokes.
+                if ry % 8 < 5 || rx % 6 < 3 {
+                    buf[off..off + 4].copy_from_slice(&[250, 250, 250, 0xFF]);
+                } else if cleartype {
+                    // > 256 unique subpixel-antialiased fringe RGB colors on solid background.
+                    buf[off] = ((rx * 5 + ry * 3) & 0x7F) as u8;
+                    buf[off + 1] = ((rx * 7 + ry * 11) & 0x7F) as u8;
+                    buf[off + 2] = ((rx * 13 + ry * 17) & 0x7F) as u8;
+                    buf[off + 3] = 0xFF;
+                } else {
+                    buf[off..off + 4].copy_from_slice(&[20, 24, 30, 0xFF]);
+                }
+            }
+        }
+    }
+
+    fn rect_psnr_rgb(orig: &[u8], dec: &[u8], stride_px: usize, rect: TileRect) -> f64 {
+        let mut sse = 0u64;
+        for ry in 0..rect.h as usize {
+            for rx in 0..rect.w as usize {
+                let off = ((rect.y as usize + ry) * stride_px + rect.x as usize + rx) * 4;
+                for c in 0..3 {
+                    let d = i32::from(orig[off + c]) - i32::from(dec[off + c]);
+                    sse += (d * d) as u64;
+                }
+            }
+        }
+        if sse == 0 {
+            return f64::INFINITY;
+        }
+        let n_ch = (rect.w as u64) * (rect.h as u64) * 3;
+        10.0 * (255.0 * 255.0 / (sse as f64 / n_ch as f64)).log10()
+    }
+
+    #[test]
+    #[cfg_attr(miri, ignore)]
+    fn test_hybrid_quadtree_merge_split_and_quality() {
+        with_test_codec(|compressor, decompressor| {
+            let tr = |x, y, w, h| TileRect { x, y, w, h };
+            let hybrid_444 = CompressionMode::hybrid_default();
+
+            // 1. All-text `256x256` (both <= 256 palette AND > 256 ClearType with >= 35% bg)
+            //    must NOT split and must decode bit-exact (`max_err == 0`).
+            let meta_256 = BufferMetadata {
+                width: 256,
+                height: 256,
+                stride: 256 * 4,
+                format: BufferFormat::Xrgb8888,
+            };
+            for cleartype in [false, true] {
+                let mut text_buf = vec![0u8; 256 * 256 * 4];
+                fill_ui_text(&mut text_buf, 256, tr(0, 0, 256, 256), cleartype);
+                let ptr = text_buf.as_ptr();
+                let bp = unsafe { BufferPointer::new(&ptr, text_buf.len()) };
+                let tiles = filter_and_compress(bp, meta_256, hybrid_444, compressor);
+                assert_eq!(tiles.tiles.len(), 1);
+                if cleartype {
+                    assert!(matches!(
+                        tiles.tiles[0].payload,
+                        TilePayload::Leaf(LeafPayload::AosZstd { .. })
+                    ));
+                } else {
+                    assert!(matches!(
+                        tiles.tiles[0].payload,
+                        TilePayload::Leaf(LeafPayload::Palette { .. })
+                    ));
+                }
+                assert_decodes_at_both_alignments(&tiles, &text_buf, decompressor);
+            }
+
+            // 2. All-photo `256x256` must merge into ONE `LeafPayload::Jpeg` across all
+            //    subsampling modes, preserve high PSNR, and write byte 3 == `0xFF` on Xrgb8888.
+            let mut photo_buf = vec![0u8; 256 * 256 * 4];
+            fill_smooth_photo(&mut photo_buf, 256, tr(0, 0, 256, 256), 0x12);
+            for (subsamp, min_psnr) in [
+                (JpegSubsamp::Sub444, 38.0),
+                (JpegSubsamp::Sub422, 36.0),
+                (JpegSubsamp::Sub420, 34.0),
+            ] {
+                let mode = CompressionMode::Hybrid {
+                    quality: 90,
+                    subsamp,
+                };
+                let ptr = photo_buf.as_ptr();
+                let bp = unsafe { BufferPointer::new(&ptr, photo_buf.len()) };
+                let tiles = filter_and_compress(bp, meta_256, mode, compressor);
+                assert_eq!(tiles.tiles.len(), 1);
+                assert!(matches!(
+                    tiles.tiles[0].payload,
+                    TilePayload::Leaf(LeafPayload::Jpeg {
+                        alpha: AlphaChannel::Omitted,
+                        ..
+                    })
+                ));
+                let mut out = vec![0x33u8; photo_buf.len()];
+                decompress_and_unfilter(&tiles, decompressor, &mut out).unwrap();
+                assert!(
+                    out.as_chunks::<4>().0.iter().all(|px| px[3] == 0xFF),
+                    "Xrgb8888 JPEG decode must set byte 3 to 0xFF ({subsamp:?})"
+                );
+                let psnr = rect_psnr_rgb(&photo_buf, &out, 256, tr(0, 0, 256, 256));
+                assert!(
+                    psnr >= min_psnr,
+                    "expected PSNR >= {min_psnr} dB for {subsamp:?}, got {psnr:.2}"
+                );
+            }
+
+            // 3. Mixed `256x256` tile (TL palette UI text, TR ClearType text, BL & BR photos)
+            //    must emit `TilePayload::Split` of 4 quadrants where text quadrants decode
+            //    BIT-EXACT and photo quadrants decode as JPEG with high PSNR through wire framing.
+            let mut mixed = vec![0u8; 256 * 256 * 4];
+            let q_tl = tr(0, 0, 128, 128);
+            let q_tr = tr(128, 0, 128, 128);
+            let q_bl = tr(0, 128, 128, 128);
+            let q_br = tr(128, 128, 128, 128);
+            fill_ui_text(&mut mixed, 256, q_tl, false);
+            fill_ui_text(&mut mixed, 256, q_tr, true);
+            fill_smooth_photo(&mut mixed, 256, q_bl, 0xFF);
+            fill_smooth_photo(&mut mixed, 256, q_br, 0xFF);
+
+            let ptr = mixed.as_ptr();
+            let bp = unsafe { BufferPointer::new(&ptr, mixed.len()) };
+            let mut streaming_opt = None;
+            filter_and_compress_full_streaming(
+                bp,
+                ClientId(1),
+                WlSurfaceId(2),
+                meta_256,
+                hybrid_444,
+                None,
+                compressor,
+                |s| streaming_opt = Some(s),
+            );
+            let mut wire = Vec::new();
+            streaming_opt.unwrap().framed_write(&mut wire).unwrap();
+
+            let mut rx_stream = None;
+            let mut rdr = wire.as_slice();
+            CompressedTileStream::read_from_stream(&mut rdr, |s| {
+                rx_stream = Some(s);
+                Ok(())
+            })
+            .unwrap();
+            assert!(rdr.is_empty());
+            let stream = rx_stream.unwrap();
+            let wire_tiles: Vec<CompressedTile> = stream
+                .tiles
+                .into_iter()
+                .collect::<Result<Vec<_>>>()
+                .unwrap();
+            assert_eq!(wire_tiles.len(), 1);
+            let TilePayload::Split(subs) = &wire_tiles[0].payload else {
+                panic!("expected TilePayload::Split for mixed 256x256 tile");
+            };
+            assert_eq!(subs.len(), 4);
+            assert!(matches!(subs[0].payload, LeafPayload::Palette { .. }));
+            assert!(matches!(subs[1].payload, LeafPayload::AosZstd { .. }));
+            assert!(matches!(subs[2].payload, LeafPayload::Jpeg { .. }));
+            assert!(matches!(subs[3].payload, LeafPayload::Jpeg { .. }));
+
+            let mut mixed_out = vec![0x55u8; mixed.len()];
+            decompress_and_unfilter(
+                &CompressedTiles {
+                    metadata: meta_256,
+                    tile_rects: stream.header.tile_rects,
+                    tiles: wire_tiles,
+                },
+                decompressor,
+                &mut mixed_out,
+            )
+            .unwrap();
+            assert!(rect_psnr_rgb(&mixed, &mixed_out, 256, q_tl).is_infinite());
+            assert!(rect_psnr_rgb(&mixed, &mixed_out, 256, q_tr).is_infinite());
+            assert!(rect_psnr_rgb(&mixed, &mixed_out, 256, q_bl) >= 38.0);
+            assert!(rect_psnr_rgb(&mixed, &mixed_out, 256, q_br) >= 38.0);
+
+            // 4. Non-splittable `<= 128x128` photo encodes as a single JPEG leaf;
+            //    thin/small `< 16`px photos stay lossless bit-exact.
+            for (w, h, expect_jpeg) in [(100i32, 80i32, true), (256, 12, false), (12, 256, false)] {
+                let meta = BufferMetadata {
+                    width: w,
+                    height: h,
+                    stride: w * 4,
+                    format: BufferFormat::Xrgb8888,
+                };
+                let mut buf = vec![0u8; (w * h * 4) as usize];
+                fill_smooth_photo(&mut buf, w as usize, tr(0, 0, w as u32, h as u32), 0xFF);
+                let ptr = buf.as_ptr();
+                let bp = unsafe { BufferPointer::new(&ptr, buf.len()) };
+                let tiles = filter_and_compress(bp, meta, hybrid_444, compressor);
+                assert_eq!(tiles.tiles.len(), 1);
+                assert_eq!(
+                    matches!(
+                        tiles.tiles[0].payload,
+                        TilePayload::Leaf(LeafPayload::Jpeg { .. })
+                    ),
+                    expect_jpeg
+                );
+                if !expect_jpeg {
+                    assert_decodes_at_both_alignments(&tiles, &buf, decompressor);
+                }
+            }
+
+            // 5. Mixed edge tile (`256x132`): top-left text, top-right photo, bottom
+            //    `128x4` slivers (`h < MIN_JPEG_DIM`) must stay lossless inside `Split`.
+            let meta_edge = BufferMetadata {
+                width: 256,
+                height: 132,
+                stride: 256 * 4,
+                format: BufferFormat::Xrgb8888,
+            };
+            let mut edge_buf = vec![0u8; 256 * 132 * 4];
+            fill_ui_text(&mut edge_buf, 256, tr(0, 0, 128, 128), false);
+            fill_smooth_photo(&mut edge_buf, 256, tr(128, 0, 128, 128), 0xFF);
+            fill_smooth_photo(&mut edge_buf, 256, tr(0, 128, 256, 4), 0xFF);
+            let ptr = edge_buf.as_ptr();
+            let bp = unsafe { BufferPointer::new(&ptr, edge_buf.len()) };
+            let edge_tiles = filter_and_compress(bp, meta_edge, hybrid_444, compressor);
+            let TilePayload::Split(edge_subs) = &edge_tiles.tiles[0].payload else {
+                panic!("expected Split for mixed 256x132 tile");
+            };
+            assert_eq!(edge_subs.len(), 4);
+            assert!(matches!(edge_subs[0].payload, LeafPayload::Palette { .. }));
+            assert!(matches!(edge_subs[1].payload, LeafPayload::Jpeg { .. }));
+            assert!(!matches!(edge_subs[2].payload, LeafPayload::Jpeg { .. }));
+            assert!(!matches!(edge_subs[3].payload, LeafPayload::Jpeg { .. }));
+        });
+    }
+
+    #[test]
+    #[cfg_attr(miri, ignore)]
+    fn test_hybrid_argb_translucent_jpeg_bit_exact_alpha() {
+        with_test_codec(|compressor, decompressor| {
+            let meta = BufferMetadata {
+                width: 256,
+                height: 256,
+                stride: 256 * 4,
+                format: BufferFormat::Argb8888,
+            };
+            let mode = CompressionMode::hybrid_default();
+
+            // Constant translucent alpha (`0x77`).
+            let mut const_a = vec![0u8; 256 * 256 * 4];
+            fill_smooth_photo(
+                &mut const_a,
+                256,
+                TileRect {
+                    x: 0,
+                    y: 0,
+                    w: 256,
+                    h: 256,
+                },
+                0x77,
+            );
+            let ptr = const_a.as_ptr();
+            let bp = unsafe { BufferPointer::new(&ptr, const_a.len()) };
+            let tiles = filter_and_compress(bp, meta, mode, compressor);
+            assert!(matches!(
+                tiles.tiles[0].payload,
+                TilePayload::Leaf(LeafPayload::Jpeg {
+                    alpha: AlphaChannel::Constant(0x77),
+                    ..
+                })
+            ));
+            let mut out = vec![0u8; const_a.len()];
+            decompress_and_unfilter(&tiles, decompressor, &mut out).unwrap();
+            assert!(out.as_chunks::<4>().0.iter().all(|px| px[3] == 0x77));
+            assert!(
+                rect_psnr_rgb(
+                    &const_a,
+                    &out,
+                    256,
+                    TileRect {
+                        x: 0,
+                        y: 0,
+                        w: 256,
+                        h: 256
+                    }
+                ) >= 38.0
+            );
+
+            // Varying alpha gradient on photo -> bit-exact alpha channel on every pixel.
+            let mut var_a = const_a;
+            for y in 0..256usize {
+                for x in 0..256usize {
+                    var_a[(y * 256 + x) * 4 + 3] = ((x + y * 3) & 0xFF) as u8;
+                }
+            }
+            let ptr = var_a.as_ptr();
+            let bp = unsafe { BufferPointer::new(&ptr, var_a.len()) };
+            let tiles = filter_and_compress(bp, meta, mode, compressor);
+            assert!(matches!(
+                tiles.tiles[0].payload,
+                TilePayload::Leaf(LeafPayload::Jpeg {
+                    alpha: AlphaChannel::Uncompressed(_) | AlphaChannel::Zstd(_),
+                    ..
+                })
+            ));
+            out.fill(0);
+            decompress_and_unfilter(&tiles, decompressor, &mut out).unwrap();
+            for (i, (got, exp)) in out
+                .as_chunks::<4>()
+                .0
+                .iter()
+                .zip(var_a.as_chunks::<4>().0.iter())
+                .enumerate()
+            {
+                assert_eq!(got[3], exp[3], "alpha mismatch at pixel {i}");
+            }
+            assert!(
+                rect_psnr_rgb(
+                    &var_a,
+                    &out,
+                    256,
+                    TileRect {
+                        x: 0,
+                        y: 0,
+                        w: 256,
+                        h: 256
+                    }
+                ) >= 38.0
+            );
+        });
+    }
+
+    #[test]
+    #[cfg_attr(miri, ignore)]
+    fn test_hybrid_incremental_skip_zero_generation_loss() {
+        with_test_codec(|compressor, decompressor| {
+            let tr = |x, y, w, h| TileRect { x, y, w, h };
+            let meta = BufferMetadata {
+                width: 256,
+                height: 256,
+                stride: 256 * 4,
+                format: BufferFormat::Xrgb8888,
+            };
+            let mode = CompressionMode::Hybrid {
+                quality: 85,
+                subsamp: JpegSubsamp::Sub420,
+            };
+            let mut frame = vec![0u8; 256 * 256 * 4];
+            fill_smooth_photo(&mut frame, 256, tr(0, 0, 256, 256), 0xFF);
+            let mut shadow = Vec::new();
+            let mut canvas = vec![0u8; frame.len()];
+
+            // Initial full sync encodes JPEG and snapshots raw `wl_shm` into `shadow`.
+            {
+                let ptr = frame.as_ptr();
+                let bp = unsafe { BufferPointer::new(&ptr, frame.len()) };
+                let mut streaming = None;
+                filter_and_compress_full_streaming(
+                    bp,
+                    ClientId(1),
+                    WlSurfaceId(2),
+                    meta,
+                    mode,
+                    Some(&mut shadow),
+                    compressor,
+                    |s| streaming = Some(s),
+                );
+                let mut wire = Vec::new();
+                streaming.unwrap().framed_write(&mut wire).unwrap();
+                let mut rx = None;
+                CompressedTileStream::read_from_stream(&mut wire.as_slice(), |s| {
+                    rx = Some(s);
+                    Ok(())
+                })
+                .unwrap();
+                let validated = ValidatedTileStream::new(rx.unwrap()).unwrap();
+                decompress_and_unfilter_streaming(validated, decompressor, &mut canvas).unwrap();
+            }
+            let canvas_after_f1 = canvas.clone();
+
+            // Unchanged frame emits 0 tiles -> zero generation loss.
+            {
+                let ptr = frame.as_ptr();
+                let bp = unsafe { BufferPointer::new(&ptr, frame.len()) };
+                let dirty = filter_and_compress_incremental_streaming(
+                    bp,
+                    ClientId(1),
+                    WlSurfaceId(2),
+                    meta,
+                    mode,
+                    None,
+                    &mut shadow,
+                    compressor,
+                    |_| panic!("unchanged hybrid frame must emit 0 tiles"),
+                );
+                assert!(dirty.is_empty());
+            }
+
+            // Edit only top-left `128x128` quadrant -> only TL transmitted; untouched
+            // quadrants keep exact Frame-1 decoded bytes with zero generation loss.
+            fill_ui_text(&mut frame, 256, tr(0, 0, 128, 128), false);
+            {
+                let ptr = frame.as_ptr();
+                let bp = unsafe { BufferPointer::new(&ptr, frame.len()) };
+                let mut streaming = None;
+                let dirty = filter_and_compress_incremental_streaming(
+                    bp,
+                    ClientId(1),
+                    WlSurfaceId(2),
+                    meta,
+                    mode,
+                    None,
+                    &mut shadow,
+                    compressor,
+                    |s| streaming = Some(s),
+                );
+                assert_eq!(dirty, vec![tr(0, 0, 128, 128)]);
+                let mut wire = Vec::new();
+                streaming.unwrap().framed_write(&mut wire).unwrap();
+                let mut rx = None;
+                CompressedTileStream::read_from_stream(&mut wire.as_slice(), |s| {
+                    rx = Some(s);
+                    Ok(())
+                })
+                .unwrap();
+                let validated = ValidatedTileStream::new(rx.unwrap()).unwrap();
+                decompress_and_unfilter_streaming(validated, decompressor, &mut canvas).unwrap();
+            }
+            // TL text quadrant is bit-exact; untouched quadrants are byte-identical to Frame 1.
+            assert!(rect_psnr_rgb(&frame, &canvas, 256, tr(0, 0, 128, 128)).is_infinite());
+            for y in 0..256usize {
+                for x in 0..256usize {
+                    if x >= 128 || y >= 128 {
+                        let off = (y * 256 + x) * 4;
+                        assert_eq!(&canvas[off..off + 4], &canvas_after_f1[off..off + 4]);
+                    }
+                }
+            }
+        });
+    }
+
+    #[test]
+    #[cfg_attr(miri, ignore)]
+    fn test_jpeg_and_split_decoder_errors() {
+        with_test_codec(|compressor, decompressor| {
+            let tr = |x, y, w, h| TileRect { x, y, w, h };
+
+            // Encode a valid `32x32` JPEG payload.
+            let mut small_photo = vec![0u8; 32 * 32 * 4];
+            fill_smooth_photo(&mut small_photo, 32, tr(0, 0, 32, 32), 0xFF);
+            let ptr = small_photo.as_ptr();
+            let bp = unsafe { BufferPointer::new(&ptr, small_photo.len()) };
+            let encoded = filter_and_compress(
+                bp,
+                BufferMetadata {
+                    width: 32,
+                    height: 32,
+                    stride: 32 * 4,
+                    format: BufferFormat::Xrgb8888,
+                },
+                CompressionMode::hybrid_default(),
+                compressor,
+            );
+            let TilePayload::Leaf(LeafPayload::Jpeg {
+                data: valid_32x32_jpeg,
+                ..
+            }) = &encoded.tiles[0].payload
+            else {
+                panic!("expected 32x32 JPEG leaf");
+            };
+
+            // Mismatched JPEG dimensions (both larger `64x64` and smaller `16x16` target rects)
+            // must fail loudly instead of writing partial pixels or overflowing.
+            for dim in [64i32, 16i32] {
+                let meta = BufferMetadata {
+                    width: dim,
+                    height: dim,
+                    stride: dim * 4,
+                    format: BufferFormat::Xrgb8888,
+                };
+                let mut out = vec![0u8; (dim * dim * 4) as usize];
+                let bad = CompressedTiles {
+                    metadata: meta,
+                    tile_rects: vec![tr(0, 0, dim as u32, dim as u32)],
+                    tiles: vec![CompressedTile {
+                        tile_idx: 0,
+                        payload: TilePayload::Leaf(LeafPayload::Jpeg {
+                            data: valid_32x32_jpeg.clone(),
+                            alpha: AlphaChannel::Omitted,
+                        }),
+                    }],
+                };
+                assert!(decompress_and_unfilter(&bad, decompressor, &mut out).is_err());
+            }
+
+            // Empty and corrupt JPEG payloads must fail.
+            let meta_32 = BufferMetadata {
+                width: 32,
+                height: 32,
+                stride: 32 * 4,
+                format: BufferFormat::Xrgb8888,
+            };
+            let mut out_32 = vec![0u8; 32 * 32 * 4];
+            for bad_bytes in [Vec::new(), vec![0x00, 0x01, 0x02, 0x03]] {
+                let bad = CompressedTiles {
+                    metadata: meta_32,
+                    tile_rects: vec![tr(0, 0, 32, 32)],
+                    tiles: vec![CompressedTile {
+                        tile_idx: 0,
+                        payload: TilePayload::Leaf(LeafPayload::Jpeg {
+                            data: bad_bytes,
+                            alpha: AlphaChannel::Omitted,
+                        }),
+                    }],
+                };
+                assert!(decompress_and_unfilter(&bad, decompressor, &mut out_32).is_err());
+            }
+
+            // Invalid Split tiles passed directly to `decompress_and_unfilter` must fail.
+            let meta_256 = BufferMetadata {
+                width: 256,
+                height: 256,
+                stride: 256 * 4,
+                format: BufferFormat::Xrgb8888,
+            };
+            let mut out_256 = vec![0u8; 256 * 256 * 4];
+            let solid = LeafPayload::Solid([1, 2, 3, 0xFF]);
+            for (parent_rect, bad_subs) in [
+                // Non-splittable `128x128`
+                (
+                    tr(0, 0, 128, 128),
+                    vec![
+                        SubTile {
+                            rect: tr(0, 0, 64, 128),
+                            payload: solid.clone(),
+                        },
+                        SubTile {
+                            rect: tr(64, 0, 64, 128),
+                            payload: solid.clone(),
+                        },
+                    ],
+                ),
+                // Count 1 (< 2)
+                (
+                    tr(0, 0, 256, 256),
+                    vec![SubTile {
+                        rect: tr(0, 0, 256, 256),
+                        payload: solid.clone(),
+                    }],
+                ),
+                // Count 5 (> 4)
+                (
+                    tr(0, 0, 256, 256),
+                    vec![
+                        SubTile {
+                            rect: tr(0, 0, 128, 128),
+                            payload: solid.clone(),
+                        },
+                        SubTile {
+                            rect: tr(128, 0, 128, 128),
+                            payload: solid.clone(),
+                        },
+                        SubTile {
+                            rect: tr(0, 128, 128, 128),
+                            payload: solid.clone(),
+                        },
+                        SubTile {
+                            rect: tr(128, 128, 64, 128),
+                            payload: solid.clone(),
+                        },
+                        SubTile {
+                            rect: tr(192, 128, 64, 128),
+                            payload: solid.clone(),
+                        },
+                    ],
+                ),
+                // Overlapping sub-rects whose summed area equals parent area
+                (
+                    tr(0, 0, 256, 256),
+                    vec![
+                        SubTile {
+                            rect: tr(0, 0, 160, 256),
+                            payload: solid.clone(),
+                        },
+                        SubTile {
+                            rect: tr(64, 0, 96, 256),
+                            payload: solid.clone(),
+                        },
+                    ],
+                ),
+                // Incomplete coverage
+                (
+                    tr(0, 0, 256, 256),
+                    vec![
+                        SubTile {
+                            rect: tr(0, 0, 128, 256),
+                            payload: solid.clone(),
+                        },
+                        SubTile {
+                            rect: tr(128, 0, 127, 256),
+                            payload: solid,
+                        },
+                    ],
+                ),
+            ] {
+                let bad = CompressedTiles {
+                    metadata: meta_256,
+                    tile_rects: vec![parent_rect],
+                    tiles: vec![CompressedTile {
+                        tile_idx: 0,
+                        payload: TilePayload::Split(bad_subs),
+                    }],
+                };
+                assert!(decompress_and_unfilter(&bad, decompressor, &mut out_256).is_err());
             }
         });
     }

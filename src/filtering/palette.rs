@@ -29,6 +29,11 @@ const MAX_PALETTE_COLORS: usize = 256;
 const HASH_SLOTS: usize = 512;
 const HASH_MASK: usize = HASH_SLOTS - 1;
 
+/// Dominant-color pixel share threshold (%) for [`PaletteScratch::is_text_safe`].
+/// Catches ClearType / LCD subpixel-antialiased text tiles that exceed 256
+/// unique RGB colors on a solid background.
+const TEXT_SAFE_DOMINANT_BG_PCT: usize = 35;
+
 fn pack_indices(indices: &[u8], n_colors: usize, packed: &mut [u8]) -> usize {
     let n = indices.len();
     let out_len = packed_palette_indices_len(n, n_colors);
@@ -72,6 +77,29 @@ pub(crate) struct PaletteScratch {
     pub(crate) palette: [u32; MAX_PALETTE_COLORS],
     indices: Vec<u8>,
     pub(crate) packed: Vec<u8>,
+}
+
+/// Result of classifying a tile/quadrant for hybrid lossy/lossless encoding.
+#[derive(Debug, Copy, Clone, Eq, PartialEq)]
+pub(crate) enum TextSafeClass {
+    /// Confirmed `<= 256` unique RGB colors, or early-exited on a dominant
+    /// background before observing 257 unique colors (still eligible for
+    /// palette encoding).
+    PaletteCandidate,
+    /// Confirmed `> 256` unique RGB colors (`> 256` BGRA colors too, so
+    /// palette encoding cannot succeed) with a single RGB color covering
+    /// `>= 35%` of pixels.
+    DominantBg,
+    /// Neither `<= 256` unique RGB colors nor `>= 35%` dominant background;
+    /// eligible for JPEG encoding.
+    Photo,
+}
+
+impl TextSafeClass {
+    #[inline]
+    pub(crate) fn is_text_safe(self) -> bool {
+        !matches!(self, Self::Photo)
+    }
 }
 
 impl PaletteScratch {
@@ -172,6 +200,179 @@ impl PaletteScratch {
         }
         let packed_len = pack_indices(&self.indices[..n_px], count, &mut self.packed);
         Some((count, packed_len))
+    }
+
+    /// Classifies `rect` for hybrid lossy/lossless encoding: `TextSafe` iff
+    /// `<= 256` unique RGB colors OR a single RGB color covering `>= 35%` of
+    /// its pixels (alpha byte 3 is ignored because alpha is always coded
+    /// losslessly).
+    ///
+    /// Runs unique-color tracking in the existing 512-slot hash table alongside
+    /// 2-slot Misra-Gries heavy-hitter tracking (`k = 3`, mathematically
+    /// guaranteed to retain any color with `> 1/3 = 33.3%`, hence any `>= 35%`
+    /// color). Once the 257th unique RGB color appears, hashing stops and
+    /// remaining pixels run a tight Misra-Gries-only loop. Because `n0` and
+    /// `n1` are exact lower bounds on true color counts at every prefix, the
+    /// scan exits early as soon as either reaches the `35%` threshold;
+    /// otherwise exact bounds (`n <= count <= n + decrements`) resolve nearly
+    /// all tiles in a single pass, running an exact verification pass only in
+    /// the narrow uncertain band.
+    #[inline]
+    pub(crate) fn classify_text_safe(
+        &mut self,
+        aos: BufferPointer<Vec4u8>,
+        stride_px: usize,
+        rect: TileRect,
+    ) -> TextSafeClass {
+        let x0 = rect.x as usize;
+        let y0 = rect.y as usize;
+        let tw = rect.w as usize;
+        let th = rect.h as usize;
+        let n_px = tw * th;
+        debug_assert!(n_px > 0 && n_px <= TILE_PIXELS);
+        if n_px <= MAX_PALETTE_COLORS {
+            return TextSafeClass::PaletteCandidate;
+        }
+
+        self.cur_gen = self.cur_gen.wrapping_add(1);
+        if self.cur_gen == 0 {
+            self.gens.fill(0);
+            self.cur_gen = 1;
+        }
+        let cur_epoch = self.cur_gen;
+
+        let threshold = (n_px * TEXT_SAFE_DOMINANT_BG_PCT).div_ceil(100);
+        let mut unique = 0usize;
+        let mut tracking_unique = true;
+        let mut last_color = 0u32;
+
+        // 2-slot Misra-Gries heavy-hitter state (`n0 > 0 && n1 > 0 => c0 != c1`).
+        let mut c0 = 0u32;
+        let mut n0 = 0usize;
+        let mut c1 = 0u32;
+        let mut n1 = 0usize;
+        let mut decrements = 0usize;
+
+        for ry in 0..th {
+            let row_start = (y0 + ry) * stride_px + x0;
+            debug_assert!(row_start + tw <= aos.len());
+            // SAFETY: Caller guarantees `rect` is inside `aos`.
+            let row_ptr = unsafe { aos.ptr().add(row_start) };
+            let mut x = 0usize;
+            if tracking_unique {
+                while x < tw {
+                    // SAFETY: `x < tw` and `row_ptr` is valid for `tw` reads.
+                    let px = unsafe { row_ptr.add(x).read() };
+                    x += 1;
+                    let c = u32::from_le_bytes([px.0, px.1, px.2, 0xFF]);
+
+                    if n0 > 0 && c == c0 {
+                        n0 += 1;
+                    } else if n1 > 0 && c == c1 {
+                        n1 += 1;
+                    } else if n0 == 0 {
+                        c0 = c;
+                        n0 = 1;
+                    } else if n1 == 0 {
+                        c1 = c;
+                        n1 = 1;
+                    } else {
+                        n0 -= 1;
+                        n1 -= 1;
+                        decrements += 1;
+                    }
+
+                    if unique > 0 && c == last_color {
+                        continue;
+                    }
+                    let mut h = (c.wrapping_mul(0x9E37_79B1) >> 23) as usize & HASH_MASK;
+                    loop {
+                        if self.gens[h] != cur_epoch {
+                            if unique >= MAX_PALETTE_COLORS {
+                                tracking_unique = false;
+                                break;
+                            }
+                            self.gens[h] = cur_epoch;
+                            self.keys[h] = c;
+                            unique += 1;
+                            last_color = c;
+                            break;
+                        }
+                        if self.keys[h] == c {
+                            last_color = c;
+                            break;
+                        }
+                        h = (h + 1) & HASH_MASK;
+                    }
+                    if !tracking_unique {
+                        break;
+                    }
+                }
+            }
+            while x < tw {
+                // SAFETY: `x < tw` and `row_ptr` is valid for `tw` reads.
+                let px = unsafe { row_ptr.add(x).read() };
+                x += 1;
+                let c = u32::from_le_bytes([px.0, px.1, px.2, 0xFF]);
+
+                if n0 > 0 && c == c0 {
+                    n0 += 1;
+                } else if n1 > 0 && c == c1 {
+                    n1 += 1;
+                } else if n0 == 0 {
+                    c0 = c;
+                    n0 = 1;
+                } else if n1 == 0 {
+                    c1 = c;
+                    n1 = 1;
+                } else {
+                    n0 -= 1;
+                    n1 -= 1;
+                    decrements += 1;
+                }
+            }
+            if n0 >= threshold || n1 >= threshold {
+                return if tracking_unique {
+                    TextSafeClass::PaletteCandidate
+                } else {
+                    TextSafeClass::DominantBg
+                };
+            }
+        }
+
+        if tracking_unique {
+            return TextSafeClass::PaletteCandidate;
+        }
+
+        let check0 = n0 > 0 && n0 + decrements >= threshold;
+        let check1 = n1 > 0 && n1 + decrements >= threshold;
+        if !check0 && !check1 {
+            return TextSafeClass::Photo;
+        }
+
+        let mut exact0 = 0usize;
+        let mut exact1 = 0usize;
+        for ry in 0..th {
+            let row_start = (y0 + ry) * stride_px + x0;
+            // SAFETY: Caller guarantees `rect` is inside `aos`.
+            let row_ptr = unsafe { aos.ptr().add(row_start) };
+            for x in 0..tw {
+                // SAFETY: `x < tw` and `row_ptr` is valid for `tw` reads.
+                let px = unsafe { row_ptr.add(x).read() };
+                let c = u32::from_le_bytes([px.0, px.1, px.2, 0xFF]);
+                if check0 && c == c0 {
+                    exact0 += 1;
+                } else if check1 && c == c1 {
+                    exact1 += 1;
+                }
+            }
+        }
+
+        if exact0 >= threshold || exact1 >= threshold {
+            TextSafeClass::DominantBg
+        } else {
+            TextSafeClass::Photo
+        }
     }
 }
 
@@ -429,5 +630,188 @@ mod tests {
         assert!(prepare_palette_lut(false, &[0, 1], &[0], 1).is_err());
         assert!(prepare_palette_lut(false, &[0, 1, 2], &[], 1).is_err());
         assert!(prepare_palette_lut(false, &pal2, &[0, 0], 1).is_err());
+    }
+
+    fn oracle_is_text_safe(frame: &[Vec4u8], stride_px: usize, rect: TileRect) -> bool {
+        let mut counts = std::collections::HashMap::<u32, usize>::new();
+        let n_px = rect.w as usize * rect.h as usize;
+        for ry in 0..rect.h as usize {
+            for rx in 0..rect.w as usize {
+                let px = frame[(rect.y as usize + ry) * stride_px + rect.x as usize + rx];
+                let rgb = u32::from_le_bytes([px.0, px.1, px.2, 0xFF]);
+                *counts.entry(rgb).or_insert(0) += 1;
+            }
+        }
+        if counts.len() <= MAX_PALETTE_COLORS {
+            return true;
+        }
+        let max_cnt = counts.values().copied().max().unwrap_or(0);
+        max_cnt * 100 >= n_px * TEXT_SAFE_DOMINANT_BG_PCT
+    }
+
+    #[test]
+    fn test_is_text_safe_thresholds_and_misra_gries_adversarial() {
+        let mut scratch = PaletteScratch::new();
+        let run = |scratch: &mut PaletteScratch, pixels: &[Vec4u8], w: u32, h: u32| -> bool {
+            let ptr = pixels.as_ptr();
+            let bp = unsafe { BufferPointer::new(&ptr, pixels.len()) };
+            scratch
+                .classify_text_safe(bp, w as usize, TileRect { x: 0, y: 0, w, h })
+                .is_text_safe()
+        };
+        let unique_color = |i: usize| -> Vec4u8 {
+            Vec4u8(
+                (i & 0xFF) as u8,
+                ((i >> 8) & 0xFF) as u8,
+                ((i >> 16) & 0xFF) as u8,
+                0xFF,
+            )
+        };
+
+        // 1. Exactly 256 unique RGB colors (even with > 256 unique BGRA via varying alpha) -> true.
+        let mut px256: Vec<Vec4u8> = (0..1000)
+            .map(|i| {
+                let mut c = unique_color(i % 256);
+                c.3 = (i % 251) as u8;
+                c
+            })
+            .collect();
+        assert!(run(&mut scratch, &px256, 40, 25));
+
+        // 2. 257 unique RGB colors uniformly distributed (~0.4% each) -> false.
+        px256[999] = unique_color(256);
+        assert!(!run(&mut scratch, &px256, 40, 25));
+
+        // 3. Exact 35% boundary (`n_px = 1000`: 349 -> false, 350 -> true;
+        //    `n_px = 1001`: 350 -> false, 351 -> true).
+        let dom = Vec4u8(250, 251, 252, 0xFF);
+        for (w, h, below, at_thresh) in [(40u32, 25u32, 349usize, 350usize), (77, 13, 350, 351)] {
+            let n = (w * h) as usize;
+            // Dominant color placed at the end (worst case for naive front-sampling).
+            let mut tail_below: Vec<Vec4u8> = (0..n).map(|i| unique_color(i + 1)).collect();
+            for px in &mut tail_below[n - below..] {
+                *px = dom;
+            }
+            assert!(!run(&mut scratch, &tail_below, w, h));
+
+            let mut tail_at = tail_below;
+            tail_at[n - at_thresh] = dom;
+            assert!(run(&mut scratch, &tail_at, w, h));
+
+            // Dominant color at the beginning.
+            let mut head_at: Vec<Vec4u8> = (0..n).map(|i| unique_color(i + 1)).collect();
+            for px in &mut head_at[..at_thresh] {
+                *px = dom;
+            }
+            assert!(run(&mut scratch, &head_at, w, h));
+        }
+
+        // 4. Misra-Gries adversarial cancellation orderings: interleave `[u_a, u_b, dom]`
+        //    repeatedly so both slots constantly cancel out. `dom` still survives!
+        for (dom_cnt, expected) in [(349usize, false), (350, true)] {
+            let n = 1000usize;
+            let mut adv = Vec::with_capacity(n);
+            let mut next_u = 1usize;
+            let mut dom_left = dom_cnt;
+            while adv.len() < n {
+                if (dom_left > 0 && adv.len() % 3 == 2) || n - adv.len() <= dom_left {
+                    adv.push(dom);
+                    dom_left -= 1;
+                } else {
+                    adv.push(unique_color(next_u));
+                    next_u += 1;
+                }
+            }
+            assert_eq!(run(&mut scratch, &adv, 40, 25), expected);
+            assert_eq!(
+                expected,
+                oracle_is_text_safe(
+                    &adv,
+                    40,
+                    TileRect {
+                        x: 0,
+                        y: 0,
+                        w: 40,
+                        h: 25
+                    }
+                )
+            );
+        }
+
+        // 5. Two competing ~35% colors (`350` of A, `350` of B, `300` unique) -> true;
+        //    `349` of A, `349` of B, `302` unique -> false.
+        for (cnt, expected) in [(349usize, false), (350, true)] {
+            let mut dual = Vec::with_capacity(1000);
+            let a = Vec4u8(1, 2, 3, 0xFF);
+            let b = Vec4u8(4, 5, 6, 0xFF);
+            for i in 0..cnt {
+                dual.push(a);
+                dual.push(b);
+                if i < 1000 - 2 * cnt {
+                    dual.push(unique_color(1000 + i));
+                }
+            }
+            while dual.len() < 1000 {
+                dual.push(unique_color(5000 + dual.len()));
+            }
+            assert_eq!(run(&mut scratch, &dual, 40, 25), expected);
+        }
+
+        // 6. Padded stride and non-zero `(x0, y0)`: outer solid background must not leak into rect.
+        let stride_px = 64usize;
+        let mut padded = vec![dom; stride_px * 50];
+        let rect = TileRect {
+            x: 7,
+            y: 5,
+            w: 30,
+            h: 20,
+        };
+        for ry in 0..rect.h as usize {
+            for rx in 0..rect.w as usize {
+                padded[(rect.y as usize + ry) * stride_px + rect.x as usize + rx] =
+                    unique_color(ry * 30 + rx + 1);
+            }
+        }
+        let ptr = padded.as_ptr();
+        let bp = unsafe { BufferPointer::new(&ptr, padded.len()) };
+        assert_eq!(
+            scratch.classify_text_safe(bp, stride_px, rect),
+            TextSafeClass::Photo
+        );
+
+        // 7. Oracle cross-check across diverse pseudo-random and bimodal tiles.
+        let mut rng = 0x5EED_CAFE_1234_5678u64;
+        for case in 0..40usize {
+            let w = 24 + (case % 17);
+            let h = 16 + ((case * 3) % 13);
+            let n = w * h;
+            let mut buf = Vec::with_capacity(n);
+            let bg_pct = (case * 7) % 60;
+            for i in 0..n {
+                rng = rng
+                    .wrapping_mul(6364136223846793005)
+                    .wrapping_add(1442695040888963407);
+                let v = (rng >> 32) as usize;
+                let px = if (v % 100) < bg_pct {
+                    dom
+                } else if case % 5 == 0 {
+                    unique_color(v % 250)
+                } else {
+                    unique_color(1000 + (v ^ i) % 10_000)
+                };
+                buf.push(px);
+            }
+            let r = TileRect {
+                x: 0,
+                y: 0,
+                w: w as u32,
+                h: h as u32,
+            };
+            assert_eq!(
+                run(&mut scratch, &buf, w as u32, h as u32),
+                oracle_is_text_safe(&buf, w, r),
+                "oracle mismatch on case {case}"
+            );
+        }
     }
 }

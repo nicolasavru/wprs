@@ -63,6 +63,7 @@ use crate::compositor_utils;
 use crate::filtering;
 use crate::prelude::*;
 use crate::serialization::Capabilities;
+use crate::serialization::CompressionMode;
 use crate::serialization::Event;
 use crate::serialization::RecvType;
 use crate::serialization::Request;
@@ -133,6 +134,7 @@ fn committed_wl_buffer(surface_data: &SurfaceData) -> Option<WlBuffer> {
 fn sync_surface_data(
     serializer: &Serializer<Request, Event>,
     compressor: &mut ShardingCompressor,
+    compression_mode: CompressionMode,
     synced_buffers: &mut HashMap<WlSurfaceId, SyncedSurfaceBuffer>,
     surface_data: &SurfaceData,
 ) {
@@ -166,6 +168,7 @@ fn sync_surface_data(
                             surface_state_to_send.client,
                             surface_state_to_send.id,
                             metadata,
+                            compression_mode,
                             Some(&mut shadow_pixels),
                             compressor,
                             |raw_buffer_to_send| {
@@ -228,6 +231,7 @@ impl WprsServerState {
                 sync_surface_data(
                     &self.serializer,
                     &mut self.compressor,
+                    self.compression_mode,
                     &mut self.synced_buffers,
                     surface_data,
                 );
@@ -878,6 +882,9 @@ impl WprsServerState {
         for (_, (_, global_id)) in old_outputs {
             self.dh.remove_global::<Self>(global_id);
         }
+        // Reset compression mode to Lossless on each new connection so a
+        // lossless client never inherits a prior hybrid client's setting.
+        self.compression_mode = CompressionMode::Lossless;
         self.synced_buffers.clear();
         self.dirty_sync_surfaces.clear();
 
@@ -1208,6 +1215,14 @@ impl WprsServerState {
     }
 
     #[instrument(skip(self), level = "debug")]
+    fn handle_set_compression_mode(&mut self, mode: CompressionMode) -> Result<()> {
+        mode.validate().location(loc!())?;
+        info!("client set compression mode: {mode:?}");
+        self.compression_mode = mode;
+        Ok(())
+    }
+
+    #[instrument(skip(self), level = "debug")]
     pub fn handle_event(&mut self, conn_id: u64, event: RecvType<Event>) {
         if matches!(event, RecvType::Connected) {
             if !self.serializer.activate_connection(conn_id) {
@@ -1230,9 +1245,91 @@ impl WprsServerState {
             RecvType::Object(Event::Surface(surface_event)) => {
                 self.handle_surface_event(surface_event)
             },
+            RecvType::Object(Event::SetCompressionMode(mode)) => {
+                self.handle_set_compression_mode(mode)
+            },
             RecvType::RawBuffer(_) => unreachable!(),
         }
         .log_and_ignore(loc!());
         // TODO: maybe send errors back to the client.
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::os::unix::net::UnixStream;
+    use std::time::Duration;
+
+    use smithay::reexports::calloop::EventLoop;
+    use smithay::reexports::wayland_server::Display;
+
+    use super::*;
+    use crate::serialization::JpegSubsamp;
+
+    #[test]
+    #[cfg_attr(miri, ignore)]
+    fn test_set_compression_mode_and_connect_reset() {
+        let sock_path = std::env::temp_dir().join(format!(
+            "wprs_comp_mode_test_{}_{}.sock",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let mut serializer: Serializer<Request, Event> =
+            Serializer::new_server(&sock_path).unwrap();
+        let reader = serializer.reader().unwrap();
+        let display: Display<WprsServerState> = Display::new().unwrap();
+        let event_loop: EventLoop<WprsServerState> = EventLoop::try_new().unwrap();
+        let mut state = WprsServerState::new(
+            display.handle(),
+            event_loop.handle(),
+            serializer,
+            false,
+            Duration::from_millis(16),
+            false,
+        );
+        assert_eq!(state.compression_mode, CompressionMode::Lossless);
+
+        // Client 1 connects -> activates session -> sets Hybrid mode.
+        let client1 = UnixStream::connect(&sock_path).unwrap();
+        let (conn1, msg1) = reader.recv().unwrap();
+        assert!(matches!(msg1, RecvType::Connected));
+        state.handle_event(conn1, msg1);
+        assert_eq!(state.compression_mode, CompressionMode::Lossless);
+
+        let hybrid = CompressionMode::Hybrid {
+            quality: 85,
+            subsamp: JpegSubsamp::Sub420,
+        };
+        state.handle_event(conn1, RecvType::Object(Event::SetCompressionMode(hybrid)));
+        assert_eq!(state.compression_mode, hybrid);
+
+        // Invalid wire quality (`0` and `101`) must be rejected without mutating state.
+        for bad_q in [0u8, 101] {
+            let bad = CompressionMode::Hybrid {
+                quality: bad_q,
+                subsamp: JpegSubsamp::Sub444,
+            };
+            assert!(state.handle_set_compression_mode(bad).is_err());
+            state.handle_event(conn1, RecvType::Object(Event::SetCompressionMode(bad)));
+            assert_eq!(state.compression_mode, hybrid);
+        }
+
+        // Client 1 disconnects and Client 2 connects -> `handle_connect` resets to Lossless.
+        drop(client1);
+        let client2 = UnixStream::connect(&sock_path).unwrap();
+        let (conn2, msg2) = reader.recv().unwrap();
+        assert!(matches!(msg2, RecvType::Connected));
+        state.handle_event(conn2, msg2);
+        assert_eq!(state.compression_mode, CompressionMode::Lossless);
+
+        // Stale event from Client 1 is ignored.
+        state.handle_event(conn1, RecvType::Object(Event::SetCompressionMode(hybrid)));
+        assert_eq!(state.compression_mode, CompressionMode::Lossless);
+
+        drop(client2);
+        _ = std::fs::remove_file(&sock_path);
     }
 }
