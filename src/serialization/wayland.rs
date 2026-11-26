@@ -21,6 +21,7 @@ use enum_as_inner::EnumAsInner;
 use rkyv::Archive;
 use rkyv::Deserialize;
 use rkyv::Serialize;
+use smithay::backend::input::AxisRelativeDirection as SmithayAxisRelativeDirection;
 use smithay::backend::input::AxisSource as SmithayAxisSource;
 use smithay::output::Subpixel as SmithaySubpixel;
 use smithay::reexports::wayland_server::Resource;
@@ -41,6 +42,7 @@ use smithay_client_toolkit::output::OutputInfo as SctkOutputInfo;
 use smithay_client_toolkit::reexports::client::protocol::wl_data_device_manager::DndAction as SctkWlDndAction;
 use smithay_client_toolkit::reexports::client::protocol::wl_output::Subpixel as SctkSubpixel;
 use smithay_client_toolkit::reexports::client::protocol::wl_output::Transform as SctkTransform;
+use smithay_client_toolkit::reexports::client::protocol::wl_pointer::AxisRelativeDirection as SctkAxisRelativeDirection;
 use smithay_client_toolkit::reexports::client::protocol::wl_pointer::AxisSource as SctkAxisSource;
 use smithay_client_toolkit::reexports::client::protocol::wl_shm::Format as SctkBufferFormat;
 use smithay_client_toolkit::seat::keyboard::Modifiers as SmithayModifiers;
@@ -305,18 +307,60 @@ pub enum KeyboardEvent {
     },
 }
 
-#[derive(Debug, Copy, Clone, PartialEq, Archive, Deserialize, Serialize)]
+#[derive(Debug, Default, Copy, Clone, Eq, PartialEq, Archive, Deserialize, Serialize)]
+pub enum AxisRelativeDirection {
+    #[default]
+    Identical,
+    Inverted,
+}
+
+impl From<SctkAxisRelativeDirection> for AxisRelativeDirection {
+    fn from(direction: SctkAxisRelativeDirection) -> Self {
+        match direction {
+            SctkAxisRelativeDirection::Identical => Self::Identical,
+            SctkAxisRelativeDirection::Inverted => Self::Inverted,
+            _ => {
+                warn!("Unknown axis relative direction {direction:?}, using Identical instead.");
+                Self::Identical
+            },
+        }
+    }
+}
+
+impl From<AxisRelativeDirection> for SmithayAxisRelativeDirection {
+    fn from(direction: AxisRelativeDirection) -> Self {
+        match direction {
+            AxisRelativeDirection::Identical => Self::Identical,
+            AxisRelativeDirection::Inverted => Self::Inverted,
+        }
+    }
+}
+
+#[derive(Debug, Default, Copy, Clone, PartialEq, Archive, Deserialize, Serialize)]
 pub struct AxisScroll {
     pub absolute: f64,
-    pub discrete: i32,
+    /// High-resolution wheel scroll steps in units of 1/120th of a detent
+    /// (from `wl_pointer::axis_value120` on v8+ or `axis_discrete * 120` on
+    /// v5-v7; zero for continuous scrolling).
+    pub v120: i32,
+    pub relative_direction: AxisRelativeDirection,
     pub stop: bool,
 }
 
 impl From<SctkAxisScroll> for AxisScroll {
     fn from(axis_scroll: SctkAxisScroll) -> Self {
+        let v120 = if axis_scroll.value120 != 0 {
+            axis_scroll.value120
+        } else {
+            axis_scroll.discrete.saturating_mul(120)
+        };
         Self {
             absolute: axis_scroll.absolute,
-            discrete: axis_scroll.discrete,
+            v120,
+            relative_direction: axis_scroll
+                .relative_direction
+                .map(Into::into)
+                .unwrap_or_default(),
             stop: axis_scroll.stop,
         }
     }
@@ -337,7 +381,7 @@ impl From<SctkAxisSource> for AxisSource {
             SctkAxisSource::Finger => Self::Finger,
             SctkAxisSource::Continuous => Self::Continuous,
             SctkAxisSource::WheelTilt => Self::WheelTilt,
-            _ => unreachable!(), // TODO: error message
+            _ => unreachable!("got unknown AxisSource {axis_source:?}"),
         }
     }
 }
@@ -1064,5 +1108,110 @@ mod tests {
                 "expected validate() error for ({width}, {height}, {stride})"
             );
         }
+    }
+
+    #[test]
+    fn test_axis_scroll_from_sctk() {
+        // `wl_pointer` v8+: `value120` populated, deprecated `discrete == 0`.
+        for (value120, absolute, rel_dir, expected_dir) in [
+            (
+                120,
+                15.0,
+                Some(SctkAxisRelativeDirection::Identical),
+                AxisRelativeDirection::Identical,
+            ),
+            (
+                -120,
+                -15.0,
+                Some(SctkAxisRelativeDirection::Inverted),
+                AxisRelativeDirection::Inverted,
+            ),
+            (60, 7.5, None, AxisRelativeDirection::Identical),
+        ] {
+            let converted = AxisScroll::from(SctkAxisScroll {
+                absolute,
+                discrete: 0,
+                value120,
+                relative_direction: rel_dir,
+                stop: false,
+            });
+            assert_eq!(
+                converted,
+                AxisScroll {
+                    absolute,
+                    v120: value120,
+                    relative_direction: expected_dir,
+                    stop: false,
+                }
+            );
+        }
+
+        // `wl_pointer` v5-v7: `discrete` populated, `value120 == 0`.
+        for (discrete, expected_v120) in [
+            (1, 120),
+            (-2, -240),
+            (i32::MAX, i32::MAX),
+            (i32::MIN, i32::MIN),
+        ] {
+            let converted = AxisScroll::from(SctkAxisScroll {
+                absolute: 15.0,
+                discrete,
+                value120: 0,
+                relative_direction: None,
+                stop: false,
+            });
+            assert_eq!(
+                converted,
+                AxisScroll {
+                    absolute: 15.0,
+                    v120: expected_v120,
+                    relative_direction: AxisRelativeDirection::Identical,
+                    stop: false,
+                }
+            );
+        }
+
+        // Continuous touchpad scroll: `absolute != 0.0`, `discrete == 0`, `value120 == 0`.
+        let continuous = AxisScroll::from(SctkAxisScroll {
+            absolute: 12.25,
+            discrete: 0,
+            value120: 0,
+            relative_direction: Some(SctkAxisRelativeDirection::Inverted),
+            stop: true,
+        });
+        assert_eq!(
+            continuous,
+            AxisScroll {
+                absolute: 12.25,
+                v120: 0,
+                relative_direction: AxisRelativeDirection::Inverted,
+                stop: true,
+            }
+        );
+
+        // If both `value120` and `discrete` are non-zero, `value120` takes precedence.
+        let both = AxisScroll::from(SctkAxisScroll {
+            absolute: 7.5,
+            discrete: 1,
+            value120: 60,
+            relative_direction: None,
+            stop: false,
+        });
+        assert_eq!(both.v120, 60);
+
+        // Wire round-trip via `rkyv`.
+        let event = PointerEventKind::Axis {
+            horizontal: continuous,
+            vertical: AxisScroll {
+                absolute: -15.0,
+                v120: -120,
+                relative_direction: AxisRelativeDirection::Identical,
+                stop: false,
+            },
+            source: Some(AxisSource::Wheel),
+        };
+        let bytes = rkyv::to_bytes::<rkyv::rancor::Error>(&event).unwrap();
+        let decoded = rkyv::from_bytes::<PointerEventKind, rkyv::rancor::Error>(&bytes).unwrap();
+        assert_eq!(decoded, event);
     }
 }

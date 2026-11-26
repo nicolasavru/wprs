@@ -16,6 +16,8 @@ use std::collections::HashSet;
 use std::sync::Mutex;
 use std::time::Duration;
 
+use smithay::backend::input::Axis;
+use smithay::input::pointer::AxisFrame;
 use smithay::output::Mode;
 use smithay::output::Output;
 use smithay::output::Scale;
@@ -39,6 +41,8 @@ use crate::constants;
 use crate::prelude::*;
 use crate::serialization::framing::RowBand;
 use crate::serialization::geometry::Rectangle as SerRectangle;
+use crate::serialization::wayland::AxisScroll;
+use crate::serialization::wayland::AxisSource;
 use crate::serialization::wayland::OutputInfo;
 use crate::serialization::wayland::ViewportState;
 
@@ -312,12 +316,45 @@ pub fn damage_to_buffer_rects(
         .collect()
 }
 
+/// Builds a Smithay [`AxisFrame`] from normalized horizontal and vertical
+/// scroll payloads, omitting `v120` for continuous (non-wheel) scrolls so
+/// Smithay leaves `AxisFrame::v120` as `None`.
+pub fn build_axis_frame(
+    time: u32,
+    horizontal: AxisScroll,
+    vertical: AxisScroll,
+    source: Option<AxisSource>,
+) -> AxisFrame {
+    let mut axis_frame = AxisFrame::new(time);
+    if let Some(source) = source {
+        axis_frame = axis_frame.source(source.into());
+    }
+    for (axis, scroll) in [(Axis::Horizontal, horizontal), (Axis::Vertical, vertical)] {
+        axis_frame = axis_frame.relative_direction(axis, scroll.relative_direction.into());
+        if scroll.absolute != 0.0 {
+            axis_frame = axis_frame.value(axis, scroll.absolute);
+        }
+        if scroll.v120 != 0 {
+            axis_frame = axis_frame.v120(axis, scroll.v120);
+        }
+        if scroll.stop {
+            axis_frame = axis_frame.stop(axis);
+        }
+    }
+    axis_frame
+}
+
 #[cfg(test)]
 mod tests {
+    use smithay::backend::input::AxisRelativeDirection as SmithayAxisRelativeDirection;
+    use smithay::backend::input::AxisSource as SmithayAxisSource;
     use smithay::utils::Point;
+    use smithay_client_toolkit::reexports::client::protocol::wl_pointer::AxisRelativeDirection as SctkAxisRelativeDirection;
+    use smithay_client_toolkit::seat::pointer::AxisScroll as SctkAxisScroll;
 
     use super::*;
     use crate::serialization::geometry;
+    use crate::serialization::wayland::AxisRelativeDirection;
 
     fn viewport(src: Option<geometry::Rectangle<f64>>, dst: Option<(i32, i32)>) -> ViewportState {
         ViewportState {
@@ -736,5 +773,120 @@ mod tests {
             64,
             Some(&[RowBand { y0: 0, y1: 1 }, RowBand { y0: 2, y1: 3 }]),
         );
+    }
+
+    #[test]
+    fn test_build_axis_frame() {
+        // `wl_pointer` v8+ vertical wheel scroll (`value120 = 120`, `discrete = 0`).
+        let wheel_frame = build_axis_frame(
+            42,
+            AxisScroll::default(),
+            SctkAxisScroll {
+                absolute: 15.0,
+                discrete: 0,
+                value120: 120,
+                relative_direction: Some(SctkAxisRelativeDirection::Inverted),
+                stop: false,
+            }
+            .into(),
+            Some(AxisSource::Wheel),
+        );
+        assert_eq!(wheel_frame.time, 42);
+        assert_eq!(wheel_frame.source, Some(SmithayAxisSource::Wheel));
+        assert_eq!(wheel_frame.axis, (0.0, 15.0));
+        assert_eq!(wheel_frame.v120, Some((0, 120)));
+        assert_eq!(
+            wheel_frame.relative_direction,
+            (
+                SmithayAxisRelativeDirection::Identical,
+                SmithayAxisRelativeDirection::Inverted,
+            )
+        );
+        assert_eq!(wheel_frame.stop, (false, false));
+
+        // High-resolution two-axis scroll combined with legacy v5-v7 `discrete`.
+        let mixed_frame = build_axis_frame(
+            99,
+            SctkAxisScroll {
+                absolute: -7.5,
+                discrete: 0,
+                value120: -60,
+                relative_direction: None,
+                stop: false,
+            }
+            .into(),
+            SctkAxisScroll {
+                absolute: -30.0,
+                discrete: -2,
+                value120: 0,
+                relative_direction: None,
+                stop: false,
+            }
+            .into(),
+            Some(AxisSource::WheelTilt),
+        );
+        assert_eq!(mixed_frame.source, Some(SmithayAxisSource::WheelTilt));
+        assert_eq!(mixed_frame.axis, (-7.5, -30.0));
+        assert_eq!(mixed_frame.v120, Some((-60, -240)));
+
+        // Continuous touchpad scroll leaves `v120 == None`.
+        let touchpad_frame = build_axis_frame(
+            123,
+            AxisScroll {
+                absolute: 3.5,
+                v120: 0,
+                relative_direction: AxisRelativeDirection::Inverted,
+                stop: false,
+            },
+            AxisScroll {
+                absolute: -4.25,
+                v120: 0,
+                relative_direction: AxisRelativeDirection::Inverted,
+                stop: false,
+            },
+            Some(AxisSource::Finger),
+        );
+        assert_eq!(touchpad_frame.source, Some(SmithayAxisSource::Finger));
+        assert_eq!(touchpad_frame.axis, (3.5, -4.25));
+        assert_eq!(touchpad_frame.v120, None);
+        assert_eq!(
+            touchpad_frame.relative_direction,
+            (
+                SmithayAxisRelativeDirection::Inverted,
+                SmithayAxisRelativeDirection::Inverted,
+            )
+        );
+        assert_eq!(touchpad_frame.stop, (false, false));
+
+        // `source: None` with asymmetric `stop` flags and zero deltas.
+        let stop_h = build_axis_frame(
+            456,
+            AxisScroll {
+                stop: true,
+                ..AxisScroll::default()
+            },
+            AxisScroll::default(),
+            None,
+        );
+        assert_eq!(stop_h.time, 456);
+        assert_eq!(stop_h.source, None);
+        assert_eq!(stop_h.axis, (0.0, 0.0));
+        assert_eq!(stop_h.v120, None);
+        assert_eq!(stop_h.stop, (true, false));
+
+        let stop_v = build_axis_frame(
+            789,
+            AxisScroll::default(),
+            AxisScroll {
+                stop: true,
+                ..AxisScroll::default()
+            },
+            Some(AxisSource::Continuous),
+        );
+        assert_eq!(stop_v.time, 789);
+        assert_eq!(stop_v.source, Some(SmithayAxisSource::Continuous));
+        assert_eq!(stop_v.axis, (0.0, 0.0));
+        assert_eq!(stop_v.v120, None);
+        assert_eq!(stop_v.stop, (false, true));
     }
 }

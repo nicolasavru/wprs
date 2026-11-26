@@ -25,7 +25,6 @@ use std::thread;
 
 use nix::fcntl::OFlag;
 use nix::unistd;
-use smithay::backend::input::Axis;
 use smithay::backend::input::ButtonState;
 use smithay::backend::input::KeyState as SmithayKeyState;
 use smithay::backend::renderer::utils::RendererSurfaceStateUserData;
@@ -34,7 +33,6 @@ use smithay::input::keyboard::KeysymHandle;
 use smithay::input::keyboard::Layout;
 use smithay::input::keyboard::ModifiersState;
 use smithay::input::keyboard::XkbContext;
-use smithay::input::pointer::AxisFrame;
 use smithay::input::pointer::ButtonEvent;
 use smithay::input::pointer::CursorImageStatus as SmithayCursorImageStatus;
 use smithay::input::pointer::CursorImageSurfaceData;
@@ -443,22 +441,10 @@ impl WprsServerState {
                     debug!(
                         "axis event: horizontal {horizontal:?}, vertical {vertical:?}, source {source:?}"
                     );
-                    let mut axis_frame = AxisFrame::new(time)
-                        .value(Axis::Horizontal, horizontal.absolute)
-                        .value(Axis::Vertical, vertical.absolute)
-                        .v120(Axis::Horizontal, horizontal.discrete)
-                        .v120(Axis::Vertical, vertical.discrete);
-
-                    if let Some(source) = source {
-                        axis_frame = axis_frame.source(source.into());
-                    }
-                    if horizontal.stop {
-                        axis_frame = axis_frame.stop(Axis::Horizontal);
-                    }
-                    if vertical.stop {
-                        axis_frame = axis_frame.stop(Axis::Vertical);
-                    }
-                    pointer.axis(self, axis_frame);
+                    pointer.axis(
+                        self,
+                        compositor_utils::build_axis_frame(time, horizontal, vertical, source),
+                    );
                 },
             }
         }

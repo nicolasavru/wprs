@@ -17,12 +17,9 @@ use std::num::NonZeroU32;
 use std::sync::Arc;
 
 use enum_as_inner::EnumAsInner;
-use smithay::backend::input::Axis;
-use smithay::backend::input::AxisSource;
 use smithay::backend::input::ButtonState;
 use smithay::input::keyboard::Layout;
 use smithay::input::keyboard::XkbContext;
-use smithay::input::pointer::AxisFrame;
 use smithay::input::pointer::ButtonEvent;
 use smithay::input::pointer::MotionEvent;
 use smithay::input::pointer::PointerTarget;
@@ -65,7 +62,6 @@ use smithay_client_toolkit::reexports::client::protocol::wl_data_source::WlDataS
 use smithay_client_toolkit::reexports::client::protocol::wl_keyboard::WlKeyboard;
 use smithay_client_toolkit::reexports::client::protocol::wl_output::Transform;
 use smithay_client_toolkit::reexports::client::protocol::wl_output::WlOutput;
-use smithay_client_toolkit::reexports::client::protocol::wl_pointer::AxisSource as WlPointerAxisSource;
 use smithay_client_toolkit::reexports::client::protocol::wl_pointer::WlPointer;
 use smithay_client_toolkit::reexports::client::protocol::wl_seat::WlSeat;
 use smithay_client_toolkit::reexports::client::protocol::wl_subcompositor::Event as WlSubcompositorEvent;
@@ -128,6 +124,7 @@ use crate::client_utils::SeatObject;
 use crate::client_utils::SwapchainStep;
 use crate::client_utils::advance_two_slot_swapchain;
 use crate::client_utils::combine_band_history;
+use crate::compositor_utils;
 use crate::filtering;
 use crate::prelude::*;
 use crate::serialization;
@@ -953,18 +950,12 @@ impl PointerHandler for WprsState {
                 } => x11_surface.axis(
                     &compositor_seat,
                     self,
-                    AxisFrame::new(time)
-                        .source(match source.unwrap() {
-                            WlPointerAxisSource::Wheel => AxisSource::Wheel,
-                            WlPointerAxisSource::Finger => AxisSource::Finger,
-                            WlPointerAxisSource::Continuous => AxisSource::Continuous,
-                            WlPointerAxisSource::WheelTilt => AxisSource::WheelTilt,
-                            _ => unreachable!("got unknown AxisSource {:?}", source),
-                        })
-                        .value(Axis::Horizontal, horizontal.absolute)
-                        .value(Axis::Vertical, vertical.absolute)
-                        .v120(Axis::Horizontal, horizontal.discrete * 120)
-                        .v120(Axis::Vertical, vertical.discrete * 120),
+                    compositor_utils::build_axis_frame(
+                        time,
+                        horizontal.into(),
+                        vertical.into(),
+                        source.map(Into::into),
+                    ),
                 ),
             }
         }
