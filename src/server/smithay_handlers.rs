@@ -193,6 +193,53 @@ impl WprsServerState {
                 self.send_toplevel_request(surface, payload_to_send);
             }
         });
+
+        if !self.serializer.other_end_connected() && surface.is_initial_configure_sent() {
+            self.send_detached_toplevel_configure(surface);
+        }
+    }
+
+    fn send_detached_toplevel_configure(&self, toplevel: &ToplevelSurface) {
+        let (decoration_mode, maximized, fullscreen) =
+            compositor::with_states(toplevel.wl_surface(), |surface_data| {
+                surface_data
+                    .data_map
+                    .get::<LockedSurfaceState>()
+                    .and_then(|locked| match &locked.0.lock().unwrap().state.role {
+                        Some(Role::XdgToplevel(tl)) => {
+                            Some((tl.decoration_mode, tl.maximized, tl.fullscreen))
+                        },
+                        _ => None,
+                    })
+                    .unwrap_or((None, None, None))
+            });
+        toplevel.with_pending_state(|state| {
+            state.states.set(xdg_toplevel::State::Activated);
+            match maximized {
+                Some(true) => {
+                    state.states.set(xdg_toplevel::State::Maximized);
+                },
+                Some(false) => {
+                    state.states.unset(xdg_toplevel::State::Maximized);
+                },
+                None => {},
+            }
+            match fullscreen {
+                Some(true) => {
+                    state.states.set(xdg_toplevel::State::Fullscreen);
+                },
+                Some(false) => {
+                    state.states.unset(xdg_toplevel::State::Fullscreen);
+                },
+                None => {},
+            }
+            state.decoration_mode = Some(
+                decoration_mode
+                    .map(Into::into)
+                    .unwrap_or(XdgDecorationMode::ClientSide),
+            );
+        });
+        toplevel.send_configure();
     }
 }
 
@@ -218,11 +265,11 @@ impl XdgShellHandler for WprsServerState {
             tracked.has_committed = false;
             tracked.dirty = true;
         });
-
-        toplevel.with_pending_state(|state| {
-            state.states.set(xdg_toplevel::State::Activated);
-        });
-        toplevel.send_configure();
+        // Defer the initial configure until the client performs its initial
+        // commit (per `xdg-shell` and `xdg-decoration-unstable-v1`): when
+        // `wprsc` is connected, `handle_toplevel_configure` forwards the host
+        // compositor's configure; when detached, `commit` emits the fallback
+        // configure after `zxdg_toplevel_decoration_v1` has been created.
     }
 
     #[instrument(skip(self), level = "debug")]
@@ -769,6 +816,21 @@ pub fn commit(surface: &WlSurface, state: &mut WprsServerState) -> Result<()> {
         state.dirty_sync_surfaces.remove(&surface_id);
     }
     on_commit_buffer_handler::<WprsServerState>(surface);
+    // When no `wprsc` is connected to supply a host configure, answer the
+    // initial (or post-unmap remap) toplevel commit directly so applications
+    // receive both `zxdg_toplevel_decoration_v1.configure` and
+    // `xdg_surface.configure` instead of blocking indefinitely.
+    if !state.serializer.other_end_connected()
+        && let Some(toplevel) = state
+            .xdg_shell_state
+            .toplevel_surfaces()
+            .iter()
+            .find(|t| t.wl_surface() == surface)
+            .cloned()
+        && !toplevel.is_initial_configure_sent()
+    {
+        state.send_detached_toplevel_configure(&toplevel);
+    }
     Ok(())
 }
 
@@ -1187,14 +1249,14 @@ impl SeatHandler for WprsServerState {
 }
 
 impl WprsServerState {
-    fn set_decoration_mode(&mut self, surface: &WlSurface, mode: Option<DecorationMode>) {
+    fn set_decoration_mode(&mut self, surface: &WlSurface, mode: Option<DecorationMode>) -> bool {
         let surface_id = WlSurfaceId::new(surface);
         let is_committed =
             self.serializer.other_end_connected() && self.committed_surfaces.contains(&surface_id);
         let surface_order = is_committed.then(|| get_surface_z_order(surface));
         compositor::with_states(surface, |surface_data| {
             let Some(locked_state) = surface_data.data_map.get::<LockedSurfaceState>() else {
-                return;
+                return false;
             };
             let tracked = &mut locked_state.0.lock().unwrap();
 
@@ -1202,7 +1264,7 @@ impl WprsServerState {
             // decorations for any surface, only forward them for XdgToplevel
             // since that's what wprs currently expects.
             let Some(Role::XdgToplevel(toplevel_state)) = &mut tracked.state.role else {
-                return;
+                return false;
             };
             let changed = toplevel_state.decoration_mode != mode;
             toplevel_state.decoration_mode = mode;
@@ -1226,29 +1288,53 @@ impl WprsServerState {
                     if tracked.state.buffer.is_some() {
                         tracked.dirty = false;
                     }
+                    return true;
                 }
             } else {
                 tracked.dirty = true;
             }
-        });
+            false
+        })
+    }
+
+    fn send_post_commit_decoration_configure(&self, toplevel: &ToplevelSurface) {
+        if !self.serializer.other_end_connected() {
+            self.send_detached_toplevel_configure(toplevel);
+        } else {
+            toplevel.send_configure();
+        }
     }
 }
 
 impl XdgDecorationHandler for WprsServerState {
     #[instrument(skip(self), level = "debug")]
-    fn new_decoration(&mut self, toplevel: ToplevelSurface) {}
+    fn new_decoration(&mut self, toplevel: ToplevelSurface) {
+        // Wait for the initial commit before sending the initial configure.
+        // Only emit a configure here if the toplevel was already configured
+        // before creating its decoration object so the client still receives
+        // the mandatory initial `zxdg_toplevel_decoration_v1.configure`.
+        if toplevel.is_initial_configure_sent() {
+            self.send_post_commit_decoration_configure(&toplevel);
+        }
+    }
 
     #[instrument(skip(self), level = "debug")]
     fn request_mode(&mut self, toplevel: ToplevelSurface, mode: XdgDecorationMode) {
         let mode: Option<DecorationMode> = mode.try_into().log(loc!()).ok();
         if mode.is_some() {
-            self.set_decoration_mode(toplevel.wl_surface(), mode);
-        };
+            let forwarded = self.set_decoration_mode(toplevel.wl_surface(), mode);
+            if !forwarded && toplevel.is_initial_configure_sent() {
+                self.send_post_commit_decoration_configure(&toplevel);
+            }
+        }
     }
 
     #[instrument(skip(self), level = "debug")]
     fn unset_mode(&mut self, toplevel: ToplevelSurface) {
-        self.set_decoration_mode(toplevel.wl_surface(), None);
+        let forwarded = self.set_decoration_mode(toplevel.wl_surface(), None);
+        if !forwarded && toplevel.is_initial_configure_sent() {
+            self.send_post_commit_decoration_configure(&toplevel);
+        }
     }
 }
 
@@ -1517,6 +1603,20 @@ mod tests {
     use crate::serialization::Event;
     use crate::serialization::RecvType;
     use crate::serialization::Serializer;
+    use crate::serialization::xdg_shell::ToplevelConfigure;
+    use crate::serialization::xdg_shell::ToplevelEvent;
+
+    #[derive(Debug, Eq, PartialEq)]
+    enum ClientConfigureEvent {
+        Decoration(zxdg_toplevel_decoration_v1::Mode),
+        Toplevel {
+            width: i32,
+            height: i32,
+            maximized: bool,
+            activated: bool,
+        },
+        SurfaceConfigure,
+    }
 
     #[derive(Default)]
     struct WireClientData {
@@ -1525,6 +1625,7 @@ mod tests {
         shm: Option<wl_shm::WlShm>,
         xdg_wm_base: Option<XdgWmBase>,
         xdg_decoration_manager: Option<ZxdgDecorationManagerV1>,
+        configures: Vec<ClientConfigureEvent>,
     }
 
     impl Dispatch<wl_registry::WlRegistry, ()> for WireClientData {
@@ -1662,7 +1763,7 @@ mod tests {
 
     impl Dispatch<xdg_surface::XdgSurface, ()> for WireClientData {
         fn event(
-            _state: &mut Self,
+            state: &mut Self,
             xdg_surface: &xdg_surface::XdgSurface,
             event: xdg_surface::Event,
             _data: &(),
@@ -1670,6 +1771,9 @@ mod tests {
             _qh: &QueueHandle<Self>,
         ) {
             if let xdg_surface::Event::Configure { serial } = event {
+                state
+                    .configures
+                    .push(ClientConfigureEvent::SurfaceConfigure);
                 xdg_surface.ack_configure(serial);
             }
         }
@@ -1677,13 +1781,36 @@ mod tests {
 
     impl Dispatch<xdg_toplevel::XdgToplevel, ()> for WireClientData {
         fn event(
-            _state: &mut Self,
+            state: &mut Self,
             _proxy: &xdg_toplevel::XdgToplevel,
-            _event: xdg_toplevel::Event,
+            event: xdg_toplevel::Event,
             _data: &(),
             _conn: &Connection,
             _qh: &QueueHandle<Self>,
         ) {
+            if let xdg_toplevel::Event::Configure {
+                width,
+                height,
+                states,
+            } = event
+            {
+                let mut maximized = false;
+                let mut activated = false;
+                for &chunk in states.as_chunks::<4>().0 {
+                    let raw = u32::from_ne_bytes(chunk);
+                    if raw == xdg_toplevel::State::Maximized as u32 {
+                        maximized = true;
+                    } else if raw == xdg_toplevel::State::Activated as u32 {
+                        activated = true;
+                    }
+                }
+                state.configures.push(ClientConfigureEvent::Toplevel {
+                    width,
+                    height,
+                    maximized,
+                    activated,
+                });
+            }
         }
     }
 
@@ -1737,13 +1864,21 @@ mod tests {
 
     impl Dispatch<zxdg_toplevel_decoration_v1::ZxdgToplevelDecorationV1, ()> for WireClientData {
         fn event(
-            _state: &mut Self,
+            state: &mut Self,
             _proxy: &zxdg_toplevel_decoration_v1::ZxdgToplevelDecorationV1,
-            _event: zxdg_toplevel_decoration_v1::Event,
+            event: zxdg_toplevel_decoration_v1::Event,
             _data: &(),
             _conn: &Connection,
             _qh: &QueueHandle<Self>,
         ) {
+            if let zxdg_toplevel_decoration_v1::Event::Configure {
+                mode: smithay_client_toolkit::reexports::client::WEnum::Value(mode),
+            } = event
+            {
+                state
+                    .configures
+                    .push(ClientConfigureEvent::Decoration(mode));
+            }
         }
     }
 
@@ -2271,6 +2406,248 @@ mod tests {
                 Request::Toplevel(ToplevelRequest { surface, .. }) if *surface == uncommitted_id
             )),
             "destroying uncommitted toplevel sent premature Destroyed: {destroy_uncommitted_reqs:?}"
+        );
+    }
+
+    #[test]
+    #[cfg_attr(miri, ignore)]
+    fn test_connected_toplevel_defers_configure_until_host_configure_wire() {
+        let mut h = WaylandTestHarness::new(true);
+        let compositor = h.client_data.compositor.clone().unwrap();
+        let xdg_wm_base = h.client_data.xdg_wm_base.clone().unwrap();
+        let dec_mgr = h.client_data.xdg_decoration_manager.clone().unwrap();
+
+        let surface = compositor.create_surface(&h.qh, ());
+        let xdg_surf = xdg_wm_base.get_xdg_surface(&surface, &h.qh, ());
+        let toplevel = xdg_surf.get_toplevel(&h.qh, ());
+        let dec = dec_mgr.get_toplevel_decoration(&toplevel, &h.qh, ());
+        dec.set_mode(zxdg_toplevel_decoration_v1::Mode::ServerSide);
+        toplevel.unset_maximized();
+        h.roundtrip();
+
+        // No configure before initial commit.
+        assert!(
+            h.client_data.configures.is_empty(),
+            "received premature configure before initial commit: {:?}",
+            h.client_data.configures
+        );
+
+        // Initial commit forwards to `wprsc` and waits for the host configure.
+        surface.commit();
+        h.roundtrip();
+        assert!(
+            h.client_data.configures.is_empty(),
+            "connected server must wait for host configure: {:?}",
+            h.client_data.configures
+        );
+
+        // Simulated host `WindowHandler::configure` from `wprsc` delivers
+        // `zxdg_toplevel_decoration_v1.configure` + `xdg_toplevel.configure` +
+        // `xdg_surface.configure` atomically.
+        let surface_id = h.server_surface_id(&surface);
+        let conn_id = h.conn_id.unwrap();
+        let mut host_configure =
+            smithay_client_toolkit::shell::xdg::window::WindowConfigure::default();
+        host_configure.new_size = (
+            std::num::NonZeroU32::new(800),
+            std::num::NonZeroU32::new(600),
+        );
+        host_configure.decoration_mode =
+            smithay_client_toolkit::shell::xdg::window::DecorationMode::Server;
+        host_configure.state = smithay_client_toolkit::reexports::csd_frame::WindowState::ACTIVATED;
+        h.state.handle_event(
+            conn_id,
+            RecvType::Object(Event::Toplevel(ToplevelEvent::Configure(
+                ToplevelConfigure::from_smithay(&surface_id, host_configure),
+            ))),
+        );
+        h.roundtrip();
+        assert_eq!(
+            h.client_data.configures,
+            vec![
+                ClientConfigureEvent::Decoration(zxdg_toplevel_decoration_v1::Mode::ServerSide),
+                ClientConfigureEvent::Toplevel {
+                    width: 800,
+                    height: 600,
+                    maximized: false,
+                    activated: true,
+                },
+                ClientConfigureEvent::SurfaceConfigure,
+            ]
+        );
+
+        // Post-commit no-op `set_mode(ServerSide)` still receives a configure.
+        h.client_data.configures.clear();
+        dec.set_mode(zxdg_toplevel_decoration_v1::Mode::ServerSide);
+        h.roundtrip();
+        assert_eq!(
+            h.client_data.configures.last(),
+            Some(&ClientConfigureEvent::SurfaceConfigure)
+        );
+
+        // Late `get_toplevel_decoration` created AFTER initial configure still
+        // receives its mandatory initial `zxdg_toplevel_decoration_v1.configure`.
+        let surf2 = compositor.create_surface(&h.qh, ());
+        let xdg2 = xdg_wm_base.get_xdg_surface(&surf2, &h.qh, ());
+        let tl2 = xdg2.get_toplevel(&h.qh, ());
+        surf2.commit();
+        h.roundtrip();
+        let surf2_id = h.server_surface_id(&surf2);
+        let mut host_configure2 =
+            smithay_client_toolkit::shell::xdg::window::WindowConfigure::default();
+        host_configure2.decoration_mode =
+            smithay_client_toolkit::shell::xdg::window::DecorationMode::Client;
+        host_configure2.state =
+            smithay_client_toolkit::reexports::csd_frame::WindowState::ACTIVATED;
+        h.state.handle_event(
+            conn_id,
+            RecvType::Object(Event::Toplevel(ToplevelEvent::Configure(
+                ToplevelConfigure::from_smithay(&surf2_id, host_configure2),
+            ))),
+        );
+        h.roundtrip();
+        h.client_data.configures.clear();
+
+        let _dec2 = dec_mgr.get_toplevel_decoration(&tl2, &h.qh, ());
+        h.roundtrip();
+        assert_eq!(
+            h.client_data.configures,
+            vec![
+                ClientConfigureEvent::Decoration(zxdg_toplevel_decoration_v1::Mode::ClientSide),
+                ClientConfigureEvent::Toplevel {
+                    width: 0,
+                    height: 0,
+                    maximized: false,
+                    activated: true,
+                },
+                ClientConfigureEvent::SurfaceConfigure,
+            ]
+        );
+    }
+
+    #[test]
+    #[cfg_attr(miri, ignore)]
+    fn test_detached_toplevel_initial_and_post_commit_configures_wire() {
+        let mut h = WaylandTestHarness::new(false);
+        let compositor = h.client_data.compositor.clone().unwrap();
+        let shm = h.client_data.shm.clone().unwrap();
+        let xdg_wm_base = h.client_data.xdg_wm_base.clone().unwrap();
+        let dec_mgr = h.client_data.xdg_decoration_manager.clone().unwrap();
+
+        let surface = compositor.create_surface(&h.qh, ());
+        let xdg_surf = xdg_wm_base.get_xdg_surface(&surface, &h.qh, ());
+        let toplevel = xdg_surf.get_toplevel(&h.qh, ());
+        let dec = dec_mgr.get_toplevel_decoration(&toplevel, &h.qh, ());
+        dec.set_mode(zxdg_toplevel_decoration_v1::Mode::ServerSide);
+        toplevel.set_maximized();
+        h.roundtrip();
+
+        // Still no configure before initial commit while detached.
+        assert!(h.client_data.configures.is_empty());
+
+        // Initial commit emits decoration + toplevel (Activated + Maximized) +
+        // surface configure atomically.
+        surface.commit();
+        h.roundtrip();
+        assert_eq!(
+            h.client_data.configures,
+            vec![
+                ClientConfigureEvent::Decoration(zxdg_toplevel_decoration_v1::Mode::ServerSide),
+                ClientConfigureEvent::Toplevel {
+                    width: 0,
+                    height: 0,
+                    maximized: true,
+                    activated: true,
+                },
+                ClientConfigureEvent::SurfaceConfigure,
+            ]
+        );
+
+        // Post-commit `set_mode(ClientSide)` while detached emits a new
+        // decoration configure + surface configure without waiting for commit.
+        h.client_data.configures.clear();
+        dec.set_mode(zxdg_toplevel_decoration_v1::Mode::ClientSide);
+        h.roundtrip();
+        assert_eq!(
+            h.client_data.configures,
+            vec![
+                ClientConfigureEvent::Decoration(zxdg_toplevel_decoration_v1::Mode::ClientSide),
+                ClientConfigureEvent::Toplevel {
+                    width: 0,
+                    height: 0,
+                    maximized: true,
+                    activated: true,
+                },
+                ClientConfigureEvent::SurfaceConfigure,
+            ]
+        );
+
+        // Post-commit `unset_maximized` while detached emits updated configure.
+        h.client_data.configures.clear();
+        toplevel.unset_maximized();
+        h.roundtrip();
+        assert_eq!(
+            h.client_data.configures,
+            vec![
+                ClientConfigureEvent::Toplevel {
+                    width: 0,
+                    height: 0,
+                    maximized: false,
+                    activated: true,
+                },
+                ClientConfigureEvent::SurfaceConfigure,
+            ]
+        );
+
+        // Map -> `attach(NULL)` unmap (no configure on unmap) -> bufferless
+        // remap commit emits a fresh initial decoration + surface configure.
+        let shm_path = std::env::temp_dir().join(format!(
+            "wprs_detached_shm_test_{}_{}.bin",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let shm_file = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create_new(true)
+            .open(&shm_path)
+            .unwrap();
+        shm_file.set_len(4).unwrap();
+        _ = std::fs::remove_file(&shm_path);
+        let pool = shm.create_pool(shm_file.as_fd(), 4, &h.qh, ());
+        let buffer = pool.create_buffer(0, 1, 1, 4, wl_shm::Format::Argb8888, &h.qh, ());
+
+        h.client_data.configures.clear();
+        surface.attach(Some(&buffer), 0, 0);
+        surface.commit();
+        h.roundtrip();
+        assert!(h.client_data.configures.is_empty());
+
+        surface.attach(None, 0, 0);
+        surface.commit();
+        h.roundtrip();
+        assert!(
+            h.client_data.configures.is_empty(),
+            "unmap commit must not emit a premature configure"
+        );
+
+        surface.commit();
+        h.roundtrip();
+        assert_eq!(
+            h.client_data.configures,
+            vec![
+                ClientConfigureEvent::Decoration(zxdg_toplevel_decoration_v1::Mode::ClientSide),
+                ClientConfigureEvent::Toplevel {
+                    width: 0,
+                    height: 0,
+                    maximized: false,
+                    activated: true,
+                },
+                ClientConfigureEvent::SurfaceConfigure,
+            ]
         );
     }
 
