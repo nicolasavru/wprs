@@ -138,6 +138,7 @@ fn sync_surface_data(
     compressor: &mut ShardingCompressor,
     compression_mode: CompressionMode,
     synced_buffers: &mut HashMap<WlSurfaceId, SyncedSurfaceBuffer>,
+    committed_surfaces: &mut HashSet<WlSurfaceId>,
     surface_data: &SurfaceData,
     parent_id: Option<WlSurfaceId>,
     sync: bool,
@@ -148,7 +149,11 @@ fn sync_surface_data(
     let Some(locked_state) = surface_data.data_map.get::<LockedSurfaceState>() else {
         return;
     };
-    let mut surface_state_to_send = locked_state.0.lock().unwrap().clone();
+    let mut tracked = locked_state.0.lock().unwrap();
+    if !tracked.has_committed {
+        return;
+    }
+    let mut surface_state_to_send = tracked.state.clone();
     sync_subsurface_role(
         &mut surface_state_to_send,
         matches!(surface_data.role, Some("subsurface")),
@@ -239,6 +244,10 @@ fn sync_surface_data(
             surface,
             payload: SurfaceRequestPayload::Commit(surface_state_to_send),
         })));
+    committed_surfaces.insert(surface);
+    if tracked.state.buffer.is_some() {
+        tracked.dirty = false;
+    }
 }
 
 impl WprsServerState {
@@ -266,6 +275,7 @@ impl WprsServerState {
                     &mut self.compressor,
                     self.compression_mode,
                     &mut self.synced_buffers,
+                    &mut self.committed_surfaces,
                     surface_data,
                     parent_id,
                     sync,
@@ -299,14 +309,15 @@ impl WprsServerState {
                         .unwrap()
                         .hotspot;
 
-                    let surface_state = &mut surface_data
+                    let mut tracked = surface_data
                         .data_map
                         .get::<LockedSurfaceState>()
                         .unwrap()
                         .0
                         .lock()
                         .unwrap();
-                    surface_state.role = Some(Role::Cursor(hotspot.into()));
+                    tracked.state.role = Some(Role::Cursor(hotspot.into()));
+                    tracked.dirty = true;
 
                     hotspot
                 });
@@ -805,14 +816,14 @@ impl WprsServerState {
                 continue;
             };
             compositor::with_states(&surface, |surface_data| {
-                let mut surface_state = surface_data
+                let mut tracked = surface_data
                     .data_map
                     .get::<LockedSurfaceState>()
                     .expect("surfaces in object_map have LockedSurfaceState")
                     .0
                     .lock()
                     .unwrap();
-                f(&surface, &mut surface_state);
+                f(&surface, &mut tracked.state);
             });
         }
     }
@@ -910,6 +921,7 @@ impl WprsServerState {
         self.compression_mode = CompressionMode::Lossless;
         self.synced_buffers.clear();
         self.dirty_sync_surfaces.clear();
+        self.committed_surfaces.clear();
 
         self.serializer
             .writer()
@@ -1222,7 +1234,7 @@ impl WprsServerState {
                 .data_map
                 .get::<LockedSurfaceState>()
                 .expect("surfaces in object_map have LockedSurfaceState");
-            let surface_state = &mut locked_state.0.lock().unwrap();
+            let surface_state = &mut locked_state.0.lock().unwrap().state;
 
             let new_ids: HashSet<u32> = HashSet::from_iter(outputs.iter().map(|output| output.id));
             let old_ids = HashSet::from_iter(surface_state.output_ids.iter().cloned());

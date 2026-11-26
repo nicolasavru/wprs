@@ -146,11 +146,15 @@ impl WprsServerState {
         let Some(client) = surface.client() else {
             return;
         };
+        let surface_id = WlSurfaceId::new(surface);
+        if !self.committed_surfaces.contains(&surface_id) {
+            return;
+        }
         self.serializer
             .writer()
             .send(SendType::Object(Request::Toplevel(ToplevelRequest {
                 client: serialization::ClientId::new(&client),
-                surface: (&surface.id()).into(),
+                surface: surface_id,
                 payload,
             })))
     }
@@ -163,22 +167,31 @@ impl WprsServerState {
     ) where
         F: FnMut(&mut XdgToplevelState),
     {
-        // Changing maximized/fullscreen is not idempotent, and can be ignored be the compositor,
-        // so we must send every request we receive.  However, in case we need to resync the client surface
-        // (e.g. if the client reconnects or a toplevel request is sent before the initial commit)
-        // we also keep track of the current state.
+        // Changing maximized/fullscreen is not idempotent, and can be ignored by the compositor,
+        // so we must send every request we receive once the surface has been committed to `wprsc`.
+        // Before the initial commit (or while disconnected), record the state so the initial
+        // `Commit` (or reconnect sync) applies it without sending a `ToplevelRequest` for an
+        // unknown surface on `wprsc`.
+        let surface_id = WlSurfaceId::new(surface.wl_surface());
+        let is_committed =
+            self.serializer.other_end_connected() && self.committed_surfaces.contains(&surface_id);
         compositor::with_states(surface.wl_surface(), |surface_data| {
             let locked_state = surface_data
                 .data_map
                 .get::<LockedSurfaceState>()
                 .expect("LockedSurfaceState inserted in new_toplevel");
-            let surface_state = &mut locked_state.0.lock().unwrap();
+            let tracked = &mut locked_state.0.lock().unwrap();
 
-            if let Some(Role::XdgToplevel(toplevel_state)) = &mut surface_state.role {
+            if let Some(Role::XdgToplevel(toplevel_state)) = &mut tracked.state.role {
                 toplevel_state_mutator(toplevel_state);
+                if !is_committed {
+                    tracked.dirty = true;
+                }
             }
 
-            self.send_toplevel_request(surface, payload_to_send);
+            if is_committed {
+                self.send_toplevel_request(surface, payload_to_send);
+            }
         });
     }
 }
@@ -191,15 +204,19 @@ impl XdgShellHandler for WprsServerState {
     #[instrument(skip(self), level = "debug")]
     fn new_toplevel(&mut self, toplevel: ToplevelSurface) {
         log_and_return!(self.insert_surface(toplevel.wl_surface()));
+        let surface_id = WlSurfaceId::new(toplevel.wl_surface());
+        self.committed_surfaces.remove(&surface_id);
         compositor::with_states(toplevel.wl_surface(), |surface_data| {
-            let surface_state = &mut surface_data
+            let tracked = &mut surface_data
                 .data_map
                 .get::<LockedSurfaceState>()
                 .unwrap()
                 .0
                 .lock()
                 .unwrap();
-            surface_state.role = Some(Role::XdgToplevel(Default::default()));
+            tracked.state.role = Some(Role::XdgToplevel(Default::default()));
+            tracked.has_committed = false;
+            tracked.dirty = true;
         });
 
         toplevel.with_pending_state(|state| {
@@ -212,40 +229,48 @@ impl XdgShellHandler for WprsServerState {
     fn toplevel_destroyed(&mut self, toplevel: ToplevelSurface) {
         // If client() returns None, the surface was already destroyed and an
         // appropriate message would have been sent to the client, so we don't
-        // need to worry about destroying the toplevel,
+        // need to worry about destroying the toplevel.
         if toplevel.wl_surface().client().is_some() {
-            self.synced_buffers
-                .remove(&WlSurfaceId::new(toplevel.wl_surface()));
+            let surface_id = WlSurfaceId::new(toplevel.wl_surface());
+            self.synced_buffers.remove(&surface_id);
+            self.dirty_sync_surfaces.remove(&surface_id);
             compositor::with_states(toplevel.wl_surface(), |surface_data| {
-                surface_data
+                let mut tracked = surface_data
                     .data_map
                     .get::<LockedSurfaceState>()
                     .expect("LockedSurfaceState inserted in new_toplevel")
                     .0
                     .lock()
-                    .unwrap()
-                    .role = None;
+                    .unwrap();
+                tracked.state.role = None;
+                tracked.has_committed = false;
+                tracked.dirty = true;
             });
 
             self.send_toplevel_request(&toplevel, ToplevelRequestPayload::Destroyed);
+            self.committed_surfaces.remove(&surface_id);
         }
     }
 
     #[instrument(skip(self))]
     fn new_popup(&mut self, popup: PopupSurface, positioner: PositionerState) {
         log_and_return!(self.insert_surface(popup.wl_surface()));
+        let surface_id = WlSurfaceId::new(popup.wl_surface());
+        self.committed_surfaces.remove(&surface_id);
 
         // Uses with_states internally and with_states is not reentrant.
         let popup_state = log_and_return!(XdgPopupState::new(&popup, &positioner));
         compositor::with_states(popup.wl_surface(), |surface_data| {
-            let surface_state = &mut surface_data
+            let tracked = &mut surface_data
                 .data_map
                 .get::<LockedSurfaceState>()
                 .unwrap()
                 .0
                 .lock()
                 .unwrap();
-            surface_state.role = Some(Role::XdgPopup(popup_state));
+            tracked.state.role = Some(Role::XdgPopup(popup_state));
+            tracked.has_committed = false;
+            tracked.dirty = true;
         });
 
         // TODO: this sometimes sends duplicate configures and causes "The popup
@@ -258,29 +283,35 @@ impl XdgShellHandler for WprsServerState {
     fn popup_destroyed(&mut self, popup: PopupSurface) {
         // If client() returns None, the surface was already destroyed and an
         // appropriate message would have been sent to the client, so we don't
-        // need to worry about destroying the popup,
+        // need to worry about destroying the popup.
         if let Some(client) = popup.wl_surface().client() {
-            self.synced_buffers
-                .remove(&WlSurfaceId::new(popup.wl_surface()));
+            let surface_id = WlSurfaceId::new(popup.wl_surface());
+            self.synced_buffers.remove(&surface_id);
+            self.dirty_sync_surfaces.remove(&surface_id);
+            let was_committed = self.committed_surfaces.remove(&surface_id);
             // Uses with_states internally and with_states is not reentrant.
             compositor::with_states(popup.wl_surface(), |surface_data| {
-                surface_data
+                let mut tracked = surface_data
                     .data_map
                     .get::<LockedSurfaceState>()
                     .expect("LockedSurfaceState inserted in new_popup")
                     .0
                     .lock()
-                    .unwrap()
-                    .role = None;
+                    .unwrap();
+                tracked.state.role = None;
+                tracked.has_committed = false;
+                tracked.dirty = true;
             });
 
-            self.serializer
-                .writer()
-                .send(SendType::Object(Request::Popup(PopupRequest {
-                    client: serialization::ClientId::new(&client),
-                    surface: (&popup.wl_surface().id()).into(),
-                    payload: PopupRequestPayload::Destroyed,
-                })));
+            if was_committed {
+                self.serializer
+                    .writer()
+                    .send(SendType::Object(Request::Popup(PopupRequest {
+                        client: serialization::ClientId::new(&client),
+                        surface: surface_id,
+                        payload: PopupRequestPayload::Destroyed,
+                    })));
+            }
         };
     }
 
@@ -381,33 +412,43 @@ impl XdgShellHandler for WprsServerState {
         popup.send_repositioned(token);
 
         let surface = popup.wl_surface();
+        let surface_id = WlSurfaceId::new(surface);
+        let is_committed =
+            self.serializer.other_end_connected() && self.committed_surfaces.contains(&surface_id);
         let xdg_positioner = XdgPositioner::new(&positioner);
-        let surface_order = get_surface_z_order(surface);
+        let surface_order = is_committed.then(|| get_surface_z_order(surface));
         compositor::with_states(surface, |surface_data| {
             let locked_state = surface_data
                 .data_map
                 .get::<LockedSurfaceState>()
                 .expect("LockedSurfaceState inserted in new_popup");
-            let surface_state = &mut locked_state.0.lock().unwrap();
+            let tracked = &mut locked_state.0.lock().unwrap();
 
-            if let Some(Role::XdgPopup(popup_state)) = &mut surface_state.role {
+            if let Some(Role::XdgPopup(popup_state)) = &mut tracked.state.role {
                 popup_state.positioner = xdg_positioner;
             } else {
                 error!("reposition called on surface that wasn't a popup");
                 return;
             }
-            surface_state.z_ordered_children = surface_order;
 
-            let surface_state_to_send = surface_state.clone_without_buffer();
-            let client = surface_state_to_send.client;
-            let surface = surface_state_to_send.id;
-            self.serializer
-                .writer()
-                .send(SendType::Object(Request::Surface(SurfaceRequest {
-                    client,
-                    surface,
-                    payload: SurfaceRequestPayload::Commit(surface_state_to_send),
-                })));
+            if let Some(surface_order) = surface_order {
+                tracked.state.z_ordered_children = surface_order;
+                let surface_state_to_send = tracked.state.clone_without_buffer();
+                let client = surface_state_to_send.client;
+                let surface = surface_state_to_send.id;
+                self.serializer
+                    .writer()
+                    .send(SendType::Object(Request::Surface(SurfaceRequest {
+                        client,
+                        surface,
+                        payload: SurfaceRequestPayload::Commit(surface_state_to_send),
+                    })));
+                if tracked.state.buffer.is_some() {
+                    tracked.dirty = false;
+                }
+            } else {
+                tracked.dirty = true;
+            }
         });
     }
 
@@ -813,7 +854,7 @@ pub fn commit_impl(
     surface_order: Vec<SubsurfacePosition>,
     children_dirty: bool,
 ) -> Result<bool> {
-    let surface_state = &mut surface_data
+    let tracked = &mut surface_data
         .data_map
         .get::<LockedSurfaceState>()
         .location(loc!())?
@@ -821,7 +862,11 @@ pub fn commit_impl(
         .lock()
         .unwrap();
     let connected = state.serializer.other_end_connected();
-    let prev_without_buffer = connected.then(|| surface_state.clone_without_buffer());
+    let surface_id = tracked.state.id;
+    let was_committed = state.committed_surfaces.contains(&surface_id);
+    let was_dirty = tracked.dirty;
+    let prev_without_buffer = connected.then(|| tracked.state.clone_without_buffer());
+    let surface_state = &mut tracked.state;
 
     sync_subsurface_role(
         surface_state,
@@ -1075,13 +1120,25 @@ pub fn commit_impl(
         None => {},
     }
 
+    let unmapped_xdg_surface = matches!(buffer_to_send, Some(BufferAssignment::Removed))
+        && matches!(
+            surface_state.role,
+            Some(Role::XdgToplevel(_) | Role::XdgPopup(_))
+        );
+    tracked.has_committed = true;
+
     let Some(prev_without_buffer) = prev_without_buffer else {
+        if unmapped_xdg_surface {
+            tracked.dirty = true;
+        }
         return Ok(false);
     };
 
-    let mut surface_state_to_send = surface_state.clone_without_buffer();
+    let mut surface_state_to_send = tracked.state.clone_without_buffer();
     surface_state_to_send.buffer = buffer_to_send;
-    if surface_state_to_send.buffer.is_none()
+    if was_committed
+        && !was_dirty
+        && surface_state_to_send.buffer.is_none()
         && surface_state_to_send == prev_without_buffer
         && !children_dirty
     {
@@ -1100,6 +1157,10 @@ pub fn commit_impl(
             surface,
             payload: SurfaceRequestPayload::Commit(surface_state_to_send),
         })));
+    state.committed_surfaces.insert(surface);
+    // Keep `dirty = true` after an `xdg_shell` unmap (`attach(NULL)`) so the
+    // subsequent bufferless remap commit is not deduplicated away.
+    tracked.dirty = unmapped_xdg_surface;
     Ok(true)
 }
 
@@ -1126,17 +1187,48 @@ impl SeatHandler for WprsServerState {
 }
 
 impl WprsServerState {
-    fn set_decoration_mode(&self, surface: &WlSurface, mode: Option<DecorationMode>) {
+    fn set_decoration_mode(&mut self, surface: &WlSurface, mode: Option<DecorationMode>) {
+        let surface_id = WlSurfaceId::new(surface);
+        let is_committed =
+            self.serializer.other_end_connected() && self.committed_surfaces.contains(&surface_id);
+        let surface_order = is_committed.then(|| get_surface_z_order(surface));
         compositor::with_states(surface, |surface_data| {
             let Some(locked_state) = surface_data.data_map.get::<LockedSurfaceState>() else {
                 return;
             };
-            let surface_state = &mut locked_state.0.lock().unwrap();
+            let tracked = &mut locked_state.0.lock().unwrap();
 
-            // even though the kde server decoration protocol can send decorations for any surface, only send them
-            // for XdgTopLevel since that's what wprs currently expects
-            if let Some(Role::XdgToplevel(toplevel_state)) = &mut surface_state.role {
-                toplevel_state.decoration_mode = mode;
+            // Even though the KDE server decoration protocol can send
+            // decorations for any surface, only forward them for XdgToplevel
+            // since that's what wprs currently expects.
+            let Some(Role::XdgToplevel(toplevel_state)) = &mut tracked.state.role else {
+                return;
+            };
+            let changed = toplevel_state.decoration_mode != mode;
+            toplevel_state.decoration_mode = mode;
+
+            if let Some(surface_order) = surface_order {
+                // `zxdg_toplevel_decoration_v1::{set_mode, unset_mode}` are not
+                // double-buffered: forward mode changes immediately so `wprsc`
+                // updates the host compositor without waiting for a commit.
+                if changed {
+                    tracked.state.z_ordered_children = surface_order;
+                    let surface_state_to_send = tracked.state.clone_without_buffer();
+                    let client = surface_state_to_send.client;
+                    let surface = surface_state_to_send.id;
+                    self.serializer
+                        .writer()
+                        .send(SendType::Object(Request::Surface(SurfaceRequest {
+                            client,
+                            surface,
+                            payload: SurfaceRequestPayload::Commit(surface_state_to_send),
+                        })));
+                    if tracked.state.buffer.is_some() {
+                        tracked.dirty = false;
+                    }
+                }
+            } else {
+                tracked.dirty = true;
             }
         });
     }
@@ -1391,6 +1483,7 @@ smithay::delegate_viewporter!(WprsServerState);
 #[cfg(test)]
 mod tests {
     use std::collections::HashMap;
+    use std::os::fd::AsFd;
     use std::os::unix::net::UnixStream;
     use std::sync::Arc;
     use std::sync::atomic::AtomicBool;
@@ -1404,12 +1497,17 @@ mod tests {
     use smithay_client_toolkit::reexports::client::EventQueue;
     use smithay_client_toolkit::reexports::client::Proxy;
     use smithay_client_toolkit::reexports::client::QueueHandle;
+    use smithay_client_toolkit::reexports::client::protocol::wl_buffer::WlBuffer;
     use smithay_client_toolkit::reexports::client::protocol::wl_callback;
     use smithay_client_toolkit::reexports::client::protocol::wl_compositor::WlCompositor;
     use smithay_client_toolkit::reexports::client::protocol::wl_registry;
+    use smithay_client_toolkit::reexports::client::protocol::wl_shm;
+    use smithay_client_toolkit::reexports::client::protocol::wl_shm_pool::WlShmPool;
     use smithay_client_toolkit::reexports::client::protocol::wl_subcompositor::WlSubcompositor;
     use smithay_client_toolkit::reexports::client::protocol::wl_subsurface::WlSubsurface;
     use smithay_client_toolkit::reexports::client::protocol::wl_surface::WlSurface as ClientWlSurface;
+    use smithay_client_toolkit::reexports::protocols::xdg::decoration::zv1::client::zxdg_decoration_manager_v1::ZxdgDecorationManagerV1;
+    use smithay_client_toolkit::reexports::protocols::xdg::decoration::zv1::client::zxdg_toplevel_decoration_v1;
     use smithay_client_toolkit::reexports::protocols::xdg::shell::client::xdg_surface;
     use smithay_client_toolkit::reexports::protocols::xdg::shell::client::xdg_toplevel;
     use smithay_client_toolkit::reexports::protocols::xdg::shell::client::xdg_wm_base::XdgWmBase;
@@ -1424,7 +1522,9 @@ mod tests {
     struct WireClientData {
         compositor: Option<WlCompositor>,
         subcompositor: Option<WlSubcompositor>,
+        shm: Option<wl_shm::WlShm>,
         xdg_wm_base: Option<XdgWmBase>,
+        xdg_decoration_manager: Option<ZxdgDecorationManagerV1>,
     }
 
     impl Dispatch<wl_registry::WlRegistry, ()> for WireClientData {
@@ -1455,9 +1555,26 @@ mod tests {
                             (),
                         ));
                     },
+                    "wl_shm" => {
+                        state.shm = Some(registry.bind::<wl_shm::WlShm, _, _>(
+                            name,
+                            version.min(1),
+                            qh,
+                            (),
+                        ));
+                    },
                     "xdg_wm_base" => {
                         state.xdg_wm_base =
                             Some(registry.bind::<XdgWmBase, _, _>(name, version.min(6), qh, ()));
+                    },
+                    "zxdg_decoration_manager_v1" => {
+                        state.xdg_decoration_manager =
+                            Some(registry.bind::<ZxdgDecorationManagerV1, _, _>(
+                                name,
+                                version.min(1),
+                                qh,
+                                (),
+                            ));
                     },
                     _ => {},
                 }
@@ -1563,6 +1680,66 @@ mod tests {
             _state: &mut Self,
             _proxy: &xdg_toplevel::XdgToplevel,
             _event: xdg_toplevel::Event,
+            _data: &(),
+            _conn: &Connection,
+            _qh: &QueueHandle<Self>,
+        ) {
+        }
+    }
+
+    impl Dispatch<wl_shm::WlShm, ()> for WireClientData {
+        fn event(
+            _state: &mut Self,
+            _proxy: &wl_shm::WlShm,
+            _event: wl_shm::Event,
+            _data: &(),
+            _conn: &Connection,
+            _qh: &QueueHandle<Self>,
+        ) {
+        }
+    }
+
+    impl Dispatch<WlShmPool, ()> for WireClientData {
+        fn event(
+            _state: &mut Self,
+            _proxy: &WlShmPool,
+            _event: <WlShmPool as Proxy>::Event,
+            _data: &(),
+            _conn: &Connection,
+            _qh: &QueueHandle<Self>,
+        ) {
+        }
+    }
+
+    impl Dispatch<WlBuffer, ()> for WireClientData {
+        fn event(
+            _state: &mut Self,
+            _proxy: &WlBuffer,
+            _event: <WlBuffer as Proxy>::Event,
+            _data: &(),
+            _conn: &Connection,
+            _qh: &QueueHandle<Self>,
+        ) {
+        }
+    }
+
+    impl Dispatch<ZxdgDecorationManagerV1, ()> for WireClientData {
+        fn event(
+            _state: &mut Self,
+            _proxy: &ZxdgDecorationManagerV1,
+            _event: <ZxdgDecorationManagerV1 as Proxy>::Event,
+            _data: &(),
+            _conn: &Connection,
+            _qh: &QueueHandle<Self>,
+        ) {
+        }
+    }
+
+    impl Dispatch<zxdg_toplevel_decoration_v1::ZxdgToplevelDecorationV1, ()> for WireClientData {
+        fn event(
+            _state: &mut Self,
+            _proxy: &zxdg_toplevel_decoration_v1::ZxdgToplevelDecorationV1,
+            _event: zxdg_toplevel_decoration_v1::Event,
             _data: &(),
             _conn: &Connection,
             _qh: &QueueHandle<Self>,
@@ -1884,6 +2061,217 @@ mod tests {
                     Some(Role::SubSurface(SubSurfaceState { parent, .. })) if parent == p3_id
                 )
         )));
+    }
+
+    #[test]
+    #[cfg_attr(miri, ignore)]
+    fn test_pre_commit_toplevel_requests_and_reuse_commits_wire() {
+        let mut h = WaylandTestHarness::new(true);
+        let compositor = h.client_data.compositor.clone().unwrap();
+        let shm = h.client_data.shm.clone().unwrap();
+        let xdg_wm_base = h.client_data.xdg_wm_base.clone().unwrap();
+        let dec_mgr = h.client_data.xdg_decoration_manager.clone().unwrap();
+
+        // 1. Electron startup sequence: `get_toplevel` + `get_toplevel_decoration`
+        // + `set_mode(ServerSide)` + `unset_maximized()` BEFORE initial commit.
+        // No `Request::Toplevel` may be sent before the initial commit.
+        let surface = compositor.create_surface(&h.qh, ());
+        let xdg_surf = xdg_wm_base.get_xdg_surface(&surface, &h.qh, ());
+        let toplevel = xdg_surf.get_toplevel(&h.qh, ());
+        let dec = dec_mgr.get_toplevel_decoration(&toplevel, &h.qh, ());
+        dec.set_mode(zxdg_toplevel_decoration_v1::Mode::ServerSide);
+        toplevel.unset_maximized();
+        h.roundtrip();
+
+        let pre_commit_reqs = h.drain_requests();
+        assert!(
+            pre_commit_reqs.is_empty(),
+            "expected no requests before initial commit, got {pre_commit_reqs:?}"
+        );
+
+        // Initial bufferless commit carries the buffered `maximized` and
+        // `decoration_mode` state.
+        surface.commit();
+        h.roundtrip();
+        let surface_id = h.server_surface_id(&surface);
+        let init_reqs = h.drain_requests();
+        assert!(init_reqs.iter().any(|r| matches!(
+            r,
+            Request::Surface(SurfaceRequest {
+                surface,
+                payload: SurfaceRequestPayload::Commit(st),
+                ..
+            }) if *surface == surface_id
+                && matches!(
+                    &st.role,
+                    Some(Role::XdgToplevel(tl))
+                        if tl.maximized == Some(false)
+                            && tl.decoration_mode == Some(DecorationMode::Server)
+                )
+        )));
+
+        // 2. Post-commit `set_maximized` forwards `ToplevelRequest` and
+        // post-commit `set_mode(ClientSide)` forwards an immediate bufferless
+        // `Commit` without waiting for `wl_surface.commit()`.
+        toplevel.set_maximized();
+        dec.set_mode(zxdg_toplevel_decoration_v1::Mode::ClientSide);
+        h.roundtrip();
+        let post_reqs = h.drain_requests();
+        assert!(post_reqs.iter().any(|r| matches!(
+            r,
+            Request::Toplevel(ToplevelRequest {
+                surface,
+                payload: ToplevelRequestPayload::SetMaximized,
+                ..
+            }) if *surface == surface_id
+        )));
+        assert!(post_reqs.iter().any(|r| matches!(
+            r,
+            Request::Surface(SurfaceRequest {
+                surface,
+                payload: SurfaceRequestPayload::Commit(st),
+                ..
+            }) if *surface == surface_id
+                && matches!(
+                    &st.role,
+                    Some(Role::XdgToplevel(tl))
+                        if tl.decoration_mode == Some(DecorationMode::Client)
+                )
+        )));
+
+        // 3. `attach(buffer)` -> `attach(NULL)` unmap -> bufferless remap commit
+        // must NOT be deduplicated away.
+        let shm_path = std::env::temp_dir().join(format!(
+            "wprs_shm_test_{}_{}.bin",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let shm_file = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create_new(true)
+            .open(&shm_path)
+            .unwrap();
+        shm_file.set_len(4).unwrap();
+        _ = std::fs::remove_file(&shm_path);
+        let pool = shm.create_pool(shm_file.as_fd(), 4, &h.qh, ());
+        let buffer = pool.create_buffer(0, 1, 1, 4, wl_shm::Format::Argb8888, &h.qh, ());
+
+        surface.attach(Some(&buffer), 0, 0);
+        surface.commit();
+        h.roundtrip();
+        h.drain_requests();
+
+        surface.attach(None, 0, 0);
+        surface.commit();
+        h.roundtrip();
+        let unmap_reqs = h.drain_requests();
+        assert!(unmap_reqs.iter().any(|r| matches!(
+            r,
+            Request::Surface(SurfaceRequest {
+                surface,
+                payload: SurfaceRequestPayload::Commit(st),
+                ..
+            }) if *surface == surface_id && st.buffer == Some(BufferAssignment::Removed)
+        )));
+
+        // Remap commit (bufferless, identical metadata) must still be sent.
+        surface.commit();
+        h.roundtrip();
+        let remap_reqs = h.drain_requests();
+        assert!(
+            remap_reqs.iter().any(|r| matches!(
+                r,
+                Request::Surface(SurfaceRequest {
+                    surface,
+                    payload: SurfaceRequestPayload::Commit(st),
+                    ..
+                }) if *surface == surface_id && st.buffer.is_none()
+            )),
+            "expected bufferless remap Commit after attach(NULL), got {remap_reqs:?}"
+        );
+
+        // 4. Electron `Hide()` -> `Show()` reusing the same `wl_surface`:
+        // destroying `xdg_toplevel` sends `Destroyed`, recreating it suppresses
+        // pre-commit `unset_maximized()`, and the bufferless initial commit is
+        // forwarded instead of deduplicated against the mutated `SurfaceState`.
+        dec.destroy();
+        toplevel.destroy();
+        xdg_surf.destroy();
+        h.roundtrip();
+        let hide_reqs = h.drain_requests();
+        assert!(hide_reqs.iter().any(|r| matches!(
+            r,
+            Request::Toplevel(ToplevelRequest {
+                surface,
+                payload: ToplevelRequestPayload::Destroyed,
+                ..
+            }) if *surface == surface_id
+        )));
+
+        let xdg_surf2 = xdg_wm_base.get_xdg_surface(&surface, &h.qh, ());
+        let toplevel2 = xdg_surf2.get_toplevel(&h.qh, ());
+        toplevel2.unset_maximized();
+        h.roundtrip();
+        assert!(
+            h.drain_requests().is_empty(),
+            "recreated toplevel must not send pre-commit requests"
+        );
+
+        surface.commit();
+        h.roundtrip();
+        let show_reqs = h.drain_requests();
+        assert!(
+            show_reqs.iter().any(|r| matches!(
+                r,
+                Request::Surface(SurfaceRequest {
+                    surface,
+                    payload: SurfaceRequestPayload::Commit(st),
+                    ..
+                }) if *surface == surface_id
+                    && matches!(&st.role, Some(Role::XdgToplevel(tl)) if tl.maximized == Some(false))
+            )),
+            "reused wl_surface initial bufferless commit was dropped: {show_reqs:?}"
+        );
+
+        // 5. Uncommitted toplevel is skipped by reconnect `sync_surface_tree`
+        // and does not emit `ToplevelRequestPayload::Destroyed` if destroyed
+        // before committing.
+        let uncommitted_surf = compositor.create_surface(&h.qh, ());
+        let uncommitted_xdg = xdg_wm_base.get_xdg_surface(&uncommitted_surf, &h.qh, ());
+        let uncommitted_tl = uncommitted_xdg.get_toplevel(&h.qh, ());
+        h.roundtrip();
+        let uncommitted_id = h.server_surface_id(&uncommitted_surf);
+
+        h.connect_wprsc();
+        let sync_reqs = h.drain_requests();
+        assert!(sync_reqs.iter().any(|r| matches!(
+            r,
+            Request::Surface(SurfaceRequest {
+                surface,
+                payload: SurfaceRequestPayload::Commit(_),
+                ..
+            }) if *surface == surface_id
+        )));
+        assert!(!sync_reqs.iter().any(|r| matches!(
+            r,
+            Request::Surface(SurfaceRequest { surface, .. }) if *surface == uncommitted_id
+        )));
+
+        uncommitted_tl.destroy();
+        uncommitted_xdg.destroy();
+        h.roundtrip();
+        let destroy_uncommitted_reqs = h.drain_requests();
+        assert!(
+            !destroy_uncommitted_reqs.iter().any(|r| matches!(
+                r,
+                Request::Toplevel(ToplevelRequest { surface, .. }) if *surface == uncommitted_id
+            )),
+            "destroying uncommitted toplevel sent premature Destroyed: {destroy_uncommitted_reqs:?}"
+        );
     }
 
     #[test]

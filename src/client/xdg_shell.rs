@@ -39,6 +39,7 @@ pub struct RemoteXdgToplevel {
     // TODO: add configured field to Window, have it be set before dispatching
     // first configure;
     pub configured: bool,
+    pub parent: Option<WlSurfaceId>,
     pub title: Option<String>,
     pub title_prefix: String,
     pub app_id: Option<String>,
@@ -56,27 +57,37 @@ impl RemoteXdgToplevel {
         qh: &QueueHandle<WprsClientState>,
         title_prefix: &str,
     ) -> Result<()> {
-        let local_surface = {
-            let surface = surfaces.get_mut(&surface_id).location(loc!())?;
-            if surface.role.is_some() {
+        {
+            let surface = surfaces.get(&surface_id).location(loc!())?;
+            if matches!(surface.role, Some(Role::XdgToplevel(_))) {
                 return Ok(());
             }
-            surface.local_surface.take().location(loc!())?
-        };
+            if surface.role.is_some() {
+                bail!("surface {surface_id:?} already has a non-toplevel role");
+            }
+        }
         let toplevel_state = surface_state.xdg_toplevel().location(loc!())?;
+        let desired_parent = toplevel_state.parent.filter(|&id| id != surface_id);
+        let parent_window = desired_parent.and_then(|id| {
+            surfaces
+                .get(&id)
+                .and_then(|s| s.xdg_toplevel().ok())
+                .map(|t| t.local_window.clone())
+        });
+        let applied_parent = parent_window.as_ref().and(desired_parent);
+
+        let local_surface = surfaces
+            .get_mut(&surface_id)
+            .location(loc!())?
+            .local_surface
+            .take()
+            .location(loc!())?;
 
         let local_window =
             xdg_shell_state.create_window(local_surface, WindowDecorations::ServerDefault, qh);
 
-        if let Some(id) = toplevel_state.parent {
-            local_window.set_parent(Some(
-                &surfaces
-                    .get(&id)
-                    .location(loc!())?
-                    .xdg_toplevel()
-                    .location(loc!())?
-                    .local_window,
-            ));
+        if let Some(parent_window) = &parent_window {
+            local_window.set_parent(Some(parent_window));
         }
 
         if let Some(maximized) = toplevel_state.maximized {
@@ -98,6 +109,7 @@ impl RemoteXdgToplevel {
         let new_toplevel = Self {
             local_window,
             configured: false,
+            parent: applied_parent,
             title: None,
             title_prefix: title_prefix.to_owned(),
             app_id: None,
@@ -154,31 +166,11 @@ impl RemoteXdgToplevel {
         }
     }
 
-    pub fn update(surface_state: SurfaceState, surface: &mut RemoteSurface) -> Result<()> {
-        let remote_toplevel = surface
-            .role
-            .as_mut()
-            .location(loc!())?
-            .as_xdg_toplevel_mut()
-            .location(loc!())?;
-
-        // TODO: only update if changed
-
-        // TODO: why isn't this always set?
-        // let xdg_surface_state = surface_state.xdg_surface_state.as_ref().unwrap();
-        if let Some(xdg_surface_state) = &surface_state.xdg_surface_state
-            && let Some(window_geometry) = xdg_surface_state.window_geometry
-        {
-            remote_toplevel.set_window_geometry(
-                window_geometry.loc.x as u32,
-                window_geometry.loc.y as u32,
-                window_geometry.size.w as u32,
-                window_geometry.size.h as u32,
-            );
-            remote_toplevel.set_max_size(xdg_surface_state.max_size);
-            remote_toplevel.set_min_size(xdg_surface_state.min_size);
-        }
-
+    pub fn update(
+        surface_state: SurfaceState,
+        surface_id: WlSurfaceId,
+        surfaces: &mut HashMap<WlSurfaceId, RemoteSurface>,
+    ) -> Result<()> {
         let toplevel_state = surface_state
             .role
             .location(loc!())?
@@ -186,6 +178,55 @@ impl RemoteXdgToplevel {
             // The error type is the enum. :(
             .map_err(|_| anyhow!("role wasn't xdg toplevel"))
             .location(loc!())?;
+
+        let desired_parent = toplevel_state.parent.filter(|&id| id != surface_id);
+        let current_parent = surfaces
+            .get(&surface_id)
+            .location(loc!())?
+            .xdg_toplevel()
+            .location(loc!())?
+            .parent;
+        let parent_update = if current_parent != desired_parent {
+            let parent_window = desired_parent.and_then(|id| {
+                surfaces
+                    .get(&id)
+                    .and_then(|s| s.xdg_toplevel().ok())
+                    .map(|t| t.local_window.clone())
+            });
+            (desired_parent.is_none() || parent_window.is_some())
+                .then_some((parent_window.as_ref().and(desired_parent), parent_window))
+        } else {
+            None
+        };
+
+        let remote_toplevel = surfaces
+            .get_mut(&surface_id)
+            .location(loc!())?
+            .role
+            .as_mut()
+            .location(loc!())?
+            .as_xdg_toplevel_mut()
+            .location(loc!())?;
+
+        if let Some((applied_parent, parent_window)) = parent_update {
+            remote_toplevel
+                .local_window
+                .set_parent(parent_window.as_ref());
+            remote_toplevel.parent = applied_parent;
+        }
+
+        if let Some(xdg_surface_state) = &surface_state.xdg_surface_state {
+            if let Some(window_geometry) = xdg_surface_state.window_geometry {
+                remote_toplevel.set_window_geometry(
+                    window_geometry.loc.x as u32,
+                    window_geometry.loc.y as u32,
+                    window_geometry.size.w as u32,
+                    window_geometry.size.h as u32,
+                );
+            }
+            remote_toplevel.set_max_size(xdg_surface_state.max_size);
+            remote_toplevel.set_min_size(xdg_surface_state.min_size);
+        }
 
         remote_toplevel.set_title(toplevel_state.title);
         remote_toplevel.set_app_id(toplevel_state.app_id);
@@ -211,8 +252,7 @@ impl RemoteXdgToplevel {
             title_prefix,
         )
         .location(loc!())?;
-        let surface = surfaces.get_mut(&surface_id).location(loc!())?;
-        Self::update(surface_state, surface)
+        Self::update(surface_state, surface_id, surfaces)
     }
 }
 
@@ -275,13 +315,15 @@ impl RemoteXdgPopup {
         xdg_shell_state: &XdgShell,
         qh: &QueueHandle<WprsClientState>,
     ) -> Result<()> {
-        let local_surface = {
-            let surface = surfaces.get_mut(&surface_id).location(loc!())?;
-            if surface.role.is_some() {
+        {
+            let surface = surfaces.get(&surface_id).location(loc!())?;
+            if matches!(surface.role, Some(Role::XdgPopup(_))) {
                 return Ok(());
             }
-            surface.local_surface.take().location(loc!())?
-        };
+            if surface.role.is_some() {
+                bail!("surface {surface_id:?} already has a non-popup role");
+            }
+        }
         let popup_state = surface_state.xdg_popup().location(loc!())?;
 
         let parent = surfaces
@@ -291,6 +333,13 @@ impl RemoteXdgPopup {
 
         let positioner =
             Self::new_positioner(xdg_shell_state, &popup_state.positioner).location(loc!())?;
+
+        let local_surface = surfaces
+            .get_mut(&surface_id)
+            .location(loc!())?
+            .local_surface
+            .take()
+            .location(loc!())?;
 
         let local_popup = popup::Popup::from_surface(
             parent.as_ref(),

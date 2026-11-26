@@ -88,6 +88,7 @@ impl WprsClientState {
             .buffer
             .as_ref()
             .is_some_and(BufferAssignment::is_new);
+        let buffer_removed = matches!(surface_state.buffer, Some(BufferAssignment::Removed));
 
         let frame_callback_completed = {
             let client = self.remote_display.client(&client_id);
@@ -190,6 +191,14 @@ impl WprsClientState {
             None => {
                 subsurface::detach_subsurface(surface_id, surfaces);
             },
+        }
+
+        if buffer_removed && let Some(remote_surface) = surfaces.get_mut(&surface_id) {
+            match &mut remote_surface.role {
+                Some(Role::XdgToplevel(toplevel)) => toplevel.configured = false,
+                Some(Role::XdgPopup(popup)) => popup.configured = false,
+                _ => {},
+            }
         }
 
         if frame_callback_completed {

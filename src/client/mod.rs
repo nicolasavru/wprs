@@ -686,6 +686,10 @@ impl RemoteSurface {
         let wl_surface = self.wl_surface().clone();
         self.drop_buffer();
         wl_surface.attach(None, 0, 0);
+        // Unmapping a surface (`attach(NULL)`) can prevent a pending frame
+        // callback on the prior frame from ever firing; unblock future commits
+        // (including remap commits).
+        self.frame_callback_completed = true;
     }
 
     #[instrument(skip(self), level = "debug")]

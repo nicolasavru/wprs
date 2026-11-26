@@ -59,7 +59,20 @@ use crate::utils::SerialMap;
 pub mod client_handlers;
 pub mod smithay_handlers;
 
-struct LockedSurfaceState(Mutex<SurfaceState>);
+pub(crate) struct TrackedSurfaceState {
+    pub(crate) state: SurfaceState,
+    /// Whether this surface has received at least one `wl_surface.commit` for
+    /// its current role lifecycle (reset when `xdg_toplevel`/`xdg_popup` is
+    /// created or destroyed so uncommitted shell roles are not synced early).
+    pub(crate) has_committed: bool,
+    /// Whether `state` has pending out-of-commit mutations (role assignment,
+    /// pre-commit toplevel/decoration requests, or an `xdg_shell` unmap
+    /// awaiting a bufferless remap commit) that must not be deduplicated away
+    /// on the next bufferless commit.
+    pub(crate) dirty: bool,
+}
+
+struct LockedSurfaceState(Mutex<TrackedSurfaceState>);
 
 /// Last buffer transmitted to the currently connected client for a surface,
 /// retaining a local shadow copy of its pixels so subsequent commits skip
@@ -71,13 +84,14 @@ pub struct SyncedSurfaceBuffer {
 
 fn surface_destruction_callback(state: &mut WprsServerState, surface: &WlSurface) {
     compositor::with_states(surface, |surface_data| {
-        let surface_state = surface_data
+        let surface_state = &surface_data
             .data_map
             .get::<LockedSurfaceState>()
             .unwrap()
             .0
             .lock()
-            .unwrap();
+            .unwrap()
+            .state;
 
         let writer = state.serializer.writer();
 
@@ -90,6 +104,7 @@ fn surface_destruction_callback(state: &mut WprsServerState, surface: &WlSurface
         state.object_map.remove(&surface_state.id);
         state.synced_buffers.remove(&surface_state.id);
         state.dirty_sync_surfaces.remove(&surface_state.id);
+        state.committed_surfaces.remove(&surface_state.id);
         if matches!(
             &state.cursor_status,
             Some(SmithayCursorImageStatus::Surface(cursor_surface)) if cursor_surface == surface
@@ -140,6 +155,11 @@ pub struct WprsServerState {
     /// their desynchronized ancestor last committed, so bufferless parent sync
     /// commits still forward `Commit(parent)` to flush them on `wprsc`.
     pub dirty_sync_surfaces: HashSet<WlSurfaceId>,
+    /// Tracks surfaces for which the currently connected `wprsc` has received
+    /// at least one `Commit` under the surface's active shell role, so
+    /// pre-commit toplevel/decoration/reposition requests are buffered into
+    /// `SurfaceState` instead of targeting an unknown surface on `wprsc`.
+    pub committed_surfaces: HashSet<WlSurfaceId>,
     pub cursor_status: Option<SmithayCursorImageStatus>,
     pub outputs: HashMap<u32, (Output, GlobalId)>,
     serial_map: SerialMap,
@@ -192,6 +212,7 @@ impl WprsServerState {
             object_map: HashMap::new(),
             synced_buffers: HashMap::new(),
             dirty_sync_surfaces: HashSet::new(),
+            committed_surfaces: HashSet::new(),
             cursor_status: None,
             outputs: HashMap::new(),
             serial_map: SerialMap::new(),
@@ -214,9 +235,13 @@ impl WprsServerState {
             .insert(WlSurfaceId::new(surface), surface.id());
 
         let newly_inserted = compositor::with_states(surface, |surface_data| {
-            surface_data
-                .data_map
-                .insert_if_missing_threadsafe(|| LockedSurfaceState(Mutex::new(initial_state)))
+            surface_data.data_map.insert_if_missing_threadsafe(|| {
+                LockedSurfaceState(Mutex::new(TrackedSurfaceState {
+                    state: initial_state,
+                    has_committed: false,
+                    dirty: true,
+                }))
+            })
         });
         // TODO: https://github.com/Smithay/smithay/issues/538 - move into block
         // above.
