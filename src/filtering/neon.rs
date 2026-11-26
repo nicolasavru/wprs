@@ -12,13 +12,12 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-//! Filtering pipeline for aarch64 using NEON structure load/store.
+//! AArch64 NEON row kernels for direct 3-byte `SubGreen(BGR)` AoS filtering.
 //!
-//! The forward transform (AoS→SoA, subtract_green, running_difference) and
-//! its inverse (prefix_sum, add_green, SoA→AoS) are fused within each
-//! 32-pixel block so channel data stays register-resident across all stages.
-//! The transpose step uses `vld4q_u8`/`vst4q_u8` — hardware four-channel
-//! deinterleave/interleave.
+//! Uses hardware structure load/store (`vld4q_u8`/`vst3q_u8` on encode and
+//! `vld3q_u8`/`vst4q_u8` on decode), `vextq_u8` for 3-byte and 1-byte shifts,
+//! `vqtbl1q_u8` for 3-byte prefix-sum carry broadcast, and `vabsq_s8` +
+//! `vpaddlq_u8`/`vpadalq_u16` for fused signed-byte SAD.
 //!
 //! # `unsafe` and `#[target_feature]`
 //!
@@ -26,384 +25,481 @@
 //! `std::arch::aarch64` intrinsics carry `#[target_feature(enable = "neon")]`.
 //! Per RFC 2396 (stabilized in Rust 1.86), calling such functions requires
 //! `unsafe` unless the *caller* also carries a matching `#[target_feature]`
-//! annotation — the compilation target's default features alone do not
-//! suffice. The `unsafe` blocks in this module exist solely for this reason
-//! when the enclosed operations are register-to-register.
+//! annotation — the compilation target's default features alone do not suffice.
 
 use std::arch::aarch64::uint8x16_t;
+use std::arch::aarch64::uint8x16x3_t;
 use std::arch::aarch64::uint8x16x4_t;
+use std::arch::aarch64::vabsq_s8;
 use std::arch::aarch64::vaddq_u8;
+use std::arch::aarch64::vaddvq_u32;
 use std::arch::aarch64::vdupq_laneq_u8;
 use std::arch::aarch64::vdupq_n_u8;
 use std::arch::aarch64::vdupq_n_u32;
+use std::arch::aarch64::veorq_u8;
 use std::arch::aarch64::vextq_u8;
 use std::arch::aarch64::vld1q_u8;
+use std::arch::aarch64::vld3q_u8;
 use std::arch::aarch64::vld4q_u8;
 use std::arch::aarch64::vmaxvq_u8;
-use std::arch::aarch64::vorrq_u8;
+use std::arch::aarch64::vpadalq_u16;
+use std::arch::aarch64::vpaddlq_u8;
+use std::arch::aarch64::vqtbl1q_u8;
+use std::arch::aarch64::vreinterpretq_s8_u8;
+use std::arch::aarch64::vreinterpretq_u8_s8;
 use std::arch::aarch64::vreinterpretq_u8_u32;
 use std::arch::aarch64::vst1q_u8;
+use std::arch::aarch64::vst3q_u8;
 use std::arch::aarch64::vst4q_u8;
 use std::arch::aarch64::vsubq_u8;
 
-use crate::buffer_pointer::KnownSizeBufferPointer;
-use crate::filtering::FilterKernel;
+use crate::buffer_pointer::BufferPointer;
+use crate::filtering::RowKernel;
 use crate::vec4u8::Vec4u8;
 
-// --- 16-byte primitives ---
+/// Table indices repeating pixel 3 (`bytes 9, 10, 11`) across all four 3-byte
+/// pixel slots inside a 16-byte NEON vector.
+const LAST3_TBL: [u8; 16] = [9, 10, 11, 9, 10, 11, 9, 10, 11, 9, 10, 11, 9, 10, 11, 9];
 
-/// Running difference: `out[i] = in[i] - in[i-1]`, carry in NEON domain.
+/// Max bytes accumulated into a `uint32x4_t` SAD accumulator before folding
+/// into `u64` (`65,536 * 128 = 8,388,608 << u32::MAX`).
+const SAD_CHUNK_BYTES: usize = 65_536;
+
 #[inline(always)]
-fn running_difference_16(block: uint8x16_t, prev: uint8x16_t) -> (uint8x16_t, uint8x16_t) {
-    // SAFETY: register-to-register NEON; see module doc on #[target_feature].
-    unsafe {
-        let shifted = vextq_u8::<15>(prev, block);
-        (vsubq_u8(block, shifted), vdupq_laneq_u8::<15>(block))
-    }
+fn abs_signed_u8(v: uint8x16_t) -> uint8x16_t {
+    // SAFETY: register-to-register NEON; `vabsq_s8(-128)` wraps to `-128`
+    // (`0x80`), which reinterpreted as `u8` is `128 == (-128i8).unsigned_abs()`.
+    unsafe { vreinterpretq_u8_s8(vabsq_s8(vreinterpretq_s8_u8(v))) }
 }
-
-/// Inclusive prefix sum: Hillis-Steele doubling, 4 steps for 16 lanes.
-#[inline(always)]
-fn prefix_sum_16(mut block: uint8x16_t) -> uint8x16_t {
-    // SAFETY: register-to-register NEON; see module doc on #[target_feature].
-    unsafe {
-        let zero = vdupq_n_u8(0);
-        block = vaddq_u8(block, vextq_u8::<15>(zero, block));
-        block = vaddq_u8(block, vextq_u8::<14>(zero, block));
-        block = vaddq_u8(block, vextq_u8::<12>(zero, block));
-        block = vaddq_u8(block, vextq_u8::<8>(zero, block));
-        block
-    }
-}
-
-/// Chain local prefix sums across blocks via broadcast carry.
-#[inline(always)]
-fn accumulate_16(block: uint8x16_t, carry: uint8x16_t) -> (uint8x16_t, uint8x16_t) {
-    // SAFETY: register-to-register NEON; see module doc on #[target_feature].
-    unsafe {
-        let block_last = vdupq_laneq_u8::<15>(block);
-        (vaddq_u8(block, carry), vaddq_u8(carry, block_last))
-    }
-}
-
-// --- 32-pixel fused blocks ---
-
-type Carry4 = (uint8x16_t, uint8x16_t, uint8x16_t, uint8x16_t);
-
-/// Forward: deinterleave → subtract_green → running_difference, 32 pixels.
-///
-/// Carry state stays in the NEON register file throughout; the forward and
-/// inverse transforms are now symmetric in their carry representation.
-#[inline]
-fn aos_to_soa_u8_32x4<const HAS_ALPHA: bool, const ACCUM_OR: bool>(
-    input: *const u8,
-    out0: &mut [u8; 32],
-    out1: &mut [u8; 32],
-    out2: &mut [u8; 32],
-    out3: &mut [u8; 32],
-    (prev0, prev1, prev2, prev3): Carry4,
-    or_acc: &mut Carry4,
-) -> Carry4 {
-    // SAFETY: `input` points to 128 bytes (32 × Vec4u8) from array_chunks::<32>.
-    // vld4q_u8 reads 64 bytes; vst1q_u8 writes 16 bytes per half.
-    unsafe {
-        let lo = vld4q_u8(input);
-        let hi = vld4q_u8(input.add(64));
-
-        let (ch0_lo, ch0_hi) = (lo.0, hi.0);
-        let (ch1_lo, ch1_hi) = (lo.1, hi.1);
-        let (ch2_lo, ch2_hi) = (lo.2, hi.2);
-        let (ch3_lo, ch3_hi) = (lo.3, hi.3);
-
-        // subtract_green: B -= G, R -= G
-        let ch0_lo = vsubq_u8(ch0_lo, ch1_lo);
-        let ch0_hi = vsubq_u8(ch0_hi, ch1_hi);
-        let ch2_lo = vsubq_u8(ch2_lo, ch1_lo);
-        let ch2_hi = vsubq_u8(ch2_hi, ch1_hi);
-
-        // running_difference per channel
-        let (d0_lo, mid0) = running_difference_16(ch0_lo, prev0);
-        let (d0_hi, next0) = running_difference_16(ch0_hi, mid0);
-        let (d1_lo, mid1) = running_difference_16(ch1_lo, prev1);
-        let (d1_hi, next1) = running_difference_16(ch1_hi, mid1);
-        let (d2_lo, mid2) = running_difference_16(ch2_lo, prev2);
-        let (d2_hi, next2) = running_difference_16(ch2_hi, mid2);
-        let (d3_lo, d3_hi, next3) = if HAS_ALPHA {
-            let (d_lo, mid) = running_difference_16(ch3_lo, prev3);
-            let (d_hi, next) = running_difference_16(ch3_hi, mid);
-            (d_lo, d_hi, next)
-        } else {
-            (prev3, prev3, prev3)
-        };
-
-        if ACCUM_OR {
-            or_acc.0 = vorrq_u8(or_acc.0, vorrq_u8(d0_lo, d0_hi));
-            or_acc.1 = vorrq_u8(or_acc.1, vorrq_u8(d1_lo, d1_hi));
-            or_acc.2 = vorrq_u8(or_acc.2, vorrq_u8(d2_lo, d2_hi));
-            if HAS_ALPHA {
-                or_acc.3 = vorrq_u8(or_acc.3, vorrq_u8(d3_lo, d3_hi));
-            }
-        }
-
-        vst1q_u8(out0.as_mut_ptr(), d0_lo);
-        vst1q_u8(out0.as_mut_ptr().add(16), d0_hi);
-        vst1q_u8(out1.as_mut_ptr(), d1_lo);
-        vst1q_u8(out1.as_mut_ptr().add(16), d1_hi);
-        vst1q_u8(out2.as_mut_ptr(), d2_lo);
-        vst1q_u8(out2.as_mut_ptr().add(16), d2_hi);
-        if HAS_ALPHA {
-            vst1q_u8(out3.as_mut_ptr(), d3_lo);
-            vst1q_u8(out3.as_mut_ptr().add(16), d3_hi);
-        }
-
-        (next0, next1, next2, next3)
-    }
-}
-
-/// Inverse: prefix_sum → add_green → interleave, 32 pixels.
-#[inline]
-fn soa_to_aos_u8_32x4<const CONST_ALPHA: bool>(
-    input0: &[u8; 32],
-    input1: &[u8; 32],
-    input2: &[u8; 32],
-    input3: &[u8; 32],
-    const_alpha: u8,
-    out: &mut [Vec4u8; 32],
-    (prev0, prev1, prev2, mut prev3): Carry4,
-) -> Carry4 {
-    // SAFETY: vld1q_u8 reads 16 bytes per half; vst4q_u8 writes 64 bytes × 2.
-    unsafe {
-        let ch0_lo = vld1q_u8(input0.as_ptr());
-        let ch0_hi = vld1q_u8(input0.as_ptr().add(16));
-        let ch1_lo = vld1q_u8(input1.as_ptr());
-        let ch1_hi = vld1q_u8(input1.as_ptr().add(16));
-        let ch2_lo = vld1q_u8(input2.as_ptr());
-        let ch2_hi = vld1q_u8(input2.as_ptr().add(16));
-
-        // prefix_sum per channel (inverse of running_difference)
-        let ch0_lo = prefix_sum_16(ch0_lo);
-        let (ch0_lo, prev0) = accumulate_16(ch0_lo, prev0);
-        let ch0_hi = prefix_sum_16(ch0_hi);
-        let (ch0_hi, prev0) = accumulate_16(ch0_hi, prev0);
-
-        let ch1_lo = prefix_sum_16(ch1_lo);
-        let (ch1_lo, prev1) = accumulate_16(ch1_lo, prev1);
-        let ch1_hi = prefix_sum_16(ch1_hi);
-        let (ch1_hi, prev1) = accumulate_16(ch1_hi, prev1);
-
-        let ch2_lo = prefix_sum_16(ch2_lo);
-        let (ch2_lo, prev2) = accumulate_16(ch2_lo, prev2);
-        let ch2_hi = prefix_sum_16(ch2_hi);
-        let (ch2_hi, prev2) = accumulate_16(ch2_hi, prev2);
-
-        let (ch3_lo, ch3_hi) = if CONST_ALPHA {
-            let a = vdupq_n_u8(const_alpha);
-            (a, a)
-        } else {
-            let c3_lo = prefix_sum_16(vld1q_u8(input3.as_ptr()));
-            let (c3_lo, p3) = accumulate_16(c3_lo, prev3);
-            let c3_hi = prefix_sum_16(vld1q_u8(input3.as_ptr().add(16)));
-            let (c3_hi, p3) = accumulate_16(c3_hi, p3);
-            prev3 = p3;
-            (c3_lo, c3_hi)
-        };
-
-        // add_green (inverse VP8L): B += G, R += G
-        let ch0_lo = vaddq_u8(ch0_lo, ch1_lo);
-        let ch0_hi = vaddq_u8(ch0_hi, ch1_hi);
-        let ch2_lo = vaddq_u8(ch2_lo, ch1_lo);
-        let ch2_hi = vaddq_u8(ch2_hi, ch1_hi);
-
-        // interleave
-        let out_ptr = out.as_mut_ptr().cast::<u8>();
-        vst4q_u8(out_ptr, uint8x16x4_t(ch0_lo, ch1_lo, ch2_lo, ch3_lo));
-        vst4q_u8(
-            out_ptr.add(64),
-            uint8x16x4_t(ch0_hi, ch1_hi, ch2_hi, ch3_hi),
-        );
-
-        (prev0, prev1, prev2, prev3)
-    }
-}
-
-// --- kernel trait impl ---
 
 pub(super) struct Kernel;
 
-impl FilterKernel for Kernel {
-    type ForwardCarry = Carry4;
-    type InverseCarry = Carry4;
+impl RowKernel for Kernel {
     const STREAM_ALIGN: usize = 1;
 
     #[inline]
-    fn zero_forward() -> Carry4 {
-        // SAFETY: register broadcast; see module doc on #[target_feature].
-        let z = unsafe { vdupq_n_u8(0) };
-        (z, z, z, z)
-    }
+    fn bgra_to_subgreen_bgr3<const HAS_ALPHA: bool>(
+        src: BufferPointer<Vec4u8>,
+        dst_bgr: &mut [u8],
+        dst_alpha: &mut [u8],
+    ) {
+        let tw = src.len();
+        debug_assert_eq!(dst_bgr.len(), tw * 3);
+        debug_assert!(!HAS_ALPHA || dst_alpha.len() == tw);
 
-    #[inline]
-    fn zero_inverse() -> Carry4 {
-        Self::zero_forward()
-    }
-
-    #[inline]
-    fn or_accum_is_zero((a0, a1, a2, a3): Carry4) -> (bool, bool, bool, bool) {
-        // SAFETY: register-to-register NEON; see module doc on #[target_feature].
+        let lim = (tw / 16) * 16;
+        let mut x = 0usize;
+        // SAFETY: `x + 16 <= tw`, so `vld4q_u8` reads 64 bytes in bounds,
+        // `vst3q_u8` writes 48 bytes in bounds, and `vst1q_u8` writes 16 bytes in bounds.
         unsafe {
-            (
-                vmaxvq_u8(a0) == 0,
-                vmaxvq_u8(a1) == 0,
-                vmaxvq_u8(a2) == 0,
-                vmaxvq_u8(a3) == 0,
-            )
+            let src_base = src.ptr().cast::<u8>();
+            while x < lim {
+                let px = vld4q_u8(src_base.add(x * 4));
+                let b = vsubq_u8(px.0, px.1);
+                let g = px.1;
+                let r = vsubq_u8(px.2, px.1);
+                vst3q_u8(dst_bgr.as_mut_ptr().add(x * 3), uint8x16x3_t(b, g, r));
+                if HAS_ALPHA {
+                    vst1q_u8(dst_alpha.as_mut_ptr().add(x), px.3);
+                }
+                x += 16;
+            }
         }
-    }
-
-    #[inline]
-    fn forward_block<const HAS_ALPHA: bool, const ACCUM_OR: bool>(
-        input: KnownSizeBufferPointer<Vec4u8, 32>,
-        out0: &mut [u8; 32],
-        out1: &mut [u8; 32],
-        out2: &mut [u8; 32],
-        out3: &mut [u8; 32],
-        prev: Carry4,
-        or_acc: &mut Carry4,
-    ) -> Carry4 {
-        aos_to_soa_u8_32x4::<HAS_ALPHA, ACCUM_OR>(
-            input.ptr().cast::<u8>(),
-            out0,
-            out1,
-            out2,
-            out3,
-            prev,
-            or_acc,
-        )
-    }
-
-    #[inline]
-    unsafe fn splat_blocks<const STREAM: bool>(out_blocks: &mut [[Vec4u8; 32]], pixel: Vec4u8) {
-        // SAFETY: each `out` has size `32 * 4 == 128` bytes, so the eight
-        // 16-byte `vst1q_u8` stores cover `0..128` in bounds.
-        unsafe {
-            let word = u32::from_ne_bytes([pixel.0, pixel.1, pixel.2, pixel.3]);
-            let vec = vreinterpretq_u8_u32(vdupq_n_u32(word));
-            for out in out_blocks {
-                let ptr = out.as_mut_ptr().cast::<u8>();
-                vst1q_u8(ptr, vec);
-                vst1q_u8(ptr.add(16), vec);
-                vst1q_u8(ptr.add(32), vec);
-                vst1q_u8(ptr.add(48), vec);
-                vst1q_u8(ptr.add(64), vec);
-                vst1q_u8(ptr.add(80), vec);
-                vst1q_u8(ptr.add(96), vec);
-                vst1q_u8(ptr.add(112), vec);
+        for (off, bgr) in dst_bgr[lim * 3..]
+            .as_chunks_mut::<3>()
+            .0
+            .iter_mut()
+            .enumerate()
+        {
+            let i = lim + off;
+            // SAFETY: `i < tw == src.len()`.
+            let px = unsafe { src.ptr().add(i).read() };
+            bgr[0] = px.0.wrapping_sub(px.1);
+            bgr[1] = px.1;
+            bgr[2] = px.2.wrapping_sub(px.1);
+            if HAS_ALPHA {
+                dst_alpha[i] = px.3;
             }
         }
     }
 
     #[inline]
-    unsafe fn inverse_block<const STREAM: bool, const CONST_ALPHA: bool>(
-        in0: &[u8; 32],
-        in1: &[u8; 32],
-        in2: &[u8; 32],
-        in3: &[u8; 32],
+    fn sad_signed_bytes(data: &[u8]) -> u64 {
+        let mut sum = 0u64;
+        for block in data.chunks(SAD_CHUNK_BYTES) {
+            let lim = (block.len() / 16) * 16;
+            // SAFETY: NEON is mandatory on AArch64 and `i + 16 <= block.len()`.
+            unsafe {
+                let mut acc = vdupq_n_u32(0);
+                let mut i = 0usize;
+                while i < lim {
+                    let v = vld1q_u8(block.as_ptr().add(i));
+                    acc = vpadalq_u16(acc, vpaddlq_u8(abs_signed_u8(v)));
+                    i += 16;
+                }
+                sum += u64::from(vaddvq_u32(acc));
+            }
+            for &b in &block[lim..] {
+                sum += u64::from((b as i8).unsigned_abs());
+            }
+        }
+        sum
+    }
+
+    #[inline]
+    fn row_sub3_forward_sad(src: &[u8], dst: &mut [u8]) -> u64 {
+        let len = src.len();
+        debug_assert_eq!(dst.len(), len);
+        let lim = (len / 16) * 16;
+        let mut sum = 0u64;
+        // SAFETY: NEON is mandatory on AArch64 and `i + 16 <= len`.
+        unsafe {
+            let mut prev = vdupq_n_u8(0);
+            let mut i = 0usize;
+            while i < lim {
+                let chunk_end = (i + SAD_CHUNK_BYTES).min(lim);
+                let mut acc = vdupq_n_u32(0);
+                while i < chunk_end {
+                    let v = vld1q_u8(src.as_ptr().add(i));
+                    let shifted = vextq_u8::<13>(prev, v);
+                    let diff = vsubq_u8(v, shifted);
+                    prev = v;
+                    vst1q_u8(dst.as_mut_ptr().add(i), diff);
+                    acc = vpadalq_u16(acc, vpaddlq_u8(abs_signed_u8(diff)));
+                    i += 16;
+                }
+                sum += u64::from(vaddvq_u32(acc));
+            }
+        }
+        for j in lim..len {
+            let p = if j >= 3 { src[j - 3] } else { 0 };
+            let d = src[j].wrapping_sub(p);
+            dst[j] = d;
+            sum += u64::from((d as i8).unsigned_abs());
+        }
+        sum
+    }
+
+    #[inline]
+    fn row_up_forward_sad(cur: &[u8], prev: &[u8], dst: &mut [u8]) -> u64 {
+        let len = cur.len();
+        debug_assert_eq!(prev.len(), len);
+        debug_assert_eq!(dst.len(), len);
+        let lim = (len / 16) * 16;
+        let mut sum = 0u64;
+        // SAFETY: NEON is mandatory on AArch64 and `i + 16 <= len`.
+        unsafe {
+            let mut i = 0usize;
+            while i < lim {
+                let chunk_end = (i + SAD_CHUNK_BYTES).min(lim);
+                let mut acc = vdupq_n_u32(0);
+                while i < chunk_end {
+                    let c = vld1q_u8(cur.as_ptr().add(i));
+                    let u = vld1q_u8(prev.as_ptr().add(i));
+                    let diff = vsubq_u8(c, u);
+                    vst1q_u8(dst.as_mut_ptr().add(i), diff);
+                    acc = vpadalq_u16(acc, vpaddlq_u8(abs_signed_u8(diff)));
+                    i += 16;
+                }
+                sum += u64::from(vaddvq_u32(acc));
+            }
+        }
+        for j in lim..len {
+            let d = cur[j].wrapping_sub(prev[j]);
+            dst[j] = d;
+            sum += u64::from((d as i8).unsigned_abs());
+        }
+        sum
+    }
+
+    #[inline]
+    fn row_subup3_forward_sad(cur: &[u8], prev: &[u8], dst: &mut [u8]) -> u64 {
+        let len = cur.len();
+        debug_assert_eq!(prev.len(), len);
+        debug_assert_eq!(dst.len(), len);
+        let lim = (len / 16) * 16;
+        let mut sum = 0u64;
+        // SAFETY: NEON is mandatory on AArch64 and `i + 16 <= len`.
+        unsafe {
+            let mut prev_up = vdupq_n_u8(0);
+            let mut i = 0usize;
+            while i < lim {
+                let chunk_end = (i + SAD_CHUNK_BYTES).min(lim);
+                let mut acc = vdupq_n_u32(0);
+                while i < chunk_end {
+                    let c = vld1q_u8(cur.as_ptr().add(i));
+                    let u = vld1q_u8(prev.as_ptr().add(i));
+                    let up = vsubq_u8(c, u);
+                    let shifted = vextq_u8::<13>(prev_up, up);
+                    let diff = vsubq_u8(up, shifted);
+                    prev_up = up;
+                    vst1q_u8(dst.as_mut_ptr().add(i), diff);
+                    acc = vpadalq_u16(acc, vpaddlq_u8(abs_signed_u8(diff)));
+                    i += 16;
+                }
+                sum += u64::from(vaddvq_u32(acc));
+            }
+        }
+        for j in lim..len {
+            let up = cur[j].wrapping_sub(prev[j]);
+            let prev_u = if j >= 3 {
+                cur[j - 3].wrapping_sub(prev[j - 3])
+            } else {
+                0
+            };
+            let d = up.wrapping_sub(prev_u);
+            dst[j] = d;
+            sum += u64::from((d as i8).unsigned_abs());
+        }
+        sum
+    }
+
+    #[inline]
+    fn row_sub3_inverse(src: &[u8], dst: &mut [u8]) {
+        let len = src.len();
+        debug_assert_eq!(dst.len(), len);
+        let lim = if len >= 16 { ((len - 4) / 12) * 12 } else { 0 };
+        // SAFETY: NEON is mandatory on AArch64; for `i < lim`, `i + 16 <= lim + 4 <= len`.
+        unsafe {
+            let zero = vdupq_n_u8(0);
+            let tbl = vld1q_u8(LAST3_TBL.as_ptr());
+            let mut prev_px = zero;
+            let mut i = 0usize;
+            while i < lim {
+                let mut v = vld1q_u8(src.as_ptr().add(i));
+                v = vaddq_u8(v, vextq_u8::<13>(zero, v));
+                v = vaddq_u8(v, vextq_u8::<10>(zero, v));
+                v = vaddq_u8(v, prev_px);
+                prev_px = vqtbl1q_u8(v, tbl);
+                vst1q_u8(dst.as_mut_ptr().add(i), v);
+                i += 12;
+            }
+        }
+        for j in lim..len {
+            let p = if j >= 3 { dst[j - 3] } else { 0 };
+            dst[j] = src[j].wrapping_add(p);
+        }
+    }
+
+    #[inline]
+    fn row_up_inverse(src: &[u8], prev: &[u8], dst: &mut [u8]) {
+        let len = src.len();
+        debug_assert_eq!(prev.len(), len);
+        debug_assert_eq!(dst.len(), len);
+        let lim = (len / 16) * 16;
+        // SAFETY: NEON is mandatory on AArch64 and `i + 16 <= len`.
+        unsafe {
+            let mut i = 0usize;
+            while i < lim {
+                let d = vld1q_u8(src.as_ptr().add(i));
+                let u = vld1q_u8(prev.as_ptr().add(i));
+                vst1q_u8(dst.as_mut_ptr().add(i), vaddq_u8(d, u));
+                i += 16;
+            }
+        }
+        for j in lim..len {
+            dst[j] = src[j].wrapping_add(prev[j]);
+        }
+    }
+
+    #[inline]
+    fn row_subup3_inverse(src: &[u8], prev: &[u8], dst: &mut [u8]) {
+        let len = src.len();
+        debug_assert_eq!(prev.len(), len);
+        debug_assert_eq!(dst.len(), len);
+        debug_assert!(len.is_multiple_of(3));
+        let lim = if len >= 16 { ((len - 4) / 12) * 12 } else { 0 };
+        // SAFETY: NEON is mandatory on AArch64; for `i < lim`, `i + 16 <= lim + 4 <= len`.
+        unsafe {
+            let zero = vdupq_n_u8(0);
+            let tbl = vld1q_u8(LAST3_TBL.as_ptr());
+            let mut prev_px = zero;
+            let mut i = 0usize;
+            while i < lim {
+                let mut v = vld1q_u8(src.as_ptr().add(i));
+                v = vaddq_u8(v, vextq_u8::<13>(zero, v));
+                v = vaddq_u8(v, vextq_u8::<10>(zero, v));
+                v = vaddq_u8(v, prev_px);
+                prev_px = vqtbl1q_u8(v, tbl);
+                let u = vld1q_u8(prev.as_ptr().add(i));
+                vst1q_u8(dst.as_mut_ptr().add(i), vaddq_u8(v, u));
+                i += 12;
+            }
+        }
+        let mut acc = [0u8; 3];
+        if lim >= 3 {
+            for ch in 0..3 {
+                acc[ch] = dst[lim - 3 + ch].wrapping_sub(prev[lim - 3 + ch]);
+            }
+        }
+        for j in lim..len {
+            let ch = j % 3;
+            acc[ch] = acc[ch].wrapping_add(src[j]);
+            dst[j] = acc[ch].wrapping_add(prev[j]);
+        }
+    }
+
+    #[inline]
+    unsafe fn subgreen_bgr3_to_bgra<const STREAM: bool, const CONST_ALPHA: bool>(
+        src_bgr: &[u8],
+        alpha_row: &[u8],
         const_alpha: u8,
-        out: &mut [Vec4u8; 32],
-        prev: Carry4,
-    ) -> Carry4 {
-        soa_to_aos_u8_32x4::<CONST_ALPHA>(in0, in1, in2, in3, const_alpha, out, prev)
+        dst: &mut [Vec4u8],
+    ) {
+        let tw = dst.len();
+        debug_assert_eq!(src_bgr.len(), tw * 3);
+        debug_assert!(CONST_ALPHA || alpha_row.len() == tw);
+
+        let lim = (tw / 16) * 16;
+        let mut x = 0usize;
+        // SAFETY: `x + 16 <= tw`, so `vld3q_u8` reads 48 bytes in bounds,
+        // `vld1q_u8` reads 16 bytes in bounds, and `vst4q_u8` writes 64 bytes in bounds.
+        unsafe {
+            let const_a = vdupq_n_u8(const_alpha);
+            let dst_base = dst.as_mut_ptr().cast::<u8>();
+            while x < lim {
+                let bgr = vld3q_u8(src_bgr.as_ptr().add(x * 3));
+                let g = bgr.1;
+                let b = vaddq_u8(bgr.0, g);
+                let r = vaddq_u8(bgr.2, g);
+                let a = if CONST_ALPHA {
+                    const_a
+                } else {
+                    vld1q_u8(alpha_row.as_ptr().add(x))
+                };
+                vst4q_u8(dst_base.add(x * 4), uint8x16x4_t(b, g, r, a));
+                x += 16;
+            }
+        }
+        for (off, out) in dst[lim..].iter_mut().enumerate() {
+            let i = lim + off;
+            let s = i * 3;
+            let g = src_bgr[s + 1];
+            let a = if CONST_ALPHA {
+                const_alpha
+            } else {
+                alpha_row[i]
+            };
+            *out = Vec4u8(
+                src_bgr[s].wrapping_add(g),
+                g,
+                src_bgr[s + 2].wrapping_add(g),
+                a,
+            );
+        }
+    }
+
+    #[inline]
+    unsafe fn splat_row<const STREAM: bool>(dst: &mut [Vec4u8], pixel: Vec4u8) {
+        let lim = (dst.len() / 4) * 4;
+        // SAFETY: `x + 4 <= dst.len()`, so `vst1q_u8` writes 16 bytes in bounds.
+        unsafe {
+            let word = u32::from_ne_bytes([pixel.0, pixel.1, pixel.2, pixel.3]);
+            let vec = vreinterpretq_u8_u32(vdupq_n_u32(word));
+            let base = dst.as_mut_ptr().cast::<u8>();
+            let mut x = 0usize;
+            while x < lim {
+                vst1q_u8(base.add(x * 4), vec);
+                x += 4;
+            }
+        }
+        dst[lim..].fill(pixel);
+    }
+
+    #[inline]
+    fn is_constant_plane(data: &[u8]) -> Option<u8> {
+        let first = *data.first()?;
+        let lim = (data.len() / 16) * 16;
+        // SAFETY: NEON is mandatory on AArch64 and `i + 16 <= data.len()`.
+        unsafe {
+            let target = vdupq_n_u8(first);
+            let mut i = 0usize;
+            while i < lim {
+                let v = vld1q_u8(data.as_ptr().add(i));
+                if vmaxvq_u8(veorq_u8(v, target)) != 0 {
+                    return None;
+                }
+                i += 16;
+            }
+        }
+        data[lim..].iter().all(|&b| b == first).then_some(first)
+    }
+
+    #[inline]
+    fn row_sub1_forward(src: &[u8], dst: &mut [u8]) {
+        let len = src.len();
+        debug_assert_eq!(dst.len(), len);
+        let lim = (len / 16) * 16;
+        // SAFETY: NEON is mandatory on AArch64 and `i + 16 <= len`.
+        unsafe {
+            let mut prev = vdupq_n_u8(0);
+            let mut i = 0usize;
+            while i < lim {
+                let v = vld1q_u8(src.as_ptr().add(i));
+                let shifted = vextq_u8::<15>(prev, v);
+                vst1q_u8(dst.as_mut_ptr().add(i), vsubq_u8(v, shifted));
+                prev = v;
+                i += 16;
+            }
+        }
+        let mut p = if lim > 0 { src[lim - 1] } else { 0 };
+        for j in lim..len {
+            let cur = src[j];
+            dst[j] = cur.wrapping_sub(p);
+            p = cur;
+        }
+    }
+
+    #[inline]
+    fn row_up_forward(cur: &[u8], prev: &[u8], dst: &mut [u8]) {
+        let len = cur.len();
+        debug_assert_eq!(prev.len(), len);
+        debug_assert_eq!(dst.len(), len);
+        let lim = (len / 16) * 16;
+        // SAFETY: NEON is mandatory on AArch64 and `i + 16 <= len`.
+        unsafe {
+            let mut i = 0usize;
+            while i < lim {
+                let c = vld1q_u8(cur.as_ptr().add(i));
+                let u = vld1q_u8(prev.as_ptr().add(i));
+                vst1q_u8(dst.as_mut_ptr().add(i), vsubq_u8(c, u));
+                i += 16;
+            }
+        }
+        for j in lim..len {
+            dst[j] = cur[j].wrapping_sub(prev[j]);
+        }
+    }
+
+    #[inline]
+    fn row_sub1_inverse(src: &[u8], dst: &mut [u8]) {
+        let len = src.len();
+        debug_assert_eq!(dst.len(), len);
+        let lim = (len / 16) * 16;
+        // SAFETY: NEON is mandatory on AArch64 and `i + 16 <= len`.
+        unsafe {
+            let zero = vdupq_n_u8(0);
+            let mut carry = zero;
+            let mut i = 0usize;
+            while i < lim {
+                let mut v = vld1q_u8(src.as_ptr().add(i));
+                v = vaddq_u8(v, vextq_u8::<15>(zero, v));
+                v = vaddq_u8(v, vextq_u8::<14>(zero, v));
+                v = vaddq_u8(v, vextq_u8::<12>(zero, v));
+                v = vaddq_u8(v, vextq_u8::<8>(zero, v));
+                v = vaddq_u8(v, carry);
+                carry = vdupq_laneq_u8::<15>(v);
+                vst1q_u8(dst.as_mut_ptr().add(i), v);
+                i += 16;
+            }
+        }
+        let mut acc = if lim > 0 { dst[lim - 1] } else { 0 };
+        for j in lim..len {
+            acc = acc.wrapping_add(src[j]);
+            dst[j] = acc;
+        }
     }
 
     #[inline]
     fn fence_stream() {}
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    /// Helper: extract 16 bytes from a NEON register.
-    fn to_array(v: uint8x16_t) -> [u8; 16] {
-        let mut out = [0u8; 16];
-        // SAFETY: vst1q_u8 writes 16 bytes to a 16-byte array.
-        unsafe { vst1q_u8(out.as_mut_ptr(), v) };
-        out
-    }
-
-    /// Helper: load 16 bytes into a NEON register.
-    fn from_array(a: &[u8; 16]) -> uint8x16_t {
-        // SAFETY: vld1q_u8 reads 16 bytes from a 16-byte array.
-        unsafe { vld1q_u8(a.as_ptr()) }
-    }
-
-    #[test]
-    fn test_running_difference_16() {
-        let input: [u8; 16] = [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15];
-        // SAFETY: register broadcast; see module doc on #[target_feature].
-        let zero = unsafe { vdupq_n_u8(0) };
-        let (result, carry) = running_difference_16(from_array(&input), zero);
-        assert_eq!(
-            to_array(result),
-            [0, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1]
-        );
-        assert_eq!(to_array(carry), [15; 16]);
-    }
-
-    #[test]
-    fn test_running_difference_16_with_carry() {
-        let input: [u8; 16] = [
-            10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25,
-        ];
-        // SAFETY: register broadcast; see module doc on #[target_feature].
-        let carry_in = unsafe { vdupq_n_u8(9) };
-        let (result, carry) = running_difference_16(from_array(&input), carry_in);
-        assert_eq!(
-            to_array(result),
-            [1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1]
-        );
-        assert_eq!(to_array(carry), [25; 16]);
-    }
-
-    #[test]
-    fn test_prefix_sum_16() {
-        let input: [u8; 16] = [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15];
-        let result = prefix_sum_16(from_array(&input));
-        // Inclusive prefix sum: [0, 0+1, 0+1+2, ...] = [0, 1, 3, 6, 10, 15, 21, 28, ...]
-        assert_eq!(
-            to_array(result),
-            [0, 1, 3, 6, 10, 15, 21, 28, 36, 45, 55, 66, 78, 91, 105, 120]
-        );
-    }
-
-    #[test]
-    fn test_prefix_sum_roundtrip() {
-        // prefix_sum is left inverse of running_difference.
-        let input: [u8; 16] = [
-            42, 17, 255, 0, 1, 128, 99, 200, 3, 7, 11, 13, 50, 60, 70, 80,
-        ];
-        // SAFETY: register broadcast; see module doc on #[target_feature].
-        let zero = unsafe { vdupq_n_u8(0) };
-        let (diff, carry) = running_difference_16(from_array(&input), zero);
-        let recovered = prefix_sum_16(diff);
-        assert_eq!(to_array(recovered), input);
-        assert_eq!(to_array(carry), [80; 16]);
-    }
-
-    #[test]
-    fn test_accumulate_16() {
-        let block: [u8; 16] = [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16];
-        // SAFETY: register broadcast; see module doc on #[target_feature].
-        let carry = unsafe { vdupq_n_u8(100) };
-        let (result, new_carry) = accumulate_16(from_array(&block), carry);
-        // Each element += 100.
-        assert_eq!(
-            to_array(result),
-            [
-                101, 102, 103, 104, 105, 106, 107, 108, 109, 110, 111, 112, 113, 114, 115, 116
-            ]
-        );
-        // New carry = old carry + last element of block = 100 + 16 = 116.
-        assert_eq!(to_array(new_carry), [116; 16]);
-    }
 }

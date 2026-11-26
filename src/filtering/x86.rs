@@ -12,640 +12,1148 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-/// u8 AoS<>SoA conversion and filtering.
-/// Ref:
-/// * https://afrantzis.com/pixel-format-guide/wayland_drm.html
-/// * https://stackoverflow.com/questions/44984724/whats-the-fastest-stride-3-gather-instruction-sequence.
-/// * https://en.algorithmica.org/hpc/algorithms/prefix/.
-use std::ops::IndexMut;
+//! x86_64 row kernels for direct 3-byte `SubGreen(BGR)` AoS filtering.
+//!
+//! Dispatches statically at compile time via `cfg_if!`:
+//! - `avx2` (`x86-64-v3` default): 256-bit AVX2 + 128-bit SSSE3 3-byte prefix
+//!   sum + 32-byte-aligned `_mm256_stream_si256` non-temporal stores.
+//! - `ssse3` (`+ssse3`, `x86-64-v2`, `+avx`): 128-bit native SSSE3 + 16-byte
+//!   `_mm_stream_si128` non-temporal stores.
+//! - `sse2` (`x86-64` baseline) and Miri: portable [`crate::filtering::ScalarKernel`].
 
-use crate::buffer_pointer::KnownSizeBufferPointer;
-use crate::simd::__m128i;
-use crate::simd::__m256i;
-use crate::simd::_mm_add_epi8;
-use crate::simd::_mm_extract_epi8;
-use crate::simd::_mm_loadu_si128;
-use crate::simd::_mm_set1_epi8;
-use crate::simd::_mm_setzero_si128;
-use crate::simd::_mm_sfence;
-use crate::simd::_mm256_add_epi8;
-use crate::simd::_mm256_alignr_epi8;
-use crate::simd::_mm256_blend_epi32;
-use crate::simd::_mm256_castps_si256;
-use crate::simd::_mm256_castsi128_si256;
-use crate::simd::_mm256_castsi256_ps;
-use crate::simd::_mm256_castsi256_si128;
-use crate::simd::_mm256_extracti128_si256;
-use crate::simd::_mm256_inserti128_si256;
-use crate::simd::_mm256_is_zero;
-use crate::simd::_mm256_loadu_si256;
-use crate::simd::_mm256_or_si256;
-use crate::simd::_mm256_permute2x128_si256;
-use crate::simd::_mm256_set_epi8;
-use crate::simd::_mm256_set_m128i;
-use crate::simd::_mm256_set1_epi8;
-use crate::simd::_mm256_set1_epi32;
-use crate::simd::_mm256_setzero_si256;
-use crate::simd::_mm256_shuffle_epi8;
-use crate::simd::_mm256_shuffle_ps;
-use crate::simd::_mm256_slli_si256;
-use crate::simd::_mm256_storeu_si256;
-use crate::simd::_mm256_stream_si256;
-use crate::simd::_mm256_sub_epi8;
-use crate::vec4u8::Vec4u8;
+use cfg_if::cfg_if;
 
-#[inline]
-fn _mm256_shufps_epi32<const MASK: i32>(a: __m256i, b: __m256i) -> __m256i {
-    // SAFETY: simd/mod.rs exposes versions of this function for SSE2, SSSE3,
-    // SSE4.1, AVX, and AVX2. Which version is used depends on compiler flags,
-    // but there is no good way to plumb that through to avoid the unsafe.
-    unsafe {
-        _mm256_castps_si256(_mm256_shuffle_ps::<MASK>(
-            _mm256_castsi256_ps(a),
-            _mm256_castsi256_ps(b),
-        ))
-    }
-}
+cfg_if! {
+    if #[cfg(all(target_feature = "avx2", not(miri)))] {
+        mod imp {
+            use std::arch::x86_64::__m128i;
+            use std::arch::x86_64::__m256i;
+            use std::arch::x86_64::_mm_add_epi8;
+            use std::arch::x86_64::_mm_cvtsi64_si128;
+            use std::arch::x86_64::_mm_cvtsi128_si32;
+            use std::arch::x86_64::_mm_loadu_si128;
+            use std::arch::x86_64::_mm_set_epi8;
+            use std::arch::x86_64::_mm_set1_epi8;
+            use std::arch::x86_64::_mm_setzero_si128;
+            use std::arch::x86_64::_mm_sfence;
+            use std::arch::x86_64::_mm_shuffle_epi8;
+            use std::arch::x86_64::_mm_slli_si128;
+            use std::arch::x86_64::_mm_srli_si128;
+            use std::arch::x86_64::_mm_storeu_si128;
+            use std::arch::x86_64::_mm256_abs_epi8;
+            use std::arch::x86_64::_mm256_add_epi8;
+            use std::arch::x86_64::_mm256_add_epi64;
+            use std::arch::x86_64::_mm256_alignr_epi8;
+            use std::arch::x86_64::_mm256_castsi256_si128;
+            use std::arch::x86_64::_mm256_extracti128_si256;
+            use std::arch::x86_64::_mm256_loadu_si256;
+            use std::arch::x86_64::_mm256_or_si256;
+            use std::arch::x86_64::_mm256_permute2x128_si256;
+            use std::arch::x86_64::_mm256_sad_epu8;
+            use std::arch::x86_64::_mm256_set_epi8;
+            use std::arch::x86_64::_mm256_set_m128i;
+            use std::arch::x86_64::_mm256_set1_epi8;
+            use std::arch::x86_64::_mm256_set1_epi32;
+            use std::arch::x86_64::_mm256_setzero_si256;
+            use std::arch::x86_64::_mm256_shuffle_epi8;
+            use std::arch::x86_64::_mm256_slli_si256;
+            use std::arch::x86_64::_mm256_storeu_si256;
+            use std::arch::x86_64::_mm256_stream_si256;
+            use std::arch::x86_64::_mm256_sub_epi8;
+            use std::arch::x86_64::_mm256_testz_si256;
+            use std::arch::x86_64::_mm256_xor_si256;
 
-#[inline]
-fn load_m128i_vec4u8(src: &KnownSizeBufferPointer<Vec4u8, 4>) -> __m128i {
-    // SAFETY: src is 4 Vec4u8s, which is 16 u8s, which is 128 bits, so it is
-    // safe to read 128 bits from it.
-    unsafe { _mm_loadu_si128(src.ptr().cast::<__m128i>()) }
-}
+            use crate::buffer_pointer::BufferPointer;
+            use crate::filtering::RowKernel;
+            use crate::vec4u8::Vec4u8;
 
-#[inline]
-fn load_m256i(src: &[u8; 32]) -> __m256i {
-    // SAFETY: src is which is 32 u8s, which is 256 bits, so it is safe to read
-    // 256 bits from it.
-    unsafe { _mm256_loadu_si256(src.as_ptr().cast::<__m256i>()) }
-}
+            #[inline]
+            fn hsum_epi64(acc: __m256i) -> u64 {
+                let mut tmp = [0u64; 4];
+                // SAFETY: `tmp` is 32 bytes and AVX2 is statically enabled.
+                unsafe {
+                    _mm256_storeu_si256(tmp.as_mut_ptr().cast::<__m256i>(), acc);
+                }
+                tmp[0] + tmp[1] + tmp[2] + tmp[3]
+            }
 
-#[inline]
-fn store_m256i(dst: &mut [u8; 32], val: __m256i) {
-    // SAFETY: dst is 32 u8s, which is 256 bits, so it is safe to write 256 bits
-    // to it.
-    unsafe { _mm256_storeu_si256(dst.as_mut_ptr().cast::<__m256i>(), val) }
-}
+            pub(crate) struct Kernel;
 
-/// # Safety
-/// When `STREAM` is `true`, `dst` must be 32-byte aligned.
-#[inline]
-unsafe fn store_m256i_vec4u8<const STREAM: bool>(dst: &mut [Vec4u8; 8], val: __m256i) {
-    debug_assert!(!STREAM || (dst.as_mut_ptr() as usize).is_multiple_of(32));
-    // SAFETY: dst is 8 Vec4u8s (32 bytes = 256 bits), and the caller upholds
-    // 32-byte alignment when `STREAM` is `true`.
-    unsafe {
-        if STREAM {
-            _mm256_stream_si256(dst.as_mut_ptr().cast::<__m256i>(), val);
-        } else {
-            _mm256_storeu_si256(dst.as_mut_ptr().cast::<__m256i>(), val);
-        }
-    }
-}
+            impl RowKernel for Kernel {
+                const STREAM_ALIGN: usize = 32;
 
-#[inline]
-fn subtract_green(b: __m256i, g: __m256i, r: __m256i) -> (__m256i, __m256i) {
-    // SAFETY: simd/mod.rs exposes versions of this function for SSE2, SSSE3,
-    // SSE4.1, AVX, and AVX2. Which version is used depends on compiler flags,
-    // but there is no good way to plumb that through to avoid the unsafe.
-    unsafe { (_mm256_sub_epi8(b, g), _mm256_sub_epi8(r, g)) }
-}
+                #[inline]
+                fn bgra_to_subgreen_bgr3<const HAS_ALPHA: bool>(
+                    src: BufferPointer<Vec4u8>,
+                    dst_bgr: &mut [u8],
+                    dst_alpha: &mut [u8],
+                ) {
+                    let tw = src.len();
+                    debug_assert_eq!(dst_bgr.len(), tw * 3);
+                    debug_assert!(!HAS_ALPHA || dst_alpha.len() == tw);
 
-#[inline]
-fn add_green(b: __m256i, g: __m256i, r: __m256i) -> (__m256i, __m256i) {
-    // SAFETY: simd/mod.rs exposes versions of this function for SSE2, SSSE3,
-    // SSE4.1, AVX, and AVX2. Which version is used depends on compiler flags,
-    // but there is no good way to plumb that through to avoid the unsafe.
-    unsafe { (_mm256_add_epi8(b, g), _mm256_add_epi8(r, g)) }
-}
+                    // Each 8-pixel iteration writes 16 bytes at `di` and 16 bytes at `di + 12`
+                    // (reaching `di + 28`). Stopping at `lim <= tw - 2` ensures `di + 28 <= tw * 3`
+                    // with zero out-of-row writes and no slack bytes required.
+                    let lim = if tw >= 10 { ((tw - 2) / 8) * 8 } else { 0 };
+                    let mut x = 0usize;
+                    let mut di = 0usize;
 
-#[inline]
-fn prefix_sum_32(mut block: __m256i) -> __m256i {
-    // SAFETY: simd/mod.rs exposes versions of this function for SSE2, SSSE3,
-    // SSE4.1, AVX, and AVX2. Which version is used depends on compiler flags,
-    // but there is no good way to plumb that through to avoid the unsafe.
-    unsafe {
-        block = _mm256_add_epi8(block, _mm256_slli_si256::<1>(block));
-        block = _mm256_add_epi8(block, _mm256_slli_si256::<2>(block));
-        block = _mm256_add_epi8(block, _mm256_slli_si256::<4>(block));
-        block = _mm256_add_epi8(block, _mm256_slli_si256::<8>(block));
-    }
-    block
-}
+                    // SAFETY: AVX2 is statically enabled; `x + 8 <= tw` and `di + 28 <= dst_bgr.len()`
+                    // for all iterations `x < lim`.
+                    unsafe {
+                        let shuf_g = _mm256_set_epi8(
+                            -1, 13, -1, 13, -1, 9, -1, 9, -1, 5, -1, 5, -1, 1, -1, 1, -1, 13, -1,
+                            13, -1, 9, -1, 9, -1, 5, -1, 5, -1, 1, -1, 1,
+                        );
+                        let pack12 = _mm256_set_epi8(
+                            -1, -1, -1, -1, 14, 13, 12, 10, 9, 8, 6, 5, 4, 2, 1, 0, -1, -1, -1,
+                            -1, 14, 13, 12, 10, 9, 8, 6, 5, 4, 2, 1, 0,
+                        );
+                        let shuf_a = _mm256_set_epi8(
+                            -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, 15, 11, 7, 3, -1, -1,
+                            -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, 15, 11, 7, 3,
+                        );
 
-#[inline]
-fn accumulate_sum_16(mut block: __m128i, prev_block: __m128i) -> (__m128i, __m128i) {
-    // SAFETY: simd/mod.rs exposes versions of this function for SSE2, SSSE3,
-    // SSE4.1, AVX, and AVX2. Which version is used depends on compiler flags,
-    // but there is no good way to plumb that through to avoid the unsafe.
-    unsafe {
-        let cur_sum = _mm_set1_epi8(_mm_extract_epi8::<15>(block) as i8);
-        block = _mm_add_epi8(prev_block, block);
-        (block, _mm_add_epi8(prev_block, cur_sum))
-    }
-}
+                        while x < lim {
+                            let v = _mm256_loadu_si256(src.ptr().add(x).cast::<__m256i>());
+                            let g = _mm256_shuffle_epi8(v, shuf_g);
+                            let sg = _mm256_sub_epi8(v, g);
+                            let pk = _mm256_shuffle_epi8(sg, pack12);
+                            _mm_storeu_si128(
+                                dst_bgr.as_mut_ptr().add(di).cast::<__m128i>(),
+                                _mm256_castsi256_si128(pk),
+                            );
+                            _mm_storeu_si128(
+                                dst_bgr.as_mut_ptr().add(di + 12).cast::<__m128i>(),
+                                _mm256_extracti128_si256::<1>(pk),
+                            );
+                            if HAS_ALPHA {
+                                let a_pk = _mm256_shuffle_epi8(v, shuf_a);
+                                let a_lo = _mm_cvtsi128_si32(_mm256_castsi256_si128(a_pk)) as u32;
+                                let a_hi =
+                                    _mm_cvtsi128_si32(_mm256_extracti128_si256::<1>(a_pk)) as u32;
+                                dst_alpha[x..x + 4].copy_from_slice(&a_lo.to_le_bytes());
+                                dst_alpha[x + 4..x + 8].copy_from_slice(&a_hi.to_le_bytes());
+                            }
+                            x += 8;
+                            di += 24;
+                        }
+                    }
 
-#[inline]
-fn accumulate_sum_32(block: __m256i, prev_block: __m128i) -> (__m256i, __m128i) {
-    // SAFETY: simd/mod.rs exposes versions of this function for SSE2, SSSE3,
-    // SSE4.1, AVX, and AVX2. Which version is used depends on compiler flags,
-    // but there is no good way to plumb that through to avoid the unsafe.
-    unsafe {
-        let (block0, prev_block) =
-            accumulate_sum_16(_mm256_extracti128_si256::<0>(block), prev_block);
-        let (block1, prev_block) =
-            accumulate_sum_16(_mm256_extracti128_si256::<1>(block), prev_block);
-        (_mm256_set_m128i(block1, block0), prev_block)
-    }
-}
+                    for (off, bgr) in dst_bgr[lim * 3..].as_chunks_mut::<3>().0.iter_mut().enumerate() {
+                        let i = lim + off;
+                        // SAFETY: `i < tw == src.len()`.
+                        let px = unsafe { src.ptr().add(i).read() };
+                        bgr[0] = px.0.wrapping_sub(px.1);
+                        bgr[1] = px.1;
+                        bgr[2] = px.2.wrapping_sub(px.1);
+                        if HAS_ALPHA {
+                            dst_alpha[i] = px.3;
+                        }
+                    }
+                }
 
-#[inline]
-fn prefix_sum(block: __m256i, prev_block: __m128i) -> (__m256i, __m128i) {
-    accumulate_sum_32(prefix_sum_32(block), prev_block)
-}
+                #[inline]
+                fn sad_signed_bytes(data: &[u8]) -> u64 {
+                    let lim = (data.len() / 32) * 32;
+                    let mut sum = 0u64;
+                    // SAFETY: AVX2 is statically enabled and `i + 32 <= data.len()`.
+                    unsafe {
+                        let zero = _mm256_setzero_si256();
+                        let mut acc = _mm256_setzero_si256();
+                        let mut i = 0usize;
+                        while i < lim {
+                            let v = _mm256_loadu_si256(data.as_ptr().add(i).cast::<__m256i>());
+                            let ab = _mm256_abs_epi8(v);
+                            acc = _mm256_add_epi64(acc, _mm256_sad_epu8(ab, zero));
+                            i += 32;
+                        }
+                        sum += hsum_epi64(acc);
+                    }
+                    for &b in &data[lim..] {
+                        sum += u64::from((b as i8).unsigned_abs());
+                    }
+                    sum
+                }
 
-#[inline]
-fn running_difference_32(block: __m256i, prev_block: __m256i) -> (__m256i, __m256i) {
-    // SAFETY: simd/mod.rs exposes versions of this function for SSE2, SSSE3,
-    // SSE4.1, AVX, and AVX2.
-    unsafe {
-        let prev_lane = _mm256_permute2x128_si256::<0x21>(prev_block, block);
-        let shifted = _mm256_alignr_epi8::<15>(block, prev_lane);
-        (_mm256_sub_epi8(block, shifted), block)
-    }
-}
+                #[inline]
+                fn row_sub3_forward_sad(src: &[u8], dst: &mut [u8]) -> u64 {
+                    let len = src.len();
+                    debug_assert_eq!(dst.len(), len);
+                    let lim = (len / 32) * 32;
+                    let mut sum = 0u64;
+                    // SAFETY: AVX2 is statically enabled and `i + 32 <= len`.
+                    unsafe {
+                        let zero = _mm256_setzero_si256();
+                        let mut acc = _mm256_setzero_si256();
+                        let mut prev = _mm256_setzero_si256();
+                        let mut i = 0usize;
+                        while i < lim {
+                            let v = _mm256_loadu_si256(src.as_ptr().add(i).cast::<__m256i>());
+                            let prev_lane = _mm256_permute2x128_si256::<0x21>(prev, v);
+                            let shifted = _mm256_alignr_epi8::<13>(v, prev_lane);
+                            let diff = _mm256_sub_epi8(v, shifted);
+                            prev = v;
+                            _mm256_storeu_si256(dst.as_mut_ptr().add(i).cast::<__m256i>(), diff);
+                            acc = _mm256_add_epi64(acc, _mm256_sad_epu8(_mm256_abs_epi8(diff), zero));
+                            i += 32;
+                        }
+                        sum += hsum_epi64(acc);
+                    }
+                    for j in lim..len {
+                        let p = if j >= 3 { src[j - 3] } else { 0 };
+                        let d = src[j].wrapping_sub(p);
+                        dst[j] = d;
+                        sum += u64::from((d as i8).unsigned_abs());
+                    }
+                    sum
+                }
 
-type ForwardCarry4 = (__m256i, __m256i, __m256i, __m256i);
-type InverseCarry4 = (__m128i, __m128i, __m128i, __m128i);
+                #[inline]
+                fn row_up_forward_sad(cur: &[u8], prev: &[u8], dst: &mut [u8]) -> u64 {
+                    let len = cur.len();
+                    debug_assert_eq!(prev.len(), len);
+                    debug_assert_eq!(dst.len(), len);
+                    let lim = (len / 32) * 32;
+                    let mut sum = 0u64;
+                    // SAFETY: AVX2 is statically enabled and `i + 32 <= len`.
+                    unsafe {
+                        let zero = _mm256_setzero_si256();
+                        let mut acc = _mm256_setzero_si256();
+                        let mut i = 0usize;
+                        while i < lim {
+                            let c = _mm256_loadu_si256(cur.as_ptr().add(i).cast::<__m256i>());
+                            let u = _mm256_loadu_si256(prev.as_ptr().add(i).cast::<__m256i>());
+                            let diff = _mm256_sub_epi8(c, u);
+                            _mm256_storeu_si256(dst.as_mut_ptr().add(i).cast::<__m256i>(), diff);
+                            acc = _mm256_add_epi64(acc, _mm256_sad_epu8(_mm256_abs_epi8(diff), zero));
+                            i += 32;
+                        }
+                        sum += hsum_epi64(acc);
+                    }
+                    for j in lim..len {
+                        let d = cur[j].wrapping_sub(prev[j]);
+                        dst[j] = d;
+                        sum += u64::from((d as i8).unsigned_abs());
+                    }
+                    sum
+                }
 
-#[inline]
-fn aos_to_soa_u8_32x4<const HAS_ALPHA: bool, const ACCUM_OR: bool>(
-    input: KnownSizeBufferPointer<Vec4u8, 32>,
-    out0: &mut [u8; 32],
-    out1: &mut [u8; 32],
-    out2: &mut [u8; 32],
-    out3: &mut [u8; 32],
-    (prev0, prev1, prev2, prev3): ForwardCarry4,
-    or_acc: &mut ForwardCarry4,
-) -> ForwardCarry4 {
-    // SAFETY: simd/mod.rs exposes versions of this function for SSE2, SSSE3,
-    // SSE4.1, AVX, and AVX2. Which version is used depends on compiler flags,
-    // but there is no good way to plumb that through to avoid the unsafe.
-    unsafe {
-        let p0 = _mm256_set_epi8(
-            15, 11, 7, 3, 14, 10, 6, 2, 13, 9, 5, 1, 12, 8, 4, 0, 15, 11, 7, 3, 14, 10, 6, 2, 13,
-            9, 5, 1, 12, 8, 4, 0,
-        );
-        let p1 = _mm256_set_epi8(
-            14, 10, 6, 2, 13, 9, 5, 1, 12, 8, 4, 0, 15, 11, 7, 3, 14, 10, 6, 2, 13, 9, 5, 1, 12, 8,
-            4, 0, 15, 11, 7, 3,
-        );
-        let p2 = _mm256_set_epi8(
-            13, 9, 5, 1, 12, 8, 4, 0, 15, 11, 7, 3, 14, 10, 6, 2, 13, 9, 5, 1, 12, 8, 4, 0, 15, 11,
-            7, 3, 14, 10, 6, 2,
-        );
-        let p3 = _mm256_set_epi8(
-            12, 8, 4, 0, 15, 11, 7, 3, 14, 10, 6, 2, 13, 9, 5, 1, 12, 8, 4, 0, 15, 11, 7, 3, 14,
-            10, 6, 2, 13, 9, 5, 1,
-        );
+                #[inline]
+                fn row_subup3_forward_sad(cur: &[u8], prev: &[u8], dst: &mut [u8]) -> u64 {
+                    let len = cur.len();
+                    debug_assert_eq!(prev.len(), len);
+                    debug_assert_eq!(dst.len(), len);
+                    let lim = (len / 32) * 32;
+                    let mut sum = 0u64;
+                    // SAFETY: AVX2 is statically enabled and `i + 32 <= len`.
+                    unsafe {
+                        let zero = _mm256_setzero_si256();
+                        let mut acc = _mm256_setzero_si256();
+                        let mut prev_up = _mm256_setzero_si256();
+                        let mut i = 0usize;
+                        while i < lim {
+                            let c = _mm256_loadu_si256(cur.as_ptr().add(i).cast::<__m256i>());
+                            let u = _mm256_loadu_si256(prev.as_ptr().add(i).cast::<__m256i>());
+                            let up = _mm256_sub_epi8(c, u);
+                            let prev_lane = _mm256_permute2x128_si256::<0x21>(prev_up, up);
+                            let shifted = _mm256_alignr_epi8::<13>(up, prev_lane);
+                            let diff = _mm256_sub_epi8(up, shifted);
+                            prev_up = up;
+                            _mm256_storeu_si256(dst.as_mut_ptr().add(i).cast::<__m256i>(), diff);
+                            acc = _mm256_add_epi64(acc, _mm256_sad_epu8(_mm256_abs_epi8(diff), zero));
+                            i += 32;
+                        }
+                        sum += hsum_epi64(acc);
+                    }
+                    for j in lim..len {
+                        let up = cur[j].wrapping_sub(prev[j]);
+                        let prev_u = if j >= 3 {
+                            cur[j - 3].wrapping_sub(prev[j - 3])
+                        } else {
+                            0
+                        };
+                        let d = up.wrapping_sub(prev_u);
+                        dst[j] = d;
+                        sum += u64::from((d as i8).unsigned_abs());
+                    }
+                    sum
+                }
 
-        let [i0, i1, i2, i3, i4, i5, i6, i7] = input.as_chunks::<4, 8>();
+                #[inline]
+                fn row_sub3_inverse(src: &[u8], dst: &mut [u8]) {
+                    let len = src.len();
+                    debug_assert_eq!(dst.len(), len);
+                    // Step by 12 bytes (4 RGB pixels) while guaranteeing 16-byte loads/stores
+                    // stay strictly inside `0..len` (`i + 16 <= len`).
+                    let lim = if len >= 16 { ((len - 4) / 12) * 12 } else { 0 };
+                    // SAFETY: AVX2 implies SSSE3; for `i < lim`, `i + 16 <= lim + 4 <= len`.
+                    unsafe {
+                        // Repeats pixel 3 (`bytes 9, 10, 11`) across all four 3-byte pixel slots.
+                        let shuf_last3 =
+                            _mm_set_epi8(9, 11, 10, 9, 11, 10, 9, 11, 10, 9, 11, 10, 9, 11, 10, 9);
+                        let mut prev_px = _mm_setzero_si128();
+                        let mut i = 0usize;
+                        while i < lim {
+                            let mut v = _mm_loadu_si128(src.as_ptr().add(i).cast::<__m128i>());
+                            v = _mm_add_epi8(v, _mm_slli_si128::<3>(v));
+                            v = _mm_add_epi8(v, _mm_slli_si128::<6>(v));
+                            v = _mm_add_epi8(v, prev_px);
+                            prev_px = _mm_shuffle_epi8(v, shuf_last3);
+                            _mm_storeu_si128(dst.as_mut_ptr().add(i).cast::<__m128i>(), v);
+                            i += 12;
+                        }
+                    }
+                    for j in lim..len {
+                        let p = if j >= 3 { dst[j - 3] } else { 0 };
+                        dst[j] = src[j].wrapping_add(p);
+                    }
+                }
 
-        // let input: *const u8 = input.ptr().cast();
-        // print!("i0  ");
-        // crate::simd::print_vec_char_256_hex(load_m256i(&*input.offset(0).cast::<[u8; 32]>()));
-        // print!("i1  ");
-        // crate::simd::print_vec_char_256_hex(load_m256i(&*input.offset(32).cast::<[u8; 32]>()));
-        // print!("i2  ");
-        // crate::simd::print_vec_char_256_hex(load_m256i(&*input.offset(64).cast::<[u8; 32]>()));
-        // print!("i3  ");
-        // crate::simd::print_vec_char_256_hex(load_m256i(&*input.offset(96).cast::<[u8; 32]>()));
-        // print!("\n");
+                #[inline]
+                fn row_up_inverse(src: &[u8], prev: &[u8], dst: &mut [u8]) {
+                    let len = src.len();
+                    debug_assert_eq!(prev.len(), len);
+                    debug_assert_eq!(dst.len(), len);
+                    let lim = (len / 32) * 32;
+                    // SAFETY: AVX2 is statically enabled and `i + 32 <= len`.
+                    unsafe {
+                        let mut i = 0usize;
+                        while i < lim {
+                            let d = _mm256_loadu_si256(src.as_ptr().add(i).cast::<__m256i>());
+                            let u = _mm256_loadu_si256(prev.as_ptr().add(i).cast::<__m256i>());
+                            _mm256_storeu_si256(
+                                dst.as_mut_ptr().add(i).cast::<__m256i>(),
+                                _mm256_add_epi8(d, u),
+                            );
+                            i += 32;
+                        }
+                    }
+                    for j in lim..len {
+                        dst[j] = src[j].wrapping_add(prev[j]);
+                    }
+                }
 
-        // i0  1f 1e 1d 1c | 1b 1a 19 18 | 17 16 15 14 | 13 12 11 10 || 0f 0e 0d 0c | 0b 0a 09 08 | 07 06 05 04 | 03 02 01 00
-        // i1  3f 3e 3d 3c | 3b 3a 39 38 | 37 36 35 34 | 33 32 31 30 || 2f 2e 2d 2c | 2b 2a 29 28 | 27 26 25 24 | 23 22 21 20
-        // i2  5f 5e 5d 5c | 5b 5a 59 58 | 57 56 55 54 | 53 52 51 50 || 4f 4e 4d 4c | 4b 4a 49 48 | 47 46 45 44 | 43 42 41 40
-        // i3  7f 7e 7d 7c | 7b 7a 79 78 | 77 76 75 74 | 73 72 71 70 || 6f 6e 6d 6c | 6b 6a 69 68 | 67 66 65 64 | 63 62 61 60
+                #[inline]
+                fn row_subup3_inverse(src: &[u8], prev: &[u8], dst: &mut [u8]) {
+                    let len = src.len();
+                    debug_assert_eq!(prev.len(), len);
+                    debug_assert_eq!(dst.len(), len);
+                    debug_assert!(len.is_multiple_of(3));
+                    let lim = if len >= 16 { ((len - 4) / 12) * 12 } else { 0 };
+                    // SAFETY: AVX2 implies SSSE3; for `i < lim`, `i + 16 <= lim + 4 <= len`.
+                    unsafe {
+                        let shuf_last3 =
+                            _mm_set_epi8(9, 11, 10, 9, 11, 10, 9, 11, 10, 9, 11, 10, 9, 11, 10, 9);
+                        let mut prev_px = _mm_setzero_si128();
+                        let mut i = 0usize;
+                        while i < lim {
+                            let mut v = _mm_loadu_si128(src.as_ptr().add(i).cast::<__m128i>());
+                            v = _mm_add_epi8(v, _mm_slli_si128::<3>(v));
+                            v = _mm_add_epi8(v, _mm_slli_si128::<6>(v));
+                            v = _mm_add_epi8(v, prev_px);
+                            prev_px = _mm_shuffle_epi8(v, shuf_last3);
+                            let u = _mm_loadu_si128(prev.as_ptr().add(i).cast::<__m128i>());
+                            _mm_storeu_si128(
+                                dst.as_mut_ptr().add(i).cast::<__m128i>(),
+                                _mm_add_epi8(v, u),
+                            );
+                            i += 12;
+                        }
+                    }
+                    let mut acc = [0u8; 3];
+                    if lim >= 3 {
+                        for ch in 0..3 {
+                            acc[ch] = dst[lim - 3 + ch].wrapping_sub(prev[lim - 3 + ch]);
+                        }
+                    }
+                    for j in lim..len {
+                        let ch = j % 3;
+                        acc[ch] = acc[ch].wrapping_add(src[j]);
+                        dst[j] = acc[ch].wrapping_add(prev[j]);
+                    }
+                }
 
-        let mut t0 = _mm256_castsi128_si256(load_m128i_vec4u8(&i0));
-        let mut t1 = _mm256_castsi128_si256(load_m128i_vec4u8(&i1));
-        let mut t2 = _mm256_castsi128_si256(load_m128i_vec4u8(&i2));
-        let mut t3 = _mm256_castsi128_si256(load_m128i_vec4u8(&i3));
+                #[inline]
+                unsafe fn subgreen_bgr3_to_bgra<const STREAM: bool, const CONST_ALPHA: bool>(
+                    src_bgr: &[u8],
+                    alpha_row: &[u8],
+                    const_alpha: u8,
+                    dst: &mut [Vec4u8],
+                ) {
+                    let tw = dst.len();
+                    debug_assert_eq!(src_bgr.len(), tw * 3);
+                    debug_assert!(CONST_ALPHA || alpha_row.len() == tw);
+                    debug_assert!(!STREAM || (dst.as_mut_ptr() as usize).is_multiple_of(32));
 
-        t0 = _mm256_inserti128_si256::<1>(t0, load_m128i_vec4u8(&i4));
-        t1 = _mm256_inserti128_si256::<1>(t1, load_m128i_vec4u8(&i5));
-        t2 = _mm256_inserti128_si256::<1>(t2, load_m128i_vec4u8(&i6));
-        t3 = _mm256_inserti128_si256::<1>(t3, load_m128i_vec4u8(&i7));
+                    let full8 = (tw / 8) * 8;
+                    let lim = if tw >= 10 { ((tw - 2) / 8) * 8 } else { 0 };
+                    let mut x = 0usize;
+                    let mut si = 0usize;
 
-        // print!("t0  ");
-        // crate::simd::print_vec_char_256_hex(t0);
-        // print!("t1  ");
-        // crate::simd::print_vec_char_256_hex(t1);
-        // print!("t2  ");
-        // crate::simd::print_vec_char_256_hex(t2);
-        // print!("t3  ");
-        // crate::simd::print_vec_char_256_hex(t3);
-        // print!("\n");
+                    // SAFETY: AVX2 is statically enabled; `si + 28 <= src_bgr.len()` inside the
+                    // main loop, the optional final 8-pixel block reads `si..si + 24 <= src_bgr.len()`,
+                    // and caller upholds 32-byte alignment on `dst` when `STREAM` is `true`.
+                    unsafe {
+                        let shuf_g = _mm256_set_epi8(
+                            -1, 13, -1, 13, -1, 9, -1, 9, -1, 5, -1, 5, -1, 1, -1, 1, -1, 13, -1,
+                            13, -1, 9, -1, 9, -1, 5, -1, 5, -1, 1, -1, 1,
+                        );
+                        let unpack12 = _mm256_set_epi8(
+                            -1, 11, 10, 9, -1, 8, 7, 6, -1, 5, 4, 3, -1, 2, 1, 0, -1, 11, 10, 9,
+                            -1, 8, 7, 6, -1, 5, 4, 3, -1, 2, 1, 0,
+                        );
+                        let const_alpha_vec =
+                            _mm256_set1_epi32((u32::from(const_alpha) << 24) as i32);
+                        let shuf_a_lo =
+                            _mm_set_epi8(3, -1, -1, -1, 2, -1, -1, -1, 1, -1, -1, -1, 0, -1, -1, -1);
+                        let shuf_a_hi =
+                            _mm_set_epi8(7, -1, -1, -1, 6, -1, -1, -1, 5, -1, -1, -1, 4, -1, -1, -1);
 
-        // t0  4f 4e 4d 4c | 4b 4a 49 48 | 47 46 45 44 | 43 42 41 40 || 0f 0e 0d 0c | 0b 0a 09 08 | 07 06 05 04 | 03 02 01 00
-        // t1  5f 5e 5d 5c | 5b 5a 59 58 | 57 56 55 54 | 53 52 51 50 || 1f 1e 1d 1c | 1b 1a 19 18 | 17 16 15 14 | 13 12 11 10
-        // t2  6f 6e 6d 6c | 6b 6a 69 68 | 67 66 65 64 | 63 62 61 60 || 2f 2e 2d 2c | 2b 2a 29 28 | 27 26 25 24 | 23 22 21 20
-        // t3  7f 7e 7d 7c | 7b 7a 79 78 | 77 76 75 74 | 73 72 71 70 || 3f 3e 3d 3c | 3b 3a 39 38 | 37 36 35 34 | 33 32 31 30
+                        while x < lim {
+                            let lo = _mm_loadu_si128(src_bgr.as_ptr().add(si).cast::<__m128i>());
+                            let hi =
+                                _mm_loadu_si128(src_bgr.as_ptr().add(si + 12).cast::<__m128i>());
+                            let v = _mm256_set_m128i(hi, lo);
+                            let sg = _mm256_shuffle_epi8(v, unpack12);
+                            let g = _mm256_shuffle_epi8(sg, shuf_g);
+                            let alpha_vec = if CONST_ALPHA {
+                                const_alpha_vec
+                            } else {
+                                let a64 = _mm_cvtsi64_si128(i64::from_le_bytes(
+                                    alpha_row[x..x + 8].try_into().unwrap(),
+                                ));
+                                _mm256_set_m128i(
+                                    _mm_shuffle_epi8(a64, shuf_a_hi),
+                                    _mm_shuffle_epi8(a64, shuf_a_lo),
+                                )
+                            };
+                            let bgra = _mm256_or_si256(_mm256_add_epi8(sg, g), alpha_vec);
+                            let p = dst.as_mut_ptr().add(x).cast::<__m256i>();
+                            if STREAM {
+                                _mm256_stream_si256(p, bgra);
+                            } else {
+                                _mm256_storeu_si256(p, bgra);
+                            }
+                            x += 8;
+                            si += 24;
+                        }
+                        if x < full8 {
+                            // Final 8-pixel block: load `si + 8..si + 24` in bounds and shift
+                            // right 4 bytes so lanes `0..12` hold `si + 12..si + 24`, keeping
+                            // `STREAM` rows 100% non-temporal with zero WC/cached split.
+                            let lo = _mm_loadu_si128(src_bgr.as_ptr().add(si).cast::<__m128i>());
+                            let hi = _mm_srli_si128::<4>(_mm_loadu_si128(
+                                src_bgr.as_ptr().add(si + 8).cast::<__m128i>(),
+                            ));
+                            let v = _mm256_set_m128i(hi, lo);
+                            let sg = _mm256_shuffle_epi8(v, unpack12);
+                            let g = _mm256_shuffle_epi8(sg, shuf_g);
+                            let alpha_vec = if CONST_ALPHA {
+                                const_alpha_vec
+                            } else {
+                                let a64 = _mm_cvtsi64_si128(i64::from_le_bytes(
+                                    alpha_row[x..x + 8].try_into().unwrap(),
+                                ));
+                                _mm256_set_m128i(
+                                    _mm_shuffle_epi8(a64, shuf_a_hi),
+                                    _mm_shuffle_epi8(a64, shuf_a_lo),
+                                )
+                            };
+                            let bgra = _mm256_or_si256(_mm256_add_epi8(sg, g), alpha_vec);
+                            let p = dst.as_mut_ptr().add(x).cast::<__m256i>();
+                            if STREAM {
+                                _mm256_stream_si256(p, bgra);
+                            } else {
+                                _mm256_storeu_si256(p, bgra);
+                            }
+                        }
+                    }
 
-        t0 = _mm256_shuffle_epi8(t0, p0);
-        t1 = _mm256_shuffle_epi8(t1, p1);
-        t2 = _mm256_shuffle_epi8(t2, p2);
-        t3 = _mm256_shuffle_epi8(t3, p3);
+                    for i in full8..tw {
+                        let s = i * 3;
+                        let g = src_bgr[s + 1];
+                        let a = if CONST_ALPHA {
+                            const_alpha
+                        } else {
+                            alpha_row[i]
+                        };
+                        dst[i] = Vec4u8(src_bgr[s].wrapping_add(g), g, src_bgr[s + 2].wrapping_add(g), a);
+                    }
+                }
 
-        // print!("t0  ");
-        // crate::simd::print_vec_char_256_hex(t0);
-        // print!("t1  ");
-        // crate::simd::print_vec_char_256_hex(t1);
-        // print!("t2  ");
-        // crate::simd::print_vec_char_256_hex(t2);
-        // print!("t3  ");
-        // crate::simd::print_vec_char_256_hex(t3);
-        // print!("\n");
+                #[inline]
+                unsafe fn splat_row<const STREAM: bool>(dst: &mut [Vec4u8], pixel: Vec4u8) {
+                    debug_assert!(!STREAM || (dst.as_mut_ptr() as usize).is_multiple_of(32));
+                    let lim = (dst.len() / 8) * 8;
+                    // SAFETY: AVX2 is statically enabled; each iteration writes 8 `Vec4u8` (32 bytes),
+                    // and caller upholds 32-byte alignment when `STREAM` is `true`.
+                    unsafe {
+                        let word = u32::from_le_bytes([pixel.0, pixel.1, pixel.2, pixel.3]) as i32;
+                        let vec = _mm256_set1_epi32(word);
+                        let mut x = 0usize;
+                        while x < lim {
+                            let p = dst.as_mut_ptr().add(x).cast::<__m256i>();
+                            if STREAM {
+                                _mm256_stream_si256(p, vec);
+                            } else {
+                                _mm256_storeu_si256(p, vec);
+                            }
+                            x += 8;
+                        }
+                    }
+                    dst[lim..].fill(pixel);
+                }
 
-        // t0  4f 4b 47 43 | 4e 4a 46 42 | 4d 49 45 41 | 4c 48 44 40 || 0f 0b 07 03 | 0e 0a 06 02 | 0d 09 05 01 | 0c 08 04 00
-        // t1  5e 5a 56 52 | 5d 59 55 51 | 5c 58 54 50 | 5f 5b 57 53 || 1e 1a 16 12 | 1d 19 15 11 | 1c 18 14 10 | 1f 1b 17 13
-        // t2  6d 69 65 61 | 6c 68 64 60 | 6f 6b 67 63 | 6e 6a 66 62 || 2d 29 25 21 | 2c 28 24 20 | 2f 2b 27 23 | 2e 2a 26 22
-        // t3  7c 78 74 70 | 7f 7b 77 73 | 7e 7a 76 72 | 7d 79 75 71 || 3c 38 34 30 | 3f 3b 37 33 | 3e 3a 36 32 | 3d 39 35 31
+                #[inline]
+                fn is_constant_plane(data: &[u8]) -> Option<u8> {
+                    let first = *data.first()?;
+                    let lim = (data.len() / 32) * 32;
+                    // SAFETY: AVX2 is statically enabled and `i + 32 <= data.len()`.
+                    unsafe {
+                        let target = _mm256_set1_epi8(first as i8);
+                        let mut i = 0usize;
+                        while i < lim {
+                            let v = _mm256_loadu_si256(data.as_ptr().add(i).cast::<__m256i>());
+                            let diff = _mm256_xor_si256(v, target);
+                            if _mm256_testz_si256(diff, diff) == 0 {
+                                return None;
+                            }
+                            i += 32;
+                        }
+                    }
+                    data[lim..].iter().all(|&b| b == first).then_some(first)
+                }
 
-        let u0 = _mm256_blend_epi32::<0b10101010>(t0, t1);
-        let u1 = _mm256_blend_epi32::<0b10101010>(t2, t3);
-        let u2 = _mm256_blend_epi32::<0b01010101>(t0, t1);
-        let u3 = _mm256_blend_epi32::<0b01010101>(t2, t3);
+                #[inline]
+                fn row_sub1_forward(src: &[u8], dst: &mut [u8]) {
+                    let len = src.len();
+                    debug_assert_eq!(dst.len(), len);
+                    let lim = (len / 32) * 32;
+                    // SAFETY: AVX2 is statically enabled and `i + 32 <= len`.
+                    unsafe {
+                        let mut prev = _mm256_setzero_si256();
+                        let mut i = 0usize;
+                        while i < lim {
+                            let v = _mm256_loadu_si256(src.as_ptr().add(i).cast::<__m256i>());
+                            let prev_lane = _mm256_permute2x128_si256::<0x21>(prev, v);
+                            let shifted = _mm256_alignr_epi8::<15>(v, prev_lane);
+                            _mm256_storeu_si256(
+                                dst.as_mut_ptr().add(i).cast::<__m256i>(),
+                                _mm256_sub_epi8(v, shifted),
+                            );
+                            prev = v;
+                            i += 32;
+                        }
+                    }
+                    let mut p = if lim > 0 { src[lim - 1] } else { 0 };
+                    for j in lim..len {
+                        let cur = src[j];
+                        dst[j] = cur.wrapping_sub(p);
+                        p = cur;
+                    }
+                }
 
-        // print!("u0  ");
-        // crate::simd::print_vec_char_256_hex(u0);
-        // print!("u1  ");
-        // crate::simd::print_vec_char_256_hex(u1);
-        // print!("u2  ");
-        // crate::simd::print_vec_char_256_hex(u2);
-        // print!("u3  ");
-        // crate::simd::print_vec_char_256_hex(u3);
-        // print!("\n");
+                #[inline]
+                fn row_up_forward(cur: &[u8], prev: &[u8], dst: &mut [u8]) {
+                    let len = cur.len();
+                    debug_assert_eq!(prev.len(), len);
+                    debug_assert_eq!(dst.len(), len);
+                    let lim = (len / 32) * 32;
+                    // SAFETY: AVX2 is statically enabled and `i + 32 <= len`.
+                    unsafe {
+                        let mut i = 0usize;
+                        while i < lim {
+                            let c = _mm256_loadu_si256(cur.as_ptr().add(i).cast::<__m256i>());
+                            let u = _mm256_loadu_si256(prev.as_ptr().add(i).cast::<__m256i>());
+                            _mm256_storeu_si256(
+                                dst.as_mut_ptr().add(i).cast::<__m256i>(),
+                                _mm256_sub_epi8(c, u),
+                            );
+                            i += 32;
+                        }
+                    }
+                    for j in lim..len {
+                        dst[j] = cur[j].wrapping_sub(prev[j]);
+                    }
+                }
 
-        // u0  5e 5a 56 52 | 4e 4a 46 42 | 5c 58 54 50 | 4c 48 44 40 || 1e 1a 16 12 | 0e 0a 06 02 | 1c 18 14 10 | 0c 08 04 00
-        // u1  7c 78 74 70 | 6c 68 64 60 | 7e 7a 76 72 | 6e 6a 66 62 || 3c 38 34 30 | 2c 28 24 20 | 3e 3a 36 32 | 2e 2a 26 22
-        // u2  4f 4b 47 43 | 5d 59 55 51 | 4d 49 45 41 | 5f 5b 57 53 || 0f 0b 07 03 | 1d 19 15 11 | 0d 09 05 01 | 1f 1b 17 13
-        // u3  6d 69 65 61 | 7f 7b 77 73 | 6f 6b 67 63 | 7d 79 75 71 || 2d 29 25 21 | 3f 3b 37 33 | 2f 2b 27 23 | 3d 39 35 31
+                #[inline]
+                fn row_sub1_inverse(src: &[u8], dst: &mut [u8]) {
+                    let len = src.len();
+                    debug_assert_eq!(dst.len(), len);
+                    let lim = (len / 32) * 32;
+                    // SAFETY: AVX2 is statically enabled and `i + 32 <= len`.
+                    unsafe {
+                        let bcast_last = _mm_set1_epi8(15);
+                        let mut prev = _mm_setzero_si128();
+                        let mut i = 0usize;
+                        while i < lim {
+                            let mut v = _mm256_loadu_si256(src.as_ptr().add(i).cast::<__m256i>());
+                            v = _mm256_add_epi8(v, _mm256_slli_si256::<1>(v));
+                            v = _mm256_add_epi8(v, _mm256_slli_si256::<2>(v));
+                            v = _mm256_add_epi8(v, _mm256_slli_si256::<4>(v));
+                            v = _mm256_add_epi8(v, _mm256_slli_si256::<8>(v));
+                            let lo = _mm_add_epi8(_mm256_castsi256_si128(v), prev);
+                            prev = _mm_shuffle_epi8(lo, bcast_last);
+                            let hi = _mm_add_epi8(_mm256_extracti128_si256::<1>(v), prev);
+                            prev = _mm_shuffle_epi8(hi, bcast_last);
+                            _mm256_storeu_si256(
+                                dst.as_mut_ptr().add(i).cast::<__m256i>(),
+                                _mm256_set_m128i(hi, lo),
+                            );
+                            i += 32;
+                        }
+                    }
+                    let mut acc = if lim > 0 { dst[lim - 1] } else { 0 };
+                    for j in lim..len {
+                        acc = acc.wrapping_add(src[j]);
+                        dst[j] = acc;
+                    }
+                }
 
-        t0 = _mm256_blend_epi32::<0b11001100>(u0, u1);
-        t1 = _mm256_shufps_epi32::<0b00111001>(u2, u3);
-        t2 = _mm256_shufps_epi32::<0b01001110>(u0, u1);
-        if HAS_ALPHA {
-            t3 = _mm256_shufps_epi32::<0b10010011>(u2, u3);
-        }
-
-        (t0, t2) = subtract_green(t0, t1, t2);
-
-        let next0;
-        let next1;
-        let next2;
-        let mut next3 = prev3;
-        (t0, next0) = running_difference_32(t0, prev0);
-        (t1, next1) = running_difference_32(t1, prev1);
-        (t2, next2) = running_difference_32(t2, prev2);
-        if HAS_ALPHA {
-            (t3, next3) = running_difference_32(t3, prev3);
-        }
-
-        if ACCUM_OR {
-            or_acc.0 = _mm256_or_si256(or_acc.0, t0);
-            or_acc.1 = _mm256_or_si256(or_acc.1, t1);
-            or_acc.2 = _mm256_or_si256(or_acc.2, t2);
-            if HAS_ALPHA {
-                or_acc.3 = _mm256_or_si256(or_acc.3, t3);
+                #[inline]
+                fn fence_stream() {
+                    // SAFETY: `_mm_sfence` is baseline SSE (mandatory on all x86_64 CPUs).
+                    unsafe { _mm_sfence() };
+                }
             }
         }
+        pub(super) use imp::Kernel;
+    } else if #[cfg(all(target_feature = "ssse3", not(miri)))] {
+        mod imp {
+            use std::arch::x86_64::__m128i;
+            use std::arch::x86_64::_mm_abs_epi8;
+            use std::arch::x86_64::_mm_add_epi8;
+            use std::arch::x86_64::_mm_add_epi64;
+            use std::arch::x86_64::_mm_alignr_epi8;
+            use std::arch::x86_64::_mm_cmpeq_epi8;
+            use std::arch::x86_64::_mm_cvtsi32_si128;
+            use std::arch::x86_64::_mm_cvtsi128_si32;
+            use std::arch::x86_64::_mm_loadu_si128;
+            use std::arch::x86_64::_mm_movemask_epi8;
+            use std::arch::x86_64::_mm_or_si128;
+            use std::arch::x86_64::_mm_sad_epu8;
+            use std::arch::x86_64::_mm_set_epi8;
+            use std::arch::x86_64::_mm_set1_epi8;
+            use std::arch::x86_64::_mm_set1_epi32;
+            use std::arch::x86_64::_mm_setzero_si128;
+            use std::arch::x86_64::_mm_sfence;
+            use std::arch::x86_64::_mm_shuffle_epi8;
+            use std::arch::x86_64::_mm_slli_si128;
+            use std::arch::x86_64::_mm_srli_si128;
+            use std::arch::x86_64::_mm_storeu_si128;
+            use std::arch::x86_64::_mm_stream_si128;
+            use std::arch::x86_64::_mm_sub_epi8;
 
-        store_m256i(out0, t0);
-        store_m256i(out1, t1);
-        store_m256i(out2, t2);
-        if HAS_ALPHA {
-            store_m256i(out3, t3);
-        }
+            use crate::buffer_pointer::BufferPointer;
+            use crate::filtering::RowKernel;
+            use crate::vec4u8::Vec4u8;
 
-        (next0, next1, next2, next3)
-    }
-}
+            #[inline]
+            fn hsum_epi64_128(acc: __m128i) -> u64 {
+                let mut tmp = [0u64; 2];
+                // SAFETY: `tmp` is 16 bytes and SSE2 is statically enabled.
+                unsafe {
+                    _mm_storeu_si128(tmp.as_mut_ptr().cast::<__m128i>(), acc);
+                }
+                tmp[0] + tmp[1]
+            }
 
-/// # Safety
-/// When `STREAM` is `true`, `out` must be 32-byte aligned.
-#[inline]
-unsafe fn soa_to_aos_u8_32x4<const STREAM: bool, const CONST_ALPHA: bool>(
-    input0: &[u8; 32],
-    input1: &[u8; 32],
-    input2: &[u8; 32],
-    input3: &[u8; 32],
-    const_alpha: u8,
-    out: &mut [Vec4u8; 32],
-    (mut prev0, mut prev1, mut prev2, mut prev3): InverseCarry4,
-) -> InverseCarry4 {
-    // SAFETY: simd/mod.rs exposes versions of this function for SSE2, SSSE3,
-    // SSE4.1, AVX, and AVX2. Which version is used depends on compiler flags,
-    // but there is no good way to plumb that through to avoid the unsafe; when
-    // `STREAM` is true, the caller guarantees `out` is 32-byte aligned.
-    unsafe {
-        let p0 = _mm256_set_epi8(
-            7, 11, 15, 3, 6, 10, 14, 2, 5, 9, 13, 1, 4, 8, 12, 0, 7, 11, 15, 3, 6, 10, 14, 2, 5, 9,
-            13, 1, 4, 8, 12, 0,
-        );
-        let p1 = _mm256_set_epi8(
-            3, 15, 11, 7, 2, 14, 10, 6, 1, 13, 9, 5, 0, 12, 8, 4, 3, 15, 11, 7, 2, 14, 10, 6, 1,
-            13, 9, 5, 0, 12, 8, 4,
-        );
-        let p2 = _mm256_set_epi8(
-            15, 3, 7, 11, 14, 2, 6, 10, 13, 1, 5, 9, 12, 0, 4, 8, 15, 3, 7, 11, 14, 2, 6, 10, 13,
-            1, 5, 9, 12, 0, 4, 8,
-        );
-        let p3 = _mm256_set_epi8(
-            11, 7, 3, 15, 10, 6, 2, 14, 9, 5, 1, 13, 8, 4, 0, 12, 11, 7, 3, 15, 10, 6, 2, 14, 9, 5,
-            1, 13, 8, 4, 0, 12,
-        );
+            pub(crate) struct Kernel;
 
-        let mut t0 = load_m256i(input0);
-        let mut t1 = load_m256i(input1);
-        let mut t2 = load_m256i(input2);
+            impl RowKernel for Kernel {
+                const STREAM_ALIGN: usize = 16;
 
-        (t0, prev0) = prefix_sum(t0, prev0);
-        (t1, prev1) = prefix_sum(t1, prev1);
-        (t2, prev2) = prefix_sum(t2, prev2);
+                #[inline]
+                fn bgra_to_subgreen_bgr3<const HAS_ALPHA: bool>(
+                    src: BufferPointer<Vec4u8>,
+                    dst_bgr: &mut [u8],
+                    dst_alpha: &mut [u8],
+                ) {
+                    let tw = src.len();
+                    debug_assert_eq!(dst_bgr.len(), tw * 3);
+                    debug_assert!(!HAS_ALPHA || dst_alpha.len() == tw);
 
-        let mut t3 = if CONST_ALPHA {
-            _mm256_set1_epi8(const_alpha as i8)
-        } else {
-            let (v, p3) = prefix_sum(load_m256i(input3), prev3);
-            prev3 = p3;
-            v
-        };
+                    // Each 4-pixel iteration stores 16 bytes at `di = x * 3`, reaching `di + 16`.
+                    // Stopping at `lim <= tw - 2` ensures `di + 16 <= tw * 3`.
+                    let lim = if tw >= 6 { ((tw - 2) / 4) * 4 } else { 0 };
+                    let mut x = 0usize;
+                    let mut di = 0usize;
 
-        (t0, t2) = add_green(t0, t1, t2);
+                    // SAFETY: SSSE3 is statically enabled; `x + 4 <= tw` and `di + 16 <= dst_bgr.len()`.
+                    unsafe {
+                        let shuf_g =
+                            _mm_set_epi8(-1, 13, -1, 13, -1, 9, -1, 9, -1, 5, -1, 5, -1, 1, -1, 1);
+                        let pack12 =
+                            _mm_set_epi8(-1, -1, -1, -1, 14, 13, 12, 10, 9, 8, 6, 5, 4, 2, 1, 0);
+                        let shuf_a =
+                            _mm_set_epi8(-1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, 15, 11, 7, 3);
 
-        // print!("t0  ");
-        // crate::simd::print_vec_char_256_hex(t0);
-        // print!("t1  ");
-        // crate::simd::print_vec_char_256_hex(t1);
-        // print!("t2  ");
-        // crate::simd::print_vec_char_256_hex(t2);
-        // print!("t3  ");
-        // crate::simd::print_vec_char_256_hex(t3);
-        // print!("\n");
+                        while x < lim {
+                            let v = _mm_loadu_si128(src.ptr().add(x).cast::<__m128i>());
+                            let g = _mm_shuffle_epi8(v, shuf_g);
+                            let sg = _mm_sub_epi8(v, g);
+                            let pk = _mm_shuffle_epi8(sg, pack12);
+                            _mm_storeu_si128(dst_bgr.as_mut_ptr().add(di).cast::<__m128i>(), pk);
+                            if HAS_ALPHA {
+                                let a = _mm_cvtsi128_si32(_mm_shuffle_epi8(v, shuf_a)) as u32;
+                                dst_alpha[x..x + 4].copy_from_slice(&a.to_le_bytes());
+                            }
+                            x += 4;
+                            di += 12;
+                        }
+                    }
 
-        // t0  7c 78 74 70 | 6c 68 64 60 | 5c 58 54 50 | 4c 48 44 40 || 3c 38 34 30 | 2c 28 24 20 | 1c 18 14 10 | 0c 08 04 00
-        // t1  7d 79 75 71 | 6d 69 65 61 | 5d 59 55 51 | 4d 49 45 41 || 3d 39 35 31 | 2d 29 25 21 | 1d 19 15 11 | 0d 09 05 01
-        // t2  7e 7a 76 72 | 6e 6a 66 62 | 5e 5a 56 52 | 4e 4a 46 42 || 3e 3a 36 32 | 2e 2a 26 22 | 1e 1a 16 12 | 0e 0a 06 02
-        // t3  7f 7b 77 73 | 6f 6b 67 63 | 5f 5b 57 53 | 4f 4b 47 43 || 3f 3b 37 33 | 2f 2b 27 23 | 1f 1b 17 13 | 0f 0b 07 03
+                    for (off, bgr) in dst_bgr[lim * 3..].as_chunks_mut::<3>().0.iter_mut().enumerate() {
+                        let i = lim + off;
+                        // SAFETY: `i < tw == src.len()`.
+                        let px = unsafe { src.ptr().add(i).read() };
+                        bgr[0] = px.0.wrapping_sub(px.1);
+                        bgr[1] = px.1;
+                        bgr[2] = px.2.wrapping_sub(px.1);
+                        if HAS_ALPHA {
+                            dst_alpha[i] = px.3;
+                        }
+                    }
+                }
 
-        let u0 = _mm256_shufps_epi32::<0b01000100>(t0, t2);
-        let u1 = _mm256_shufps_epi32::<0b11101110>(t2, t0);
-        let u2 = _mm256_shufps_epi32::<0b00010001>(t3, t1);
-        let u3 = _mm256_shufps_epi32::<0b10111011>(t1, t3);
+                #[inline]
+                fn sad_signed_bytes(data: &[u8]) -> u64 {
+                    let lim = (data.len() / 16) * 16;
+                    let mut sum = 0u64;
+                    // SAFETY: SSSE3 is statically enabled and `i + 16 <= data.len()`.
+                    unsafe {
+                        let zero = _mm_setzero_si128();
+                        let mut acc = _mm_setzero_si128();
+                        let mut i = 0usize;
+                        while i < lim {
+                            let v = _mm_loadu_si128(data.as_ptr().add(i).cast::<__m128i>());
+                            acc = _mm_add_epi64(acc, _mm_sad_epu8(_mm_abs_epi8(v), zero));
+                            i += 16;
+                        }
+                        sum += hsum_epi64_128(acc);
+                    }
+                    for &b in &data[lim..] {
+                        sum += u64::from((b as i8).unsigned_abs());
+                    }
+                    sum
+                }
 
-        // print!("u0  ");
-        // crate::simd::print_vec_char_256_hex(u0);
-        // print!("u1  ");
-        // crate::simd::print_vec_char_256_hex(u1);
-        // print!("u2  ");
-        // crate::simd::print_vec_char_256_hex(u2);
-        // print!("u3  ");
-        // crate::simd::print_vec_char_256_hex(u3);
-        // print!("\n");
+                #[inline]
+                fn row_sub3_forward_sad(src: &[u8], dst: &mut [u8]) -> u64 {
+                    let len = src.len();
+                    debug_assert_eq!(dst.len(), len);
+                    let lim = (len / 16) * 16;
+                    let mut sum = 0u64;
+                    // SAFETY: SSSE3 is statically enabled and `i + 16 <= len`.
+                    unsafe {
+                        let zero = _mm_setzero_si128();
+                        let mut acc = _mm_setzero_si128();
+                        let mut prev = _mm_setzero_si128();
+                        let mut i = 0usize;
+                        while i < lim {
+                            let v = _mm_loadu_si128(src.as_ptr().add(i).cast::<__m128i>());
+                            let shifted = _mm_alignr_epi8::<13>(v, prev);
+                            let diff = _mm_sub_epi8(v, shifted);
+                            prev = v;
+                            _mm_storeu_si128(dst.as_mut_ptr().add(i).cast::<__m128i>(), diff);
+                            acc = _mm_add_epi64(acc, _mm_sad_epu8(_mm_abs_epi8(diff), zero));
+                            i += 16;
+                        }
+                        sum += hsum_epi64_128(acc);
+                    }
+                    for j in lim..len {
+                        let p = if j >= 3 { src[j - 3] } else { 0 };
+                        let d = src[j].wrapping_sub(p);
+                        dst[j] = d;
+                        sum += u64::from((d as i8).unsigned_abs());
+                    }
+                    sum
+                }
 
-        // u0  5e 5a 56 52 | 4e 4a 46 42 | 5c 58 54 50 | 4c 48 44 40 || 1e 1a 16 12 | 0e 0a 06 02 | 1c 18 14 10 | 0c 08 04 00
-        // u1  7c 78 74 70 | 6c 68 64 60 | 7e 7a 76 72 | 6e 6a 66 62 || 3c 38 34 30 | 2c 28 24 20 | 3e 3a 36 32 | 2e 2a 26 22
-        // u2  4d 49 45 41 | 5d 59 55 51 | 4f 4b 47 43 | 5f 5b 57 53 || 0d 09 05 01 | 1d 19 15 11 | 0f 0b 07 03 | 1f 1b 17 13
-        // u3  6f 6b 67 63 | 7f 7b 77 73 | 6d 69 65 61 | 7d 79 75 71 || 2f 2b 27 23 | 3f 3b 37 33 | 2d 29 25 21 | 3d 39 35 31
+                #[inline]
+                fn row_up_forward_sad(cur: &[u8], prev: &[u8], dst: &mut [u8]) -> u64 {
+                    let len = cur.len();
+                    debug_assert_eq!(prev.len(), len);
+                    debug_assert_eq!(dst.len(), len);
+                    let lim = (len / 16) * 16;
+                    let mut sum = 0u64;
+                    // SAFETY: SSSE3 is statically enabled and `i + 16 <= len`.
+                    unsafe {
+                        let zero = _mm_setzero_si128();
+                        let mut acc = _mm_setzero_si128();
+                        let mut i = 0usize;
+                        while i < lim {
+                            let c = _mm_loadu_si128(cur.as_ptr().add(i).cast::<__m128i>());
+                            let u = _mm_loadu_si128(prev.as_ptr().add(i).cast::<__m128i>());
+                            let diff = _mm_sub_epi8(c, u);
+                            _mm_storeu_si128(dst.as_mut_ptr().add(i).cast::<__m128i>(), diff);
+                            acc = _mm_add_epi64(acc, _mm_sad_epu8(_mm_abs_epi8(diff), zero));
+                            i += 16;
+                        }
+                        sum += hsum_epi64_128(acc);
+                    }
+                    for j in lim..len {
+                        let d = cur[j].wrapping_sub(prev[j]);
+                        dst[j] = d;
+                        sum += u64::from((d as i8).unsigned_abs());
+                    }
+                    sum
+                }
 
-        t0 = _mm256_blend_epi32::<0b01010101>(u2, u0);
-        t1 = _mm256_blend_epi32::<0b10101010>(u2, u0);
-        t2 = _mm256_blend_epi32::<0b01010101>(u3, u1);
-        t3 = _mm256_blend_epi32::<0b10101010>(u3, u1);
+                #[inline]
+                fn row_subup3_forward_sad(cur: &[u8], prev: &[u8], dst: &mut [u8]) -> u64 {
+                    let len = cur.len();
+                    debug_assert_eq!(prev.len(), len);
+                    debug_assert_eq!(dst.len(), len);
+                    let lim = (len / 16) * 16;
+                    let mut sum = 0u64;
+                    // SAFETY: SSSE3 is statically enabled and `i + 16 <= len`.
+                    unsafe {
+                        let zero = _mm_setzero_si128();
+                        let mut acc = _mm_setzero_si128();
+                        let mut prev_up = _mm_setzero_si128();
+                        let mut i = 0usize;
+                        while i < lim {
+                            let c = _mm_loadu_si128(cur.as_ptr().add(i).cast::<__m128i>());
+                            let u = _mm_loadu_si128(prev.as_ptr().add(i).cast::<__m128i>());
+                            let up = _mm_sub_epi8(c, u);
+                            let shifted = _mm_alignr_epi8::<13>(up, prev_up);
+                            let diff = _mm_sub_epi8(up, shifted);
+                            prev_up = up;
+                            _mm_storeu_si128(dst.as_mut_ptr().add(i).cast::<__m128i>(), diff);
+                            acc = _mm_add_epi64(acc, _mm_sad_epu8(_mm_abs_epi8(diff), zero));
+                            i += 16;
+                        }
+                        sum += hsum_epi64_128(acc);
+                    }
+                    for j in lim..len {
+                        let up = cur[j].wrapping_sub(prev[j]);
+                        let prev_u = if j >= 3 {
+                            cur[j - 3].wrapping_sub(prev[j - 3])
+                        } else {
+                            0
+                        };
+                        let d = up.wrapping_sub(prev_u);
+                        dst[j] = d;
+                        sum += u64::from((d as i8).unsigned_abs());
+                    }
+                    sum
+                }
 
-        // print!("t0  ");
-        // crate::simd::print_vec_char_256_hex(t0);
-        // print!("t1  ");
-        // crate::simd::print_vec_char_256_hex(t1);
-        // print!("t2  ");
-        // crate::simd::print_vec_char_256_hex(t2);
-        // print!("t3  ");
-        // crate::simd::print_vec_char_256_hex(t3);
-        // print!("\n");
+                #[inline]
+                fn row_sub3_inverse(src: &[u8], dst: &mut [u8]) {
+                    let len = src.len();
+                    debug_assert_eq!(dst.len(), len);
+                    let lim = if len >= 16 { ((len - 4) / 12) * 12 } else { 0 };
+                    // SAFETY: SSSE3 is statically enabled; for `i < lim`, `i + 16 <= lim + 4 <= len`.
+                    unsafe {
+                        let shuf_last3 =
+                            _mm_set_epi8(9, 11, 10, 9, 11, 10, 9, 11, 10, 9, 11, 10, 9, 11, 10, 9);
+                        let mut prev_px = _mm_setzero_si128();
+                        let mut i = 0usize;
+                        while i < lim {
+                            let mut v = _mm_loadu_si128(src.as_ptr().add(i).cast::<__m128i>());
+                            v = _mm_add_epi8(v, _mm_slli_si128::<3>(v));
+                            v = _mm_add_epi8(v, _mm_slli_si128::<6>(v));
+                            v = _mm_add_epi8(v, prev_px);
+                            prev_px = _mm_shuffle_epi8(v, shuf_last3);
+                            _mm_storeu_si128(dst.as_mut_ptr().add(i).cast::<__m128i>(), v);
+                            i += 12;
+                        }
+                    }
+                    for j in lim..len {
+                        let p = if j >= 3 { dst[j - 3] } else { 0 };
+                        dst[j] = src[j].wrapping_add(p);
+                    }
+                }
 
-        // t0  4d 49 45 41 | 4e 4a 46 42 | 4f 4b 47 43 | 4c 48 44 40 || 0d 09 05 01 | 0e 0a 06 02 | 0f 0b 07 03 | 0c 08 04 00
-        // t1  5e 5a 56 52 | 5d 59 55 51 | 5c 58 54 50 | 5f 5b 57 53 || 1e 1a 16 12 | 1d 19 15 11 | 1c 18 14 10 | 1f 1b 17 13
-        // t2  6f 6b 67 63 | 6c 68 64 60 | 6d 69 65 61 | 6e 6a 66 62 || 2f 2b 27 23 | 2c 28 24 20 | 2d 29 25 21 | 2e 2a 26 22
-        // t3  7c 78 74 70 | 7f 7b 77 73 | 7e 7a 76 72 | 7d 79 75 71 || 3c 38 34 30 | 3f 3b 37 33 | 3e 3a 36 32 | 3d 39 35 31
+                #[inline]
+                fn row_up_inverse(src: &[u8], prev: &[u8], dst: &mut [u8]) {
+                    let len = src.len();
+                    debug_assert_eq!(prev.len(), len);
+                    debug_assert_eq!(dst.len(), len);
+                    let lim = (len / 16) * 16;
+                    // SAFETY: SSE2 is statically enabled and `i + 16 <= len`.
+                    unsafe {
+                        let mut i = 0usize;
+                        while i < lim {
+                            let d = _mm_loadu_si128(src.as_ptr().add(i).cast::<__m128i>());
+                            let u = _mm_loadu_si128(prev.as_ptr().add(i).cast::<__m128i>());
+                            _mm_storeu_si128(
+                                dst.as_mut_ptr().add(i).cast::<__m128i>(),
+                                _mm_add_epi8(d, u),
+                            );
+                            i += 16;
+                        }
+                    }
+                    for j in lim..len {
+                        dst[j] = src[j].wrapping_add(prev[j]);
+                    }
+                }
 
-        t0 = _mm256_shuffle_epi8(t0, p0);
-        t1 = _mm256_shuffle_epi8(t1, p1);
-        t2 = _mm256_shuffle_epi8(t2, p2);
-        t3 = _mm256_shuffle_epi8(t3, p3);
+                #[inline]
+                fn row_subup3_inverse(src: &[u8], prev: &[u8], dst: &mut [u8]) {
+                    let len = src.len();
+                    debug_assert_eq!(prev.len(), len);
+                    debug_assert_eq!(dst.len(), len);
+                    debug_assert!(len.is_multiple_of(3));
+                    let lim = if len >= 16 { ((len - 4) / 12) * 12 } else { 0 };
+                    // SAFETY: SSSE3 is statically enabled; for `i < lim`, `i + 16 <= lim + 4 <= len`.
+                    unsafe {
+                        let shuf_last3 =
+                            _mm_set_epi8(9, 11, 10, 9, 11, 10, 9, 11, 10, 9, 11, 10, 9, 11, 10, 9);
+                        let mut prev_px = _mm_setzero_si128();
+                        let mut i = 0usize;
+                        while i < lim {
+                            let mut v = _mm_loadu_si128(src.as_ptr().add(i).cast::<__m128i>());
+                            v = _mm_add_epi8(v, _mm_slli_si128::<3>(v));
+                            v = _mm_add_epi8(v, _mm_slli_si128::<6>(v));
+                            v = _mm_add_epi8(v, prev_px);
+                            prev_px = _mm_shuffle_epi8(v, shuf_last3);
+                            let u = _mm_loadu_si128(prev.as_ptr().add(i).cast::<__m128i>());
+                            _mm_storeu_si128(
+                                dst.as_mut_ptr().add(i).cast::<__m128i>(),
+                                _mm_add_epi8(v, u),
+                            );
+                            i += 12;
+                        }
+                    }
+                    let mut acc = [0u8; 3];
+                    if lim >= 3 {
+                        for ch in 0..3 {
+                            acc[ch] = dst[lim - 3 + ch].wrapping_sub(prev[lim - 3 + ch]);
+                        }
+                    }
+                    for j in lim..len {
+                        let ch = j % 3;
+                        acc[ch] = acc[ch].wrapping_add(src[j]);
+                        dst[j] = acc[ch].wrapping_add(prev[j]);
+                    }
+                }
 
-        // print!("t0  ");
-        // crate::simd::print_vec_char_256_hex(t0);
-        // print!("t1  ");
-        // crate::simd::print_vec_char_256_hex(t1);
-        // print!("t2  ");
-        // crate::simd::print_vec_char_256_hex(t2);
-        // print!("t3  ");
-        // crate::simd::print_vec_char_256_hex(t3);
-        // print!("\n");
+                #[inline]
+                unsafe fn subgreen_bgr3_to_bgra<const STREAM: bool, const CONST_ALPHA: bool>(
+                    src_bgr: &[u8],
+                    alpha_row: &[u8],
+                    const_alpha: u8,
+                    dst: &mut [Vec4u8],
+                ) {
+                    let tw = dst.len();
+                    debug_assert_eq!(src_bgr.len(), tw * 3);
+                    debug_assert!(CONST_ALPHA || alpha_row.len() == tw);
+                    debug_assert!(!STREAM || (dst.as_mut_ptr() as usize).is_multiple_of(16));
 
-        // t0  4f 4e 4d 4c | 4b 4a 49 48 | 47 46 45 44 | 43 42 41 40 || 0f 0e 0d 0c | 0b 0a 09 08 | 07 06 05 04 | 03 02 01 00
-        // t1  5f 5e 5d 5c | 5b 5a 59 58 | 57 56 55 54 | 53 52 51 50 || 1f 1e 1d 1c | 1b 1a 19 18 | 17 16 15 14 | 13 12 11 10
-        // t2  6f 6e 6d 6c | 6b 6a 69 68 | 67 66 65 64 | 63 62 61 60 || 2f 2e 2d 2c | 2b 2a 29 28 | 27 26 25 24 | 23 22 21 20
-        // t3  7f 7e 7d 7c | 7b 7a 79 78 | 77 76 75 74 | 73 72 71 70 || 3f 3e 3d 3c | 3b 3a 39 38 | 37 36 35 34 | 33 32 31 30
+                    let full4 = if tw >= 8 { (tw / 4) * 4 } else { 0 };
+                    let lim = if tw >= 6 { ((tw - 2) / 4) * 4 } else { 0 };
+                    let end = full4.max(lim);
+                    let mut x = 0usize;
+                    let mut si = 0usize;
 
-        store_m256i_vec4u8::<STREAM>(
-            out.index_mut(0..8).try_into().unwrap(),
-            _mm256_set_m128i(_mm256_castsi256_si128(t1), _mm256_castsi256_si128(t0)),
-        );
-        store_m256i_vec4u8::<STREAM>(
-            out.index_mut(8..16).try_into().unwrap(),
-            _mm256_set_m128i(_mm256_castsi256_si128(t3), _mm256_castsi256_si128(t2)),
-        );
+                    // SAFETY: SSSE3 is statically enabled; `si + 16 <= src_bgr.len()` inside `x < lim`,
+                    // and for the final 4-pixel block (`x >= 4`, `si >= 12`), `si - 4..si + 12` stays
+                    // in bounds and shifts right 4 bytes to align lanes `0..12`.
+                    unsafe {
+                        let shuf_g =
+                            _mm_set_epi8(-1, 13, -1, 13, -1, 9, -1, 9, -1, 5, -1, 5, -1, 1, -1, 1);
+                        let unpack12 =
+                            _mm_set_epi8(-1, 11, 10, 9, -1, 8, 7, 6, -1, 5, 4, 3, -1, 2, 1, 0);
+                        let const_alpha_vec = _mm_set1_epi32((u32::from(const_alpha) << 24) as i32);
+                        let shuf_a =
+                            _mm_set_epi8(3, -1, -1, -1, 2, -1, -1, -1, 1, -1, -1, -1, 0, -1, -1, -1);
 
-        store_m256i_vec4u8::<STREAM>(
-            out.index_mut(16..24).try_into().unwrap(),
-            _mm256_set_m128i(
-                _mm256_extracti128_si256::<1>(t1),
-                _mm256_extracti128_si256::<1>(t0),
-            ),
-        );
-        store_m256i_vec4u8::<STREAM>(
-            out.index_mut(24..32).try_into().unwrap(),
-            _mm256_set_m128i(
-                _mm256_extracti128_si256::<1>(t3),
-                _mm256_extracti128_si256::<1>(t2),
-            ),
-        );
+                        while x < lim {
+                            let v = _mm_loadu_si128(src_bgr.as_ptr().add(si).cast::<__m128i>());
+                            let sg = _mm_shuffle_epi8(v, unpack12);
+                            let g = _mm_shuffle_epi8(sg, shuf_g);
+                            let alpha_vec = if CONST_ALPHA {
+                                const_alpha_vec
+                            } else {
+                                let a32 = _mm_cvtsi32_si128(i32::from_le_bytes(
+                                    alpha_row[x..x + 4].try_into().unwrap(),
+                                ));
+                                _mm_shuffle_epi8(a32, shuf_a)
+                            };
+                            let bgra = _mm_or_si128(_mm_add_epi8(sg, g), alpha_vec);
+                            let p = dst.as_mut_ptr().add(x).cast::<__m128i>();
+                            if STREAM {
+                                _mm_stream_si128(p, bgra);
+                            } else {
+                                _mm_storeu_si128(p, bgra);
+                            }
+                            x += 4;
+                            si += 12;
+                        }
+                        if x < end {
+                            let v = _mm_srli_si128::<4>(_mm_loadu_si128(
+                                src_bgr.as_ptr().add(si - 4).cast::<__m128i>(),
+                            ));
+                            let sg = _mm_shuffle_epi8(v, unpack12);
+                            let g = _mm_shuffle_epi8(sg, shuf_g);
+                            let alpha_vec = if CONST_ALPHA {
+                                const_alpha_vec
+                            } else {
+                                let a32 = _mm_cvtsi32_si128(i32::from_le_bytes(
+                                    alpha_row[x..x + 4].try_into().unwrap(),
+                                ));
+                                _mm_shuffle_epi8(a32, shuf_a)
+                            };
+                            let bgra = _mm_or_si128(_mm_add_epi8(sg, g), alpha_vec);
+                            let p = dst.as_mut_ptr().add(x).cast::<__m128i>();
+                            if STREAM {
+                                _mm_stream_si128(p, bgra);
+                            } else {
+                                _mm_storeu_si128(p, bgra);
+                            }
+                        }
+                    }
 
-        (prev0, prev1, prev2, prev3)
-    }
-}
+                    for i in end..tw {
+                        let s = i * 3;
+                        let g = src_bgr[s + 1];
+                        let a = if CONST_ALPHA {
+                            const_alpha
+                        } else {
+                            alpha_row[i]
+                        };
+                        dst[i] = Vec4u8(src_bgr[s].wrapping_add(g), g, src_bgr[s + 2].wrapping_add(g), a);
+                    }
+                }
 
-// --- kernel trait impl ---
+                #[inline]
+                unsafe fn splat_row<const STREAM: bool>(dst: &mut [Vec4u8], pixel: Vec4u8) {
+                    debug_assert!(!STREAM || (dst.as_mut_ptr() as usize).is_multiple_of(16));
+                    let lim = (dst.len() / 4) * 4;
+                    // SAFETY: SSE2 is statically enabled; each iteration writes 4 `Vec4u8` (16 bytes),
+                    // and caller upholds 16-byte alignment when `STREAM` is `true`.
+                    unsafe {
+                        let word = u32::from_le_bytes([pixel.0, pixel.1, pixel.2, pixel.3]) as i32;
+                        let vec = _mm_set1_epi32(word);
+                        let mut x = 0usize;
+                        while x < lim {
+                            let p = dst.as_mut_ptr().add(x).cast::<__m128i>();
+                            if STREAM {
+                                _mm_stream_si128(p, vec);
+                            } else {
+                                _mm_storeu_si128(p, vec);
+                            }
+                            x += 4;
+                        }
+                    }
+                    dst[lim..].fill(pixel);
+                }
 
-use crate::filtering::FilterKernel;
+                #[inline]
+                fn is_constant_plane(data: &[u8]) -> Option<u8> {
+                    let first = *data.first()?;
+                    let lim = (data.len() / 16) * 16;
+                    // SAFETY: SSE2 is statically enabled and `i + 16 <= data.len()`.
+                    unsafe {
+                        let target = _mm_set1_epi8(first as i8);
+                        let mut i = 0usize;
+                        while i < lim {
+                            let v = _mm_loadu_si128(data.as_ptr().add(i).cast::<__m128i>());
+                            if _mm_movemask_epi8(_mm_cmpeq_epi8(v, target)) != 0xFFFF {
+                                return None;
+                            }
+                            i += 16;
+                        }
+                    }
+                    data[lim..].iter().all(|&b| b == first).then_some(first)
+                }
 
-pub(super) struct Kernel;
+                #[inline]
+                fn row_sub1_forward(src: &[u8], dst: &mut [u8]) {
+                    let len = src.len();
+                    debug_assert_eq!(dst.len(), len);
+                    let lim = (len / 16) * 16;
+                    // SAFETY: SSSE3 is statically enabled and `i + 16 <= len`.
+                    unsafe {
+                        let mut prev = _mm_setzero_si128();
+                        let mut i = 0usize;
+                        while i < lim {
+                            let v = _mm_loadu_si128(src.as_ptr().add(i).cast::<__m128i>());
+                            let shifted = _mm_alignr_epi8::<15>(v, prev);
+                            _mm_storeu_si128(
+                                dst.as_mut_ptr().add(i).cast::<__m128i>(),
+                                _mm_sub_epi8(v, shifted),
+                            );
+                            prev = v;
+                            i += 16;
+                        }
+                    }
+                    let mut p = if lim > 0 { src[lim - 1] } else { 0 };
+                    for j in lim..len {
+                        let cur = src[j];
+                        dst[j] = cur.wrapping_sub(p);
+                        p = cur;
+                    }
+                }
 
-impl FilterKernel for Kernel {
-    type ForwardCarry = ForwardCarry4;
-    type InverseCarry = InverseCarry4;
-    const STREAM_ALIGN: usize = 32;
+                #[inline]
+                fn row_up_forward(cur: &[u8], prev: &[u8], dst: &mut [u8]) {
+                    let len = cur.len();
+                    debug_assert_eq!(prev.len(), len);
+                    debug_assert_eq!(dst.len(), len);
+                    let lim = (len / 16) * 16;
+                    // SAFETY: SSE2 is statically enabled and `i + 16 <= len`.
+                    unsafe {
+                        let mut i = 0usize;
+                        while i < lim {
+                            let c = _mm_loadu_si128(cur.as_ptr().add(i).cast::<__m128i>());
+                            let u = _mm_loadu_si128(prev.as_ptr().add(i).cast::<__m128i>());
+                            _mm_storeu_si128(
+                                dst.as_mut_ptr().add(i).cast::<__m128i>(),
+                                _mm_sub_epi8(c, u),
+                            );
+                            i += 16;
+                        }
+                    }
+                    for j in lim..len {
+                        dst[j] = cur[j].wrapping_sub(prev[j]);
+                    }
+                }
 
-    #[inline]
-    fn zero_forward() -> Self::ForwardCarry {
-        // SAFETY: simd/mod.rs exposes versions of this function for SSE2,
-        // SSSE3, SSE4.1, AVX, and AVX2.
-        unsafe {
-            let z = _mm256_setzero_si256();
-            (z, z, z, z)
-        }
-    }
+                #[inline]
+                fn row_sub1_inverse(src: &[u8], dst: &mut [u8]) {
+                    let len = src.len();
+                    debug_assert_eq!(dst.len(), len);
+                    let lim = (len / 16) * 16;
+                    // SAFETY: SSSE3 is statically enabled and `i + 16 <= len`.
+                    unsafe {
+                        let bcast_last = _mm_set1_epi8(15);
+                        let mut prev = _mm_setzero_si128();
+                        let mut i = 0usize;
+                        while i < lim {
+                            let mut v = _mm_loadu_si128(src.as_ptr().add(i).cast::<__m128i>());
+                            v = _mm_add_epi8(v, _mm_slli_si128::<1>(v));
+                            v = _mm_add_epi8(v, _mm_slli_si128::<2>(v));
+                            v = _mm_add_epi8(v, _mm_slli_si128::<4>(v));
+                            v = _mm_add_epi8(v, _mm_slli_si128::<8>(v));
+                            v = _mm_add_epi8(v, prev);
+                            prev = _mm_shuffle_epi8(v, bcast_last);
+                            _mm_storeu_si128(dst.as_mut_ptr().add(i).cast::<__m128i>(), v);
+                            i += 16;
+                        }
+                    }
+                    let mut acc = if lim > 0 { dst[lim - 1] } else { 0 };
+                    for j in lim..len {
+                        acc = acc.wrapping_add(src[j]);
+                        dst[j] = acc;
+                    }
+                }
 
-    #[inline]
-    fn zero_inverse() -> Self::InverseCarry {
-        // SAFETY: simd/mod.rs exposes versions of this function for SSE2,
-        // SSSE3, SSE4.1, AVX, and AVX2.
-        unsafe {
-            let z = _mm_setzero_si128();
-            (z, z, z, z)
-        }
-    }
-
-    #[inline]
-    fn or_accum_is_zero((a0, a1, a2, a3): Self::ForwardCarry) -> (bool, bool, bool, bool) {
-        // SAFETY: simd/mod.rs exposes versions of this function for SSE2,
-        // SSSE3, SSE4.1, AVX, and AVX2.
-        unsafe {
-            (
-                _mm256_is_zero(a0),
-                _mm256_is_zero(a1),
-                _mm256_is_zero(a2),
-                _mm256_is_zero(a3),
-            )
-        }
-    }
-
-    #[inline]
-    fn forward_block<const HAS_ALPHA: bool, const ACCUM_OR: bool>(
-        input: KnownSizeBufferPointer<Vec4u8, 32>,
-        out0: &mut [u8; 32],
-        out1: &mut [u8; 32],
-        out2: &mut [u8; 32],
-        out3: &mut [u8; 32],
-        prev: Self::ForwardCarry,
-        or_acc: &mut Self::ForwardCarry,
-    ) -> Self::ForwardCarry {
-        aos_to_soa_u8_32x4::<HAS_ALPHA, ACCUM_OR>(input, out0, out1, out2, out3, prev, or_acc)
-    }
-
-    #[inline]
-    unsafe fn splat_blocks<const STREAM: bool>(out_blocks: &mut [[Vec4u8; 32]], pixel: Vec4u8) {
-        // SAFETY: simd/mod.rs exposes versions of `_mm256_set1_epi32` for SSE2
-        // through AVX2, `store_m256i_vec4u8` writes 8 `Vec4u8`s (32 bytes) per
-        // sub-slice, and the caller upholds 32-byte alignment on `out_blocks`
-        // when `STREAM` is `true` (each 8-pixel sub-slice is at a +32B offset).
-        unsafe {
-            let word = u32::from_le_bytes([pixel.0, pixel.1, pixel.2, pixel.3]) as i32;
-            let vec = _mm256_set1_epi32(word);
-            for out in out_blocks {
-                store_m256i_vec4u8::<STREAM>(out.index_mut(0..8).try_into().unwrap(), vec);
-                store_m256i_vec4u8::<STREAM>(out.index_mut(8..16).try_into().unwrap(), vec);
-                store_m256i_vec4u8::<STREAM>(out.index_mut(16..24).try_into().unwrap(), vec);
-                store_m256i_vec4u8::<STREAM>(out.index_mut(24..32).try_into().unwrap(), vec);
+                #[inline]
+                fn fence_stream() {
+                    // SAFETY: `_mm_sfence` is baseline SSE (mandatory on all x86_64 CPUs).
+                    unsafe { _mm_sfence() };
+                }
             }
         }
-    }
-
-    #[inline]
-    unsafe fn inverse_block<const STREAM: bool, const CONST_ALPHA: bool>(
-        in0: &[u8; 32],
-        in1: &[u8; 32],
-        in2: &[u8; 32],
-        in3: &[u8; 32],
-        const_alpha: u8,
-        out: &mut [Vec4u8; 32],
-        prev: Self::InverseCarry,
-    ) -> Self::InverseCarry {
-        // SAFETY: Caller upholds 32-byte alignment on `out` when `STREAM` is `true`.
-        unsafe {
-            soa_to_aos_u8_32x4::<STREAM, CONST_ALPHA>(in0, in1, in2, in3, const_alpha, out, prev)
-        }
-    }
-
-    #[inline]
-    fn fence_stream() {
-        // SAFETY: `_mm_sfence` is baseline SSE (mandatory on all x86_64 CPUs).
-        unsafe { _mm_sfence() };
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    #[cfg_attr(miri, ignore)]
-    fn test_prefix_sum() {
-        let input = [
-            0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23,
-            24, 25, 26, 27, 28, 29, 30, 31,
-        ];
-        let mut output = [0; 32];
-        unsafe {
-            store_m256i(
-                (&mut output[..]).try_into().unwrap(),
-                prefix_sum(
-                    load_m256i((&input[..]).try_into().unwrap()),
-                    _mm_setzero_si128(),
-                )
-                .0,
-            );
-        }
-        let expected = [
-            0, 1, 3, 6, 10, 15, 21, 28, 36, 45, 55, 66, 78, 91, 105, 120, 136, 153, 171, 190, 210,
-            231, 253, 20, 44, 69, 95, 122, 150, 179, 209, 240,
-        ];
-        assert_eq!(output, expected);
-    }
-
-    #[test]
-    #[cfg_attr(miri, ignore)]
-    fn test_running_difference() {
-        let input = [
-            0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23,
-            24, 25, 26, 27, 28, 29, 30, 31,
-        ];
-        let mut output = [0; 32];
-        let carry = unsafe {
-            let (diff, carry) = running_difference_32(
-                load_m256i((&input[..]).try_into().unwrap()),
-                _mm256_setzero_si256(),
-            );
-            store_m256i((&mut output[..]).try_into().unwrap(), diff);
-            carry
-        };
-        let expected = [
-            0, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1,
-            1, 1, 1,
-        ];
-        assert_eq!(output, expected);
-
-        let input2 = [40u8; 32];
-        let mut output2 = [0; 32];
-        store_m256i(
-            (&mut output2[..]).try_into().unwrap(),
-            running_difference_32(load_m256i((&input2[..]).try_into().unwrap()), carry).0,
-        );
-        let mut expected2 = [0u8; 32];
-        expected2[0] = 9;
-        assert_eq!(output2, expected2);
+        pub(super) use imp::Kernel;
+    } else {
+        pub(super) use crate::filtering::ScalarKernel as Kernel;
     }
 }

@@ -29,6 +29,7 @@ use rkyv::util::AlignedVec;
 use wprs::buffer_pointer::BufferPointer;
 use wprs::filtering;
 use wprs::serialization::wayland::BufferFormat;
+use wprs::serialization::wayland::BufferMetadata;
 use wprs::sharding_compression::ShardingCompressor;
 use wprs::sharding_compression::ShardingDecompressor;
 
@@ -47,7 +48,7 @@ fn reorder_channels(data: &mut [u8]) {
     }
 }
 
-fn read_png(path: &Path) -> Vec<u8> {
+fn read_png(path: &Path) -> (Vec<u8>, u32, u32) {
     println!("reading png {}", path.display());
     let decoder = Decoder::new(BufReader::new(File::open(path).unwrap()));
     let mut reader = decoder.read_info().unwrap();
@@ -58,26 +59,30 @@ fn read_png(path: &Path) -> Vec<u8> {
     assert_eq!(info.bit_depth, BitDepth::Eight);
     let mut data = buf[..info.buffer_size()].to_vec();
     reorder_channels(&mut data);
-    data
+    (data, info.width, info.height)
 }
 
 fn filter_compress_png(c: &mut Criterion, path: &Path) {
-    let data = read_png(path);
+    let (data, width, height) = read_png(path);
     let data_ptr = data.as_ptr();
     let buf_ptr = unsafe { BufferPointer::new(&data_ptr, data.len()) };
+    let metadata = BufferMetadata {
+        width: width as i32,
+        height: height as i32,
+        stride: (width * 4) as i32,
+        format: BufferFormat::Argb8888,
+    };
 
     let uncompressed_size = data.len();
 
     let n_compressors = NonZeroUsize::new(16).unwrap();
     let mut compressor = ShardingCompressor::new(n_compressors, 1).unwrap();
 
-    let mut compressed_tiles =
-        filtering::filter_and_compress(buf_ptr, BufferFormat::Argb8888, &mut compressor);
+    let mut compressed_tiles = filtering::filter_and_compress(buf_ptr, metadata, &mut compressor);
 
     c.bench_function(&format!("filter and compress: {}", path.display()), |b| {
         b.iter(|| {
-            compressed_tiles =
-                filtering::filter_and_compress(buf_ptr, BufferFormat::Argb8888, &mut compressor);
+            compressed_tiles = filtering::filter_and_compress(buf_ptr, metadata, &mut compressor);
         })
     });
 

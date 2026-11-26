@@ -12,8 +12,6 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use std::alloc;
-use std::alloc::Layout;
 use std::any::Any;
 use std::num::NonZeroUsize;
 use std::panic;
@@ -29,27 +27,11 @@ use zstd::bulk::Compressor;
 use zstd::bulk::Decompressor;
 use zstd::zstd_safe;
 
+use crate::filtering::palette::PaletteScratch;
 use crate::prelude::*;
+use crate::serialization::framing::EncodedBytes;
 use crate::serialization::framing::TILE_PIXELS;
-use crate::serialization::framing::TileChannel;
-
-#[repr(C, align(64))]
-pub(crate) struct TileSoaScratch(pub(crate) [[u8; TILE_PIXELS]; 4]);
-
-impl TileSoaScratch {
-    fn new_boxed() -> Box<Self> {
-        let layout = Layout::new::<Self>();
-        // SAFETY: `TileSoaScratch` is a plain byte array with non-zero size, so
-        // an all-zero allocation is valid for `Self`.
-        let ptr = unsafe { alloc::alloc_zeroed(layout) };
-        if ptr.is_null() {
-            alloc::handle_alloc_error(layout);
-        }
-        // SAFETY: `ptr` was allocated with `Layout::new::<Self>()` and
-        // initialized to valid zero bytes.
-        unsafe { Box::from_raw(ptr.cast::<Self>()) }
-    }
-}
+use crate::serialization::framing::TILE_W;
 
 struct PoolJob<S> {
     n_active_target: usize,
@@ -256,31 +238,50 @@ impl<S> Drop for WorkerPool<S> {
 
 pub(crate) struct CompressorWorkerState {
     pub(crate) compressor: Compressor<'static>,
-    pub(crate) soa_scratch: Box<TileSoaScratch>,
     pub(crate) zstd_scratch: Vec<u8>,
+    pub(crate) filt_bgr: Vec<u8>,
+    pub(crate) raw_row_a: Vec<u8>,
+    pub(crate) raw_row_b: Vec<u8>,
+    pub(crate) cand_row: Vec<u8>,
+    pub(crate) raw_alpha: Vec<u8>,
+    pub(crate) filt_alpha: Vec<u8>,
+    pub(crate) palette: PaletteScratch,
 }
 
 impl CompressorWorkerState {
     fn new(compression_level: i32) -> Result<Self> {
-        let compressor = Compressor::new(compression_level).location(loc!())?;
-        let zstd_scratch = Vec::with_capacity(zstd_safe::compress_bound(TILE_PIXELS));
+        let mut compressor = Compressor::new(compression_level).location(loc!())?;
+        if compression_level == 1 {
+            // Raising minMatch from Zstd L1's default 6 to 7 avoids short hash
+            // collisions on peaked image residuals, improving both ratio and speed.
+            compressor
+                .set_parameter(zstd_safe::CParameter::MinMatch(7))
+                .location(loc!())?;
+        }
+        let max_bgr = TILE_PIXELS * 3;
         Ok(Self {
             compressor,
-            soa_scratch: TileSoaScratch::new_boxed(),
-            zstd_scratch,
+            zstd_scratch: Vec::with_capacity(zstd_safe::compress_bound(max_bgr)),
+            filt_bgr: vec![0u8; max_bgr],
+            raw_row_a: vec![0u8; TILE_W * 3],
+            raw_row_b: vec![0u8; TILE_W * 3],
+            cand_row: vec![0u8; TILE_W * 3],
+            raw_alpha: Vec::new(),
+            filt_alpha: Vec::new(),
+            palette: PaletteScratch::new(),
         })
     }
 }
 
-/// Maximum filtered channel-slice length sent uncompressed without attempting
-/// zstd (`512 B` compresses ~4.4x in ~4.4 us at level 1, ~730 Mbps breakeven).
+/// Maximum payload length sent uncompressed without attempting zstd (`512 B`
+/// compresses ~4.4x in ~4.4 us at level 1, ~730 Mbps breakeven).
 const MIN_SIZE_TO_COMPRESS: usize = 512;
 
-pub(crate) fn compress_channel_slice(
+pub(crate) fn compress_bytes(
     compressor: &mut Compressor<'static>,
     zstd_scratch: &mut Vec<u8>,
     data: &[u8],
-) -> TileChannel {
+) -> EncodedBytes {
     if data.len() > MIN_SIZE_TO_COMPRESS {
         let bound = zstd_safe::compress_bound(data.len());
         zstd_scratch.clear();
@@ -289,22 +290,32 @@ pub(crate) fn compress_channel_slice(
             .compress_to_buffer(data, zstd_scratch)
             .expect("dst reserved to compress_bound");
         if n < data.len() {
-            return TileChannel::Zstd(zstd_scratch[..n].to_vec());
+            return EncodedBytes::Zstd(zstd_scratch[..n].to_vec());
         }
     }
-    TileChannel::Uncompressed(data.to_vec())
+    EncodedBytes::Uncompressed(data.to_vec())
 }
 
 pub(crate) struct DecompressorWorkerState {
     pub(crate) decompressor: Decompressor<'static>,
-    pub(crate) soa_scratch: Box<TileSoaScratch>,
+    pub(crate) filt_bgr: Vec<u8>,
+    pub(crate) dec_row_a: Vec<u8>,
+    pub(crate) dec_row_b: Vec<u8>,
+    pub(crate) alpha_filt: Vec<u8>,
+    pub(crate) alpha_row_a: Vec<u8>,
+    pub(crate) alpha_row_b: Vec<u8>,
 }
 
 impl DecompressorWorkerState {
     fn new() -> Result<Self> {
         Ok(Self {
             decompressor: Decompressor::new().location(loc!())?,
-            soa_scratch: TileSoaScratch::new_boxed(),
+            filt_bgr: vec![0u8; TILE_PIXELS * 3],
+            dec_row_a: vec![0u8; TILE_W * 3],
+            dec_row_b: vec![0u8; TILE_W * 3],
+            alpha_filt: Vec::new(),
+            alpha_row_a: Vec::new(),
+            alpha_row_b: Vec::new(),
         })
     }
 }
@@ -344,26 +355,14 @@ mod tests {
     use super::*;
 
     #[test]
-    fn test_tile_soa_scratch_alignment_and_zero_init() {
-        let mut scratch = TileSoaScratch::new_boxed();
-        let addr = (&raw const *scratch) as usize;
-        assert_eq!(addr % 64, 0);
-        assert_eq!(scratch.0[0][0], 0);
-        assert_eq!(scratch.0[3][TILE_PIXELS - 1], 0);
-        scratch.0[2][123] = 0xAB;
-        assert_eq!(scratch.0[2][123], 0xAB);
-    }
-
-    #[test]
     #[cfg_attr(miri, ignore)]
-    fn test_compress_channel_slice_selects_codec() {
-        let mut compressor = Compressor::new(1).unwrap();
-        let mut scratch = Vec::new();
+    fn test_compress_bytes_selects_codec() {
+        let mut state = CompressorWorkerState::new(1).unwrap();
         let mut noise = vec![0u8; TILE_PIXELS];
-        let mut state = 0x9E37_79B9_7F4A_7C15u64;
+        let mut prng = 0x9E37_79B9_7F4A_7C15u64;
         for chunk in noise.as_chunks_mut::<8>().0 {
-            state = state.wrapping_add(0x9E37_79B9_7F4A_7C15);
-            let mut z = state;
+            prng = prng.wrapping_add(0x9E37_79B9_7F4A_7C15);
+            let mut z = prng;
             z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
             z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
             z ^= z >> 31;
@@ -372,17 +371,19 @@ mod tests {
         let compressible: Vec<u8> = (0..TILE_PIXELS).map(|i| (i / 64) as u8).collect();
 
         assert_eq!(
-            compress_channel_slice(
-                &mut compressor,
-                &mut scratch,
+            compress_bytes(
+                &mut state.compressor,
+                &mut state.zstd_scratch,
                 &compressible[..MIN_SIZE_TO_COMPRESS]
             ),
-            TileChannel::Uncompressed(compressible[..MIN_SIZE_TO_COMPRESS].to_vec())
+            EncodedBytes::Uncompressed(compressible[..MIN_SIZE_TO_COMPRESS].to_vec())
         );
         let above_threshold = &compressible[..MIN_SIZE_TO_COMPRESS + 1];
-        let TileChannel::Zstd(compressed_above) =
-            compress_channel_slice(&mut compressor, &mut scratch, above_threshold)
-        else {
+        let EncodedBytes::Zstd(compressed_above) = compress_bytes(
+            &mut state.compressor,
+            &mut state.zstd_scratch,
+            above_threshold,
+        ) else {
             panic!("expected Zstd above MIN_SIZE_TO_COMPRESS");
         };
         assert_eq!(
@@ -391,12 +392,14 @@ mod tests {
         );
 
         assert_eq!(
-            compress_channel_slice(&mut compressor, &mut scratch, &noise),
-            TileChannel::Uncompressed(noise.clone())
+            compress_bytes(&mut state.compressor, &mut state.zstd_scratch, &noise),
+            EncodedBytes::Uncompressed(noise.clone())
         );
-        let TileChannel::Zstd(compressed) =
-            compress_channel_slice(&mut compressor, &mut scratch, &compressible)
-        else {
+        let EncodedBytes::Zstd(compressed) = compress_bytes(
+            &mut state.compressor,
+            &mut state.zstd_scratch,
+            &compressible,
+        ) else {
             panic!("expected Zstd for compressible input");
         };
         assert_eq!(
@@ -415,22 +418,18 @@ mod tests {
         })
         .unwrap();
 
-        // max_tasks = 0 does not run the closure.
         let calls = AtomicUsize::new(0);
         pool.execute(0, |_| {
             calls.fetch_add(1, Ordering::SeqCst);
         });
         assert_eq!(calls.load(Ordering::SeqCst), 0);
 
-        // max_tasks = 1 runs inline on worker 0 only.
         pool.execute(1, |id| {
             assert_eq!(*id, 0);
             calls.fetch_add(1, Ordering::SeqCst);
         });
         assert_eq!(calls.load(Ordering::SeqCst), 1);
 
-        // Verify 1, 2 (`1 < n_active_target < n_workers`), and all 3 background
-        // workers wake deterministically alongside the inline caller thread.
         for (max_tasks, expected_parties, iters) in [(2, 2, 8), (3, 3, 4), (12, 4, 2)] {
             for _ in 0..iters {
                 let barrier = Barrier::new(expected_parties);
@@ -453,9 +452,6 @@ mod tests {
             }
         }
 
-        // `WorkerPool::new` builds all states before spawning threads, so a
-        // mid-init error drops already-constructed states immediately without
-        // leaving background threads holding them.
         let dropped = Arc::new(AtomicUsize::new(0));
         let mut created = 0usize;
         let err_res: Result<WorkerPool<Counted>> =
@@ -477,7 +473,6 @@ mod tests {
         })
         .unwrap();
 
-        // Worker panic propagates cleanly.
         let res = panic::catch_unwind(AssertUnwindSafe(|| {
             let barrier = Barrier::new(2);
             pool.execute(2, |worker_id| {
@@ -489,8 +484,6 @@ mod tests {
         }));
         assert!(res.is_err());
 
-        // Dual inline + worker panic must not leave stale `panic_payload` for
-        // subsequent jobs.
         let res_dual = panic::catch_unwind(AssertUnwindSafe(|| {
             let barrier = Barrier::new(2);
             pool.execute(2, |_| {
