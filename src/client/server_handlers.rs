@@ -628,7 +628,7 @@ impl WprsClientState {
             let canvas = remote_surface
                 .prepare_buffer_canvas(
                     metadata,
-                    validated.bands(),
+                    validated.incremental_tile_rects(),
                     &mut self.pool,
                     &mut self.slot_copy_scratch,
                 )

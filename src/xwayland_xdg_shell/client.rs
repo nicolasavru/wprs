@@ -1016,13 +1016,14 @@ fn write_xwayland_swapchain<P, B>(
         active_buffer,
         back_buffer,
         cur_bands,
-        height,
         is_released,
+        |prev, cur| combine_band_history(prev, cur, height),
+        |cur| cur.map(ToOwned::to_owned),
         alloc_and_write_full,
     )? {
         SwapchainStep::ReusedActive => write_slot(pool, active_buffer, cur_bands),
-        SwapchainStep::Swapped { prev_bands } => {
-            let merged = combine_band_history(prev_bands, cur_bands, height);
+        SwapchainStep::Swapped { prev_history } => {
+            let merged = combine_band_history(prev_history, cur_bands, height);
             write_slot(pool, active_buffer, merged.as_deref());
         },
         SwapchainStep::Allocated => {},

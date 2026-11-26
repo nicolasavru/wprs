@@ -69,7 +69,6 @@ use crate::serialization::Request;
 use crate::serialization::SendType;
 use crate::serialization::Serializer;
 use crate::serialization::wayland::BufferAssignment;
-use crate::serialization::wayland::BufferMetadata;
 use crate::serialization::wayland::ClientSurface;
 use crate::serialization::wayland::CursorImage;
 use crate::serialization::wayland::CursorImageStatus;
@@ -98,6 +97,7 @@ use crate::serialization::xdg_shell::PopupEvent;
 use crate::serialization::xdg_shell::ToplevelConfigure;
 use crate::serialization::xdg_shell::ToplevelEvent;
 use crate::server::LockedSurfaceState;
+use crate::server::SyncedSurfaceBuffer;
 use crate::server::WprsServerState;
 use crate::server::smithay_handlers::DndGrab;
 use crate::sharding_compression::ShardingCompressor;
@@ -133,7 +133,7 @@ fn committed_wl_buffer(surface_data: &SurfaceData) -> Option<WlBuffer> {
 fn sync_surface_data(
     serializer: &Serializer<Request, Event>,
     compressor: &mut ShardingCompressor,
-    synced_buffers: &mut HashMap<WlSurfaceId, BufferMetadata>,
+    synced_buffers: &mut HashMap<WlSurfaceId, SyncedSurfaceBuffer>,
     surface_data: &SurfaceData,
 ) {
     // Uncommitted child subsurfaces visited by `with_surface_tree_downward` do
@@ -147,33 +147,41 @@ fn sync_surface_data(
     surface_state_to_send.damage = None;
 
     if matches!(surface_state_to_send.buffer, Some(BufferAssignment::New(_))) {
+        // Remove any prior shadow buffer before reading `wl_shm` so a `BadMap`
+        // or invalid-metadata error cannot leave a stale shadow behind.
+        let mut shadow_pixels = synced_buffers
+            .remove(&surface_state_to_send.id)
+            .map_or_else(Vec::new, |old| old.pixels);
         match committed_wl_buffer(surface_data) {
             Some(wl_buffer) => {
                 let mut raw_buffer_sent = false;
                 let writer = serializer.writer();
                 let sync_res = compositor_utils::with_buffer_contents(
                     &wl_buffer,
-                    |data, spec| -> Result<BufferMetadata> {
+                    |data, spec| -> Result<SyncedSurfaceBuffer> {
                         let metadata = surface_state_to_send.set_buffer(&spec).location(loc!())?;
                         compositor_utils::fault_probe_buffer(data, metadata.stride as usize, None);
-                        filtering::filter_and_compress_streaming(
+                        filtering::filter_and_compress_full_streaming(
                             data,
                             surface_state_to_send.client,
                             surface_state_to_send.id,
                             metadata,
-                            None,
+                            Some(&mut shadow_pixels),
                             compressor,
                             |raw_buffer_to_send| {
                                 raw_buffer_sent = true;
                                 writer.send(SendType::RawBuffer(raw_buffer_to_send));
                             },
                         );
-                        Ok(metadata)
+                        Ok(SyncedSurfaceBuffer {
+                            metadata,
+                            pixels: shadow_pixels,
+                        })
                     },
                 );
                 match sync_res {
-                    Ok(Ok(metadata)) => {
-                        synced_buffers.insert(surface_state_to_send.id, metadata);
+                    Ok(Ok(synced)) => {
+                        synced_buffers.insert(surface_state_to_send.id, synced);
                     },
                     Ok(Err(err)) => {
                         warn!("skipping invalid buffer during surface sync: {err:?}");

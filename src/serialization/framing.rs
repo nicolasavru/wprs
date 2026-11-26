@@ -39,9 +39,19 @@ pub const TILE_W: usize = 256;
 /// Nominal 2D tile height in pixels.
 pub const TILE_H: usize = 256;
 
+/// Sub-tile quadrant width in pixels for incremental dirty-region skipping.
+pub const SUBTILE_W: usize = 128;
+
+/// Sub-tile quadrant height in pixels for incremental dirty-region skipping.
+pub const SUBTILE_H: usize = 128;
+
 /// Maximum pixels in any self-contained L2-resident tile (`256 * 256 = 65,536`,
 /// `192 KiB` packed 3-byte `SubGreen(BGR)` payload).
 pub const TILE_PIXELS: usize = TILE_W * TILE_H;
+
+/// Upper bound on planned tiles in a single [`RawBufferHeader`] (covers 8K
+/// down to `16x16` tiles while capping header memory at `<= 4 MiB`).
+pub const MAX_FRAME_TILES: usize = 262_144;
 
 /// Returns the exact bitpacked index byte length for `n_pixels` pixels indexed
 /// into an `n_colors`-entry palette (`1`/`2`/`4`/`8` bpp for `2`/`3..=4`/
@@ -370,14 +380,16 @@ pub struct RawBufferHeader {
     pub client: ClientId,
     pub surface: WlSurfaceId,
     pub metadata: BufferMetadata,
-    pub n_tiles: u32,
-    pub bands: Option<Vec<RowBand>>,
+    pub incremental: bool,
+    pub tile_rects: Vec<TileRect>,
 }
 
 const RAW_BUFFER_HEADER_LEN: usize = 34;
 
 impl Framed for RawBufferHeader {
     fn framed_write<W: Write>(&self, stream: &mut W) -> Result<()> {
+        let n_tiles = u32::try_from(self.tile_rects.len())
+            .context(loc!(), "tile_rects length exceeds u32::MAX")?;
         let mut buf = [0u8; RAW_BUFFER_HEADER_LEN];
         buf[0..8].copy_from_slice(&self.client.0.to_be_bytes());
         buf[8..16].copy_from_slice(&self.surface.0.to_be_bytes());
@@ -388,15 +400,11 @@ impl Framed for RawBufferHeader {
             BufferFormat::Argb8888 => 0,
             BufferFormat::Xrgb8888 => 1,
         };
-        buf[29..33].copy_from_slice(&self.n_tiles.to_be_bytes());
-        buf[33] = u8::from(self.bands.is_some());
+        buf[29] = u8::from(self.incremental);
+        buf[30..34].copy_from_slice(&n_tiles.to_be_bytes());
         stream.write_all(&buf).location(loc!())?;
-        if let Some(bands) = &self.bands {
-            bands.len().framed_write(stream).location(loc!())?;
-            for band in bands {
-                band.y0.framed_write(stream).location(loc!())?;
-                band.y1.framed_write(stream).location(loc!())?;
-            }
+        for &rect in &self.tile_rects {
+            rect.write_framed(stream).location(loc!())?;
         }
         Ok(())
     }
@@ -414,35 +422,38 @@ impl Framed for RawBufferHeader {
             1 => BufferFormat::Xrgb8888,
             tag => bail!("invalid BufferFormat tag: {tag}"),
         };
-        let n_tiles = u32::from_be_bytes(buf[29..33].try_into().unwrap());
-        let bands = match buf[33] {
-            0 => None,
-            1 => {
-                let n_bands = u32::framed_read(stream).location(loc!())? as usize;
-                if height < 0 || n_bands > height as usize {
-                    bail!("invalid band count {n_bands} for buffer height {height}");
-                }
-                let mut bands = Vec::new();
-                for _ in 0..n_bands {
-                    let y0 = u32::framed_read(stream).location(loc!())?;
-                    let y1 = u32::framed_read(stream).location(loc!())?;
-                    bands.push(RowBand { y0, y1 });
-                }
-                Some(bands)
-            },
-            tag => bail!("invalid bands tag: {tag}"),
+        let incremental = match buf[29] {
+            0 => false,
+            1 => true,
+            tag => bail!("invalid incremental tag: {tag}"),
         };
+        let n_tiles = u32::from_be_bytes(buf[30..34].try_into().unwrap()) as usize;
+        let metadata = BufferMetadata {
+            width,
+            height,
+            stride,
+            format,
+        };
+        metadata.validate().location(loc!())?;
+        let width_u32 = width as u32;
+        let height_u32 = height as u32;
+        let max_tiles = (u64::from(width_u32) * u64::from(height_u32)).min(MAX_FRAME_TILES as u64);
+        if n_tiles as u64 > max_tiles {
+            bail!("tile count {n_tiles} exceeds maximum {max_tiles} for {width}x{height}");
+        }
+        let mut tile_rects = Vec::with_capacity(n_tiles.min(1024));
+        for _ in 0..n_tiles {
+            let (rect, _) = TileRect::read_framed(stream).location(loc!())?;
+            rect.validate_in_bounds(width_u32, height_u32)
+                .location(loc!())?;
+            tile_rects.push(rect);
+        }
         Ok(Self {
             client,
             surface,
-            metadata: BufferMetadata {
-                width,
-                height,
-                stride,
-                format,
-            },
-            n_tiles,
-            bands,
+            metadata,
+            incremental,
+            tile_rects,
         })
     }
 }
@@ -824,7 +835,7 @@ impl fmt::Debug for TilePayload {
 
 #[derive(Debug, Clone, Eq, PartialEq)]
 pub struct CompressedTile {
-    pub rect: TileRect,
+    pub tile_idx: u32,
     pub payload: TilePayload,
 }
 
@@ -833,24 +844,41 @@ impl CompressedTile {
         self.payload.payload_len()
     }
 
-    fn write_framed<W: Write>(&self, has_alpha: bool, stream: &mut W) -> Result<()> {
-        let pixels = self.rect.checked_pixels().location(loc!())?;
-        self.rect.write_framed(stream).location(loc!())?;
+    fn write_framed<W: Write>(
+        &self,
+        rect: TileRect,
+        has_alpha: bool,
+        stream: &mut W,
+    ) -> Result<()> {
+        let pixels = rect.checked_pixels().location(loc!())?;
+        self.tile_idx.framed_write(stream).location(loc!())?;
         self.payload
-            .write_framed(self.rect, pixels, has_alpha, stream)
+            .write_framed(rect, pixels, has_alpha, stream)
             .location(loc!())
     }
 
-    fn read_framed<R: Read>(has_alpha: bool, stream: &mut R) -> Result<Self> {
-        let (rect, pixels) = TileRect::read_framed(stream).location(loc!())?;
+    fn read_framed<R: Read>(
+        tile_rects: &[TileRect],
+        has_alpha: bool,
+        stream: &mut R,
+    ) -> Result<Self> {
+        let tile_idx = u32::framed_read(stream).location(loc!())?;
+        let rect = *tile_rects.get(tile_idx as usize).with_context(loc!(), || {
+            format!(
+                "tile_idx {tile_idx} out of bounds for {} tiles",
+                tile_rects.len()
+            )
+        })?;
+        let pixels = rect.checked_pixels().location(loc!())?;
         let payload = TilePayload::read_framed(rect, pixels, has_alpha, stream).location(loc!())?;
-        Ok(Self { rect, payload })
+        Ok(Self { tile_idx, payload })
     }
 }
 
 #[derive(Debug, Clone, Eq, PartialEq)]
 pub struct CompressedTiles {
     pub metadata: BufferMetadata,
+    pub tile_rects: Vec<TileRect>,
     pub tiles: Vec<CompressedTile>,
 }
 
@@ -873,24 +901,25 @@ impl StreamingCompressedTiles {
             BufferFormat::Argb8888 => 4,
             BufferFormat::Xrgb8888 => 3,
         };
-        let row_pixels = self.header.metadata.width as usize;
-        match &self.header.bands {
-            None => (self.header.metadata.height as usize) * row_pixels * n_channels,
-            Some(bands) => {
-                let damaged_rows: usize = bands.iter().map(|b| (b.y1 - b.y0) as usize).sum();
-                damaged_rows * row_pixels * n_channels
-            },
-        }
+        let total_pixels: usize = self
+            .header
+            .tile_rects
+            .iter()
+            .map(|r| r.w as usize * r.h as usize)
+            .sum();
+        total_pixels * n_channels
     }
 
     pub fn framed_write<W: Write>(self, stream: &mut W) -> Result<usize> {
         let has_alpha = self.header.metadata.format == BufferFormat::Argb8888;
         self.header.framed_write(stream).location(loc!())?;
         // Flush the header immediately so `wprsc` can prepare the destination
-        // `wl_shm` canvas while the first tile is still compressing.
+        // `wl_shm` canvas (including any 2-slot swapchain rect copies) while
+        // the first tile is still compressing.
         stream.flush().location(loc!())?;
 
-        let mut remaining = self.header.n_tiles as usize;
+        let tile_rects = &self.header.tile_rects;
+        let mut remaining = tile_rects.len();
         let mut total_compressed_size = 0;
 
         while remaining > 0 {
@@ -898,19 +927,39 @@ impl StreamingCompressedTiles {
                 .tiles
                 .recv()
                 .context(loc!(), "tile sender dropped before sending all tiles")?;
+            let rect = *tile_rects
+                .get(tile.tile_idx as usize)
+                .with_context(loc!(), || {
+                    format!(
+                        "tile_idx {} out of bounds for {} tiles",
+                        tile.tile_idx,
+                        tile_rects.len()
+                    )
+                })?;
             let mut batch_bytes = tile.compressed_len();
             total_compressed_size += batch_bytes;
-            tile.write_framed(has_alpha, stream).location(loc!())?;
+            tile.write_framed(rect, has_alpha, stream)
+                .location(loc!())?;
             remaining -= 1;
 
             while remaining > 0
                 && batch_bytes < MAX_COALESCED_TILE_BYTES
                 && let Ok(tile) = self.tiles.try_recv()
             {
+                let rect = *tile_rects
+                    .get(tile.tile_idx as usize)
+                    .with_context(loc!(), || {
+                        format!(
+                            "tile_idx {} out of bounds for {} tiles",
+                            tile.tile_idx,
+                            tile_rects.len()
+                        )
+                    })?;
                 let tile_len = tile.compressed_len();
                 batch_bytes += tile_len;
                 total_compressed_size += tile_len;
-                tile.write_framed(has_alpha, stream).location(loc!())?;
+                tile.write_framed(rect, has_alpha, stream)
+                    .location(loc!())?;
                 remaining -= 1;
             }
 
@@ -933,7 +982,8 @@ impl CompressedTileStream {
     {
         let header = RawBufferHeader::framed_read(stream).location(loc!())?;
         let has_alpha = header.metadata.format == BufferFormat::Argb8888;
-        let n_tiles = header.n_tiles;
+        let tile_rects = header.tile_rects.clone();
+        let n_tiles = tile_rects.len();
         let (tiles_tx, tiles_rx) = crossbeam_channel::unbounded();
         on_stream(Self {
             header,
@@ -942,7 +992,7 @@ impl CompressedTileStream {
         .location(loc!())?;
 
         for _ in 0..n_tiles {
-            match CompressedTile::read_framed(has_alpha, stream) {
+            match CompressedTile::read_framed(&tile_rects, has_alpha, stream) {
                 Ok(tile) => {
                     // Drain all `n_tiles` off `stream` even if the consumer dropped
                     // `tiles_rx` early (e.g. when `handle_buffer` fails to decode) so
@@ -1063,17 +1113,41 @@ mod tests {
     #[test]
     fn test_raw_buffer_header_and_tile_payload_framing() {
         for format in [BufferFormat::Argb8888, BufferFormat::Xrgb8888] {
-            for (height, bands) in [
-                (480, None),
-                (480, Some(vec![])),
+            for (incremental, tile_rects) in [
                 (
-                    480,
-                    Some(vec![RowBand { y0: 4, y1: 20 }, RowBand { y0: 50, y1: 100 }]),
+                    false,
+                    vec![
+                        TileRect {
+                            x: 0,
+                            y: 0,
+                            w: 256,
+                            h: 256,
+                        },
+                        TileRect {
+                            x: 256,
+                            y: 0,
+                            w: 256,
+                            h: 256,
+                        },
+                    ],
                 ),
-                // Exact `n_bands == height as usize` boundary (`2 == 2`).
+                (true, vec![]),
                 (
-                    2,
-                    Some(vec![RowBand { y0: 0, y1: 1 }, RowBand { y0: 1, y1: 2 }]),
+                    true,
+                    vec![
+                        TileRect {
+                            x: 128,
+                            y: 0,
+                            w: 128,
+                            h: 128,
+                        },
+                        TileRect {
+                            x: 512,
+                            y: 256,
+                            w: 128,
+                            h: 224,
+                        },
+                    ],
                 ),
             ] {
                 let hdr = RawBufferHeader {
@@ -1081,50 +1155,95 @@ mod tests {
                     surface: WlSurfaceId(99),
                     metadata: BufferMetadata {
                         width: 640,
-                        height,
+                        height: 480,
                         stride: 640 * 4 + 16,
                         format,
                     },
-                    n_tiles: 5,
-                    bands,
+                    incremental,
+                    tile_rects,
                 };
                 let mut wire = Vec::new();
                 hdr.framed_write(&mut wire).unwrap();
                 let decoded = RawBufferHeader::framed_read(&mut wire.as_slice()).unwrap();
                 assert_eq!(decoded, hdr);
-                assert_eq!(
-                    decoded.metadata.validate().unwrap(),
-                    (height as usize) * (640 + 4)
-                );
+                assert_eq!(decoded.metadata.validate().unwrap(), 480 * (640 + 4));
             }
         }
 
-        // Invalid BufferFormat and bands tags must return Err.
-        let mut bad = [0u8; RAW_BUFFER_HEADER_LEN];
-        bad[28] = 9;
-        assert!(RawBufferHeader::framed_read(&mut bad.as_slice()).is_err());
+        // Valid fixed prefix helper for negative header tests (`640x480` Xrgb).
+        let make_header_prefix = |w: i32, h: i32, stride: i32, fmt: u8, inc: u8, n_tiles: u32| {
+            let mut buf = [0u8; RAW_BUFFER_HEADER_LEN];
+            buf[16..20].copy_from_slice(&w.to_be_bytes());
+            buf[20..24].copy_from_slice(&h.to_be_bytes());
+            buf[24..28].copy_from_slice(&stride.to_be_bytes());
+            buf[28] = fmt;
+            buf[29] = inc;
+            buf[30..34].copy_from_slice(&n_tiles.to_be_bytes());
+            buf
+        };
 
-        let mut bad_bands = [0u8; RAW_BUFFER_HEADER_LEN];
-        bad_bands[33] = 2;
-        assert!(RawBufferHeader::framed_read(&mut bad_bands.as_slice()).is_err());
-
-        for bad_height in [1i32, -1i32] {
-            let bad_n_bands = RawBufferHeader {
-                client: ClientId(42),
-                surface: WlSurfaceId(99),
-                metadata: BufferMetadata {
-                    width: 640,
-                    height: bad_height,
-                    stride: 640 * 4,
-                    format: BufferFormat::Xrgb8888,
-                },
-                n_tiles: 1,
-                bands: Some(vec![RowBand { y0: 0, y1: 1 }, RowBand { y0: 1, y1: 2 }]),
-            };
-            let mut wire = Vec::new();
-            bad_n_bands.framed_write(&mut wire).unwrap();
-            assert!(RawBufferHeader::framed_read(&mut wire.as_slice()).is_err());
+        // Invalid BufferFormat, incremental tag, invalid metadata, and excessive
+        // tile count (`> width * height` or `> MAX_FRAME_TILES`) must fail
+        // before reading/allocating tile rects.
+        assert!(
+            RawBufferHeader::framed_read(
+                &mut make_header_prefix(640, 480, 640 * 4, 9, 0, 0).as_slice()
+            )
+            .is_err()
+        );
+        assert!(
+            RawBufferHeader::framed_read(
+                &mut make_header_prefix(640, 480, 640 * 4, 1, 2, 0).as_slice()
+            )
+            .is_err()
+        );
+        assert!(
+            RawBufferHeader::framed_read(
+                &mut make_header_prefix(0, 480, 640 * 4, 1, 0, 0).as_slice()
+            )
+            .is_err()
+        );
+        // Excessive tile count (`> width * height` or `> MAX_FRAME_TILES`) must
+        // fail BEFORE reading or allocating any `TileRect`s.
+        let unit_rect = TileRect {
+            x: 0,
+            y: 0,
+            w: 1,
+            h: 1,
+        };
+        let mut too_many_for_2x2 = make_header_prefix(2, 2, 8, 1, 1, 5).to_vec();
+        for _ in 0..5 {
+            unit_rect.write_framed(&mut too_many_for_2x2).unwrap();
         }
+        let mut rdr = too_many_for_2x2.as_slice();
+        assert!(RawBufferHeader::framed_read(&mut rdr).is_err());
+        assert_eq!(rdr.len(), 5 * TILE_RECT_LEN);
+
+        let mut too_many_global =
+            make_header_prefix(3840, 2160, 3840 * 4, 1, 1, MAX_FRAME_TILES as u32 + 1).to_vec();
+        unit_rect.write_framed(&mut too_many_global).unwrap();
+        let mut rdr = too_many_global.as_slice();
+        assert!(RawBufferHeader::framed_read(&mut rdr).is_err());
+        assert_eq!(rdr.len(), TILE_RECT_LEN);
+
+        assert!(
+            RawBufferHeader::framed_read(
+                &mut make_header_prefix(3840, 2160, 3840 * 4, 1, 1, u32::MAX).as_slice()
+            )
+            .is_err()
+        );
+
+        // Out-of-bounds TileRect in header must fail immediately on read.
+        let mut oob_hdr = make_header_prefix(64, 64, 64 * 4, 1, 1, 1).to_vec();
+        TileRect {
+            x: 32,
+            y: 0,
+            w: 33,
+            h: 64,
+        }
+        .write_framed(&mut oob_hdr)
+        .unwrap();
+        assert!(RawBufferHeader::framed_read(&mut oob_hdr.as_slice()).is_err());
 
         // Roundtrip all TilePayload variants across Xrgb8888 and Argb8888.
         let rect = TileRect {
@@ -1133,13 +1252,14 @@ mod tests {
             w: 4,
             h: 3,
         };
+        let tile_rects = [rect];
         let opaque_tiles = [
             CompressedTile {
-                rect,
+                tile_idx: 0,
                 payload: TilePayload::Solid([10, 20, 30, 0xFF]),
             },
             CompressedTile {
-                rect,
+                tile_idx: 0,
                 payload: TilePayload::Palette {
                     has_alpha: false,
                     palette: vec![1, 2, 3, 4, 5, 6],
@@ -1147,7 +1267,7 @@ mod tests {
                 },
             },
             CompressedTile {
-                rect,
+                tile_idx: 0,
                 payload: TilePayload::Palette {
                     has_alpha: false,
                     palette: vec![1; 17 * 3],
@@ -1155,7 +1275,7 @@ mod tests {
                 },
             },
             CompressedTile {
-                rect,
+                tile_idx: 0,
                 payload: TilePayload::AosZstd {
                     predictors: vec![0b00_10_01_00],
                     color: EncodedBytes::Uncompressed(vec![7u8; 4 * 3 * 3]),
@@ -1166,19 +1286,21 @@ mod tests {
         for tile in &opaque_tiles {
             for has_alpha in [false, true] {
                 let mut wire = Vec::new();
-                tile.write_framed(has_alpha, &mut wire).unwrap();
-                let decoded = CompressedTile::read_framed(has_alpha, &mut wire.as_slice()).unwrap();
+                tile.write_framed(rect, has_alpha, &mut wire).unwrap();
+                let decoded =
+                    CompressedTile::read_framed(&tile_rects, has_alpha, &mut wire.as_slice())
+                        .unwrap();
                 assert_eq!(&decoded, tile);
             }
         }
 
         let translucent_tiles = [
             CompressedTile {
-                rect,
+                tile_idx: 0,
                 payload: TilePayload::Solid([10, 20, 30, 0x80]),
             },
             CompressedTile {
-                rect,
+                tile_idx: 0,
                 payload: TilePayload::Palette {
                     has_alpha: true,
                     palette: vec![1, 2, 3, 0x40, 4, 5, 6, 0xFF],
@@ -1186,7 +1308,7 @@ mod tests {
                 },
             },
             CompressedTile {
-                rect,
+                tile_idx: 0,
                 payload: TilePayload::AosZstd {
                     predictors: vec![0],
                     color: EncodedBytes::Zstd(vec![1, 2, 3, 4]),
@@ -1194,7 +1316,7 @@ mod tests {
                 },
             },
             CompressedTile {
-                rect,
+                tile_idx: 0,
                 payload: TilePayload::AosZstd {
                     predictors: vec![0],
                     color: EncodedBytes::Zstd(vec![1, 2, 3, 4]),
@@ -1202,7 +1324,7 @@ mod tests {
                 },
             },
             CompressedTile {
-                rect,
+                tile_idx: 0,
                 payload: TilePayload::AosZstd {
                     predictors: vec![0],
                     color: EncodedBytes::Zstd(vec![1, 2, 3, 4]),
@@ -1212,15 +1334,23 @@ mod tests {
         ];
         for tile in &translucent_tiles {
             let mut wire = Vec::new();
-            tile.write_framed(true, &mut wire).unwrap();
-            let decoded = CompressedTile::read_framed(true, &mut wire.as_slice()).unwrap();
+            tile.write_framed(rect, true, &mut wire).unwrap();
+            let decoded =
+                CompressedTile::read_framed(&tile_rects, true, &mut wire.as_slice()).unwrap();
             assert_eq!(&decoded, tile);
             // Translucent payloads must fail on Xrgb8888 (both write and read).
-            assert!(tile.write_framed(false, &mut Vec::new()).is_err());
-            assert!(CompressedTile::read_framed(false, &mut wire.as_slice()).is_err());
+            assert!(tile.write_framed(rect, false, &mut Vec::new()).is_err());
+            assert!(CompressedTile::read_framed(&tile_rects, false, &mut wire.as_slice()).is_err());
         }
 
-        // Malformed wire payloads must fail BEFORE allocating huge buffers.
+        // Out-of-range `tile_idx` must fail before reading payload.
+        let mut oob_idx_wire = Vec::new();
+        1u32.framed_write(&mut oob_idx_wire).unwrap();
+        assert!(
+            CompressedTile::read_framed(&tile_rects, true, &mut oob_idx_wire.as_slice()).is_err()
+        );
+
+        // Oversized TileRect (`> TILE_PIXELS`) must fail on `TileRect::read_framed`.
         let mut oversized_rect_wire = Vec::new();
         TileRect {
             x: 0,
@@ -1230,13 +1360,13 @@ mod tests {
         }
         .write_framed(&mut oversized_rect_wire)
         .unwrap();
-        assert!(CompressedTile::read_framed(true, &mut oversized_rect_wire.as_slice()).is_err());
+        assert!(TileRect::read_framed(&mut oversized_rect_wire.as_slice()).is_err());
 
         // Oversized Zstd length (`compress_bound(36) + 1`) with full payload bytes
         // present must fail BEFORE reading or allocating the payload.
         let max_zstd = zstd_safe::compress_bound(4 * 3 * 3);
         let mut oversized_zstd = Vec::new();
-        rect.write_framed(&mut oversized_zstd).unwrap();
+        0u32.framed_write(&mut oversized_zstd).unwrap();
         PAYLOAD_TAG_AOS_OPAQUE
             .framed_write(&mut oversized_zstd)
             .unwrap();
@@ -1246,34 +1376,38 @@ mod tests {
         let header_end = oversized_zstd.len();
         oversized_zstd.resize(header_end + max_zstd + 1, 0xAB);
         let mut rdr = oversized_zstd.as_slice();
-        assert!(CompressedTile::read_framed(false, &mut rdr).is_err());
+        assert!(CompressedTile::read_framed(&tile_rects, false, &mut rdr).is_err());
         assert_eq!(rdr.len(), max_zstd + 1);
 
         // Wrong uncompressed length on AosZstd color must fail before allocating.
         let mut wrong_raw_len = Vec::new();
-        rect.write_framed(&mut wrong_raw_len).unwrap();
+        0u32.framed_write(&mut wrong_raw_len).unwrap();
         PAYLOAD_TAG_AOS_OPAQUE
             .framed_write(&mut wrong_raw_len)
             .unwrap();
         wrong_raw_len.push(0);
         0u8.framed_write(&mut wrong_raw_len).unwrap();
         u32::MAX.framed_write(&mut wrong_raw_len).unwrap();
-        assert!(CompressedTile::read_framed(false, &mut wrong_raw_len.as_slice()).is_err());
+        assert!(
+            CompressedTile::read_framed(&tile_rects, false, &mut wrong_raw_len.as_slice()).is_err()
+        );
 
         // Invalid palette count tag `255` (`257` colors) must fail.
         let mut bad_pal_count = Vec::new();
-        rect.write_framed(&mut bad_pal_count).unwrap();
+        0u32.framed_write(&mut bad_pal_count).unwrap();
         PAYLOAD_TAG_PALETTE_OPAQUE
             .framed_write(&mut bad_pal_count)
             .unwrap();
         bad_pal_count.push(255);
-        assert!(CompressedTile::read_framed(false, &mut bad_pal_count.as_slice()).is_err());
+        assert!(
+            CompressedTile::read_framed(&tile_rects, false, &mut bad_pal_count.as_slice()).is_err()
+        );
 
         // Invalid payload tag, EncodedBytes tag, and AlphaChannel tag.
         let mut bad_tag = Vec::new();
-        rect.write_framed(&mut bad_tag).unwrap();
+        0u32.framed_write(&mut bad_tag).unwrap();
         bad_tag.push(99);
-        assert!(CompressedTile::read_framed(true, &mut bad_tag.as_slice()).is_err());
+        assert!(CompressedTile::read_framed(&tile_rects, true, &mut bad_tag.as_slice()).is_err());
         assert!(EncodedBytes::read_framed(16, &mut [9u8].as_slice()).is_err());
         assert!(AlphaChannel::read_framed(16, &mut [9u8].as_slice()).is_err());
         assert!(
@@ -1285,6 +1419,18 @@ mod tests {
 
     #[test]
     fn test_streaming_compressed_tiles_and_errors() {
+        let rect0 = TileRect {
+            x: 0,
+            y: 0,
+            w: 64,
+            h: 10,
+        };
+        let rect1 = TileRect {
+            x: 0,
+            y: 20,
+            w: 64,
+            h: 6,
+        };
         let header = RawBufferHeader {
             client: ClientId(7),
             surface: WlSurfaceId(11),
@@ -1294,25 +1440,15 @@ mod tests {
                 stride: 64 * 4 + 16,
                 format: BufferFormat::Xrgb8888,
             },
-            n_tiles: 2,
-            bands: Some(vec![RowBand { y0: 0, y1: 10 }, RowBand { y0: 20, y1: 26 }]),
+            incremental: true,
+            tile_rects: vec![rect0, rect1],
         };
         let tile0 = CompressedTile {
-            rect: TileRect {
-                x: 0,
-                y: 0,
-                w: 64,
-                h: 10,
-            },
+            tile_idx: 0,
             payload: TilePayload::Solid([1, 2, 3, 0xFF]),
         };
         let tile1 = CompressedTile {
-            rect: TileRect {
-                x: 0,
-                y: 20,
-                w: 64,
-                h: 6,
-            },
+            tile_idx: 1,
             payload: TilePayload::AosZstd {
                 predictors: vec![0, 0],
                 color: EncodedBytes::Zstd(vec![1, 2, 3, 4, 5]),
@@ -1322,24 +1458,39 @@ mod tests {
         assert_eq!(
             CompressedTiles {
                 metadata: header.metadata,
+                tile_rects: header.tile_rects.clone(),
                 tiles: vec![tile0.clone(), tile1.clone()],
             }
             .size(),
             3 + 2 + 5
         );
 
-        // `StreamingCompressedTiles::uncompressed_size` accounts for visible
-        // `width`, `BufferFormat` channel count, and `bands`.
-        for (format, bands, expected) in [
-            (BufferFormat::Xrgb8888, header.bands.clone(), 16 * 64 * 3),
-            (BufferFormat::Argb8888, header.bands.clone(), 16 * 64 * 4),
-            (BufferFormat::Xrgb8888, None, 64 * 64 * 3),
-            (BufferFormat::Argb8888, None, 64 * 64 * 4),
+        // `StreamingCompressedTiles::uncompressed_size` accounts for exact
+        // `tile_rects` pixel area and `BufferFormat` channel count.
+        let full_rect = vec![TileRect {
+            x: 0,
+            y: 0,
+            w: 64,
+            h: 64,
+        }];
+        for (format, rects, expected) in [
+            (
+                BufferFormat::Xrgb8888,
+                header.tile_rects.clone(),
+                16 * 64 * 3,
+            ),
+            (
+                BufferFormat::Argb8888,
+                header.tile_rects.clone(),
+                16 * 64 * 4,
+            ),
+            (BufferFormat::Xrgb8888, full_rect.clone(), 64 * 64 * 3),
+            (BufferFormat::Argb8888, full_rect, 64 * 64 * 4),
         ] {
             let (_tx_u, rx_u) = crossbeam_channel::unbounded();
             let mut h = header.clone();
             h.metadata.format = format;
-            h.bands = bands;
+            h.tile_rects = rects;
             let s = StreamingCompressedTiles {
                 header: h,
                 tiles: rx_u,
@@ -1403,15 +1554,35 @@ mod tests {
         }
 
         let half_cap = MAX_COALESCED_TILE_BYTES / 2;
-        let large_rect = TileRect {
-            x: 0,
-            y: 0,
-            w: 256,
-            h: 256,
-        };
+        let large_rects = [
+            TileRect {
+                x: 0,
+                y: 0,
+                w: 256,
+                h: 256,
+            },
+            TileRect {
+                x: 256,
+                y: 0,
+                w: 256,
+                h: 256,
+            },
+            TileRect {
+                x: 0,
+                y: 256,
+                w: 256,
+                h: 256,
+            },
+            TileRect {
+                x: 256,
+                y: 256,
+                w: 256,
+                h: 256,
+            },
+        ];
         let pred_len = 256usize.div_ceil(4);
         let large0 = CompressedTile {
-            rect: large_rect,
+            tile_idx: 0,
             payload: TilePayload::AosZstd {
                 predictors: vec![0; pred_len],
                 color: EncodedBytes::Zstd(vec![0xAA; half_cap - pred_len]),
@@ -1419,7 +1590,7 @@ mod tests {
             },
         };
         let large1 = CompressedTile {
-            rect: large_rect,
+            tile_idx: 1,
             payload: TilePayload::AosZstd {
                 predictors: vec![0; pred_len],
                 color: EncodedBytes::Zstd(vec![0xBB; half_cap - pred_len]),
@@ -1427,11 +1598,11 @@ mod tests {
             },
         };
         let small2 = CompressedTile {
-            rect: large_rect,
+            tile_idx: 2,
             payload: TilePayload::Solid([5, 6, 7, 0xFF]),
         };
         let small3 = CompressedTile {
-            rect: large_rect,
+            tile_idx: 3,
             payload: TilePayload::Solid([8, 9, 10, 0xFF]),
         };
         assert_eq!(
@@ -1439,17 +1610,35 @@ mod tests {
             MAX_COALESCED_TILE_BYTES
         );
 
-        let mut batch_header = header.clone();
-        batch_header.n_tiles = 4;
+        let batch_header = RawBufferHeader {
+            client: ClientId(7),
+            surface: WlSurfaceId(11),
+            metadata: BufferMetadata {
+                width: 512,
+                height: 512,
+                stride: 512 * 4,
+                format: BufferFormat::Xrgb8888,
+            },
+            incremental: false,
+            tile_rects: large_rects.to_vec(),
+        };
         let mut expected_hdr_wire = Vec::new();
         batch_header.framed_write(&mut expected_hdr_wire).unwrap();
         let mut expected_b1 = expected_hdr_wire.clone();
-        large0.write_framed(false, &mut expected_b1).unwrap();
-        large1.write_framed(false, &mut expected_b1).unwrap();
+        large0
+            .write_framed(large_rects[0], false, &mut expected_b1)
+            .unwrap();
+        large1
+            .write_framed(large_rects[1], false, &mut expected_b1)
+            .unwrap();
         let mut expected_b2 = expected_b1.clone();
-        small2.write_framed(false, &mut expected_b2).unwrap();
+        small2
+            .write_framed(large_rects[2], false, &mut expected_b2)
+            .unwrap();
         let mut expected_b3 = expected_b2.clone();
-        small3.write_framed(false, &mut expected_b3).unwrap();
+        small3
+            .write_framed(large_rects[3], false, &mut expected_b3)
+            .unwrap();
 
         let (tx_batch, rx_batch) = crossbeam_channel::unbounded();
         tx_batch.send(large0).unwrap();
@@ -1496,7 +1685,9 @@ mod tests {
         // Mid-stream truncation after 1 of 2 tiles must return `Err` AND forward an `Err` item.
         let mut truncated_wire = Vec::new();
         header.framed_write(&mut truncated_wire).unwrap();
-        tile0.write_framed(false, &mut truncated_wire).unwrap();
+        tile0
+            .write_framed(rect0, false, &mut truncated_wire)
+            .unwrap();
         let mut truncated_rx_opt = None;
         assert!(
             CompressedTileStream::read_from_stream(&mut truncated_wire.as_slice(), |stream| {

@@ -33,6 +33,7 @@ use std::arch::aarch64::uint8x16x4_t;
 use std::arch::aarch64::vabsq_s8;
 use std::arch::aarch64::vaddq_u8;
 use std::arch::aarch64::vaddvq_u32;
+use std::arch::aarch64::vandq_u8;
 use std::arch::aarch64::vdupq_laneq_u8;
 use std::arch::aarch64::vdupq_n_u8;
 use std::arch::aarch64::vdupq_n_u32;
@@ -498,6 +499,63 @@ impl RowKernel for Kernel {
             acc = acc.wrapping_add(src[j]);
             dst[j] = acc;
         }
+    }
+
+    #[inline]
+    fn diff_and_update_row<const HAS_ALPHA: bool>(
+        src: BufferPointer<Vec4u8>,
+        shadow: &mut [Vec4u8],
+    ) -> bool {
+        let n = src.len();
+        debug_assert_eq!(shadow.len(), n);
+        let src_p = src.ptr();
+        let dst_p = shadow.as_mut_ptr();
+        let lim = (n / 4) * 4;
+        // SAFETY: NEON is mandatory on AArch64, `src_p` and `dst_p` are valid
+        // for `n` `Vec4u8`s and non-overlapping, and `i + 4 <= n`.
+        unsafe {
+            let rgb_mask = vreinterpretq_u8_u32(vdupq_n_u32(0x00FF_FFFF));
+            let mut i = 0usize;
+            while i < lim {
+                let s = vld1q_u8(src_p.add(i).cast::<u8>());
+                let d = vld1q_u8(dst_p.add(i).cast::<u8>());
+                let diff = veorq_u8(s, d);
+                let masked = if HAS_ALPHA {
+                    diff
+                } else {
+                    vandq_u8(diff, rgb_mask)
+                };
+                if vmaxvq_u8(masked) != 0 {
+                    vst1q_u8(dst_p.add(i).cast::<u8>(), s);
+                    if i + 4 < n {
+                        src.split_at(i + 4)
+                            .1
+                            .copy_to_nonoverlapping(&mut shadow[i + 4..]);
+                    }
+                    return true;
+                }
+                i += 4;
+            }
+            for j in lim..n {
+                let s = src_p.add(j).read();
+                let d = dst_p.add(j).read();
+                let differs = if HAS_ALPHA {
+                    s != d
+                } else {
+                    s.0 != d.0 || s.1 != d.1 || s.2 != d.2
+                };
+                if differs {
+                    dst_p.add(j).write(s);
+                    if j + 1 < n {
+                        src.split_at(j + 1)
+                            .1
+                            .copy_to_nonoverlapping(&mut shadow[j + 1..]);
+                    }
+                    return true;
+                }
+            }
+        }
+        false
     }
 
     #[inline]

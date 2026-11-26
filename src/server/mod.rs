@@ -60,6 +60,14 @@ pub mod smithay_handlers;
 
 struct LockedSurfaceState(Mutex<SurfaceState>);
 
+/// Last buffer transmitted to the currently connected client for a surface,
+/// retaining a local shadow copy of its pixels so subsequent commits skip
+/// unchanged `128x128` quadrants and identical frames.
+pub struct SyncedSurfaceBuffer {
+    pub metadata: BufferMetadata,
+    pub pixels: Vec<u8>,
+}
+
 fn surface_destruction_callback(state: &mut WprsServerState, surface: &WlSurface) {
     compositor::with_states(surface, |surface_data| {
         let surface_state = surface_data
@@ -122,9 +130,10 @@ pub struct WprsServerState {
     // object_map:
     // left: serialized surface id, right: local native surface id
     pub object_map: HashMap<WlSurfaceId, ObjectId>,
-    /// Tracks the last `BufferMetadata` sent to the currently connected client
-    /// for each surface so `commit_impl` can safely send partial row-bands.
-    pub synced_buffers: HashMap<WlSurfaceId, BufferMetadata>,
+    /// Tracks the last synced buffer metadata and shadow pixels sent to the
+    /// currently connected client for each surface so `commit_impl` can diff
+    /// incremental updates and skip unchanged quadrants/frames.
+    pub synced_buffers: HashMap<WlSurfaceId, SyncedSurfaceBuffer>,
     /// Tracks synchronized subsurfaces that sent a `Commit` to `wprsc` since
     /// their desynchronized ancestor last committed, so bufferless parent sync
     /// commits still forward `Commit(parent)` to flush them on `wprsc`.

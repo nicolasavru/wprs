@@ -44,6 +44,7 @@ cfg_if! {
             use std::arch::x86_64::_mm256_add_epi8;
             use std::arch::x86_64::_mm256_add_epi64;
             use std::arch::x86_64::_mm256_alignr_epi8;
+            use std::arch::x86_64::_mm256_and_si256;
             use std::arch::x86_64::_mm256_castsi256_si128;
             use std::arch::x86_64::_mm256_extracti128_si256;
             use std::arch::x86_64::_mm256_loadu_si256;
@@ -614,6 +615,64 @@ cfg_if! {
                 }
 
                 #[inline]
+                fn diff_and_update_row<const HAS_ALPHA: bool>(
+                    src: BufferPointer<Vec4u8>,
+                    shadow: &mut [Vec4u8],
+                ) -> bool {
+                    let n = src.len();
+                    debug_assert_eq!(shadow.len(), n);
+                    let src_p = src.ptr();
+                    let dst_p = shadow.as_mut_ptr();
+                    let lim = (n / 8) * 8;
+                    // SAFETY: AVX2 is statically enabled, `src_p` and `dst_p` are
+                    // valid for `n` `Vec4u8`s and non-overlapping (`src` is shm/caller,
+                    // `shadow` is exclusively borrowed), and `i + 8 <= n`.
+                    unsafe {
+                        let rgb_mask = _mm256_set1_epi32(0x00FF_FFFFu32 as i32);
+                        let mut i = 0usize;
+                        while i < lim {
+                            let s = _mm256_loadu_si256(src_p.add(i).cast::<__m256i>());
+                            let d = _mm256_loadu_si256(dst_p.add(i).cast::<__m256i>());
+                            let diff = _mm256_xor_si256(s, d);
+                            let masked = if HAS_ALPHA {
+                                diff
+                            } else {
+                                _mm256_and_si256(diff, rgb_mask)
+                            };
+                            if _mm256_testz_si256(masked, masked) == 0 {
+                                _mm256_storeu_si256(dst_p.add(i).cast::<__m256i>(), s);
+                                if i + 8 < n {
+                                    src.split_at(i + 8)
+                                        .1
+                                        .copy_to_nonoverlapping(&mut shadow[i + 8..]);
+                                }
+                                return true;
+                            }
+                            i += 8;
+                        }
+                        for j in lim..n {
+                            let s = src_p.add(j).read();
+                            let d = dst_p.add(j).read();
+                            let differs = if HAS_ALPHA {
+                                s != d
+                            } else {
+                                s.0 != d.0 || s.1 != d.1 || s.2 != d.2
+                            };
+                            if differs {
+                                dst_p.add(j).write(s);
+                                if j + 1 < n {
+                                    src.split_at(j + 1)
+                                        .1
+                                        .copy_to_nonoverlapping(&mut shadow[j + 1..]);
+                                }
+                                return true;
+                            }
+                        }
+                    }
+                    false
+                }
+
+                #[inline]
                 fn fence_stream() {
                     // SAFETY: `_mm_sfence` is baseline SSE (mandatory on all x86_64 CPUs).
                     unsafe { _mm_sfence() };
@@ -628,6 +687,7 @@ cfg_if! {
             use std::arch::x86_64::_mm_add_epi8;
             use std::arch::x86_64::_mm_add_epi64;
             use std::arch::x86_64::_mm_alignr_epi8;
+            use std::arch::x86_64::_mm_and_si128;
             use std::arch::x86_64::_mm_cmpeq_epi8;
             use std::arch::x86_64::_mm_cvtsi32_si128;
             use std::arch::x86_64::_mm_cvtsi128_si32;
@@ -646,6 +706,7 @@ cfg_if! {
             use std::arch::x86_64::_mm_storeu_si128;
             use std::arch::x86_64::_mm_stream_si128;
             use std::arch::x86_64::_mm_sub_epi8;
+            use std::arch::x86_64::_mm_xor_si128;
 
             use crate::buffer_pointer::BufferPointer;
             use crate::filtering::RowKernel;
@@ -1143,6 +1204,64 @@ cfg_if! {
                         acc = acc.wrapping_add(src[j]);
                         dst[j] = acc;
                     }
+                }
+
+                #[inline]
+                fn diff_and_update_row<const HAS_ALPHA: bool>(
+                    src: BufferPointer<Vec4u8>,
+                    shadow: &mut [Vec4u8],
+                ) -> bool {
+                    let n = src.len();
+                    debug_assert_eq!(shadow.len(), n);
+                    let src_p = src.ptr();
+                    let dst_p = shadow.as_mut_ptr();
+                    let lim = (n / 4) * 4;
+                    // SAFETY: SSE2/SSSE3 are statically enabled, `src_p` and `dst_p` are
+                    // valid for `n` `Vec4u8`s and non-overlapping, and `i + 4 <= n`.
+                    unsafe {
+                        let zero = _mm_setzero_si128();
+                        let rgb_mask = _mm_set1_epi32(0x00FF_FFFFu32 as i32);
+                        let mut i = 0usize;
+                        while i < lim {
+                            let s = _mm_loadu_si128(src_p.add(i).cast::<__m128i>());
+                            let d = _mm_loadu_si128(dst_p.add(i).cast::<__m128i>());
+                            let diff = _mm_xor_si128(s, d);
+                            let masked = if HAS_ALPHA {
+                                diff
+                            } else {
+                                _mm_and_si128(diff, rgb_mask)
+                            };
+                            if _mm_movemask_epi8(_mm_cmpeq_epi8(masked, zero)) != 0xFFFF {
+                                _mm_storeu_si128(dst_p.add(i).cast::<__m128i>(), s);
+                                if i + 4 < n {
+                                    src.split_at(i + 4)
+                                        .1
+                                        .copy_to_nonoverlapping(&mut shadow[i + 4..]);
+                                }
+                                return true;
+                            }
+                            i += 4;
+                        }
+                        for j in lim..n {
+                            let s = src_p.add(j).read();
+                            let d = dst_p.add(j).read();
+                            let differs = if HAS_ALPHA {
+                                s != d
+                            } else {
+                                s.0 != d.0 || s.1 != d.1 || s.2 != d.2
+                            };
+                            if differs {
+                                dst_p.add(j).write(s);
+                                if j + 1 < n {
+                                    src.split_at(j + 1)
+                                        .1
+                                        .copy_to_nonoverlapping(&mut shadow[j + 1..]);
+                                }
+                                return true;
+                            }
+                        }
+                    }
+                    false
                 }
 
                 #[inline]

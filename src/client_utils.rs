@@ -22,6 +22,7 @@ use smithay_client_toolkit::reexports::client::protocol::wl_surface::WlSurface;
 use crate::constants;
 use crate::filtering;
 use crate::serialization::framing::RowBand;
+use crate::serialization::framing::TileRect;
 use crate::serialization::geometry::Rectangle;
 
 #[derive(Debug)]
@@ -107,94 +108,105 @@ pub(crate) fn combine_band_history(
     filtering::merge_row_bands(prev, height)
 }
 
-/// Subtracts sorted, non-overlapping `[y0, y1)` row-bands `cur` from sorted,
-/// non-overlapping `prev`, returning the sorted, non-overlapping remainder
-/// `prev \ cur`.
-pub(crate) fn subtract_row_bands(prev: &[RowBand], cur: &[RowBand]) -> Vec<RowBand> {
-    let mut out = Vec::new();
-    let mut j = 0;
+/// Maximum number of 2D dirty tile rects retained in a back slot's history
+/// before promoting to full-slot stale (`None`).
+pub(crate) const MAX_TRACKED_DIRTY_RECTS: usize = 128;
 
-    for &band in prev {
-        let mut start = band.y0;
-        while j < cur.len() && cur[j].y1 <= start {
-            j += 1;
+/// Returns `true` if `outer` completely covers `inner`.
+#[inline]
+pub(crate) fn rect_contains(outer: TileRect, inner: TileRect) -> bool {
+    inner.x >= outer.x
+        && inner.y >= outer.y
+        && u64::from(inner.x) + u64::from(inner.w) <= u64::from(outer.x) + u64::from(outer.w)
+        && u64::from(inner.y) + u64::from(inner.h) <= u64::from(outer.y) + u64::from(outer.h)
+}
+
+/// Returns `true` if `rect` is completely covered by some single rect in `cover`.
+#[inline]
+pub(crate) fn rect_covered_by(rect: TileRect, cover: &[TileRect]) -> bool {
+    cover.iter().any(|&c| rect_contains(c, rect))
+}
+
+/// Captures a frame's 2D dirty tile rects as initial back-slot history,
+/// promoting to `None` (full-slot stale) on full frames or when exceeding
+/// [`MAX_TRACKED_DIRTY_RECTS`].
+pub(crate) fn snapshot_rect_history(cur: Option<&[TileRect]>) -> Option<Vec<TileRect>> {
+    cur.filter(|rects| rects.len() <= MAX_TRACKED_DIRTY_RECTS)
+        .map(ToOwned::to_owned)
+}
+
+/// Merges `cur` into a back slot's stale 2D tile-rect history `prev`, returning
+/// `None` if either is a full-frame update or the deduplicated list exceeds
+/// [`MAX_TRACKED_DIRTY_RECTS`].
+pub(crate) fn combine_rect_history(
+    prev: Option<Vec<TileRect>>,
+    cur: Option<&[TileRect]>,
+) -> Option<Vec<TileRect>> {
+    let (mut prev, cur) = (prev?, cur?);
+    for &rect in cur {
+        if rect_covered_by(rect, &prev) {
+            continue;
         }
-        while j < cur.len() && cur[j].y0 < band.y1 {
-            if cur[j].y0 > start {
-                out.push(RowBand {
-                    y0: start,
-                    y1: cur[j].y0,
-                });
-            }
-            start = cur[j].y1;
-            if start >= band.y1 {
-                break;
-            }
-            j += 1;
+        prev.retain(|&existing| !rect_contains(rect, existing));
+        if prev.len() >= MAX_TRACKED_DIRTY_RECTS {
+            return None;
         }
-        if start < band.y1 {
-            out.push(RowBand {
-                y0: start,
-                y1: band.y1,
-            });
-        }
+        prev.push(rect);
     }
-
-    out
+    Some(prev)
 }
 
 /// Outcome of advancing a lazy 2-slot swapchain for a frame update.
 #[derive(Debug, Eq, PartialEq)]
-pub(crate) enum SwapchainStep {
+pub(crate) enum SwapchainStep<H> {
     /// `active_buffer` was released and reused in place.
     ReusedActive,
     /// `active_buffer` was held; swapped to the released back slot whose stale
-    /// row-band history relative to the previous active slot was `prev_bands`
-    /// (`None` means the entire back slot was stale). The previous active slot
-    /// is now stored in `back_buffer`.
-    Swapped { prev_bands: Option<Vec<RowBand>> },
+    /// region history relative to the previous active slot was `prev_history`.
+    /// The previous active slot is now stored in `back_buffer`.
+    Swapped { prev_history: H },
     /// Allocated a fresh slot because no released back slot was available. The
     /// previous active slot is now stored in `back_buffer`.
     Allocated,
 }
 
-/// Advances a lazy 2-slot swapchain for an update covering `cur_bands` (`None`
-/// for a full-frame update), maintaining `back_buffer`'s stale row-band history
-/// relative to `active_buffer`.
+/// Advances a lazy 2-slot swapchain, maintaining `back_buffer`'s stale region
+/// history `H` relative to `active_buffer`.
 ///
 /// `alloc_buffer` receives `back_buffer_held`: `false` on first-time lazy
 /// double-buffer allocation and `true` when both slots are held by the
 /// compositor (triple-buffer fallback). On allocation error, `active_buffer`
 /// and `back_buffer` are left unchanged.
-pub(crate) fn advance_two_slot_swapchain<P, B>(
+pub(crate) fn advance_two_slot_swapchain<P, B, H: Default, C: Copy>(
     pool: &mut P,
     active_buffer: &mut B,
-    back_buffer: &mut Option<(B, Option<Vec<RowBand>>)>,
-    cur_bands: Option<&[RowBand]>,
-    height: i32,
+    back_buffer: &mut Option<(B, H)>,
+    cur: C,
     mut is_released: impl FnMut(&mut P, &B) -> bool,
+    combine: impl FnOnce(H, C) -> H,
+    snapshot: impl FnOnce(C) -> H,
     alloc_buffer: impl FnOnce(&mut P, bool) -> Result<B>,
-) -> Result<SwapchainStep> {
+) -> Result<SwapchainStep<H>> {
     if is_released(pool, active_buffer) {
-        if let Some((_, back_bands)) = back_buffer {
-            *back_bands = combine_band_history(back_bands.take(), cur_bands, height);
+        if let Some((_, back_history)) = back_buffer {
+            *back_history = combine(std::mem::take(back_history), cur);
         }
         return Ok(SwapchainStep::ReusedActive);
     }
 
-    if let Some((back_buf, prev_bands)) = back_buffer.take() {
+    if let Some((back_buf, prev_history)) = back_buffer.take() {
         if is_released(pool, &back_buf) {
             let old_active = std::mem::replace(active_buffer, back_buf);
-            *back_buffer = Some((old_active, cur_bands.map(ToOwned::to_owned)));
-            return Ok(SwapchainStep::Swapped { prev_bands });
+            *back_buffer = Some((old_active, snapshot(cur)));
+            return Ok(SwapchainStep::Swapped { prev_history });
         }
-        *back_buffer = Some((back_buf, prev_bands));
+        *back_buffer = Some((back_buf, prev_history));
     }
 
     let back_buffer_held = back_buffer.is_some();
     let new_buffer = alloc_buffer(pool, back_buffer_held)?;
     let old_active = std::mem::replace(active_buffer, new_buffer);
-    *back_buffer = Some((old_active, cur_bands.map(ToOwned::to_owned)));
+    *back_buffer = Some((old_active, snapshot(cur)));
     Ok(SwapchainStep::Allocated)
 }
 
@@ -206,76 +218,64 @@ mod tests {
         RowBand { y0, y1 }
     }
 
+    fn tr(x: u32, y: u32, w: u32, h: u32) -> TileRect {
+        TileRect { x, y, w, h }
+    }
+
     #[test]
-    fn test_subtract_row_bands() {
-        let cases: &[(&[RowBand], &[RowBand], &[RowBand])] = &[
-            // Empty `prev` or empty `cur`.
-            (&[], &[b(2, 5)], &[]),
-            (&[b(2, 5), b(8, 10)], &[], &[b(2, 5), b(8, 10)]),
-            // Disjoint (separated and edge-touching on both sides).
-            (&[b(2, 5)], &[b(7, 9)], &[b(2, 5)]),
-            (&[b(2, 5)], &[b(5, 8)], &[b(2, 5)]),
-            (&[b(5, 8)], &[b(1, 3)], &[b(5, 8)]),
-            (&[b(5, 8)], &[b(2, 5)], &[b(5, 8)]),
-            (
-                &[b(1, 3), b(6, 8)],
-                &[b(3, 6), b(8, 10)],
-                &[b(1, 3), b(6, 8)],
-            ),
-            // Exact match (single and multi-band) -> empty.
-            (&[b(2, 5)], &[b(2, 5)], &[]),
-            (&[b(2, 5), b(10, 14)], &[b(2, 5), b(10, 14)], &[]),
-            // Wide `cur` spanning multiple `prev` bands.
-            (&[b(2, 5), b(7, 10), b(12, 15)], &[b(0, 13)], &[b(13, 15)]),
-            (&[b(2, 5), b(7, 10)], &[b(2, 10)], &[]),
-            // Partial left and right overlap (including exact edge alignment).
-            (&[b(4, 10)], &[b(2, 7)], &[b(7, 10)]),
-            (&[b(4, 10)], &[b(4, 7)], &[b(7, 10)]),
-            (&[b(4, 10)], &[b(7, 12)], &[b(4, 7)]),
-            (&[b(4, 10)], &[b(7, 10)], &[b(4, 7)]),
-            // Splitting a `prev` band around an interior `cur` band.
-            (&[b(2, 10)], &[b(4, 7)], &[b(2, 4), b(7, 10)]),
-            // Multiple overlapping and touching `cur` bands across one or many `prev` bands.
-            (
-                &[b(0, 20)],
-                &[b(2, 5), b(5, 8), b(12, 15)],
-                &[b(0, 2), b(8, 12), b(15, 20)],
-            ),
-            (
-                &[b(2, 6), b(8, 16), b(18, 22)],
-                &[b(4, 10), b(12, 14), b(15, 20)],
-                &[b(2, 4), b(10, 12), b(14, 15), b(20, 22)],
-            ),
-            // `cur` ending at one `prev` band's upper bound followed by another `cur` band.
-            (
-                &[b(2, 6), b(8, 12)],
-                &[b(4, 6), b(6, 10)],
-                &[b(2, 4), b(10, 12)],
-            ),
-        ];
+    fn test_rect_containment_and_history_tracking() {
+        let parent = tr(0, 0, 256, 256);
+        let q0 = tr(0, 0, 128, 128);
+        let q1 = tr(128, 0, 128, 128);
+        let shifted = tr(256, 0, 128, 128);
 
-        for &(prev, cur, expected) in cases {
-            let out = subtract_row_bands(prev, cur);
-            assert_eq!(out, expected, "prev={prev:?}, cur={cur:?}");
+        assert!(rect_contains(parent, parent));
+        assert!(rect_contains(parent, q0));
+        assert!(rect_contains(parent, q1));
+        assert!(!rect_contains(q0, parent));
+        assert!(!rect_contains(parent, shifted));
+        assert!(!rect_contains(tr(0, 0, 128, 128), tr(1, 0, 128, 128)));
+        assert!(!rect_contains(tr(10, 10, 10, 10), tr(9, 10, 10, 10)));
+        assert!(rect_covered_by(q0, &[shifted, parent]));
+        assert!(!rect_covered_by(shifted, &[parent]));
 
-            // Verify canonical invariants and row-by-row set difference.
-            for w in out.windows(2) {
-                assert!(w[0].y1 <= w[1].y0, "overlapping/unsorted: {out:?}");
-            }
-            for band in &out {
-                assert!(band.y0 < band.y1, "empty band: {out:?}");
-            }
-            for y in 0..24 {
-                let in_out = out.iter().any(|r| y >= r.y0 && y < r.y1);
-                let in_prev = prev.iter().any(|r| y >= r.y0 && y < r.y1);
-                let in_cur = cur.iter().any(|r| y >= r.y0 && y < r.y1);
-                assert_eq!(
-                    in_out,
-                    in_prev && !in_cur,
-                    "row {y}: prev={prev:?}, cur={cur:?}"
-                );
-            }
+        // Deduplicates repeated cursor-blink rects without growing history.
+        let mut hist = snapshot_rect_history(Some(&[q0]));
+        for _ in 0..(MAX_TRACKED_DIRTY_RECTS * 2) {
+            hist = combine_rect_history(hist, Some(&[q0]));
         }
+        assert_eq!(hist, Some(vec![q0]));
+
+        // Larger incoming parent supersedes covered quadrants in place.
+        hist = combine_rect_history(hist, Some(&[q1]));
+        assert_eq!(hist, Some(vec![q0, q1]));
+        hist = combine_rect_history(hist, Some(&[parent]));
+        assert_eq!(hist, Some(vec![parent]));
+        // Subsequent quadrant inside parent is ignored.
+        hist = combine_rect_history(hist, Some(&[q0]));
+        assert_eq!(hist, Some(vec![parent]));
+
+        // Exceeding `MAX_TRACKED_DIRTY_RECTS` promotes to `None` (full-slot stale).
+        let distinct: Vec<TileRect> = (0..=MAX_TRACKED_DIRTY_RECTS as u32)
+            .map(|i| tr(i * 128, 0, 128, 128))
+            .collect();
+        assert_eq!(
+            snapshot_rect_history(Some(&distinct[..MAX_TRACKED_DIRTY_RECTS])),
+            Some(distinct[..MAX_TRACKED_DIRTY_RECTS].to_vec())
+        );
+        assert_eq!(snapshot_rect_history(Some(&distinct)), None);
+        assert_eq!(
+            combine_rect_history(
+                Some(distinct[..MAX_TRACKED_DIRTY_RECTS].to_vec()),
+                Some(&distinct[MAX_TRACKED_DIRTY_RECTS..])
+            ),
+            None
+        );
+
+        // Non-incremental (`None`) always yields `None`.
+        assert_eq!(snapshot_rect_history(None), None);
+        assert_eq!(combine_rect_history(Some(vec![q0]), None), None);
+        assert_eq!(combine_rect_history(None, Some(&[q0])), None);
     }
 
     #[test]
@@ -289,9 +289,10 @@ mod tests {
             &mut (),
             &mut active,
             &mut back,
-            Some(&[b(1, 2)]),
-            20,
+            Some([b(1, 2)].as_slice()),
             |_, _| false,
+            |prev, cur| combine_band_history(prev, cur, 20),
+            |cur| cur.map(ToOwned::to_owned),
             |_, held| {
                 seen_held.push(held);
                 Err(anyhow::anyhow!("oom"))
@@ -309,9 +310,10 @@ mod tests {
             &mut (),
             &mut active,
             &mut back,
-            Some(&[b(6, 8)]),
-            20,
+            Some([b(6, 8)].as_slice()),
             |_, _| false,
+            |prev, cur| combine_band_history(prev, cur, 20),
+            |cur| cur.map(ToOwned::to_owned),
             |_, held| {
                 seen_held.push(held);
                 Err(anyhow::anyhow!("oom"))

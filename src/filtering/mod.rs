@@ -12,12 +12,16 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-//! 2D tiled pixel filtering and lossless compression/decompression.
+//! 2D tiled pixel filtering, incremental sub-tile diffing, and lossless
+//! compression/decompression.
 //!
-//! Pixel buffers are partitioned into self-describing 2D `256x256` tiles (with
-//! a full-width 1D strip fallback for thin `< 8`-row partial bands so 1-row
-//! updates avoid tile-header fragmentation). Each tile is encoded on a worker
-//! thread inside L1/L2 scratch memory as:
+//! Pixel buffers are partitioned into `256x256` tiles (with a full-width 1D
+//! strip fallback for thin `< 8`-row partial bands so 1-row updates avoid
+//! tile-header fragmentation). On incremental commits against a per-surface
+//! shadow buffer, a parallel linear horizontal-band SIMD pass skips unchanged
+//! `128x128` quadrants (coalescing all-dirty quadrants back into a `256x256`
+//! tile and omitting empty commits completely). Each dirty tile is encoded on
+//! a worker thread inside L1/L2 scratch memory as:
 //! - [`TilePayload::Solid`] for 1-color tiles,
 //! - [`TilePayload::Palette`] (1/2/4/8 bpp + Zstd) for `<= 256` unique colors,
 //! - [`TilePayload::AosZstd`] using fused 3-byte `SubGreen(B-G, G, R-G)` AoS,
@@ -41,8 +45,12 @@ mod arch;
 pub(crate) mod palette;
 
 use std::borrow::Cow;
+use std::cmp::Reverse;
+use std::collections::BTreeMap;
+use std::collections::BinaryHeap;
 use std::slice;
 use std::sync::Mutex;
+use std::sync::atomic::AtomicBool;
 use std::sync::atomic::AtomicUsize;
 use std::sync::atomic::Ordering;
 
@@ -58,8 +66,11 @@ use crate::serialization::framing::CompressedTile;
 use crate::serialization::framing::CompressedTileStream;
 use crate::serialization::framing::CompressedTiles;
 use crate::serialization::framing::EncodedBytes;
+use crate::serialization::framing::MAX_FRAME_TILES;
 use crate::serialization::framing::RawBufferHeader;
 use crate::serialization::framing::RowBand;
+use crate::serialization::framing::SUBTILE_H;
+use crate::serialization::framing::SUBTILE_W;
 use crate::serialization::framing::StreamingCompressedTiles;
 use crate::serialization::framing::TILE_H;
 use crate::serialization::framing::TILE_PIXELS;
@@ -127,6 +138,16 @@ pub(crate) trait RowKernel {
     fn row_up_forward(cur: &[u8], prev: &[u8], dst: &mut [u8]);
 
     fn row_sub1_inverse(src: &[u8], dst: &mut [u8]);
+
+    /// Compares `src` (via [`BufferPointer`], never creating `&[u8]` over
+    /// `wl_shm`) against `shadow` pixel-by-pixel (`BGRA` when `HAS_ALPHA`, or
+    /// ignoring byte 3 when `!HAS_ALPHA`). Returns `false` without writing
+    /// `shadow` when all pixels match; otherwise updates the differing and
+    /// subsequent pixels in `shadow` from `src` and returns `true`.
+    fn diff_and_update_row<const HAS_ALPHA: bool>(
+        src: BufferPointer<Vec4u8>,
+        shadow: &mut [Vec4u8],
+    ) -> bool;
 
     fn fence_stream();
 }
@@ -309,6 +330,35 @@ impl RowKernel for ScalarKernel {
         }
     }
 
+    fn diff_and_update_row<const HAS_ALPHA: bool>(
+        src: BufferPointer<Vec4u8>,
+        shadow: &mut [Vec4u8],
+    ) -> bool {
+        let n = src.len();
+        debug_assert_eq!(shadow.len(), n);
+        let src_p = src.ptr();
+        for j in 0..n {
+            // SAFETY: `j < n == src.len()`.
+            let s = unsafe { src_p.add(j).read() };
+            let d = shadow[j];
+            let differs = if HAS_ALPHA {
+                s != d
+            } else {
+                s.0 != d.0 || s.1 != d.1 || s.2 != d.2
+            };
+            if differs {
+                shadow[j] = s;
+                if j + 1 < n {
+                    src.split_at(j + 1)
+                        .1
+                        .copy_to_nonoverlapping(&mut shadow[j + 1..]);
+                }
+                return true;
+            }
+        }
+        false
+    }
+
     fn fence_stream() {}
 }
 
@@ -415,7 +465,7 @@ fn filter_tile<K: RowKernel, const HAS_ALPHA: bool>(
     stride_px: usize,
     rect: TileRect,
     state: &mut CompressorWorkerState,
-) -> CompressedTile {
+) -> TilePayload {
     let x0 = rect.x as usize;
     let y0 = rect.y as usize;
     let tw = rect.w as usize;
@@ -429,10 +479,7 @@ fn filter_tile<K: RowKernel, const HAS_ALPHA: bool>(
     {
         if n_colors == 1 {
             let px = state.palette.palette[0].to_le_bytes();
-            return CompressedTile {
-                rect,
-                payload: TilePayload::Solid(px),
-            };
+            return TilePayload::Solid(px);
         }
         let pal_has_alpha = HAS_ALPHA
             && state.palette.palette[..n_colors]
@@ -449,13 +496,10 @@ fn filter_tile<K: RowKernel, const HAS_ALPHA: bool>(
             &mut state.zstd_scratch,
             &state.palette.packed[..packed_len],
         );
-        return CompressedTile {
-            rect,
-            payload: TilePayload::Palette {
-                has_alpha: pal_has_alpha,
-                palette: palette_bytes,
-                data,
-            },
+        return TilePayload::Palette {
+            has_alpha: pal_has_alpha,
+            palette: palette_bytes,
+            data,
         };
     }
 
@@ -542,13 +586,10 @@ fn filter_tile<K: RowKernel, const HAS_ALPHA: bool>(
         }
     };
 
-    CompressedTile {
-        rect,
-        payload: TilePayload::AosZstd {
-            predictors,
-            color,
-            alpha,
-        },
+    TilePayload::AosZstd {
+        predictors,
+        color,
+        alpha,
     }
 }
 
@@ -609,21 +650,22 @@ fn decode_encoded_bytes<'a>(
 }
 
 /// # Safety
-/// `tile.rect` must already be validated in-bounds within `frame` and disjoint
-/// from all other tiles being decoded concurrently.
+/// `rect` must already be validated in-bounds within `frame` and disjoint from
+/// all other tiles being decoded concurrently.
 unsafe fn unfilter_tile<K: RowKernel, const HAS_ALPHA: bool>(
-    tile: &CompressedTile,
+    rect: TileRect,
+    payload: &TilePayload,
     frame: &FrameRows,
     state: &mut DecompressorWorkerState,
 ) -> Result<bool> {
-    let x0 = tile.rect.x as usize;
-    let y0 = tile.rect.y as usize;
-    let tw = tile.rect.w as usize;
-    let th = tile.rect.h as usize;
+    let x0 = rect.x as usize;
+    let y0 = rect.y as usize;
+    let tw = rect.w as usize;
+    let th = rect.h as usize;
     let n_px = tw * th;
     debug_assert!(n_px > 0 && n_px <= TILE_PIXELS);
 
-    match &tile.payload {
+    match payload {
         TilePayload::Solid(px) => {
             if !HAS_ALPHA && px[3] != 0xFF {
                 bail!("translucent Solid tile on Xrgb8888 buffer");
@@ -918,50 +960,126 @@ pub fn compute_partial_row_bands(
     merge_row_bands(bands, height)
 }
 
-fn push_region_tiles(out: &mut Vec<TileRect>, width: u32, y0: u32, y1: u32) {
-    let band_h = y1 - y0;
-    if band_h < MIN_2D_BAND_HEIGHT {
-        // Emit a single full-width 1D strip for normal displays, splitting
-        // horizontally only if `width * band_h > TILE_PIXELS` so every tile
-        // stays within L2 scratch bounds.
-        let max_strip_w = (TILE_PIXELS as u32 / band_h).max(1);
-        let mut x = 0u32;
-        while x < width {
-            let w = (width - x).min(max_strip_w);
-            out.push(TileRect {
-                x,
-                y: y0,
+/// Splits a 2D base tile (`w <= TILE_W`, `h <= TILE_H`) into 1..=4 clipped
+/// `128x128` quadrants in raster order.
+#[inline]
+fn tile_quadrants(rect: TileRect) -> ([TileRect; 4], usize) {
+    debug_assert!(rect.w <= TILE_W as u32 && rect.h <= TILE_H as u32);
+    let mut out = [rect; 4];
+    let mut n = 0;
+    let sub_w = SUBTILE_W as u32;
+    let sub_h = SUBTILE_H as u32;
+    let mut dy = 0u32;
+    while dy < rect.h {
+        let h = (rect.h - dy).min(sub_h);
+        let mut dx = 0u32;
+        while dx < rect.w {
+            let w = (rect.w - dx).min(sub_w);
+            out[n] = TileRect {
+                x: rect.x + dx,
+                y: rect.y + dy,
                 w,
-                h: band_h,
-            });
-            x += w;
+                h,
+            };
+            n += 1;
+            dx += w;
         }
-        return;
+        dy += h;
     }
+    (out, n)
+}
 
-    let mut y = y0;
-    while y < y1 {
-        let h = (y1 - y).min(TILE_H as u32);
-        let mut x = 0u32;
-        while x < width {
-            let w = (width - x).min(TILE_W as u32);
-            out.push(TileRect { x, y, w, h });
-            x += w;
-        }
-        y += h;
+/// Raw pointer handle to the server's per-surface shadow pixel buffer
+/// preserving provenance for disjoint per-tile mutable writes across workers.
+struct ShadowRows {
+    base: *mut u8,
+    stride: usize,
+}
+
+// SAFETY: Every candidate base tile is strictly in-bounds and pairwise disjoint
+// and claimed at most once via `AtomicUsize`, so concurrent workers write to
+// strictly disjoint pixel rectangles in `base`.
+unsafe impl Send for ShadowRows {}
+unsafe impl Sync for ShadowRows {}
+
+impl ShadowRows {
+    /// # Safety
+    /// Caller must guarantee `(y, x_bytes..x_bytes + row_bytes)` lies within
+    /// the shadow buffer.
+    #[inline]
+    unsafe fn row_ptr(&self, y: usize, x_bytes: usize) -> *mut u8 {
+        // SAFETY: Caller upholds in-bounds invariants.
+        unsafe { self.base.add(y * self.stride + x_bytes) }
     }
 }
 
-/// Validates `bands` (when `Some`: sorted, non-overlapping, non-empty,
-/// `y1 <= height`) and partitions the full frame (`None`) or each damaged band
-/// into clipped `256x256` 2D tiles (with `< 8`-row 1D strip fallback).
-/// `metadata` must already pass [`BufferMetadata::validate`].
-fn partition_tiles(metadata: &BufferMetadata, bands: Option<&[RowBand]>) -> Result<Vec<TileRect>> {
+/// Copies `rect` from `src` (`wl_shm` via [`BufferPointer`]) into `shadow`.
+///
+/// # Safety
+/// `rect` must be strictly in-bounds within `shadow` and disjoint from all
+/// regions concurrently accessed by other threads.
+#[inline]
+unsafe fn copy_rect_to_shadow(
+    src: BufferPointer<u8>,
+    shadow: &ShadowRows,
+    stride: usize,
+    rect: TileRect,
+) {
+    let x_bytes = rect.x as usize * 4;
+    let row_bytes = rect.w as usize * 4;
+    let y0 = rect.y as usize;
+    for ry in 0..rect.h as usize {
+        let row_off = (y0 + ry) * stride + x_bytes;
+        let (_, after_start) = src.split_at(row_off);
+        let (src_row, _) = after_start.split_at(row_bytes);
+        // SAFETY: Caller guarantees `rect` is in-bounds and disjoint across workers.
+        let dst_row =
+            unsafe { slice::from_raw_parts_mut(shadow.row_ptr(y0 + ry, x_bytes), row_bytes) };
+        src_row.copy_to_nonoverlapping(dst_row);
+    }
+}
+
+/// Disjoint horizontal scan unit executed in parallel during Phase A so each
+/// worker streams linearly across contiguous rows instead of striding across
+/// `128x128` quadrants.
+enum ScanSubBand {
+    RowBand2D { y0: u32, y1: u32, slot_base: usize },
+    Strip1D { rect: TileRect, slot_idx: usize },
+}
+
+/// Maps each `256x256` base tile (or `< 8`-row 1D strip) to its dirty-flag
+/// slots populated by Phase A so the main thread coalesces all-dirty quadrants
+/// back into a single `256x256` tile in deterministic raster order.
+#[derive(Debug, Copy, Clone, Eq, PartialEq)]
+enum BaseScanEntry {
+    Strip1D {
+        rect: TileRect,
+        slot_idx: usize,
+    },
+    Tile2D {
+        rect: TileRect,
+        quad_slots: [usize; 4],
+        n_quads: usize,
+    },
+}
+
+impl BaseScanEntry {
+    #[inline]
+    fn rect(self) -> TileRect {
+        match self {
+            Self::Strip1D { rect, .. } | Self::Tile2D { rect, .. } => rect,
+        }
+    }
+}
+
+fn plan_incremental_scan(
+    metadata: &BufferMetadata,
+    bands: Option<&[RowBand]>,
+) -> Result<(Vec<ScanSubBand>, Vec<BaseScanEntry>, usize)> {
     let width = metadata.width as u32;
     let height = metadata.height as u32;
-    let mut rects = Vec::new();
-    match bands {
-        None => push_region_tiles(&mut rects, width, 0, height),
+    let regions: Vec<RowBand> = match bands {
+        None => vec![RowBand { y0: 0, y1: height }],
         Some(bands) => {
             let mut prev_y1 = 0u32;
             for band in bands {
@@ -973,22 +1091,292 @@ fn partition_tiles(metadata: &BufferMetadata, bands: Option<&[RowBand]>) -> Resu
                     );
                 }
                 prev_y1 = band.y1;
-                push_region_tiles(&mut rects, width, band.y0, band.y1);
             }
+            bands.to_vec()
         },
+    };
+
+    let n_qx = (width as usize).div_ceil(SUBTILE_W);
+    let mut sub_bands = Vec::new();
+    let mut base_entries = Vec::new();
+    let mut total_slots = 0usize;
+
+    for region in regions {
+        let band_h = region.y1 - region.y0;
+        if band_h < MIN_2D_BAND_HEIGHT {
+            let max_strip_w = (TILE_PIXELS as u32 / band_h).max(1);
+            let mut x = 0u32;
+            while x < width {
+                let w = (width - x).min(max_strip_w);
+                let rect = TileRect {
+                    x,
+                    y: region.y0,
+                    w,
+                    h: band_h,
+                };
+                let slot_idx = total_slots;
+                total_slots += 1;
+                sub_bands.push(ScanSubBand::Strip1D { rect, slot_idx });
+                base_entries.push(BaseScanEntry::Strip1D { rect, slot_idx });
+                x += w;
+            }
+            continue;
+        }
+
+        let mut y = region.y0;
+        while y < region.y1 {
+            let tile_h = (region.y1 - y).min(TILE_H as u32);
+            let top_h = tile_h.min(SUBTILE_H as u32);
+            let top_base = total_slots;
+            total_slots += n_qx;
+            sub_bands.push(ScanSubBand::RowBand2D {
+                y0: y,
+                y1: y + top_h,
+                slot_base: top_base,
+            });
+            let bot_base = if tile_h > top_h {
+                let base = total_slots;
+                total_slots += n_qx;
+                sub_bands.push(ScanSubBand::RowBand2D {
+                    y0: y + top_h,
+                    y1: y + tile_h,
+                    slot_base: base,
+                });
+                Some(base)
+            } else {
+                None
+            };
+
+            let mut x = 0u32;
+            while x < width {
+                let tile_w = (width - x).min(TILE_W as u32);
+                let qx0 = x as usize / SUBTILE_W;
+                let mut quad_slots = [0usize; 4];
+                let mut n_quads = 0usize;
+                quad_slots[n_quads] = top_base + qx0;
+                n_quads += 1;
+                if tile_w > SUBTILE_W as u32 {
+                    quad_slots[n_quads] = top_base + qx0 + 1;
+                    n_quads += 1;
+                }
+                if let Some(bot) = bot_base {
+                    quad_slots[n_quads] = bot + qx0;
+                    n_quads += 1;
+                    if tile_w > SUBTILE_W as u32 {
+                        quad_slots[n_quads] = bot + qx0 + 1;
+                        n_quads += 1;
+                    }
+                }
+                base_entries.push(BaseScanEntry::Tile2D {
+                    rect: TileRect {
+                        x,
+                        y,
+                        w: tile_w,
+                        h: tile_h,
+                    },
+                    quad_slots,
+                    n_quads,
+                });
+                x += tile_w;
+            }
+            y += tile_h;
+        }
     }
-    Ok(rects)
+
+    Ok((sub_bands, base_entries, total_slots))
+}
+
+/// Scans a `< 8`-row 1D strip linearly against `shadow`, updating `shadow`
+/// from the first differing pixel onward.
+///
+/// # Safety
+/// `rect` must be strictly in-bounds within `shadow` and disjoint from all
+/// regions concurrently accessed by other threads.
+unsafe fn diff_and_update_strip<const HAS_ALPHA: bool>(
+    aos: BufferPointer<Vec4u8>,
+    shadow: &ShadowRows,
+    stride_px: usize,
+    rect: TileRect,
+) -> bool {
+    let x0 = rect.x as usize;
+    let x_bytes = x0 * 4;
+    let w = rect.w as usize;
+    let y0 = rect.y as usize;
+    let h = rect.h as usize;
+
+    for ry in 0..h {
+        let (_, after) = aos.split_at((y0 + ry) * stride_px + x0);
+        let (src_row, _) = after.split_at(w);
+        // SAFETY: Caller guarantees `rect` is in-bounds and disjoint across workers,
+        // and `Vec4u8` is `repr(C, packed)` (align 1).
+        let dst_row = unsafe {
+            slice::from_raw_parts_mut(shadow.row_ptr(y0 + ry, x_bytes).cast::<Vec4u8>(), w)
+        };
+        if arch::Kernel::diff_and_update_row::<HAS_ALPHA>(src_row, dst_row) {
+            for rem_ry in (ry + 1)..h {
+                let (_, rem_after) = aos.split_at((y0 + rem_ry) * stride_px + x0);
+                let (rem_src, _) = rem_after.split_at(w);
+                // SAFETY: Caller guarantees `rect` is in-bounds and disjoint across workers.
+                let rem_dst = unsafe {
+                    slice::from_raw_parts_mut(
+                        shadow.row_ptr(y0 + rem_ry, x_bytes).cast::<Vec4u8>(),
+                        w,
+                    )
+                };
+                rem_src.copy_to_nonoverlapping(rem_dst);
+            }
+            return true;
+        }
+    }
+    false
+}
+
+/// Scans a horizontal `<= 128`-row 2D sub-band linearly row-by-row across all
+/// `n_qx` horizontal quadrants, updating `shadow` for dirty quadrants and
+/// falling back to bulk contiguous `memcpy` once all quadrants in the band are
+/// dirty.
+///
+/// # Safety
+/// Rows `[y0, y1)` must be strictly in-bounds within `shadow` and disjoint from
+/// all rows concurrently accessed by other threads.
+unsafe fn diff_and_update_row_band_2d<const HAS_ALPHA: bool>(
+    data: BufferPointer<u8>,
+    aos: BufferPointer<Vec4u8>,
+    shadow: &ShadowRows,
+    width: usize,
+    stride: usize,
+    y0: usize,
+    y1: usize,
+    dirty_slots: &[AtomicBool],
+) {
+    let stride_px = stride / 4;
+    let n_qx = dirty_slots.len();
+    let mut qx_dirty = vec![false; n_qx];
+    let mut dirty_count = 0usize;
+
+    for y in y0..y1 {
+        if dirty_count == n_qx {
+            let vis_bytes = width * 4;
+            if stride == vis_bytes {
+                let off = y * stride;
+                let bytes = (y1 - y) * stride;
+                let (_, after) = data.split_at(off);
+                let (chunk, _) = after.split_at(bytes);
+                // SAFETY: `[y0, y1)` is strictly disjoint across workers.
+                let dst = unsafe { slice::from_raw_parts_mut(shadow.row_ptr(y, 0), bytes) };
+                chunk.copy_to_nonoverlapping(dst);
+            } else {
+                for ry in y..y1 {
+                    let off = ry * stride;
+                    let (_, after) = data.split_at(off);
+                    let (chunk, _) = after.split_at(vis_bytes);
+                    // SAFETY: `[y0, y1)` is strictly disjoint across workers.
+                    let dst =
+                        unsafe { slice::from_raw_parts_mut(shadow.row_ptr(ry, 0), vis_bytes) };
+                    chunk.copy_to_nonoverlapping(dst);
+                }
+            }
+            break;
+        }
+
+        let (_, row_after) = aos.split_at(y * stride_px);
+        let (row_aos, _) = row_after.split_at(width);
+        // SAFETY: `[y0, y1)` is strictly disjoint across workers and `Vec4u8` has alignment 1.
+        let dst_row =
+            unsafe { slice::from_raw_parts_mut(shadow.row_ptr(y, 0).cast::<Vec4u8>(), width) };
+
+        let mut x = 0usize;
+        for is_dirty in &mut qx_dirty {
+            let cw = (width - x).min(SUBTILE_W);
+            let (_, after_x) = row_aos.split_at(x);
+            let (src_chunk, _) = after_x.split_at(cw);
+            let dst_chunk = &mut dst_row[x..x + cw];
+            if *is_dirty {
+                src_chunk.copy_to_nonoverlapping(dst_chunk);
+            } else if arch::Kernel::diff_and_update_row::<HAS_ALPHA>(src_chunk, dst_chunk) {
+                *is_dirty = true;
+                dirty_count += 1;
+            }
+            x += cw;
+        }
+    }
+
+    for (slot, &dirty) in dirty_slots.iter().zip(&qx_dirty) {
+        if dirty {
+            slot.store(true, Ordering::Relaxed);
+        }
+    }
+}
+
+/// Validates that every rect in `tile_rects` is non-empty, within
+/// [`TILE_PIXELS`], strictly inside `[0, width) x [0, height)`, and pairwise
+/// disjoint in `O(N log N)` time via a horizontal scanline sweep. Returns the
+/// total number of pixels covered.
+pub(crate) fn validate_tile_rects(tile_rects: &[TileRect], width: u32, height: u32) -> Result<u64> {
+    let mut total_pixels = 0u64;
+    for &rect in tile_rects {
+        let px = rect.validate_in_bounds(width, height).location(loc!())?;
+        total_pixels += px as u64;
+    }
+    if tile_rects.len() <= 1 {
+        return Ok(total_pixels);
+    }
+
+    let mut sorted = tile_rects.to_vec();
+    sorted.sort_unstable_by_key(|r| (r.y, r.x));
+
+    // Invariant: `active_x` maps `x0 -> x1` for every earlier rect with
+    // `y1 > cur.y`. Because all active rects overlap at `y = cur.y` and have
+    // already been proven pairwise disjoint, their `[x0, x1)` intervals are
+    // strictly disjoint and uniquely keyed by `x0`.
+    let mut active_x: BTreeMap<u32, u32> = BTreeMap::new();
+    let mut expire: BinaryHeap<Reverse<(u32, u32)>> = BinaryHeap::with_capacity(sorted.len());
+
+    for rect in sorted {
+        let rx0 = rect.x;
+        let rx1 = rect.x + rect.w;
+        let ry1 = rect.y + rect.h;
+
+        while let Some(&Reverse((y1, x0))) = expire.peek()
+            && y1 <= rect.y
+        {
+            expire.pop();
+            active_x.remove(&x0);
+        }
+
+        if let Some((&prev_x0, &prev_x1)) = active_x.range(..=rx0).next_back()
+            && prev_x1 > rx0
+        {
+            bail!(
+                "overlapping TileRect {rect:?} conflicts with active x-interval [{prev_x0}, {prev_x1})"
+            );
+        }
+        if let Some((&next_x0, &next_x1)) = active_x.range(rx0..rx1).next() {
+            bail!(
+                "overlapping TileRect {rect:?} conflicts with active x-interval [{next_x0}, {next_x1})"
+            );
+        }
+
+        active_x.insert(rx0, rx1);
+        expire.push(Reverse((ry1, rx0)));
+    }
+
+    Ok(total_pixels)
 }
 
 // --- public API ---
 
+/// Streams a full (`incremental = false`) frame covering the entire buffer.
+/// When `shadow_out` is `Some`, each worker copies its tile from `data` into
+/// `shadow_out` and encodes from that L2-hot copy so `shadow_out` always
+/// matches the transmitted pixels even if shared memory mutates concurrently.
 #[instrument(skip_all, level = "debug")]
-pub fn filter_and_compress_streaming(
+pub fn filter_and_compress_full_streaming(
     data: BufferPointer<u8>,
     client: ClientId,
     surface: WlSurfaceId,
     metadata: BufferMetadata,
-    bands: Option<Vec<RowBand>>,
+    shadow_out: Option<&mut Vec<u8>>,
     compressor: &mut ShardingCompressor,
     on_stream_ready: impl FnOnce(StreamingCompressedTiles),
 ) {
@@ -996,29 +1384,270 @@ pub fn filter_and_compress_streaming(
     let total_pixels = metadata
         .validate()
         .expect("server passed invalid BufferMetadata");
-    assert!(data.len() >= total_pixels * 4);
-    // SAFETY: Vec4u8 is a repr(C, packed) wrapper around [u8; 4].
-    let aos = unsafe { data.cast::<Vec4u8>() };
-    let stride_px = (metadata.stride as usize) / 4;
+    let byte_len = total_pixels * 4;
+    assert!(data.len() >= byte_len);
+
+    let stride = metadata.stride as usize;
+    let stride_px = stride / 4;
     let has_alpha = metadata.format == BufferFormat::Argb8888;
-    let (tiles_tx, tiles_rx) = crossbeam_channel::unbounded();
-
-    let tile_rects =
-        partition_tiles(&metadata, bands.as_deref()).expect("server generated invalid row bands");
+    let tile_rects: Vec<TileRect> = plan_incremental_scan(&metadata, None)
+        .expect("full-frame tile plan cannot fail")
+        .1
+        .into_iter()
+        .map(BaseScanEntry::rect)
+        .collect();
     let n_tiles = tile_rects.len();
+    let rects_for_workers = tile_rects.clone();
 
+    let shadow_rows = shadow_out.map(|shadow| {
+        if shadow.len() < byte_len {
+            shadow.resize(byte_len, 0);
+        } else {
+            shadow.truncate(byte_len);
+            if shadow.capacity() > byte_len.saturating_mul(2) {
+                shadow.shrink_to(byte_len);
+            }
+        }
+        ShadowRows {
+            base: shadow.as_mut_ptr(),
+            stride,
+        }
+    });
+
+    let (tiles_tx, tiles_rx) = crossbeam_channel::unbounded();
     let header = RawBufferHeader {
         client,
         surface,
         metadata,
-        n_tiles: n_tiles as u32,
-        bands,
+        incremental: false,
+        tile_rects,
     };
     on_stream_ready(StreamingCompressedTiles {
         header,
         tiles: tiles_rx,
     });
 
+    // SAFETY: Vec4u8 is a repr(C, packed) wrapper around [u8; 4].
+    let aos = unsafe { data.cast::<Vec4u8>() };
+    let next_tile = AtomicUsize::new(0);
+    compressor.pool.execute(n_tiles, |state| {
+        let mut disconnected = false;
+        loop {
+            let tile_idx = next_tile.fetch_add(1, Ordering::Relaxed);
+            if tile_idx >= n_tiles {
+                break;
+            }
+            let rect = rects_for_workers[tile_idx];
+            let shadow_ptr;
+            let encode_aos = if let Some(shadow) = &shadow_rows {
+                // SAFETY: `rects_for_workers` are pairwise disjoint and in-bounds,
+                // and each `tile_idx` is claimed once.
+                unsafe { copy_rect_to_shadow(data, shadow, stride, rect) };
+                if disconnected {
+                    continue;
+                }
+                shadow_ptr = shadow.base.cast_const().cast::<Vec4u8>();
+                // SAFETY: `shadow.base` is valid for `total_pixels` `Vec4u8`s and
+                // this worker holds exclusive access to `rect`'s pixels after the
+                // `&mut [u8]` row writes in `copy_rect_to_shadow` ended.
+                unsafe { BufferPointer::new(&shadow_ptr, total_pixels) }
+            } else {
+                aos
+            };
+            let payload = if has_alpha {
+                filter_tile::<arch::Kernel, true>(encode_aos, stride_px, rect, state)
+            } else {
+                filter_tile::<arch::Kernel, false>(encode_aos, stride_px, rect, state)
+            };
+
+            if tiles_tx
+                .send(CompressedTile {
+                    tile_idx: tile_idx as u32,
+                    payload,
+                })
+                .is_err()
+            {
+                if shadow_rows.is_some() {
+                    disconnected = true;
+                } else {
+                    break;
+                }
+            }
+        }
+    });
+}
+
+/// Diffs `data` against `shadow` across `bands` (or the full frame when `bands`
+/// is `None`), updates `shadow` for every changed `128x128` quadrant or
+/// `< 8`-row 1D strip, and streams only the dirty tiles (`incremental = true`)
+/// from `shadow`.
+///
+/// Returns the transmitted dirty [`TileRect`]s in deterministic raster order.
+/// When no pixels changed, returns an empty `Vec` without invoking
+/// `on_stream_ready`.
+#[instrument(skip_all, level = "debug")]
+pub fn filter_and_compress_incremental_streaming(
+    data: BufferPointer<u8>,
+    client: ClientId,
+    surface: WlSurfaceId,
+    metadata: BufferMetadata,
+    bands: Option<&[RowBand]>,
+    shadow: &mut [u8],
+    compressor: &mut ShardingCompressor,
+    on_stream_ready: impl FnOnce(StreamingCompressedTiles),
+) -> Vec<TileRect> {
+    assert!(data.len().is_multiple_of(4));
+    let total_pixels = metadata
+        .validate()
+        .expect("server passed invalid BufferMetadata");
+    let byte_len = total_pixels * 4;
+    assert!(data.len() >= byte_len);
+    assert!(shadow.len() >= byte_len);
+
+    let (sub_bands, base_entries, total_slots) =
+        plan_incremental_scan(&metadata, bands).expect("server generated invalid row bands");
+    if sub_bands.is_empty() {
+        return Vec::new();
+    }
+
+    let width = metadata.width as usize;
+    let stride = metadata.stride as usize;
+    let stride_px = stride / 4;
+    let has_alpha = metadata.format == BufferFormat::Argb8888;
+    let n_qx = width.div_ceil(SUBTILE_W);
+    let n_sub = sub_bands.len();
+    let dirty_flags: Vec<AtomicBool> = (0..total_slots).map(|_| AtomicBool::new(false)).collect();
+    // SAFETY: Vec4u8 is a repr(C, packed) wrapper around [u8; 4].
+    let aos = unsafe { data.cast::<Vec4u8>() };
+
+    // Phase A: parallel linear horizontal-band dirty scan + shadow update.
+    {
+        let shadow_rows = ShadowRows {
+            base: shadow.as_mut_ptr(),
+            stride,
+        };
+        let next_sub = AtomicUsize::new(0);
+        compressor.pool.execute(n_sub, |_| {
+            loop {
+                let idx = next_sub.fetch_add(1, Ordering::Relaxed);
+                if idx >= n_sub {
+                    break;
+                }
+                match sub_bands[idx] {
+                    ScanSubBand::Strip1D { rect, slot_idx } => {
+                        let dirty = if has_alpha {
+                            // SAFETY: `sub_bands` cover disjoint regions in `shadow`.
+                            unsafe {
+                                diff_and_update_strip::<true>(aos, &shadow_rows, stride_px, rect)
+                            }
+                        } else {
+                            // SAFETY: `sub_bands` cover disjoint regions in `shadow`.
+                            unsafe {
+                                diff_and_update_strip::<false>(aos, &shadow_rows, stride_px, rect)
+                            }
+                        };
+                        if dirty {
+                            dirty_flags[slot_idx].store(true, Ordering::Relaxed);
+                        }
+                    },
+                    ScanSubBand::RowBand2D { y0, y1, slot_base } => {
+                        let slots = &dirty_flags[slot_base..slot_base + n_qx];
+                        if has_alpha {
+                            // SAFETY: `sub_bands` cover disjoint row ranges in `shadow`.
+                            unsafe {
+                                diff_and_update_row_band_2d::<true>(
+                                    data,
+                                    aos,
+                                    &shadow_rows,
+                                    width,
+                                    stride,
+                                    y0 as usize,
+                                    y1 as usize,
+                                    slots,
+                                );
+                            }
+                        } else {
+                            // SAFETY: `sub_bands` cover disjoint row ranges in `shadow`.
+                            unsafe {
+                                diff_and_update_row_band_2d::<false>(
+                                    data,
+                                    aos,
+                                    &shadow_rows,
+                                    width,
+                                    stride,
+                                    y0 as usize,
+                                    y1 as usize,
+                                    slots,
+                                );
+                            }
+                        }
+                    },
+                }
+            }
+        });
+    }
+
+    let mut dirty_tiles = Vec::new();
+    for entry in &base_entries {
+        match *entry {
+            BaseScanEntry::Strip1D { rect, slot_idx } => {
+                if dirty_flags[slot_idx].load(Ordering::Relaxed) {
+                    dirty_tiles.push(rect);
+                }
+            },
+            BaseScanEntry::Tile2D {
+                rect,
+                quad_slots,
+                n_quads,
+            } => {
+                let mut mask = 0u8;
+                for (q, &slot) in quad_slots[..n_quads].iter().enumerate() {
+                    if dirty_flags[slot].load(Ordering::Relaxed) {
+                        mask |= 1u8 << q;
+                    }
+                }
+                if mask == 0 {
+                    continue;
+                }
+                let all_mask = (1u8 << n_quads) - 1;
+                if mask == all_mask {
+                    dirty_tiles.push(rect);
+                } else {
+                    let (quads, _) = tile_quadrants(rect);
+                    for (q, &quad) in quads[..n_quads].iter().enumerate() {
+                        if (mask & (1u8 << q)) != 0 {
+                            dirty_tiles.push(quad);
+                        }
+                    }
+                }
+            },
+        }
+    }
+
+    if dirty_tiles.is_empty() {
+        return dirty_tiles;
+    }
+
+    // Phase B: stream dirty tiles encoded directly from the updated `shadow`
+    // buffer so transmitted pixels are guaranteed consistent with `shadow`.
+    let n_tiles = dirty_tiles.len();
+    let (tiles_tx, tiles_rx) = crossbeam_channel::unbounded();
+    let header = RawBufferHeader {
+        client,
+        surface,
+        metadata,
+        incremental: true,
+        tile_rects: dirty_tiles.clone(),
+    };
+    on_stream_ready(StreamingCompressedTiles {
+        header,
+        tiles: tiles_rx,
+    });
+
+    let shadow_ptr = shadow.as_ptr().cast::<Vec4u8>();
+    // SAFETY: `shadow` has length `>= total_pixels * 4`, Phase A workers have
+    // joined, and `Vec4u8` is `repr(C, packed)` with alignment 1.
+    let shadow_aos = unsafe { BufferPointer::new(&shadow_ptr, total_pixels) };
     let next_tile = AtomicUsize::new(0);
     compressor.pool.execute(n_tiles, |state| {
         loop {
@@ -1026,18 +1655,26 @@ pub fn filter_and_compress_streaming(
             if tile_idx >= n_tiles {
                 break;
             }
-            let rect = tile_rects[tile_idx];
-            let tile = if has_alpha {
-                filter_tile::<arch::Kernel, true>(aos, stride_px, rect, state)
+            let rect = dirty_tiles[tile_idx];
+            let payload = if has_alpha {
+                filter_tile::<arch::Kernel, true>(shadow_aos, stride_px, rect, state)
             } else {
-                filter_tile::<arch::Kernel, false>(aos, stride_px, rect, state)
+                filter_tile::<arch::Kernel, false>(shadow_aos, stride_px, rect, state)
             };
 
-            if tiles_tx.send(tile).is_err() {
+            if tiles_tx
+                .send(CompressedTile {
+                    tile_idx: tile_idx as u32,
+                    payload,
+                })
+                .is_err()
+            {
                 break;
             }
         }
     });
+
+    dirty_tiles
 }
 
 #[instrument(skip_all, level = "debug")]
@@ -1047,7 +1684,7 @@ pub fn filter_and_compress(
     compressor: &mut ShardingCompressor,
 ) -> CompressedTiles {
     let mut streaming_opt = None;
-    filter_and_compress_streaming(
+    filter_and_compress_full_streaming(
         data,
         ClientId(0),
         WlSurfaceId(0),
@@ -1058,28 +1695,43 @@ pub fn filter_and_compress(
             streaming_opt = Some(streaming);
         },
     );
-    let mut tiles: Vec<CompressedTile> = streaming_opt.unwrap().tiles.into_iter().collect();
-    tiles.sort_by_key(|t| (t.rect.y, t.rect.x));
-    CompressedTiles { metadata, tiles }
+    let streaming = streaming_opt.unwrap();
+    let tile_rects = streaming.header.tile_rects;
+    let mut tiles: Vec<CompressedTile> = streaming.tiles.into_iter().collect();
+    tiles.sort_by_key(|t| t.tile_idx);
+    CompressedTiles {
+        metadata,
+        tile_rects,
+        tiles,
+    }
 }
 
-fn unfilter_tiles_parallel<'a>(
+/// Decodes a validated set of pairwise-disjoint `tile_rects` in parallel.
+///
+/// # Safety
+/// Caller must have validated `metadata` (`byte_len = total_pixels * 4`) and
+/// verified every rect in `tile_rects` via [`validate_tile_rects`].
+unsafe fn unfilter_tiles_parallel<'a>(
     decompressor: &mut ShardingDecompressor,
     metadata: BufferMetadata,
-    expected_tiles: usize,
+    byte_len: usize,
+    tile_rects: &[TileRect],
     output_buf: &mut [u8],
     next_tile: impl Fn() -> Option<Result<Cow<'a, CompressedTile>>> + Sync,
 ) -> Result<()> {
-    let total_pixels = metadata.validate().location(loc!())?;
-    let byte_len = total_pixels
-        .checked_mul(4)
-        .context(loc!(), "pixel count overflow")?;
     if output_buf.len() < byte_len {
         bail!("output_buf len {} < {byte_len}", output_buf.len());
     }
 
-    let width = metadata.width as u32;
-    let height = metadata.height as u32;
+    let n_tiles = tile_rects.len();
+    if n_tiles == 0 {
+        if let Some(item) = next_tile() {
+            item?;
+            bail!("received unexpected tile for 0-tile frame");
+        }
+        return Ok(());
+    }
+
     let stride_px = (metadata.stride as usize) / 4;
     let has_alpha = metadata.format == BufferFormat::Argb8888;
     let aos: &mut [Vec4u8] = bytemuck::cast_slice_mut(&mut output_buf[..byte_len]);
@@ -1088,42 +1740,34 @@ fn unfilter_tiles_parallel<'a>(
         stride_px,
     };
 
-    // Track every accepted tile rect under a short mutex so overlapping or
-    // out-of-bounds wire tiles are rejected BEFORE any worker writes to `frame`.
-    let accepted: Mutex<Vec<TileRect>> = Mutex::new(Vec::with_capacity(expected_tiles.min(1024)));
+    // Every `tile_rects` entry was validated in-bounds and pairwise disjoint
+    // upfront; an atomic slot per index rejects duplicate or out-of-range
+    // `tile_idx` without mutex contention before any worker writes `frame`.
+    let claimed: Vec<AtomicBool> = (0..n_tiles).map(|_| AtomicBool::new(false)).collect();
     let completed = AtomicUsize::new(0);
     let first_err: Mutex<Option<anyhow::Error>> = Mutex::new(None);
 
-    decompressor.pool.execute(expected_tiles, |state| {
+    decompressor.pool.execute(n_tiles, |state| {
         let mut streamed_any = false;
         while let Some(item) = next_tile() {
             let res = (|| -> Result<bool> {
                 let tile = item?;
-                tile.rect
-                    .validate_in_bounds(width, height)
-                    .location(loc!())?;
-                {
-                    let mut guard = accepted.lock().unwrap();
-                    if guard.len() >= expected_tiles {
-                        bail!("received more than expected {expected_tiles} tiles");
-                    }
-                    if let Some(conflict) = guard.iter().find(|prev| prev.overlaps(tile.rect)) {
-                        bail!(
-                            "overlapping TileRect {:?} conflicts with {:?}",
-                            tile.rect,
-                            conflict
-                        );
-                    }
-                    guard.push(tile.rect);
+                let idx = tile.tile_idx as usize;
+                let Some(slot) = claimed.get(idx) else {
+                    bail!("tile_idx {idx} out of range (n_tiles={n_tiles})");
+                };
+                if slot.swap(true, Ordering::AcqRel) {
+                    bail!("duplicate tile_idx {idx}");
                 }
-                // SAFETY: `tile.rect` passed `validate_in_bounds(width, height)`
-                // and pairwise disjointness against every other accepted tile
-                // in this frame before writing into `frame`.
+                let rect = tile_rects[idx];
+                // SAFETY: Caller validated `tile_rects` in-bounds and pairwise
+                // disjoint, and `claimed[idx]` guarantees exclusive ownership
+                // of `rect` for this worker.
                 unsafe {
                     if has_alpha {
-                        unfilter_tile::<arch::Kernel, true>(&tile, &frame, state)
+                        unfilter_tile::<arch::Kernel, true>(rect, &tile.payload, &frame, state)
                     } else {
-                        unfilter_tile::<arch::Kernel, false>(&tile, &frame, state)
+                        unfilter_tile::<arch::Kernel, false>(rect, &tile.payload, &frame, state)
                     }
                 }
             })();
@@ -1151,42 +1795,52 @@ fn unfilter_tiles_parallel<'a>(
         return Err(err);
     }
     let done = completed.load(Ordering::Relaxed);
-    if done != expected_tiles {
-        bail!("received {done} tiles, expected {expected_tiles}");
+    if done != n_tiles {
+        bail!("received {done} tiles, expected {n_tiles}");
     }
     Ok(())
 }
 
 pub struct ValidatedTileStream {
     stream: CompressedTileStream,
-    expected_tiles: usize,
+    byte_len: usize,
 }
 
 impl ValidatedTileStream {
     pub fn new(stream: CompressedTileStream) -> Result<Self> {
-        stream.header.metadata.validate().location(loc!())?;
-        let expected_tiles =
-            partition_tiles(&stream.header.metadata, stream.header.bands.as_deref())
-                .location(loc!())?
-                .len();
-        if stream.header.n_tiles as usize != expected_tiles {
+        let header = &stream.header;
+        let total_pixels = header.metadata.validate().location(loc!())?;
+        let byte_len = total_pixels
+            .checked_mul(4)
+            .context(loc!(), "pixel count overflow")?;
+        let width = header.metadata.width as u32;
+        let height = header.metadata.height as u32;
+        let max_tiles = (u64::from(width) * u64::from(height)).min(MAX_FRAME_TILES as u64);
+        if header.tile_rects.len() as u64 > max_tiles {
             bail!(
-                "header n_tiles {} != expected {expected_tiles}",
-                stream.header.n_tiles,
+                "header tile_rects len {} exceeds maximum {max_tiles} for {width}x{height}",
+                header.tile_rects.len(),
             );
         }
-        Ok(Self {
-            stream,
-            expected_tiles,
-        })
+        let covered_pixels =
+            validate_tile_rects(&header.tile_rects, width, height).location(loc!())?;
+        if !header.incremental && covered_pixels != u64::from(width) * u64::from(height) {
+            bail!(
+                "non-incremental frame covers {covered_pixels} pixels, expected {width}x{height}",
+            );
+        }
+        Ok(Self { stream, byte_len })
     }
 
     pub fn metadata(&self) -> BufferMetadata {
         self.stream.header.metadata
     }
 
-    pub fn bands(&self) -> Option<&[RowBand]> {
-        self.stream.header.bands.as_deref()
+    pub fn incremental_tile_rects(&self) -> Option<&[TileRect]> {
+        self.stream
+            .header
+            .incremental
+            .then_some(self.stream.header.tile_rects.as_slice())
     }
 }
 
@@ -1197,14 +1851,20 @@ pub fn decompress_and_unfilter_streaming(
     output_buf: &mut [u8],
 ) -> Result<()> {
     let metadata = validated.stream.header.metadata;
+    let tile_rects = &validated.stream.header.tile_rects;
     let tiles_rx = &validated.stream.tiles;
-    unfilter_tiles_parallel(
-        decompressor,
-        metadata,
-        validated.expected_tiles,
-        output_buf,
-        || tiles_rx.recv().ok().map(|r| r.map(Cow::Owned)),
-    )
+    // SAFETY: `ValidatedTileStream::new` validated `metadata`, `byte_len`, and
+    // `validate_tile_rects(tile_rects, width, height)`.
+    unsafe {
+        unfilter_tiles_parallel(
+            decompressor,
+            metadata,
+            validated.byte_len,
+            tile_rects,
+            output_buf,
+            || tiles_rx.recv().ok().map(|r| r.map(Cow::Owned)),
+        )
+    }
 }
 
 #[instrument(skip_all, level = "debug")]
@@ -1213,12 +1873,37 @@ pub fn decompress_and_unfilter(
     decompressor: &mut ShardingDecompressor,
     output_buf: &mut [u8],
 ) -> Result<()> {
+    let total_pixels = tiles.metadata.validate().location(loc!())?;
+    let byte_len = total_pixels
+        .checked_mul(4)
+        .context(loc!(), "pixel count overflow")?;
+    let width = tiles.metadata.width as u32;
+    let height = tiles.metadata.height as u32;
+    validate_tile_rects(&tiles.tile_rects, width, height).location(loc!())?;
+    if tiles.tiles.len() != tiles.tile_rects.len() {
+        bail!(
+            "tiles len {} != tile_rects len {}",
+            tiles.tiles.len(),
+            tiles.tile_rects.len(),
+        );
+    }
+
     let n_tiles = tiles.tiles.len();
     let next_idx = AtomicUsize::new(0);
-    unfilter_tiles_parallel(decompressor, tiles.metadata, n_tiles, output_buf, || {
-        let i = next_idx.fetch_add(1, Ordering::Relaxed);
-        (i < n_tiles).then(|| Ok(Cow::Borrowed(&tiles.tiles[i])))
-    })
+    // SAFETY: Validated `tiles.metadata` and `validate_tile_rects(&tiles.tile_rects)` above.
+    unsafe {
+        unfilter_tiles_parallel(
+            decompressor,
+            tiles.metadata,
+            byte_len,
+            &tiles.tile_rects,
+            output_buf,
+            || {
+                let i = next_idx.fetch_add(1, Ordering::Relaxed);
+                (i < n_tiles).then(|| Ok(Cow::Borrowed(&tiles.tiles[i])))
+            },
+        )
+    }
 }
 
 #[cfg(test)]
@@ -1483,6 +2168,45 @@ mod tests {
                 plane[tw / 2] ^= 1;
                 assert_eq!(arch::Kernel::is_constant_plane(&plane), None);
             }
+
+            // `diff_and_update_row` matches `ScalarKernel` on identical, alpha-only,
+            // and RGB-perturbed pixels at start/mid/end.
+            let mut sh_s = raw0.clone();
+            let mut sh_a = raw0.clone();
+            assert!(!ScalarKernel::diff_and_update_row::<true>(bp0, &mut sh_s));
+            assert!(!arch::Kernel::diff_and_update_row::<true>(bp0, &mut sh_a));
+            assert!(!arch::Kernel::diff_and_update_row::<false>(bp0, &mut sh_a));
+
+            for pos in [0, tw / 2, tw - 1] {
+                let mut alt_a = raw0.clone();
+                alt_a[pos].3 ^= 0x55;
+                let pa = alt_a.as_ptr();
+                let bpa = unsafe { BufferPointer::new(&pa, tw) };
+                sh_s.clone_from(&raw0);
+                sh_a.clone_from(&raw0);
+                assert!(!ScalarKernel::diff_and_update_row::<false>(bpa, &mut sh_s));
+                assert!(!arch::Kernel::diff_and_update_row::<false>(bpa, &mut sh_a));
+                assert_eq!(
+                    sh_a, raw0,
+                    "xrgb alpha-only must not write tw={tw} pos={pos}"
+                );
+                assert!(ScalarKernel::diff_and_update_row::<true>(bpa, &mut sh_s));
+                assert!(arch::Kernel::diff_and_update_row::<true>(bpa, &mut sh_a));
+                assert_eq!(sh_a, alt_a, "argb alpha diff tw={tw} pos={pos}");
+                assert_eq!(sh_a, sh_s);
+
+                let mut alt_rgb = raw0.clone();
+                alt_rgb[pos].1 ^= 0x33;
+                alt_rgb[tw - 1].2 ^= 0x11;
+                let pr = alt_rgb.as_ptr();
+                let bpr = unsafe { BufferPointer::new(&pr, tw) };
+                sh_s.clone_from(&raw0);
+                sh_a.clone_from(&raw0);
+                assert!(ScalarKernel::diff_and_update_row::<false>(bpr, &mut sh_s));
+                assert!(arch::Kernel::diff_and_update_row::<false>(bpr, &mut sh_a));
+                assert_eq!(sh_a, alt_rgb, "xrgb rgb diff tw={tw} pos={pos}");
+                assert_eq!(sh_a, sh_s);
+            }
         }
         // `i8::MIN` (`0x80` = `-128`) unsigned abs must equal `128` across all backends.
         let min_bytes = [0x80u8; 41];
@@ -1499,30 +2223,39 @@ mod tests {
             format: BufferFormat::Xrgb8888,
         };
         // Full 4K frame: 15 x 9 = 135 tiles (bottom row clipped to h = 112).
-        let full = partition_tiles(&meta, None).unwrap();
+        let (full_subs, full, _) = plan_incremental_scan(&meta, None).unwrap();
+        assert_eq!(full_subs.len(), 17);
         assert_eq!(full.len(), 15 * 9);
-        assert_eq!(
+        assert!(matches!(
             full[0],
-            TileRect {
-                x: 0,
-                y: 0,
-                w: 256,
-                h: 256,
+            BaseScanEntry::Tile2D {
+                rect: TileRect {
+                    x: 0,
+                    y: 0,
+                    w: 256,
+                    h: 256,
+                },
+                n_quads: 4,
+                ..
             }
-        );
-        assert_eq!(
+        ));
+        assert!(matches!(
             *full.last().unwrap(),
-            TileRect {
-                x: 3584,
-                y: 2048,
-                w: 256,
-                h: 112,
+            BaseScanEntry::Tile2D {
+                rect: TileRect {
+                    x: 3584,
+                    y: 2048,
+                    w: 256,
+                    h: 112,
+                },
+                n_quads: 2,
+                ..
             }
-        );
+        ));
 
         // Partial `< 8`-row bands emit 1 full-width 1D strip each.
         for h in [1u32, 7] {
-            let strip = partition_tiles(
+            let (_, strip, _) = plan_incremental_scan(
                 &meta,
                 Some(&[RowBand {
                     y0: 100,
@@ -1532,27 +2265,35 @@ mod tests {
             .unwrap();
             assert_eq!(
                 strip,
-                vec![TileRect {
-                    x: 0,
-                    y: 100,
-                    w: 3840,
-                    h,
+                vec![BaseScanEntry::Strip1D {
+                    rect: TileRect {
+                        x: 0,
+                        y: 100,
+                        w: 3840,
+                        h,
+                    },
+                    slot_idx: 0,
                 }]
             );
         }
 
         // Exact `band_h == 8` crosses into 2D `256x8` tiling (15 tiles on 4K).
-        let band8 = partition_tiles(&meta, Some(&[RowBand { y0: 100, y1: 108 }])).unwrap();
+        let (_, band8, _) =
+            plan_incremental_scan(&meta, Some(&[RowBand { y0: 100, y1: 108 }])).unwrap();
         assert_eq!(band8.len(), 15);
-        assert_eq!(
+        assert!(matches!(
             band8[0],
-            TileRect {
-                x: 0,
-                y: 100,
-                w: 256,
-                h: 8,
+            BaseScanEntry::Tile2D {
+                rect: TileRect {
+                    x: 0,
+                    y: 100,
+                    w: 256,
+                    h: 8,
+                },
+                n_quads: 2,
+                ..
             }
-        );
+        ));
 
         // Ultra-wide thin strip (`width = 20000, h = 7` -> `140,000 > TILE_PIXELS`) splits cleanly
         // so every tile remains `<= TILE_PIXELS`.
@@ -1562,20 +2303,329 @@ mod tests {
             stride: 20_000 * 4,
             format: BufferFormat::Xrgb8888,
         };
-        let wide_strips = partition_tiles(&wide_meta, Some(&[RowBand { y0: 0, y1: 7 }])).unwrap();
+        let (_, wide_strips, _) =
+            plan_incremental_scan(&wide_meta, Some(&[RowBand { y0: 0, y1: 7 }])).unwrap();
         assert_eq!(wide_strips.len(), 3);
-        assert!(wide_strips.iter().all(|r| r.checked_pixels().is_ok()));
-        assert_eq!(wide_strips.iter().map(|r| r.w).sum::<u32>(), 20_000);
+        assert!(wide_strips.iter().all(
+            |t| matches!(t, BaseScanEntry::Strip1D { rect, .. } if rect.checked_pixels().is_ok())
+        ));
+        assert_eq!(wide_strips.iter().map(|t| t.rect().w).sum::<u32>(), 20_000);
 
         // Empty bands -> 0 tiles; invalid bands -> Err.
-        assert!(partition_tiles(&meta, Some(&[])).unwrap().is_empty());
+        assert!(
+            plan_incremental_scan(&meta, Some(&[]))
+                .unwrap()
+                .1
+                .is_empty()
+        );
         for bad_bands in [
             vec![RowBand { y0: 5, y1: 5 }],
             vec![RowBand { y0: 10, y1: 5 }],
             vec![RowBand { y0: 10, y1: 20 }, RowBand { y0: 15, y1: 25 }],
             vec![RowBand { y0: 2150, y1: 2161 }],
         ] {
-            assert!(partition_tiles(&meta, Some(&bad_bands)).is_err());
+            assert!(plan_incremental_scan(&meta, Some(&bad_bands)).is_err());
+        }
+
+        // Quadrant subdivision across 4-, 2-horizontal-, 2-vertical-, and 1-quadrant shapes.
+        let (q4, n4) = tile_quadrants(TileRect {
+            x: 256,
+            y: 512,
+            w: 200,
+            h: 150,
+        });
+        assert_eq!(n4, 4);
+        assert_eq!(
+            &q4[..n4],
+            &[
+                TileRect {
+                    x: 256,
+                    y: 512,
+                    w: 128,
+                    h: 128
+                },
+                TileRect {
+                    x: 384,
+                    y: 512,
+                    w: 72,
+                    h: 128
+                },
+                TileRect {
+                    x: 256,
+                    y: 640,
+                    w: 128,
+                    h: 22
+                },
+                TileRect {
+                    x: 384,
+                    y: 640,
+                    w: 72,
+                    h: 22
+                },
+            ]
+        );
+        let (q2h, n2h) = tile_quadrants(TileRect {
+            x: 0,
+            y: 2048,
+            w: 256,
+            h: 112,
+        });
+        assert_eq!(n2h, 2);
+        assert_eq!(
+            &q2h[..n2h],
+            &[
+                TileRect {
+                    x: 0,
+                    y: 2048,
+                    w: 128,
+                    h: 112
+                },
+                TileRect {
+                    x: 128,
+                    y: 2048,
+                    w: 128,
+                    h: 112
+                },
+            ]
+        );
+        let (q2v, n2v) = tile_quadrants(TileRect {
+            x: 1792,
+            y: 0,
+            w: 128,
+            h: 256,
+        });
+        assert_eq!(n2v, 2);
+        assert_eq!(
+            &q2v[..n2v],
+            &[
+                TileRect {
+                    x: 1792,
+                    y: 0,
+                    w: 128,
+                    h: 128
+                },
+                TileRect {
+                    x: 1792,
+                    y: 128,
+                    w: 128,
+                    h: 128
+                },
+            ]
+        );
+        let (q1, n1) = tile_quadrants(TileRect {
+            x: 1792,
+            y: 960,
+            w: 128,
+            h: 120,
+        });
+        assert_eq!(n1, 1);
+        assert_eq!(
+            q1[0],
+            TileRect {
+                x: 1792,
+                y: 960,
+                w: 128,
+                h: 120
+            }
+        );
+    }
+
+    #[test]
+    fn test_validate_tile_rects_sweep_line() {
+        let tr = |x, y, w, h| TileRect { x, y, w, h };
+
+        // Full non-overlapping mixed 256x256 + 128x128 + edge tiling.
+        let mixed = [
+            tr(0, 0, 256, 256),
+            tr(256, 0, 128, 128),
+            tr(384, 0, 64, 128),
+            tr(256, 128, 192, 128),
+            tr(0, 256, 448, 44),
+        ];
+        assert_eq!(validate_tile_rects(&mixed, 448, 300).unwrap(), 448 * 300);
+        // Shuffled order must validate identically.
+        let mut rev = mixed;
+        rev.reverse();
+        assert_eq!(validate_tile_rects(&rev, 448, 300).unwrap(), 448 * 300);
+        assert_eq!(validate_tile_rects(&[], 448, 300).unwrap(), 0);
+
+        // Overlaps: partial corner, contained, enclosing arriving later, duplicate,
+        // and horizontal overlap with a tall earlier strip.
+        for bad in [
+            vec![tr(0, 0, 40, 40), tr(39, 39, 25, 25)],
+            vec![tr(0, 0, 128, 128), tr(10, 10, 20, 20)],
+            vec![tr(20, 0, 20, 60), tr(0, 30, 60, 10)],
+            vec![tr(0, 0, 32, 32), tr(0, 0, 32, 32)],
+            vec![tr(100, 0, 10, 200), tr(0, 50, 101, 10)],
+        ] {
+            assert!(
+                validate_tile_rects(&bad, 256, 256).is_err(),
+                "expected overlap err for {bad:?}"
+            );
+        }
+
+        // Out-of-bounds and zero-dim rects.
+        for bad in [
+            tr(32, 0, 33, 64),
+            tr(0, 32, 64, 33),
+            tr(0, 0, 0, 10),
+            tr(0, 0, 10, 0),
+        ] {
+            assert!(validate_tile_rects(&[bad], 64, 64).is_err());
+        }
+    }
+
+    #[test]
+    fn test_shadow_diff_and_copy_miri_safe() {
+        // Exercises `copy_rect_to_shadow`, `diff_and_update_strip`, and
+        // `diff_and_update_row_band_2d` (both packed and padded strides,
+        // partial-dirty and bulk-all-dirty fast paths, Xrgb vs Argb).
+        for pad_bytes in [0usize, 12usize] {
+            let width = 160usize;
+            let height = 20usize;
+            let stride = width * 4 + pad_bytes;
+            let stride_px = stride / 4;
+            let len = stride * height;
+
+            let mut src = test_vec(len);
+            let mut shadow = vec![0xAAu8; len];
+
+            let src_ptr = src.as_ptr();
+            let bp = unsafe { BufferPointer::new(&src_ptr, len) };
+            let aos = unsafe { bp.cast::<Vec4u8>() };
+            let shadow_rows = ShadowRows {
+                base: shadow.as_mut_ptr(),
+                stride,
+            };
+            let rect_band = TileRect {
+                x: 0,
+                y: 0,
+                w: width as u32,
+                h: 12,
+            };
+            let rect_strip = TileRect {
+                x: 0,
+                y: 12,
+                w: width as u32,
+                h: 4,
+            };
+
+            unsafe {
+                copy_rect_to_shadow(bp, &shadow_rows, stride, rect_band);
+                copy_rect_to_shadow(bp, &shadow_rows, stride, rect_strip);
+                assert!(!diff_and_update_strip::<true>(
+                    aos,
+                    &shadow_rows,
+                    stride_px,
+                    rect_strip
+                ));
+                assert!(!diff_and_update_strip::<false>(
+                    aos,
+                    &shadow_rows,
+                    stride_px,
+                    rect_strip
+                ));
+            }
+
+            // Flip only byte 3 (X/alpha) in quadrant 0 of `[0..12)` -> ignored
+            // on Xrgb, caught on Argb.
+            let a_off = 5 * stride + 10 * 4 + 3;
+            src[a_off] ^= 0xFF;
+            let src_ptr = src.as_ptr();
+            let bp = unsafe { BufferPointer::new(&src_ptr, len) };
+            let aos = unsafe { bp.cast::<Vec4u8>() };
+            let slots_xrgb = [AtomicBool::new(false), AtomicBool::new(false)];
+            unsafe {
+                diff_and_update_row_band_2d::<false>(
+                    bp,
+                    aos,
+                    &shadow_rows,
+                    width,
+                    stride,
+                    0,
+                    12,
+                    &slots_xrgb,
+                );
+            }
+            assert!(!slots_xrgb[0].load(Ordering::Relaxed));
+            assert!(!slots_xrgb[1].load(Ordering::Relaxed));
+            assert_ne!(shadow[a_off], src[a_off]);
+
+            let slots_argb = [AtomicBool::new(false), AtomicBool::new(false)];
+            unsafe {
+                diff_and_update_row_band_2d::<true>(
+                    bp,
+                    aos,
+                    &shadow_rows,
+                    width,
+                    stride,
+                    0,
+                    12,
+                    &slots_argb,
+                );
+            }
+            assert!(slots_argb[0].load(Ordering::Relaxed));
+            assert!(!slots_argb[1].load(Ordering::Relaxed));
+            assert_eq!(shadow[a_off], src[a_off]);
+
+            // Flip RGB in BOTH quadrants on row 0 AND another pixel on row 11
+            // to exercise the all-quadrants-dirty bulk copy fast path.
+            let q0_off = 2 * 4;
+            let q1_off = 140 * 4;
+            let last_off = 11 * stride + 150 * 4;
+            src[q0_off] ^= 0x11;
+            src[q1_off] ^= 0x22;
+            src[last_off] ^= 0x33;
+            let src_ptr = src.as_ptr();
+            let bp = unsafe { BufferPointer::new(&src_ptr, len) };
+            let aos = unsafe { bp.cast::<Vec4u8>() };
+            let slots_all = [AtomicBool::new(false), AtomicBool::new(false)];
+            unsafe {
+                diff_and_update_row_band_2d::<false>(
+                    bp,
+                    aos,
+                    &shadow_rows,
+                    width,
+                    stride,
+                    0,
+                    12,
+                    &slots_all,
+                );
+            }
+            assert!(slots_all[0].load(Ordering::Relaxed));
+            assert!(slots_all[1].load(Ordering::Relaxed));
+            assert_eq!(shadow[q0_off], src[q0_off]);
+            assert_eq!(shadow[q1_off], src[q1_off]);
+            assert_eq!(shadow[last_off], src[last_off]);
+
+            // Flip RGB in `rect_strip` (row 13 + trailing row 15).
+            let strip_off = 13 * stride + 150 * 4;
+            let strip_last = 15 * stride + 10 * 4;
+            src[strip_off] ^= 0x5A;
+            src[strip_last] ^= 0x3C;
+            let src_ptr = src.as_ptr();
+            let bp = unsafe { BufferPointer::new(&src_ptr, len) };
+            let aos = unsafe { bp.cast::<Vec4u8>() };
+            unsafe {
+                assert!(diff_and_update_strip::<false>(
+                    aos,
+                    &shadow_rows,
+                    stride_px,
+                    rect_strip
+                ));
+            }
+            assert_eq!(shadow[strip_off], src[strip_off]);
+            assert_eq!(shadow[strip_last], src[strip_last]);
+
+            // Stride padding on every row must stay untouched (`0xAA`).
+            if pad_bytes > 0 {
+                for y in 0..height {
+                    assert_eq!(
+                        &shadow[y * stride + width * 4..(y + 1) * stride],
+                        &vec![0xAAu8; pad_bytes][..]
+                    );
+                }
+            }
         }
     }
 
@@ -1894,103 +2944,280 @@ mod tests {
 
     #[test]
     #[cfg_attr(miri, ignore)]
-    fn test_partial_row_bands_streaming_roundtrip() {
+    fn test_incremental_quadrant_skip_and_shadow_sync() {
         with_test_codec(|compressor, decompressor| {
+            let tr = |x, y, w, h| TileRect { x, y, w, h };
+
             for format in [BufferFormat::Argb8888, BufferFormat::Xrgb8888] {
                 for pad_bytes in [0i32, 16i32] {
-                    let width = 480i32;
-                    let height = 600i32;
+                    // `400x360` produces:
+                    // - (0, 0, 256, 256): 4 quadrants (128x128 each)
+                    // - (256, 0, 144, 256): 4 clipped quadrants (128x128, 16x128, 128x128, 16x128)
+                    // - (0, 256, 256, 104): 2 horizontal quadrants (128x104, 128x104)
+                    // - (256, 256, 144, 104): 2 horizontal clipped quadrants (128x104, 16x104)
+                    let width = 400i32;
+                    let height = 360i32;
                     let stride = width * 4 + pad_bytes;
-                    let len = (stride * height) as usize;
-                    let mut frame0 = test_vec(len);
-                    let frame1: Vec<u8> = (0..len).map(|i| ((i * 11 + 7) % 255) as u8).collect();
-                    let mut frame1_expected = frame1.clone();
-                    if format == BufferFormat::Xrgb8888 {
-                        for px in frame0.as_chunks_mut::<4>().0 {
-                            px[3] = 0xFF;
-                        }
-                        for px in frame1_expected.as_chunks_mut::<4>().0 {
-                            px[3] = 0xFF;
-                        }
-                    }
-
-                    // Band 1: 1 row (`< 8` -> 1D strip fallback); Band 2: 180 rows (2D tiles).
-                    let partial_bands = compute_partial_row_bands(
-                        &[
-                            Rectangle::new(0, 3, width, 1),
-                            Rectangle::new(50, 300, 100, 180),
-                        ],
+                    let stride_us = stride as usize;
+                    let vis_bytes = (width * 4) as usize;
+                    let len = stride_us * height as usize;
+                    let metadata = BufferMetadata {
                         width,
                         height,
-                    )
-                    .unwrap();
+                        stride,
+                        format,
+                    };
 
-                    for bands_case in [None, Some(Vec::new()), Some(partial_bands)] {
-                        let metadata = BufferMetadata {
-                            width,
-                            height,
-                            stride,
-                            format,
-                        };
-                        let ptr = frame1.as_ptr();
-                        let buf_ptr = unsafe { BufferPointer::new(&ptr, len) };
+                    let mut frame = test_vec(len);
+                    let mut shadow = Vec::new();
+                    let mut client_canvas = AlignedVec::<64>::with_capacity(len);
+                    client_canvas.resize(len, 0xCC);
 
-                        let mut streaming_opt = None;
-                        filter_and_compress_streaming(
-                            buf_ptr,
-                            ClientId(1),
-                            WlSurfaceId(2),
-                            metadata,
-                            bands_case.clone(),
-                            compressor,
-                            |s| streaming_opt = Some(s),
-                        );
+                    let apply_stream = |streaming: StreamingCompressedTiles,
+                                        decomp: &mut ShardingDecompressor,
+                                        canvas: &mut [u8]| {
                         let mut wire = Vec::new();
-                        streaming_opt.unwrap().framed_write(&mut wire).unwrap();
-
-                        let mut client_canvas = AlignedVec::<64>::with_capacity(len);
-                        client_canvas.extend_from_slice(&frame0);
-                        let mut wire_slice = wire.as_slice();
-                        let mut tile_stream_opt = None;
-                        CompressedTileStream::read_from_stream(&mut wire_slice, |tile_stream| {
-                            tile_stream_opt = Some(tile_stream);
+                        streaming.framed_write(&mut wire).unwrap();
+                        let mut rdr = wire.as_slice();
+                        let mut rx_stream = None;
+                        CompressedTileStream::read_from_stream(&mut rdr, |s| {
+                            rx_stream = Some(s);
                             Ok(())
                         })
                         .unwrap();
-                        decompress_and_unfilter_streaming(
-                            ValidatedTileStream::new(tile_stream_opt.unwrap()).unwrap(),
-                            decompressor,
-                            &mut client_canvas,
-                        )
-                        .unwrap();
+                        assert!(rdr.is_empty());
+                        let validated = ValidatedTileStream::new(rx_stream.unwrap()).unwrap();
+                        decompress_and_unfilter_streaming(validated, decomp, canvas).unwrap();
+                    };
 
-                        let visible_bytes = (width * 4) as usize;
-                        let stride_us = stride as usize;
+                    let check_canvas = |canvas: &[u8], expected: &[u8]| {
                         for y in 0..height as usize {
-                            let row_damaged = match &bands_case {
-                                None => true,
-                                Some(bs) => bs
-                                    .iter()
-                                    .any(|b| (b.y0 as usize..b.y1 as usize).contains(&y)),
-                            };
-                            let row_off = y * stride_us;
-                            let exp_row = if row_damaged {
-                                &frame1_expected[row_off..row_off + visible_bytes]
-                            } else {
-                                &frame0[row_off..row_off + visible_bytes]
-                            };
+                            let row = y * stride_us;
+                            for x in 0..width as usize {
+                                let px = row + x * 4;
+                                let exp_a = if format == BufferFormat::Xrgb8888 {
+                                    0xFF
+                                } else {
+                                    expected[px + 3]
+                                };
+                                assert_eq!(
+                                    &canvas[px..px + 4],
+                                    &[expected[px], expected[px + 1], expected[px + 2], exp_a],
+                                    "pixel ({x},{y}) mismatch (format={format:?}, pad={pad_bytes})"
+                                );
+                            }
                             assert_eq!(
-                                &client_canvas[row_off..row_off + visible_bytes],
-                                exp_row,
-                                "row {y} mismatch (format={format:?}, pad={pad_bytes})"
-                            );
-                            // Stride padding bytes must remain untouched.
-                            assert_eq!(
-                                &client_canvas[row_off + visible_bytes..row_off + stride_us],
-                                &frame0[row_off + visible_bytes..row_off + stride_us],
+                                &canvas[row + vis_bytes..row + stride_us],
+                                &vec![0xCCu8; pad_bytes as usize][..],
                                 "stride padding modified on row {y}"
                             );
                         }
+                    };
+
+                    let set_px = |buf: &mut [u8], x: usize, y: usize, bgr_xor: u8, a_xor: u8| {
+                        let off = y * stride_us + x * 4;
+                        buf[off] ^= bgr_xor;
+                        buf[off + 1] ^= bgr_xor.rotate_left(1);
+                        buf[off + 2] ^= bgr_xor.rotate_left(2);
+                        buf[off + 3] ^= a_xor;
+                    };
+
+                    // Step 0: Initial full sync populates `shadow` and client canvas.
+                    {
+                        let ptr = frame.as_ptr();
+                        let bp = unsafe { BufferPointer::new(&ptr, len) };
+                        let mut streaming = None;
+                        filter_and_compress_full_streaming(
+                            bp,
+                            ClientId(1),
+                            WlSurfaceId(2),
+                            metadata,
+                            Some(&mut shadow),
+                            compressor,
+                            |s| streaming = Some(s),
+                        );
+                        apply_stream(streaming.unwrap(), decompressor, &mut client_canvas);
+                    }
+                    check_canvas(&client_canvas, &frame);
+
+                    // Step 1: Zero-dirty full-frame scan -> returns empty and NEVER calls `on_stream_ready`.
+                    {
+                        let ptr = frame.as_ptr();
+                        let bp = unsafe { BufferPointer::new(&ptr, len) };
+                        let mut called = false;
+                        let dirty = filter_and_compress_incremental_streaming(
+                            bp,
+                            ClientId(1),
+                            WlSurfaceId(2),
+                            metadata,
+                            None,
+                            &mut shadow,
+                            compressor,
+                            |_| called = true,
+                        );
+                        assert!(dirty.is_empty());
+                        assert!(!called);
+                    }
+
+                    // Step 2: Perturbing ONLY the alpha/X byte -> skipped on Xrgb8888,
+                    // caught on Argb8888!
+                    set_px(&mut frame, 10, 20, 0, 0x55);
+                    {
+                        let ptr = frame.as_ptr();
+                        let bp = unsafe { BufferPointer::new(&ptr, len) };
+                        let mut streaming = None;
+                        let dirty = filter_and_compress_incremental_streaming(
+                            bp,
+                            ClientId(1),
+                            WlSurfaceId(2),
+                            metadata,
+                            None,
+                            &mut shadow,
+                            compressor,
+                            |s| streaming = Some(s),
+                        );
+                        if format == BufferFormat::Xrgb8888 {
+                            assert!(dirty.is_empty());
+                            assert!(streaming.is_none());
+                        } else {
+                            assert_eq!(dirty, vec![tr(0, 0, 128, 128)]);
+                            apply_stream(streaming.unwrap(), decompressor, &mut client_canvas);
+                        }
+                    }
+                    check_canvas(&client_canvas, &frame);
+
+                    // Step 3: 1 dirty quadrant in (0,0,256,256) + 2 dirty quadrants in clipped
+                    // right edge (256,0,144,256) + 1 dirty quadrant in bottom edge (0,256,256,104).
+                    set_px(&mut frame, 150, 10, 0x33, 0); // TR of (0,0,256,256) -> (128,0,128,128)
+                    set_px(&mut frame, 390, 5, 0x44, 0); // TR of (256,0,144,256) -> (384,0,16,128)
+                    set_px(&mut frame, 260, 200, 0x55, 0); // BL of (256,0,144,256) -> (256,128,128,128)
+                    set_px(&mut frame, 200, 300, 0x66, 0); // right of (0,256,256,104) -> (128,256,128,104)
+                    {
+                        let ptr = frame.as_ptr();
+                        let bp = unsafe { BufferPointer::new(&ptr, len) };
+                        let mut streaming = None;
+                        let dirty = filter_and_compress_incremental_streaming(
+                            bp,
+                            ClientId(1),
+                            WlSurfaceId(2),
+                            metadata,
+                            None,
+                            &mut shadow,
+                            compressor,
+                            |s| streaming = Some(s),
+                        );
+                        assert_eq!(
+                            dirty,
+                            vec![
+                                tr(128, 0, 128, 128),
+                                tr(384, 0, 16, 128),
+                                tr(256, 128, 128, 128),
+                                tr(128, 256, 128, 104),
+                            ]
+                        );
+                        apply_stream(streaming.unwrap(), decompressor, &mut client_canvas);
+                    }
+                    check_canvas(&client_canvas, &frame);
+
+                    // Step 4: All 4 quadrants dirty in (0,0,256,256) -> coalesces to ONE `256x256`
+                    // tile! Also all 2 quadrants dirty in bottom-right (256,256,144,104) -> ONE
+                    // `144x104` tile!
+                    set_px(&mut frame, 1, 1, 0x11, 0);
+                    set_px(&mut frame, 130, 1, 0x11, 0);
+                    set_px(&mut frame, 1, 130, 0x11, 0);
+                    set_px(&mut frame, 130, 130, 0x11, 0);
+                    set_px(&mut frame, 260, 260, 0x22, 0);
+                    set_px(&mut frame, 395, 355, 0x22, 0);
+                    {
+                        let ptr = frame.as_ptr();
+                        let bp = unsafe { BufferPointer::new(&ptr, len) };
+                        let mut streaming = None;
+                        let dirty = filter_and_compress_incremental_streaming(
+                            bp,
+                            ClientId(1),
+                            WlSurfaceId(2),
+                            metadata,
+                            None,
+                            &mut shadow,
+                            compressor,
+                            |s| streaming = Some(s),
+                        );
+                        assert_eq!(dirty, vec![tr(0, 0, 256, 256), tr(256, 256, 144, 104)]);
+                        apply_stream(streaming.unwrap(), decompressor, &mut client_canvas);
+                    }
+                    check_canvas(&client_canvas, &frame);
+
+                    // Step 5: `< 8`-row partial band (1D strip): unchanged -> skipped;
+                    // changed -> emits single 1D strip and updates shadow.
+                    let thin_band = [RowBand { y0: 40, y1: 43 }];
+                    {
+                        let ptr = frame.as_ptr();
+                        let bp = unsafe { BufferPointer::new(&ptr, len) };
+                        let dirty = filter_and_compress_incremental_streaming(
+                            bp,
+                            ClientId(1),
+                            WlSurfaceId(2),
+                            metadata,
+                            Some(&thin_band),
+                            &mut shadow,
+                            compressor,
+                            |_| panic!("unchanged 1D strip must not emit stream"),
+                        );
+                        assert!(dirty.is_empty());
+                    }
+                    set_px(&mut frame, 300, 41, 0x77, 0);
+                    {
+                        let ptr = frame.as_ptr();
+                        let bp = unsafe { BufferPointer::new(&ptr, len) };
+                        let mut streaming = None;
+                        let dirty = filter_and_compress_incremental_streaming(
+                            bp,
+                            ClientId(1),
+                            WlSurfaceId(2),
+                            metadata,
+                            Some(&thin_band),
+                            &mut shadow,
+                            compressor,
+                            |s| streaming = Some(s),
+                        );
+                        assert_eq!(dirty, vec![tr(0, 40, 400, 3)]);
+                        apply_stream(streaming.unwrap(), decompressor, &mut client_canvas);
+                    }
+                    check_canvas(&client_canvas, &frame);
+
+                    // Step 6: Immediately re-scanning the full frame sees 0 dirty tiles,
+                    // proving the shadow buffer stayed bit-exact across all edits.
+                    {
+                        let ptr = frame.as_ptr();
+                        let bp = unsafe { BufferPointer::new(&ptr, len) };
+                        let dirty = filter_and_compress_incremental_streaming(
+                            bp,
+                            ClientId(1),
+                            WlSurfaceId(2),
+                            metadata,
+                            None,
+                            &mut shadow,
+                            compressor,
+                            |_| panic!("shadow desynchronized after multi-frame edits"),
+                        );
+                        assert!(dirty.is_empty());
+                    }
+
+                    // Step 7: Empty bands slice returns empty immediately.
+                    {
+                        let ptr = frame.as_ptr();
+                        let bp = unsafe { BufferPointer::new(&ptr, len) };
+                        let dirty = filter_and_compress_incremental_streaming(
+                            bp,
+                            ClientId(1),
+                            WlSurfaceId(2),
+                            metadata,
+                            Some(&[]),
+                            &mut shadow,
+                            compressor,
+                            |_| panic!("empty bands must not emit stream"),
+                        );
+                        assert!(dirty.is_empty());
                     }
                 }
             }
@@ -2012,28 +3239,77 @@ mod tests {
             // Overlapping TileRects must be rejected before writing!
             let overlapping = CompressedTiles {
                 metadata: meta,
+                tile_rects: vec![
+                    TileRect {
+                        x: 0,
+                        y: 0,
+                        w: 40,
+                        h: 40,
+                    },
+                    TileRect {
+                        x: 39,
+                        y: 39,
+                        w: 25,
+                        h: 25,
+                    },
+                ],
                 tiles: vec![
                     CompressedTile {
-                        rect: TileRect {
-                            x: 0,
-                            y: 0,
-                            w: 40,
-                            h: 40,
-                        },
+                        tile_idx: 0,
                         payload: TilePayload::Solid([1, 2, 3, 0xFF]),
                     },
                     CompressedTile {
-                        rect: TileRect {
-                            x: 39,
-                            y: 39,
-                            w: 25,
-                            h: 25,
-                        },
+                        tile_idx: 1,
                         payload: TilePayload::Solid([4, 5, 6, 0xFF]),
                     },
                 ],
             };
             assert!(decompress_and_unfilter(&overlapping, decompressor, &mut out).is_err());
+
+            // Duplicate `tile_idx` and out-of-range `tile_idx` must be rejected!
+            let dup_idx = CompressedTiles {
+                metadata: meta,
+                tile_rects: vec![
+                    TileRect {
+                        x: 0,
+                        y: 0,
+                        w: 32,
+                        h: 64,
+                    },
+                    TileRect {
+                        x: 32,
+                        y: 0,
+                        w: 32,
+                        h: 64,
+                    },
+                ],
+                tiles: vec![
+                    CompressedTile {
+                        tile_idx: 0,
+                        payload: TilePayload::Solid([1, 2, 3, 0xFF]),
+                    },
+                    CompressedTile {
+                        tile_idx: 0,
+                        payload: TilePayload::Solid([4, 5, 6, 0xFF]),
+                    },
+                ],
+            };
+            assert!(decompress_and_unfilter(&dup_idx, decompressor, &mut out).is_err());
+
+            let oob_idx = CompressedTiles {
+                metadata: meta,
+                tile_rects: vec![TileRect {
+                    x: 0,
+                    y: 0,
+                    w: 64,
+                    h: 64,
+                }],
+                tiles: vec![CompressedTile {
+                    tile_idx: 1,
+                    payload: TilePayload::Solid([1, 2, 3, 0xFF]),
+                }],
+            };
+            assert!(decompress_and_unfilter(&oob_idx, decompressor, &mut out).is_err());
 
             // Out-of-bounds TileRect (`x + w > width`, `y + h > height`, empty `w == 0`).
             for bad_rect in [
@@ -2058,8 +3334,9 @@ mod tests {
             ] {
                 let bad = CompressedTiles {
                     metadata: meta,
+                    tile_rects: vec![bad_rect],
                     tiles: vec![CompressedTile {
-                        rect: bad_rect,
+                        tile_idx: 0,
                         payload: TilePayload::Solid([1, 2, 3, 0xFF]),
                     }],
                 };
@@ -2118,8 +3395,9 @@ mod tests {
             ] {
                 let bad = CompressedTiles {
                     metadata: meta,
+                    tile_rects: vec![r4x3],
                     tiles: vec![CompressedTile {
-                        rect: r4x3,
+                        tile_idx: 0,
                         payload: bad_payload,
                     }],
                 };
@@ -2146,16 +3424,18 @@ mod tests {
             ] {
                 let bad = CompressedTiles {
                     metadata: xrgb_meta,
+                    tile_rects: vec![r4x3],
                     tiles: vec![CompressedTile {
-                        rect: r4x3,
+                        tile_idx: 0,
                         payload: bad_xrgb,
                     }],
                 };
                 assert!(decompress_and_unfilter(&bad, decompressor, &mut out).is_err());
             }
 
-            // Multi-tile frame: early drop in `on_stream_ready`, out-of-order arrival,
-            // undersized `output_buf`, missing tile, and mismatched `header.n_tiles`.
+            // Multi-tile frame: early drop in `on_stream_ready` (with and without shadow),
+            // out-of-order arrival, undersized `output_buf`, missing tile, and upfront
+            // `ValidatedTileStream::new` rejections.
             let meta_2 = BufferMetadata {
                 width: 300,
                 height: 20,
@@ -2166,7 +3446,7 @@ mod tests {
             let ptr_2 = data_2.as_ptr();
             let bp_2 = unsafe { BufferPointer::new(&ptr_2, data_2.len()) };
 
-            filter_and_compress_streaming(
+            filter_and_compress_full_streaming(
                 bp_2,
                 ClientId(1),
                 WlSurfaceId(1),
@@ -2175,6 +3455,18 @@ mod tests {
                 compressor,
                 drop,
             );
+            let mut shadow_dropped = Vec::new();
+            filter_and_compress_full_streaming(
+                bp_2,
+                ClientId(1),
+                WlSurfaceId(1),
+                meta_2,
+                Some(&mut shadow_dropped),
+                compressor,
+                drop,
+            );
+            // Shadow must still be fully populated even when stream receiver dropped early.
+            assert_eq!(shadow_dropped, data_2);
 
             let mut two_tiles = filter_and_compress(bp_2, meta_2, compressor);
             assert_eq!(two_tiles.tiles.len(), 2);
@@ -2186,7 +3478,7 @@ mod tests {
             let mut short_out = vec![0u8; data_2.len() - 4];
             assert!(decompress_and_unfilter(&two_tiles, decompressor, &mut short_out).is_err());
 
-            // Streaming missing tile (`done < expected_tiles`).
+            // Streaming missing tile (`done < n_tiles`).
             let (tx_short, rx_short) = crossbeam_channel::unbounded();
             tx_short.send(Ok(two_tiles.tiles[0].clone())).unwrap();
             drop(tx_short);
@@ -2195,8 +3487,8 @@ mod tests {
                     client: ClientId(1),
                     surface: WlSurfaceId(1),
                     metadata: meta_2,
-                    n_tiles: 2,
-                    bands: None,
+                    incremental: false,
+                    tile_rects: two_tiles.tile_rects.clone(),
                 },
                 tiles: rx_short,
             })
@@ -2206,20 +3498,108 @@ mod tests {
                     .is_err()
             );
 
-            // Mismatched `header.n_tiles`.
-            for bad_n_tiles in [0u32, 2] {
-                let (_tx, rx) = crossbeam_channel::unbounded();
-                let stream = CompressedTileStream {
-                    header: RawBufferHeader {
-                        client: ClientId(1),
-                        surface: WlSurfaceId(1),
-                        metadata: meta,
-                        n_tiles: bad_n_tiles,
-                        bands: None,
+            // Upfront `ValidatedTileStream::new` rejections:
+            // - non-incremental incomplete coverage (missing pixels / empty)
+            // - overlapping rects
+            // - out-of-bounds rect
+            // - zero-dim rect
+            // - excessive tile count (> width * height)
+            let bad_headers = [
+                // Non-incremental with empty rects.
+                RawBufferHeader {
+                    client: ClientId(1),
+                    surface: WlSurfaceId(1),
+                    metadata: meta,
+                    incremental: false,
+                    tile_rects: vec![],
+                },
+                // Non-incremental covering only half the frame.
+                RawBufferHeader {
+                    client: ClientId(1),
+                    surface: WlSurfaceId(1),
+                    metadata: meta,
+                    incremental: false,
+                    tile_rects: vec![TileRect {
+                        x: 0,
+                        y: 0,
+                        w: 32,
+                        h: 64,
+                    }],
+                },
+                // Incremental overlapping rects.
+                RawBufferHeader {
+                    client: ClientId(1),
+                    surface: WlSurfaceId(1),
+                    metadata: meta,
+                    incremental: true,
+                    tile_rects: vec![
+                        TileRect {
+                            x: 0,
+                            y: 0,
+                            w: 40,
+                            h: 40,
+                        },
+                        TileRect {
+                            x: 39,
+                            y: 0,
+                            w: 20,
+                            h: 40,
+                        },
+                    ],
+                },
+                // Out-of-bounds rect.
+                RawBufferHeader {
+                    client: ClientId(1),
+                    surface: WlSurfaceId(1),
+                    metadata: meta,
+                    incremental: true,
+                    tile_rects: vec![TileRect {
+                        x: 32,
+                        y: 0,
+                        w: 33,
+                        h: 64,
+                    }],
+                },
+                // Zero-dim rect.
+                RawBufferHeader {
+                    client: ClientId(1),
+                    surface: WlSurfaceId(1),
+                    metadata: meta,
+                    incremental: true,
+                    tile_rects: vec![TileRect {
+                        x: 0,
+                        y: 0,
+                        w: 0,
+                        h: 64,
+                    }],
+                },
+                // Excessive tile count (`5 > 2 * 2`).
+                RawBufferHeader {
+                    client: ClientId(1),
+                    surface: WlSurfaceId(1),
+                    metadata: BufferMetadata {
+                        width: 2,
+                        height: 2,
+                        stride: 8,
+                        format: BufferFormat::Xrgb8888,
                     },
-                    tiles: rx,
-                };
-                assert!(ValidatedTileStream::new(stream).is_err());
+                    incremental: true,
+                    tile_rects: vec![
+                        TileRect {
+                            x: 0,
+                            y: 0,
+                            w: 1,
+                            h: 1,
+                        };
+                        5
+                    ],
+                },
+            ];
+            for header in bad_headers {
+                let (_tx, rx) = crossbeam_channel::unbounded();
+                assert!(
+                    ValidatedTileStream::new(CompressedTileStream { header, tiles: rx }).is_err()
+                );
             }
         });
     }

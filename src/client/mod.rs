@@ -62,14 +62,17 @@ use crate::client_utils::FrameDamage;
 use crate::client_utils::SeatObject;
 use crate::client_utils::SwapchainStep;
 use crate::client_utils::advance_two_slot_swapchain;
-use crate::client_utils::subtract_row_bands;
+use crate::client_utils::combine_rect_history;
+use crate::client_utils::rect_covered_by;
+use crate::client_utils::snapshot_rect_history;
 use crate::prelude::*;
 use crate::serialization::Capabilities;
 use crate::serialization::ClientId;
 use crate::serialization::Event;
 use crate::serialization::Request;
 use crate::serialization::Serializer;
-use crate::serialization::framing::RowBand;
+use crate::serialization::framing::TILE_PIXELS;
+use crate::serialization::framing::TileRect;
 use crate::serialization::wayland::BufferAssignment;
 use crate::serialization::wayland::BufferMetadata;
 use crate::serialization::wayland::CursorImage;
@@ -242,69 +245,142 @@ impl WprsClientState {
     }
 }
 
-const SLOT_COPY_CHUNK: usize = 256 * 1024;
+const SLOT_COPY_CHUNK: usize = TILE_PIXELS * 4;
 
-fn for_each_band_chunk(bands: &[RowBand], stride: usize, mut copy_chunk: impl FnMut(usize, usize)) {
-    for band in bands {
-        let mut offset = band.y0 as usize * stride;
-        let byte_end = band.y1 as usize * stride;
-        while offset < byte_end {
-            let chunk = (byte_end - offset).min(SLOT_COPY_CHUNK);
-            copy_chunk(offset, chunk);
-            offset += chunk;
-        }
-    }
+enum SlotCopyRegion<'a> {
+    Full,
+    Rects(&'a [TileRect]),
 }
 
-fn copy_row_bands(
+fn copy_slot_region_with<P, S>(
+    pool: &mut P,
+    src_slot: &S,
+    dst_slot: &S,
+    byte_len: usize,
+    stride: usize,
+    region: SlotCopyRegion<'_>,
+    scratch: &mut Vec<u8>,
+    mut slot_data: impl for<'a> FnMut(&'a mut P, &S) -> &'a mut [u8],
+) -> usize {
+    let mut bytes_copied = 0;
+    match region {
+        SlotCopyRegion::Full => {
+            let mut offset = 0;
+            while offset < byte_len {
+                let chunk = (byte_len - offset).min(SLOT_COPY_CHUNK);
+                if scratch.len() < chunk {
+                    scratch.resize(SLOT_COPY_CHUNK, 0);
+                }
+                scratch[..chunk]
+                    .copy_from_slice(&slot_data(pool, src_slot)[offset..offset + chunk]);
+                slot_data(pool, dst_slot)[offset..offset + chunk]
+                    .copy_from_slice(&scratch[..chunk]);
+                bytes_copied += chunk;
+                offset += chunk;
+            }
+        },
+        SlotCopyRegion::Rects(rects) => {
+            for &rect in rects {
+                let x_bytes = rect.x as usize * 4;
+                let row_bytes = rect.w as usize * 4;
+                let rows_per_batch = (SLOT_COPY_CHUNK / row_bytes).max(1);
+                let h = rect.h as usize;
+                let mut ry = 0;
+                while ry < h {
+                    let batch_rows = (h - ry).min(rows_per_batch);
+                    let batch_bytes = batch_rows * row_bytes;
+                    if scratch.len() < batch_bytes {
+                        scratch.resize(batch_bytes.max(SLOT_COPY_CHUNK), 0);
+                    }
+                    {
+                        let src = slot_data(pool, src_slot);
+                        for i in 0..batch_rows {
+                            let src_off = (rect.y as usize + ry + i) * stride + x_bytes;
+                            scratch[i * row_bytes..(i + 1) * row_bytes]
+                                .copy_from_slice(&src[src_off..src_off + row_bytes]);
+                        }
+                    }
+                    {
+                        let dst = slot_data(pool, dst_slot);
+                        for i in 0..batch_rows {
+                            let dst_off = (rect.y as usize + ry + i) * stride + x_bytes;
+                            dst[dst_off..dst_off + row_bytes]
+                                .copy_from_slice(&scratch[i * row_bytes..(i + 1) * row_bytes]);
+                        }
+                    }
+                    bytes_copied += batch_bytes;
+                    ry += batch_rows;
+                }
+            }
+        },
+    }
+    bytes_copied
+}
+
+fn copy_slot_region(
     pool: &mut SlotPool,
     src_slot: &Slot,
     dst_slot: &Slot,
+    byte_len: usize,
     stride: usize,
-    bands: &[RowBand],
+    region: SlotCopyRegion<'_>,
     scratch: &mut Vec<u8>,
 ) {
-    for_each_band_chunk(bands, stride, |offset, chunk| {
-        if scratch.len() < chunk {
-            scratch.resize(SLOT_COPY_CHUNK, 0);
-        }
-        scratch[..chunk].copy_from_slice(&pool.raw_data_mut(src_slot)[offset..offset + chunk]);
-        pool.raw_data_mut(dst_slot)[offset..offset + chunk].copy_from_slice(&scratch[..chunk]);
-    });
+    copy_slot_region_with(
+        pool,
+        src_slot,
+        dst_slot,
+        byte_len,
+        stride,
+        region,
+        scratch,
+        |pool, slot| pool.raw_data_mut(slot),
+    );
 }
 
 fn prepare_remote_swapchain<P, B>(
     pool: &mut P,
     active_buffer: &mut B,
-    back_buffer: &mut Option<(B, Option<Vec<RowBand>>)>,
-    bands: Option<&[RowBand]>,
-    height: i32,
+    back_buffer: &mut Option<(B, Option<Vec<TileRect>>)>,
+    cur_rects: Option<&[TileRect]>,
     is_released: impl FnMut(&mut P, &B) -> bool,
     alloc_buffer: impl FnOnce(&mut P, bool) -> Result<B>,
-    copy_bands: impl FnOnce(&mut P, &B, &B, &[RowBand]),
+    copy_region: impl FnOnce(&mut P, &B, &B, SlotCopyRegion<'_>),
 ) -> Result<()> {
     let step = advance_two_slot_swapchain(
         pool,
         active_buffer,
         back_buffer,
-        bands,
-        height,
+        cur_rects,
         is_released,
+        combine_rect_history,
+        snapshot_rect_history,
         alloc_buffer,
     )?;
-    if let Some(cur_bands) = bands {
-        let prev_bands = match step {
+    if let Some(cur) = cur_rects {
+        let prev_rects = match step {
             SwapchainStep::ReusedActive => return Ok(()),
-            SwapchainStep::Swapped { prev_bands } => prev_bands,
+            SwapchainStep::Swapped { prev_history } => prev_history,
             SwapchainStep::Allocated => None,
         };
-        let full = [RowBand {
-            y0: 0,
-            y1: height as u32,
-        }];
-        let rows_to_copy = subtract_row_bands(prev_bands.as_deref().unwrap_or(&full), cur_bands);
         let old_active = &back_buffer.as_ref().unwrap().0;
-        copy_bands(pool, old_active, active_buffer, &rows_to_copy);
+        match prev_rects {
+            Some(prev) => {
+                let to_copy: Vec<TileRect> = prev
+                    .into_iter()
+                    .filter(|&r| !rect_covered_by(r, cur))
+                    .collect();
+                if !to_copy.is_empty() {
+                    copy_region(
+                        pool,
+                        old_active,
+                        active_buffer,
+                        SlotCopyRegion::Rects(&to_copy),
+                    );
+                }
+            },
+            None => copy_region(pool, old_active, active_buffer, SlotCopyRegion::Full),
+        }
     }
     Ok(())
 }
@@ -323,10 +399,10 @@ pub enum RemoteBufferState {
 pub struct RemoteBuffer {
     pub metadata: BufferMetadata,
     pub active_buffer: SlotBuffer,
-    /// Previous swapchain slot and the merged row-bands written to
-    /// `active_buffer` since this slot was last current (`None` requires
-    /// copying the undamaged complement on next partial reuse).
-    back_buffer: Option<(SlotBuffer, Option<Vec<RowBand>>)>,
+    /// Previous swapchain slot and the 2D tile rects written to `active_buffer`
+    /// since this slot was last current (`None` requires a full copy from
+    /// `active_buffer` on next incremental reuse).
+    back_buffer: Option<(SlotBuffer, Option<Vec<TileRect>>)>,
     pub state: RemoteBufferState,
 }
 
@@ -352,23 +428,24 @@ impl RemoteBuffer {
 
     fn canvas<'a>(
         &mut self,
-        bands: Option<&[RowBand]>,
+        incremental_rects: Option<&[TileRect]>,
         pool: &'a mut SlotPool,
         copy_scratch: &mut Vec<u8>,
     ) -> Result<&'a mut [u8]> {
         let metadata = self.metadata;
+        let stride = metadata.stride as usize;
+        let byte_len = metadata.height as usize * stride;
         prepare_remote_swapchain(
             pool,
             &mut self.active_buffer,
             &mut self.back_buffer,
-            bands,
-            metadata.height,
+            incremental_rects,
             |pool, buf| pool.canvas(buf).is_some(),
             |pool, back_buffer_held| {
                 debug!(
                     back_buffer_held,
-                    partial = bands.is_some(),
-                    bands = bands.map_or(0, <[_]>::len),
+                    incremental = incremental_rects.is_some(),
+                    tiles = incremental_rects.map_or(0, <[_]>::len),
                     width = metadata.width,
                     height = metadata.height,
                     "creating new buffer",
@@ -383,13 +460,14 @@ impl RemoteBuffer {
                     .location(loc!())?
                     .0)
             },
-            |pool, src_buf, dst_buf, rows| {
-                copy_row_bands(
+            |pool, src_buf, dst_buf, region| {
+                copy_slot_region(
                     pool,
                     &src_buf.slot(),
                     &dst_buf.slot(),
-                    metadata.stride as usize,
-                    rows,
+                    byte_len,
+                    stride,
+                    region,
                     copy_scratch,
                 );
             },
@@ -552,7 +630,7 @@ impl RemoteSurface {
     pub(crate) fn prepare_buffer_canvas<'a>(
         &mut self,
         metadata: BufferMetadata,
-        bands: Option<&[RowBand]>,
+        incremental_rects: Option<&[TileRect]>,
         pool: &'a mut SlotPool,
         copy_scratch: &mut Vec<u8>,
     ) -> Result<&'a mut [u8]> {
@@ -562,9 +640,9 @@ impl RemoteSurface {
             buffer.state = RemoteBufferState::Prepared;
             buffer
         } else {
-            if bands.is_some() {
+            if incremental_rects.is_some() {
                 bail!(
-                    "received partial row-band update without a matching buffer ({:?} -> {metadata:?})",
+                    "received incremental tile update without a matching buffer ({:?} -> {metadata:?})",
                     self.buffer.as_ref().map(|b| b.metadata)
                 );
             }
@@ -572,7 +650,9 @@ impl RemoteSurface {
             self.buffer
                 .insert(RemoteBuffer::new(metadata, pool).location(loc!())?)
         };
-        buffer.canvas(bands, pool, copy_scratch).location(loc!())
+        buffer
+            .canvas(incremental_rects, pool, copy_scratch)
+            .location(loc!())
     }
 
     pub(crate) fn drop_buffer(&mut self) {
@@ -864,40 +944,42 @@ impl Default for RemoteDisplay {
 mod tests {
     use super::*;
 
-    #[test]
-    fn test_for_each_band_chunk_splits_at_slot_copy_chunk() {
-        let stride = 4096;
-        let b = |y0, y1| RowBand { y0, y1 };
-        let collect_chunks = |bands: &[RowBand]| {
-            let mut chunks = Vec::new();
-            for_each_band_chunk(bands, stride, |offset, chunk| chunks.push((offset, chunk)));
-            chunks
-        };
+    fn tr(x: u32, y: u32, w: u32, h: u32) -> TileRect {
+        TileRect { x, y, w, h }
+    }
 
-        assert_eq!(collect_chunks(&[]), Vec::new());
-        // Sub-chunk band (`3 * 4096 = 12,288 B`), multi-chunk band (`85 * 4096 = 348,160 B`
-        // split as `256 KiB + 86,016 B`), and exact-chunk band (`64 * 4096 = 256 KiB`).
-        assert_eq!(
-            collect_chunks(&[b(2, 5), b(10, 95), b(100, 164)]),
-            vec![
-                (2 * stride, 3 * stride),
-                (10 * stride, SLOT_COPY_CHUNK),
-                (10 * stride + SLOT_COPY_CHUNK, 85 * stride - SLOT_COPY_CHUNK),
-                (100 * stride, SLOT_COPY_CHUNK),
-            ],
-        );
+    fn patch_rect(dst: &mut [u8], src: &[u8], stride: usize, rect: TileRect) {
+        let x_bytes = rect.x as usize * 4;
+        let row_bytes = rect.w as usize * 4;
+        for ry in 0..rect.h as usize {
+            let off = (rect.y as usize + ry) * stride + x_bytes;
+            dst[off..off + row_bytes].copy_from_slice(&src[off..off + row_bytes]);
+        }
+    }
+
+    fn assert_visible_eq(got: &[u8], expected: &[u8], width: usize, height: usize, stride: usize) {
+        let vis = width * 4;
+        for y in 0..height {
+            let off = y * stride;
+            assert_eq!(
+                &got[off..off + vis],
+                &expected[off..off + vis],
+                "visible pixel mismatch on row {y}"
+            );
+        }
     }
 
     fn apply_remote_frame(
         active: &mut usize,
-        back: &mut Option<(usize, Option<Vec<RowBand>>)>,
+        back: &mut Option<(usize, Option<Vec<TileRect>>)>,
         slots: &mut Vec<Vec<u8>>,
+        scratch: &mut Vec<u8>,
         released: &[bool],
         frame: &[u8],
-        bands: Option<&[RowBand]>,
-        height: i32,
+        incremental_rects: Option<&[TileRect]>,
         stride: usize,
     ) -> (usize, Option<bool>) {
+        let byte_len = frame.len();
         let mut bytes_copied = 0usize;
         let mut alloc_back_held = None;
 
@@ -905,35 +987,37 @@ mod tests {
             slots,
             active,
             back,
-            bands,
-            height,
+            incremental_rects,
             |_, &idx| released[idx],
             |slots, back_buffer_held| {
                 alloc_back_held = Some(back_buffer_held);
                 let idx = slots.len();
-                // Poison new slots so any uncopied undamaged row fails verification.
-                slots.push(vec![0xAAu8; frame.len()]);
+                // Poison new slots so any uncopied pixel fails verification.
+                slots.push(vec![0xAAu8; byte_len]);
                 Ok(idx)
             },
-            |slots, &src_idx, &dst_idx, rows| {
-                let src = slots[src_idx].clone();
-                let dst = &mut slots[dst_idx];
-                for_each_band_chunk(rows, stride, |offset, chunk| {
-                    dst[offset..offset + chunk].copy_from_slice(&src[offset..offset + chunk]);
-                    bytes_copied += chunk;
-                });
+            |slots, &src_idx, &dst_idx, region| {
+                bytes_copied += copy_slot_region_with(
+                    slots,
+                    &src_idx,
+                    &dst_idx,
+                    byte_len,
+                    stride,
+                    region,
+                    scratch,
+                    |slots, &idx| &mut slots[idx],
+                );
             },
         )
         .unwrap();
 
-        // Simulate `decompress_and_unfilter_streaming` writing only `bands` (or full frame).
+        // Simulate `decompress_and_unfilter_streaming` writing only `incremental_rects`
+        // (or the full frame when `None`).
         let canvas = &mut slots[*active];
-        match bands {
-            Some(cur_bands) => {
-                for band in cur_bands {
-                    let start = band.y0 as usize * stride;
-                    let end = band.y1 as usize * stride;
-                    canvas[start..end].copy_from_slice(&frame[start..end]);
+        match incremental_rects {
+            Some(rects) => {
+                for &rect in rects {
+                    patch_rect(canvas, frame, stride, rect);
                 }
             },
             None => canvas.copy_from_slice(frame),
@@ -943,259 +1027,284 @@ mod tests {
     }
 
     #[test]
-    fn test_remote_buffer_swapchain_transitions() {
-        let width = 8usize;
-        let height = 20i32;
-        let stride = width * 4 + 8; // padded stride (40 bytes/row)
-        let byte_len = height as usize * stride;
+    fn test_copy_slot_region_multi_chunk_full_and_rect() {
+        // Multi-chunk full copy (`> SLOT_COPY_CHUNK`) + single-rect copy with padded stride.
+        let width = 300usize;
+        let height = 260usize;
+        let stride = width * 4 + 16;
+        let byte_len = height * stride;
+        let src: Vec<u8> = (0..byte_len).map(|i| ((i * 29 + 7) & 0xFF) as u8).collect();
+        let mut slots = vec![src.clone(), vec![0xCCu8; byte_len]];
+        let mut scratch = Vec::new();
+
+        let rect = tr(16, 10, 256, 200);
+        let copied = copy_slot_region_with(
+            &mut slots,
+            &0,
+            &1,
+            byte_len,
+            stride,
+            SlotCopyRegion::Rects(&[rect]),
+            &mut scratch,
+            |s, &idx| &mut s[idx],
+        );
+        assert_eq!(copied, 256 * 200 * 4);
+        for y in 0..height {
+            for x in 0..width {
+                let off = y * stride + x * 4;
+                let inside = (16..272).contains(&x) && (10..210).contains(&y);
+                let exp = if inside {
+                    &src[off..off + 4]
+                } else {
+                    &[0xCC; 4]
+                };
+                assert_eq!(&slots[1][off..off + 4], exp, "px ({x},{y})");
+            }
+            assert_eq!(
+                &slots[1][y * stride + width * 4..(y + 1) * stride],
+                &[0xCC; 16],
+                "stride padding touched on row {y}"
+            );
+        }
+
+        slots[1].fill(0x55);
+        let full_copied = copy_slot_region_with(
+            &mut slots,
+            &0,
+            &1,
+            byte_len,
+            stride,
+            SlotCopyRegion::Full,
+            &mut scratch,
+            |s, &idx| &mut s[idx],
+        );
+        assert_eq!(full_copied, byte_len);
+        assert_eq!(slots[1], src);
+    }
+
+    #[test]
+    fn test_remote_buffer_swapchain_2d_rect_sync() {
+        let width = 512usize;
+        let height = 384usize;
+        let stride = width * 4 + 16; // padded stride
+        let byte_len = height * stride;
 
         let make_frame = |seed: u8| -> Vec<u8> {
             (0..byte_len)
-                .map(|i| seed.wrapping_mul(37).wrapping_add(i as u8))
+                .map(|i| seed.wrapping_mul(37).wrapping_add((i % 251) as u8))
                 .collect()
         };
-        let b = |y0, y1| RowBand { y0, y1 };
-        let patch_rows = |frame: &mut [u8], seed: u8, bands: &[RowBand]| {
+        let patch = |frame: &mut [u8], seed: u8, rects: &[TileRect]| {
             let src = make_frame(seed);
-            for band in bands {
-                let start = band.y0 as usize * stride;
-                let end = band.y1 as usize * stride;
-                frame[start..end].copy_from_slice(&src[start..end]);
+            for &rect in rects {
+                patch_rect(frame, &src, stride, rect);
             }
         };
 
+        let q_left = tr(0, 0, 128, 128);
+        let q_right_same_band = tr(256, 0, 128, 128);
+        let q_parent_left = tr(0, 0, 256, 256);
+        let q_bottom = tr(128, 256, 128, 128);
+
         let mut frame = make_frame(1);
         let mut slots = vec![frame.clone()];
+        let mut scratch = Vec::new();
         let mut active = 0usize;
-        let mut back: Option<(usize, Option<Vec<RowBand>>)> = None;
+        let mut back: Option<(usize, Option<Vec<TileRect>>)> = None;
 
         // 1. In-place reuse keeps `back_buffer == None` (zero extra slot or copy).
-        patch_rows(&mut frame, 2, &[b(2, 5)]);
+        patch(&mut frame, 2, &[q_left]);
         let (copied, alloc) = apply_remote_frame(
             &mut active,
             &mut back,
             &mut slots,
+            &mut scratch,
             &[true],
             &frame,
-            Some(&[b(2, 5)]),
-            height,
+            Some(&[q_left]),
             stride,
         );
         assert_eq!((active, slots.len(), copied, alloc), (0, 1, 0, None));
         assert_eq!(back, None);
-        assert_eq!(slots[active], frame);
+        assert_visible_eq(&slots[active], &frame, width, height, stride);
 
-        // 2. First miss allocates `back_buffer` lazily (`back_buffer_held == false`)
-        // and copies the 17 undamaged complement rows.
-        patch_rows(&mut frame, 3, &[b(3, 6)]);
+        // 2. First miss allocates Slot B (`back_buffer_held == false`), copies
+        // full Slot A -> Slot B, then applies `q_left` to Slot B. Slot A is now
+        // stale at `[q_left]`.
+        patch(&mut frame, 3, &[q_left]);
         let (copied, alloc) = apply_remote_frame(
             &mut active,
             &mut back,
             &mut slots,
+            &mut scratch,
             &[false],
             &frame,
-            Some(&[b(3, 6)]),
-            height,
+            Some(&[q_left]),
             stride,
         );
         assert_eq!(
             (active, slots.len(), copied, alloc),
-            (1, 2, 17 * stride, Some(false))
+            (1, 2, byte_len, Some(false))
         );
-        assert_eq!(back, Some((0, Some(vec![b(3, 6)]))));
-        assert_eq!(slots[active], frame);
+        assert_eq!(back, Some((0, Some(vec![q_left]))));
+        assert_visible_eq(&slots[active], &frame, width, height, stride);
 
-        // 3. Alternating swap with `prev == cur` copies 0 bytes.
-        patch_rows(&mut frame, 4, &[b(3, 6)]);
+        // 3. CRITICAL 2D regression test: Frame 1 modified `(0, 0, 128, 128)` on
+        // active Slot B; Frame 2 swaps to Slot A and modifies `(256, 0, 128, 128)`
+        // in the SAME row band (`y = 0..128`) -> must copy `(0, 0, 128, 128)`
+        // from Slot B to Slot A so Slot A has bit-exact pixels at BOTH rects!
+        patch(&mut frame, 4, &[q_right_same_band]);
         let (copied, alloc) = apply_remote_frame(
             &mut active,
             &mut back,
             &mut slots,
+            &mut scratch,
             &[true, false],
             &frame,
-            Some(&[b(3, 6)]),
-            height,
-            stride,
-        );
-        assert_eq!((active, slots.len(), copied, alloc), (0, 2, 0, None));
-        assert_eq!(back, Some((1, Some(vec![b(3, 6)]))));
-        assert_eq!(slots[active], frame);
-
-        // 4. Alternating swap with disjoint `prev` copies only `prev` (3 rows).
-        patch_rows(&mut frame, 5, &[b(12, 15)]);
-        let (copied, alloc) = apply_remote_frame(
-            &mut active,
-            &mut back,
-            &mut slots,
-            &[false, true],
-            &frame,
-            Some(&[b(12, 15)]),
-            height,
+            Some(&[q_right_same_band]),
             stride,
         );
         assert_eq!(
             (active, slots.len(), copied, alloc),
-            (1, 2, 3 * stride, None)
+            (0, 2, 128 * 128 * 4, None)
         );
-        assert_eq!(back, Some((0, Some(vec![b(12, 15)]))));
-        assert_eq!(slots[active], frame);
+        assert_eq!(back, Some((1, Some(vec![q_right_same_band]))));
+        assert_visible_eq(&slots[active], &frame, width, height, stride);
 
-        // 5. In-place reuse while `back_buffer` exists accumulates `back_bands`
-        // (`12..15 ∪ 14..18 = 12..18`); subsequent interior-overlap swap copies
-        // only `prev \ cur` (`12..14, 16..18` = 4 rows).
-        patch_rows(&mut frame, 6, &[b(14, 18)]);
+        // 4. Cursor-blink alternating swap (`prev == cur`) copies 0 bytes!
+        patch(&mut frame, 5, &[q_right_same_band]);
         let (copied, alloc) = apply_remote_frame(
             &mut active,
             &mut back,
             &mut slots,
+            &mut scratch,
             &[false, true],
             &frame,
-            Some(&[b(14, 18)]),
-            height,
+            Some(&[q_right_same_band]),
             stride,
         );
         assert_eq!((active, slots.len(), copied, alloc), (1, 2, 0, None));
-        assert_eq!(back, Some((0, Some(vec![b(12, 18)]))));
-        assert_eq!(slots[active], frame);
+        assert_eq!(back, Some((0, Some(vec![q_right_same_band]))));
+        assert_visible_eq(&slots[active], &frame, width, height, stride);
 
-        patch_rows(&mut frame, 7, &[b(14, 16)]);
+        // 5. In-place reuse accumulates `q_left`; subsequent swap writing
+        // `q_parent_left` covers `q_left` so only `q_right_same_band` is copied!
+        patch(&mut frame, 6, &[q_left]);
         let (copied, alloc) = apply_remote_frame(
             &mut active,
             &mut back,
             &mut slots,
+            &mut scratch,
+            &[false, true],
+            &frame,
+            Some(&[q_left]),
+            stride,
+        );
+        assert_eq!((active, slots.len(), copied, alloc), (1, 2, 0, None));
+        assert_eq!(back, Some((0, Some(vec![q_right_same_band, q_left]))));
+        assert_visible_eq(&slots[active], &frame, width, height, stride);
+
+        patch(&mut frame, 7, &[q_parent_left]);
+        let (copied, alloc) = apply_remote_frame(
+            &mut active,
+            &mut back,
+            &mut slots,
+            &mut scratch,
             &[true, false],
             &frame,
-            Some(&[b(14, 16)]),
-            height,
+            Some(&[q_parent_left]),
             stride,
         );
         assert_eq!(
             (active, slots.len(), copied, alloc),
-            (0, 2, 4 * stride, None)
+            (0, 2, 128 * 128 * 4, None)
         );
-        assert_eq!(back, Some((1, Some(vec![b(14, 16)]))));
-        assert_eq!(slots[active], frame);
+        assert_eq!(back, Some((1, Some(vec![q_parent_left]))));
+        assert_visible_eq(&slots[active], &frame, width, height, stride);
 
-        // 6. Full-frame update on `active` invalidates `back_bands` to `None`;
-        // next partial swap copies the undamaged complement without a 3rd alloc.
+        // 6. Full-frame update (`None`) on active invalidates `back` to `None`;
+        // next incremental swap copies full `old_active` without a 3rd alloc.
         frame = make_frame(8);
         let (copied, alloc) = apply_remote_frame(
             &mut active,
             &mut back,
             &mut slots,
+            &mut scratch,
             &[true, false],
             &frame,
             None,
-            height,
             stride,
         );
         assert_eq!((active, slots.len(), copied, alloc), (0, 2, 0, None));
         assert_eq!(back, Some((1, None)));
-        assert_eq!(slots[active], frame);
+        assert_visible_eq(&slots[active], &frame, width, height, stride);
 
-        patch_rows(&mut frame, 9, &[b(8, 11)]);
+        patch(&mut frame, 9, &[q_bottom]);
         let (copied, alloc) = apply_remote_frame(
             &mut active,
             &mut back,
             &mut slots,
+            &mut scratch,
             &[false, true],
             &frame,
-            Some(&[b(8, 11)]),
-            height,
+            Some(&[q_bottom]),
             stride,
         );
-        assert_eq!(
-            (active, slots.len(), copied, alloc),
-            (1, 2, 17 * stride, None)
-        );
-        assert_eq!(back, Some((0, Some(vec![b(8, 11)]))));
-        assert_eq!(slots[active], frame);
+        assert_eq!((active, slots.len(), copied, alloc), (1, 2, byte_len, None));
+        assert_eq!(back, Some((0, Some(vec![q_bottom]))));
+        assert_visible_eq(&slots[active], &frame, width, height, stride);
 
-        // 7. Full-frame update on swap copies 0 bytes and marks `back_bands = None`.
+        // 7. Full-frame update on swap copies 0 bytes and marks `back = None`.
         frame = make_frame(10);
         let (copied, alloc) = apply_remote_frame(
             &mut active,
             &mut back,
             &mut slots,
+            &mut scratch,
             &[true, false],
             &frame,
             None,
-            height,
             stride,
         );
         assert_eq!((active, slots.len(), copied, alloc), (0, 2, 0, None));
         assert_eq!(back, Some((1, None)));
-        assert_eq!(slots[active], frame);
+        assert_visible_eq(&slots[active], &frame, width, height, stride);
 
-        // 8. Empty-bands (`Some(&[])`) swap with `prev_bands == None` copies all rows
-        // and records `Some(vec![])`, so a subsequent swap copies 0 bytes.
+        // 8. Both slots held -> triple-buffer fallback (`back_buffer_held == true`)
+        // allocates a 3rd slot and copies full `old_active` on incremental.
+        patch(&mut frame, 11, &[q_left]);
         let (copied, alloc) = apply_remote_frame(
             &mut active,
             &mut back,
             &mut slots,
-            &[false, true],
-            &frame,
-            Some(&[]),
-            height,
-            stride,
-        );
-        assert_eq!(
-            (active, slots.len(), copied, alloc),
-            (1, 2, 20 * stride, None)
-        );
-        assert_eq!(back, Some((0, Some(Vec::new()))));
-        assert_eq!(slots[active], frame);
-
-        patch_rows(&mut frame, 11, &[b(1, 3)]);
-        let (copied, alloc) = apply_remote_frame(
-            &mut active,
-            &mut back,
-            &mut slots,
-            &[true, false],
-            &frame,
-            Some(&[b(1, 3)]),
-            height,
-            stride,
-        );
-        assert_eq!((active, slots.len(), copied, alloc), (0, 2, 0, None));
-        assert_eq!(back, Some((1, Some(vec![b(1, 3)]))));
-        assert_eq!(slots[active], frame);
-
-        // 9. Both slots held -> triple-buffer fallback (`back_buffer_held == true`)
-        // allocates a 3rd slot and copies undamaged complement rows (18 rows).
-        patch_rows(&mut frame, 12, &[b(5, 7)]);
-        let (copied, alloc) = apply_remote_frame(
-            &mut active,
-            &mut back,
-            &mut slots,
+            &mut scratch,
             &[false, false],
             &frame,
-            Some(&[b(5, 7)]),
-            height,
+            Some(&[q_left]),
             stride,
         );
         assert_eq!(
             (active, slots.len(), copied, alloc),
-            (2, 3, 18 * stride, Some(true))
+            (2, 3, byte_len, Some(true))
         );
-        assert_eq!(back, Some((0, Some(vec![b(5, 7)]))));
-        assert_eq!(slots[active], frame);
+        assert_eq!(back, Some((0, Some(vec![q_left]))));
+        assert_visible_eq(&slots[active], &frame, width, height, stride);
 
-        // 10. Both slots held on a full-frame update allocates with 0-byte copy.
-        frame = make_frame(13);
+        // 9. Both slots held on a full-frame update allocates with 0-byte copy.
+        frame = make_frame(12);
         let (copied, alloc) = apply_remote_frame(
             &mut active,
             &mut back,
             &mut slots,
+            &mut scratch,
             &[false, false, false],
             &frame,
             None,
-            height,
             stride,
         );
         assert_eq!((active, slots.len(), copied, alloc), (3, 4, 0, Some(true)));
         assert_eq!(back, Some((2, None)));
-        assert_eq!(slots[active], frame);
+        assert_visible_eq(&slots[active], &frame, width, height, stride);
     }
 
     #[test]
