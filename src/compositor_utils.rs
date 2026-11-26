@@ -26,6 +26,7 @@ use smithay::reexports::wayland_server::protocol::wl_buffer::WlBuffer;
 use smithay::reexports::wayland_server::protocol::wl_surface::WlSurface;
 use smithay::utils::Buffer as BufferCoords;
 use smithay::utils::Logical;
+use smithay::utils::Physical;
 use smithay::utils::Rectangle;
 use smithay::utils::Size;
 use smithay::utils::Transform;
@@ -163,29 +164,77 @@ pub fn send_frames(
     Ok(())
 }
 
+fn output_scale(
+    output: &OutputInfo,
+    mode_size: Size<i32, Physical>,
+    transform: Transform,
+) -> Scale {
+    let advertised_integer = output.scale_factor.max(1);
+    let Some(logical_size) = output.logical_size else {
+        return Scale::Integer(advertised_integer);
+    };
+    if logical_size.w <= 0 || logical_size.h <= 0 || mode_size.w <= 0 || mode_size.h <= 0 {
+        return Scale::Integer(advertised_integer);
+    }
+
+    let integer_logical = transform.transform_size(
+        mode_size
+            .to_f64()
+            .to_logical(f64::from(advertised_integer))
+            .to_i32_round(),
+    );
+    if integer_logical == Size::from(logical_size) {
+        return Scale::Integer(advertised_integer);
+    }
+
+    let oriented = transform.transform_size(mode_size);
+    let ow = f64::from(oriented.w);
+    let oh = f64::from(oriented.h);
+    let lw = f64::from(logical_size.w);
+    let lh = f64::from(logical_size.h);
+    // Smithay derives `zxdg_output_v1.logical_size` via `(mode_size / scale).round()`.
+    // Pick an isotropic scale inside both axes' rounding intervals when they
+    // overlap so clients receive the exact host `logical_size`.
+    let low = (ow / (lw + 0.5)).max(oh / (lh + 0.5));
+    let high = (ow / (lw - 0.5)).min(oh / (lh - 0.5));
+    let mean = 0.5 * (ow / lw + oh / lh);
+    let fractional = if mean > low && mean < high {
+        mean
+    } else if low < high {
+        0.5 * (low + high)
+    } else {
+        mean
+    };
+    Scale::Custom {
+        advertised_integer,
+        fractional,
+    }
+}
+
 pub fn update_output(local_output: &mut Output, output: OutputInfo) {
-    let current_mode = local_output.current_mode().unwrap_or(Mode {
-        size: (0, 0).into(),
-        refresh: 0,
-    });
     let received_mode = Mode {
         size: output.mode.dimensions.into(),
         refresh: output.mode.refresh_rate,
     };
-    if current_mode != received_mode {
+    if let Some(current_mode) = local_output.current_mode()
+        && current_mode != received_mode
+    {
         local_output.delete_mode(current_mode);
     }
-
-    local_output.change_current_state(
-        Some(received_mode),
-        Some(output.transform.into()),
-        Some(Scale::Integer(output.scale_factor)),
-        Some(output.location.into()),
-    );
-
     if output.mode.preferred {
         local_output.set_preferred(received_mode);
     }
+
+    let transform: Transform = output.transform.into();
+    let scale = output_scale(&output, received_mode.size, transform);
+    let location = output.logical_position.unwrap_or(output.location);
+
+    local_output.change_current_state(
+        Some(received_mode),
+        Some(transform),
+        Some(scale),
+        Some(location.into()),
+    );
 }
 
 pub fn update_surface_outputs<'a, F>(
@@ -888,5 +937,138 @@ mod tests {
         assert_eq!(stop_v.axis, (0.0, 0.0));
         assert_eq!(stop_v.v120, None);
         assert_eq!(stop_v.stop, (false, true));
+    }
+
+    #[test]
+    fn test_update_output_logical_position_and_fractional_scale() {
+        use smithay::output::PhysicalProperties;
+        use smithay::output::Subpixel;
+
+        use crate::serialization::wayland::Mode as SerMode;
+        use crate::serialization::wayland::Subpixel as SerSubpixel;
+        use crate::serialization::wayland::Transform as SerTransform;
+
+        let make_info = |dimensions: (i32, i32),
+                         scale_factor: i32,
+                         transform: SerTransform,
+                         location: (i32, i32),
+                         logical_position: Option<(i32, i32)>,
+                         logical_size: Option<(i32, i32)>,
+                         preferred: bool| OutputInfo {
+            id: 1,
+            model: "TestModel".to_string(),
+            make: "TestMake".to_string(),
+            location: location.into(),
+            physical_size: (600, 340).into(),
+            subpixel: SerSubpixel::None,
+            transform,
+            scale_factor,
+            mode: SerMode {
+                dimensions: dimensions.into(),
+                refresh_rate: 60000,
+                current: true,
+                preferred,
+            },
+            logical_position: logical_position.map(Into::into),
+            logical_size: logical_size.map(Into::into),
+            name: Some("DP-1".to_string()),
+            description: None,
+        };
+
+        let mut output = Output::new(
+            "1_DP-1".to_string(),
+            PhysicalProperties {
+                size: (600, 340).into(),
+                subpixel: Subpixel::None,
+                make: "TestMake".to_string(),
+                model: "TestModel".to_string(),
+            },
+        );
+
+        // Sway reports `wl_output.location = (0, 0)` while placing the monitor
+        // via `zxdg_output_v1.logical_position` and fractional `logical_size`.
+        update_output(
+            &mut output,
+            make_info(
+                (3840, 2160),
+                2,
+                SerTransform::Normal,
+                (0, 0),
+                Some((1920, 0)),
+                Some((2560, 1440)),
+                true,
+            ),
+        );
+        assert_eq!(output.current_location(), Point::from((1920, 0)));
+        assert_eq!(output.current_scale().integer_scale(), 2);
+        assert_eq!(
+            output
+                .current_mode()
+                .unwrap()
+                .size
+                .to_f64()
+                .to_logical(output.current_scale().fractional_scale())
+                .to_i32_round(),
+            Size::from((2560, 1440))
+        );
+        assert_eq!(output.preferred_mode(), output.current_mode());
+
+        // Non-dyadic fractional scaling and 90-degree rotation must both
+        // reproduce exact host `logical_size` under Smithay's rounding formula.
+        for (mode_size, scale_factor, transform, logical_size) in [
+            ((1920, 1080), 2, SerTransform::Normal, (1097, 617)),
+            ((1366, 768), 2, SerTransform::Normal, (1093, 614)),
+            ((3440, 1440), 2, SerTransform::Normal, (2752, 1152)),
+            ((1920, 1080), 2, SerTransform::_90, (720, 1280)),
+            ((3840, 2160), 2, SerTransform::_270, (1080, 1920)),
+        ] {
+            update_output(
+                &mut output,
+                make_info(
+                    mode_size,
+                    scale_factor,
+                    transform,
+                    (0, 0),
+                    Some((100, 200)),
+                    Some(logical_size),
+                    true,
+                ),
+            );
+            let smithay_transform: Transform = transform.into();
+            let advertised_logical = smithay_transform.transform_size(
+                output
+                    .current_mode()
+                    .unwrap()
+                    .size
+                    .to_f64()
+                    .to_logical(output.current_scale().fractional_scale())
+                    .to_i32_round(),
+            );
+            assert_eq!(
+                advertised_logical,
+                Size::from(logical_size),
+                "{mode_size:?} {transform:?} -> {logical_size:?}"
+            );
+            assert_eq!(output.current_scale().integer_scale(), scale_factor);
+        }
+
+        // Without `zxdg_output_v1` metadata, fall back to `wl_output` location
+        // and integer scale.
+        update_output(
+            &mut output,
+            make_info(
+                (1920, 1080),
+                1,
+                SerTransform::Normal,
+                (1920, 1080),
+                None,
+                None,
+                true,
+            ),
+        );
+        assert_eq!(output.current_location(), Point::from((1920, 1080)));
+        assert_eq!(output.current_scale().integer_scale(), 1);
+        assert!((output.current_scale().fractional_scale() - 1.0).abs() < f64::EPSILON);
+        assert_eq!(output.modes().len(), 1);
     }
 }

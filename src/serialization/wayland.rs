@@ -802,6 +802,8 @@ pub struct OutputInfo {
     pub transform: Transform,
     pub scale_factor: i32,
     pub mode: Mode,
+    pub logical_position: Option<Point<i32>>,
+    pub logical_size: Option<Size<i32>>,
     pub name: Option<String>,
     pub description: Option<String>,
 }
@@ -823,6 +825,8 @@ impl From<SctkOutputInfo> for OutputInfo {
                 .rfind(|mode| mode.current)
                 .unwrap()
                 .into(),
+            logical_position: output.logical_position.map(Into::into),
+            logical_size: output.logical_size.map(Into::into),
             name: output.name.clone(),
             description: output.description.clone(),
         }
@@ -1306,6 +1310,45 @@ mod tests {
         ];
         let bytes = rkyv::to_bytes::<rkyv::rancor::Error>(&events).unwrap();
         let decoded = rkyv::from_bytes::<Vec<DataEvent>, rkyv::rancor::Error>(&bytes).unwrap();
+        assert_eq!(decoded, events);
+    }
+
+    #[test]
+    fn test_output_info_wire_roundtrip() {
+        let with_xdg = OutputInfo {
+            id: 42,
+            model: "U2720Q".to_string(),
+            make: "Dell".to_string(),
+            location: (0, 0).into(),
+            physical_size: (600, 340).into(),
+            subpixel: Subpixel::HorizontalRgb,
+            transform: Transform::Normal,
+            scale_factor: 2,
+            mode: Mode {
+                dimensions: (3840, 2160).into(),
+                refresh_rate: 60000,
+                current: true,
+                preferred: true,
+            },
+            logical_position: Some((1920, 0).into()),
+            logical_size: Some((2560, 1440).into()),
+            name: Some("DP-1".to_string()),
+            description: Some("Dell U2720Q".to_string()),
+        };
+        let without_xdg = OutputInfo {
+            id: 43,
+            logical_position: None,
+            logical_size: None,
+            ..with_xdg.clone()
+        };
+
+        let events = vec![
+            OutputEvent::New(with_xdg),
+            OutputEvent::Update(without_xdg.clone()),
+            OutputEvent::Destroy(without_xdg),
+        ];
+        let bytes = rkyv::to_bytes::<rkyv::rancor::Error>(&events).unwrap();
+        let decoded = rkyv::from_bytes::<Vec<OutputEvent>, rkyv::rancor::Error>(&bytes).unwrap();
         assert_eq!(decoded, events);
     }
 }

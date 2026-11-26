@@ -1298,6 +1298,7 @@ mod tests {
     use smithay_client_toolkit::reexports::client::protocol::wl_buffer::WlBuffer;
     use smithay_client_toolkit::reexports::client::protocol::wl_callback;
     use smithay_client_toolkit::reexports::client::protocol::wl_compositor::WlCompositor;
+    use smithay_client_toolkit::reexports::client::protocol::wl_output;
     use smithay_client_toolkit::reexports::client::protocol::wl_registry;
     use smithay_client_toolkit::reexports::client::protocol::wl_shm;
     use smithay_client_toolkit::reexports::client::protocol::wl_shm_pool::WlShmPool;
@@ -1309,6 +1310,8 @@ mod tests {
     use smithay_client_toolkit::reexports::protocols::xdg::shell::client::xdg_surface;
     use smithay_client_toolkit::reexports::protocols::xdg::shell::client::xdg_toplevel;
     use smithay_client_toolkit::reexports::protocols::xdg::shell::client::xdg_wm_base::XdgWmBase;
+    use smithay_client_toolkit::reexports::protocols::xdg::xdg_output::zv1::client::zxdg_output_manager_v1::ZxdgOutputManagerV1;
+    use smithay_client_toolkit::reexports::protocols::xdg::xdg_output::zv1::client::zxdg_output_v1;
 
     use super::*;
     use crate::serialization::ClientId as WireClientId;
@@ -1330,6 +1333,17 @@ mod tests {
         SurfaceConfigure,
     }
 
+    #[derive(Debug, Default, Eq, PartialEq)]
+    struct WireOutputSnapshot {
+        wl_geometry: Option<(i32, i32)>,
+        wl_mode: Option<(i32, i32, i32, bool)>,
+        wl_scale: Option<i32>,
+        wl_name: Option<String>,
+        xdg_logical_position: Option<(i32, i32)>,
+        xdg_logical_size: Option<(i32, i32)>,
+        xdg_name: Option<String>,
+    }
+
     #[derive(Default)]
     struct WireClientData {
         compositor: Option<WlCompositor>,
@@ -1337,6 +1351,10 @@ mod tests {
         shm: Option<wl_shm::WlShm>,
         xdg_wm_base: Option<XdgWmBase>,
         xdg_decoration_manager: Option<ZxdgDecorationManagerV1>,
+        xdg_output_manager: Option<ZxdgOutputManagerV1>,
+        wl_outputs: HashMap<u32, wl_output::WlOutput>,
+        xdg_outputs: HashMap<u32, zxdg_output_v1::ZxdgOutputV1>,
+        output_snapshots: HashMap<u32, WireOutputSnapshot>,
         configures: Vec<ClientConfigureEvent>,
     }
 
@@ -1389,8 +1407,42 @@ mod tests {
                                 (),
                             ));
                     },
+                    "zxdg_output_manager_v1" => {
+                        let manager = registry.bind::<ZxdgOutputManagerV1, _, _>(
+                            name,
+                            version.min(3),
+                            qh,
+                            (),
+                        );
+                        for (&global_name, wl_out) in &state.wl_outputs {
+                            state
+                                .xdg_outputs
+                                .entry(global_name)
+                                .or_insert_with(|| manager.get_xdg_output(wl_out, qh, global_name));
+                        }
+                        state.xdg_output_manager = Some(manager);
+                    },
+                    "wl_output" => {
+                        let wl_out = registry.bind::<wl_output::WlOutput, _, _>(
+                            name,
+                            version.min(4),
+                            qh,
+                            name,
+                        );
+                        if let Some(manager) = &state.xdg_output_manager {
+                            state
+                                .xdg_outputs
+                                .insert(name, manager.get_xdg_output(&wl_out, qh, name));
+                        }
+                        state.wl_outputs.insert(name, wl_out);
+                        state.output_snapshots.entry(name).or_default();
+                    },
                     _ => {},
                 }
+            } else if let wl_registry::Event::GlobalRemove { name } = event {
+                state.xdg_outputs.remove(&name);
+                state.wl_outputs.remove(&name);
+                state.output_snapshots.remove(&name);
             }
         }
     }
@@ -1590,6 +1642,83 @@ mod tests {
                 state
                     .configures
                     .push(ClientConfigureEvent::Decoration(mode));
+            }
+        }
+    }
+
+    impl Dispatch<ZxdgOutputManagerV1, ()> for WireClientData {
+        fn event(
+            _state: &mut Self,
+            _proxy: &ZxdgOutputManagerV1,
+            _event: <ZxdgOutputManagerV1 as Proxy>::Event,
+            _data: &(),
+            _conn: &Connection,
+            _qh: &QueueHandle<Self>,
+        ) {
+        }
+    }
+
+    impl Dispatch<wl_output::WlOutput, u32> for WireClientData {
+        fn event(
+            state: &mut Self,
+            _proxy: &wl_output::WlOutput,
+            event: wl_output::Event,
+            global_name: &u32,
+            _conn: &Connection,
+            _qh: &QueueHandle<Self>,
+        ) {
+            let entry = state.output_snapshots.entry(*global_name).or_default();
+            match event {
+                wl_output::Event::Geometry { x, y, .. } => {
+                    entry.wl_geometry = Some((x, y));
+                },
+                wl_output::Event::Mode {
+                    flags: smithay_client_toolkit::reexports::client::WEnum::Value(flags),
+                    width,
+                    height,
+                    refresh,
+                } => {
+                    if flags.contains(wl_output::Mode::Current) {
+                        entry.wl_mode = Some((
+                            width,
+                            height,
+                            refresh,
+                            flags.contains(wl_output::Mode::Preferred),
+                        ));
+                    }
+                },
+                wl_output::Event::Scale { factor } => {
+                    entry.wl_scale = Some(factor);
+                },
+                wl_output::Event::Name { name } => {
+                    entry.wl_name = Some(name);
+                },
+                _ => {},
+            }
+        }
+    }
+
+    impl Dispatch<zxdg_output_v1::ZxdgOutputV1, u32> for WireClientData {
+        fn event(
+            state: &mut Self,
+            _proxy: &zxdg_output_v1::ZxdgOutputV1,
+            event: zxdg_output_v1::Event,
+            global_name: &u32,
+            _conn: &Connection,
+            _qh: &QueueHandle<Self>,
+        ) {
+            let entry = state.output_snapshots.entry(*global_name).or_default();
+            match event {
+                zxdg_output_v1::Event::LogicalPosition { x, y } => {
+                    entry.xdg_logical_position = Some((x, y));
+                },
+                zxdg_output_v1::Event::LogicalSize { width, height } => {
+                    entry.xdg_logical_size = Some((width, height));
+                },
+                zxdg_output_v1::Event::Name { name } => {
+                    entry.xdg_name = Some(name);
+                },
+                _ => {},
             }
         }
     }
@@ -2409,5 +2538,158 @@ mod tests {
             assert_eq!(taken, expected_taken, "{label}: taken");
             assert_eq!(dirty, expected_remaining, "{label}: remaining");
         }
+    }
+
+    #[test]
+    #[cfg_attr(miri, ignore)]
+    fn test_xdg_output_forwards_multi_monitor_and_fractional_layout() {
+        use crate::serialization::wayland::Mode as SerMode;
+        use crate::serialization::wayland::OutputEvent;
+        use crate::serialization::wayland::OutputInfo;
+        use crate::serialization::wayland::Subpixel as SerSubpixel;
+        use crate::serialization::wayland::Transform as SerTransform;
+
+        let mut h = WaylandTestHarness::new(true);
+        assert!(
+            h.client_data.xdg_output_manager.is_some(),
+            "wprsd must advertise zxdg_output_manager_v1"
+        );
+        let conn_id = h.conn_id.unwrap();
+
+        let make_output = |id: u32,
+                           name: &str,
+                           dimensions: (i32, i32),
+                           scale_factor: i32,
+                           transform: SerTransform,
+                           logical_position: (i32, i32),
+                           logical_size: (i32, i32)| OutputInfo {
+            id,
+            model: format!("Model-{id}"),
+            make: "Vendor".to_string(),
+            // Sway reports `(0, 0)` on `wl_output.geometry` for every monitor.
+            location: (0, 0).into(),
+            physical_size: (600, 340).into(),
+            subpixel: SerSubpixel::HorizontalRgb,
+            transform,
+            scale_factor,
+            mode: SerMode {
+                dimensions: dimensions.into(),
+                refresh_rate: 60000,
+                current: true,
+                preferred: true,
+            },
+            logical_position: Some(logical_position.into()),
+            logical_size: Some(logical_size.into()),
+            name: Some(name.to_string()),
+            description: None,
+        };
+
+        let left = make_output(
+            1,
+            "DP-1",
+            (1920, 1080),
+            1,
+            SerTransform::Normal,
+            (0, 0),
+            (1920, 1080),
+        );
+        let middle = make_output(
+            2,
+            "DP-2",
+            (3840, 2160),
+            2,
+            SerTransform::Normal,
+            (1920, 0),
+            (2560, 1440),
+        );
+        let right = make_output(
+            3,
+            "HDMI-A-1",
+            (1920, 1080),
+            2,
+            SerTransform::_90,
+            (4480, 0),
+            (720, 1280),
+        );
+
+        for output in [left, middle.clone(), right] {
+            h.state.handle_event(
+                conn_id,
+                RecvType::Object(Event::Output(OutputEvent::New(output))),
+            );
+        }
+        // Two roundtrips: first discovers `wl_output` globals and sends
+        // `get_xdg_output`; second receives initial `zxdg_output_v1` events.
+        h.roundtrip();
+        h.roundtrip();
+
+        let by_name: HashMap<String, &WireOutputSnapshot> = h
+            .client_data
+            .output_snapshots
+            .values()
+            .map(|snap| (snap.wl_name.clone().expect("wl_output.name"), snap))
+            .collect();
+        assert_eq!(by_name.len(), 3);
+
+        assert_eq!(by_name["1_DP-1"].wl_geometry, Some((0, 0)));
+        assert_eq!(by_name["1_DP-1"].wl_mode, Some((1920, 1080, 60000, true)));
+        assert_eq!(by_name["1_DP-1"].wl_scale, Some(1));
+        assert_eq!(by_name["1_DP-1"].xdg_logical_position, Some((0, 0)));
+        assert_eq!(by_name["1_DP-1"].xdg_logical_size, Some((1920, 1080)));
+        assert_eq!(by_name["1_DP-1"].xdg_name.as_deref(), Some("1_DP-1"));
+
+        assert_eq!(by_name["2_DP-2"].wl_geometry, Some((1920, 0)));
+        assert_eq!(by_name["2_DP-2"].wl_mode, Some((3840, 2160, 60000, true)));
+        assert_eq!(by_name["2_DP-2"].wl_scale, Some(2));
+        assert_eq!(by_name["2_DP-2"].xdg_logical_position, Some((1920, 0)));
+        assert_eq!(by_name["2_DP-2"].xdg_logical_size, Some((2560, 1440)));
+
+        assert_eq!(by_name["3_HDMI-A-1"].wl_geometry, Some((4480, 0)));
+        assert_eq!(
+            by_name["3_HDMI-A-1"].wl_mode,
+            Some((1920, 1080, 60000, true))
+        );
+        assert_eq!(by_name["3_HDMI-A-1"].wl_scale, Some(2));
+        assert_eq!(by_name["3_HDMI-A-1"].xdg_logical_position, Some((4480, 0)));
+        assert_eq!(by_name["3_HDMI-A-1"].xdg_logical_size, Some((720, 1280)));
+
+        // Updating position, mode, and fractional scale must update both
+        // `wl_output` (preserving `Preferred`) and `zxdg_output_v1`.
+        let mut updated_middle = middle;
+        updated_middle.mode.dimensions = (2560, 1440).into();
+        updated_middle.scale_factor = 1;
+        updated_middle.logical_position = Some((1920, 100).into());
+        updated_middle.logical_size = Some((2048, 1152).into());
+        h.state.handle_event(
+            conn_id,
+            RecvType::Object(Event::Output(OutputEvent::Update(updated_middle.clone()))),
+        );
+        h.roundtrip();
+
+        let middle_snap = h
+            .client_data
+            .output_snapshots
+            .values()
+            .find(|snap| snap.wl_name.as_deref() == Some("2_DP-2"))
+            .unwrap();
+        assert_eq!(middle_snap.wl_geometry, Some((1920, 100)));
+        assert_eq!(middle_snap.wl_mode, Some((2560, 1440, 60000, true)));
+        assert_eq!(middle_snap.wl_scale, Some(1));
+        assert_eq!(middle_snap.xdg_logical_position, Some((1920, 100)));
+        assert_eq!(middle_snap.xdg_logical_size, Some((2048, 1152)));
+
+        // Destroying an output withdraws its global cleanly.
+        h.state.handle_event(
+            conn_id,
+            RecvType::Object(Event::Output(OutputEvent::Destroy(updated_middle))),
+        );
+        h.roundtrip();
+        assert_eq!(h.client_data.output_snapshots.len(), 2);
+        assert!(
+            h.client_data
+                .output_snapshots
+                .values()
+                .all(|snap| snap.wl_name.as_deref() != Some("2_DP-2"))
+        );
     }
 }

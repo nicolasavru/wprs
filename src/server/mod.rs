@@ -32,6 +32,7 @@ use smithay::reexports::wayland_server::DisplayHandle;
 use smithay::reexports::wayland_server::Resource;
 use smithay::wayland::compositor;
 use smithay::wayland::compositor::CompositorState;
+use smithay::wayland::output::OutputManagerState;
 use smithay::wayland::selection::primary_selection::PrimarySelectionState;
 use smithay::wayland::shell::kde::decoration::KdeDecorationState;
 use smithay::wayland::shell::xdg::XdgShellState;
@@ -131,6 +132,7 @@ pub struct WprsServerState {
     pub kde_decoration_state: KdeDecorationState,
     pub shm_state: ShmState,
     pub seat_state: SeatState<Self>,
+    pub output_manager_state: OutputManagerState,
     pub data_device_state: WprsDataDeviceState,
     pub primary_selection_state: PrimarySelectionState,
     pub viewporter_state: ViewporterState,
@@ -201,6 +203,7 @@ impl WprsServerState {
             kde_decoration_state: KdeDecorationState::new::<Self>(&dh, kde_default_decoration_mode),
             shm_state: ShmState::new::<Self>(&dh, Vec::new()),
             seat_state,
+            output_manager_state: OutputManagerState::new_with_xdg_output::<Self>(&dh),
             data_device_state: WprsDataDeviceState::new(&dh),
             primary_selection_state: PrimarySelectionState::new::<Self>(&dh),
             viewporter_state: ViewporterState::new::<Self>(&dh),

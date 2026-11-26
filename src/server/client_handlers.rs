@@ -850,26 +850,28 @@ impl WprsServerState {
         match output_event {
             OutputEvent::New(output) => {
                 let output_id = output.id;
-                let (local_output, _) = self.outputs.entry(output_id).or_insert_with_key(|id| {
-                    let new_output = Output::new(
-                        format!(
-                            "{}_{}",
-                            id,
-                            output.name.clone().unwrap_or("None".to_string())
-                        ),
-                        PhysicalProperties {
-                            size: output.physical_size.into(),
-                            subpixel: output.subpixel.into(),
-                            make: output.make.clone(),
-                            model: output.model.clone(),
-                        },
-                    );
-                    let global_id = new_output.create_global::<Self>(&self.dh);
-                    (new_output, global_id)
-                });
-
-                compositor_utils::update_output(local_output, output);
-                let local_output = local_output.clone();
+                let local_output = match self.outputs.entry(output_id) {
+                    Entry::Occupied(mut entry) => {
+                        let local_output = &mut entry.get_mut().0;
+                        compositor_utils::update_output(local_output, output);
+                        local_output.clone()
+                    },
+                    Entry::Vacant(entry) => {
+                        let mut new_output = Output::new(
+                            format!("{}_{}", output_id, output.name.as_deref().unwrap_or("None")),
+                            PhysicalProperties {
+                                size: output.physical_size.into(),
+                                subpixel: output.subpixel.into(),
+                                make: output.make.clone(),
+                                model: output.model.clone(),
+                            },
+                        );
+                        compositor_utils::update_output(&mut new_output, output);
+                        let global_id = new_output.create_global::<Self>(&self.dh);
+                        entry.insert((new_output.clone(), global_id));
+                        new_output
+                    },
+                };
                 // Host compositors with `zxdg_output_v1` can emit `wl_surface.enter`
                 // (`OutputsChanged`) before `zxdg_output_v1.done` unblocks `OutputEvent::New`.
                 self.enter_surfaces_on_output(output_id, &local_output);
