@@ -73,6 +73,55 @@ use compositor::WprsCompositorState;
 use compositor::X11Parent;
 use compositor::XwaylandOptions;
 
+#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+pub(crate) enum WaylandWindowType {
+    Toplevel,
+    Popup,
+    SubSurface,
+}
+
+/// Classifies an X11 window into its target Wayland shell role.
+///
+/// Override-redirect windows and EWMH popup window types always map to
+/// `Popup` even when `WM_TRANSIENT_FOR` is set, so context menus and dropdowns
+/// receive `xdg_positioner` constraint adjustments instead of being downgraded
+/// to subsurfaces.
+pub(crate) fn classify_wayland_window_type(
+    window_type: Option<WmWindowType>,
+    is_override_redirect: bool,
+    has_explicit_transient_parent: bool,
+) -> WaylandWindowType {
+    if is_override_redirect {
+        return WaylandWindowType::Popup;
+    }
+
+    // https://specifications.freedesktop.org/wm-spec/wm-spec-latest.html#idm45317634120064
+    let resolved_type = window_type.unwrap_or(if has_explicit_transient_parent {
+        WmWindowType::Dialog
+    } else {
+        WmWindowType::Normal
+    });
+
+    match resolved_type {
+        WmWindowType::DropdownMenu
+        | WmWindowType::Menu
+        | WmWindowType::Notification
+        | WmWindowType::PopupMenu
+        | WmWindowType::Toolbar
+        | WmWindowType::Tooltip => WaylandWindowType::Popup,
+        WmWindowType::Dialog
+        | WmWindowType::Normal
+        | WmWindowType::Splash
+        | WmWindowType::Utility => {
+            if has_explicit_transient_parent {
+                WaylandWindowType::SubSurface
+            } else {
+                WaylandWindowType::Toplevel
+            }
+        },
+    }
+}
+
 #[derive(Debug)]
 pub struct XWaylandSurface {
     pub(crate) x11_surface: Option<X11Surface>,
@@ -83,7 +132,7 @@ pub struct XWaylandSurface {
     // None when the surface is owned by a role object (e.g., a Window).
     pub(crate) local_surface: Option<Surface>,
     pub(crate) role: Option<Role>,
-    pub(crate) parent: Option<X11Parent>,
+    pub(crate) parent_id: Option<CompositorObjectId>,
     pub(crate) children: HashSet<CompositorObjectId>,
     pub(crate) output_ids: HashSet<u32>,
     pub(crate) damage: FrameDamage,
@@ -99,7 +148,7 @@ impl Default for XWaylandSurface {
             buffer_transform: SctkTransform::Normal,
             local_surface: None,
             role: None,
-            parent: None,
+            parent_id: None,
             children: HashSet::new(),
             output_ids: HashSet::new(),
             damage: FrameDamage::Empty,
@@ -230,8 +279,8 @@ impl XWaylandSurface {
     fn update_x11_surface(
         &mut self,
         x11_surface: X11Surface,
+        wayland_window_type: WaylandWindowType,
         parent: Option<X11Parent>,
-        fallback_parent: &Option<X11Parent>,
         xdg_shell_state: &XdgShell,
         shm_state: &Shm,
         subcompositor_state: Arc<SubcompositorState>,
@@ -243,67 +292,10 @@ impl XWaylandSurface {
             return Ok(());
         }
 
-        let x11_surface = self.get_x11_surface().location(loc!())?;
-
-        // https://specifications.freedesktop.org/wm-spec/wm-spec-latest.html#idm45317634120064
-        let window_type = x11_surface.window_type().unwrap_or_else(|| {
-            if x11_surface.is_override_redirect() {
-                WmWindowType::Normal
-            } else if x11_surface.is_transient_for().is_some() {
-                WmWindowType::Dialog
-            } else {
-                WmWindowType::Normal
-            }
-        });
-
-        enum WaylandWindowType {
-            Toplevel,
-            Popup,
-            SubSurface,
-        }
-
-        let wayland_window_type = if parent.is_some() {
-            // X11 child windows will try to place their location relative to their parent.
-            // We use subsurfaces to let them be placed outside the bounds of their toplevel
-            // window.
-
-            WaylandWindowType::SubSurface
-        } else {
-            match window_type {
-                // Java uses Dialog with override-redirect for dropbown menus.
-                WmWindowType::Dialog if x11_surface.is_override_redirect() => {
-                    WaylandWindowType::Popup
-                },
-                // gvim uses Normal with override-redirect for tooltips.
-                WmWindowType::Normal if x11_surface.is_override_redirect() => {
-                    WaylandWindowType::Popup
-                },
-                // Firefox uses Utility with override-redirect for its hamburger
-                // menu.
-                WmWindowType::Utility if x11_surface.is_override_redirect() => {
-                    WaylandWindowType::Popup
-                },
-                WmWindowType::Dialog
-                | WmWindowType::Normal
-                | WmWindowType::Splash
-                | WmWindowType::Utility => WaylandWindowType::Toplevel,
-                WmWindowType::DropdownMenu
-                | WmWindowType::Menu
-                | WmWindowType::Notification
-                | WmWindowType::PopupMenu
-                | WmWindowType::Toolbar
-                | WmWindowType::Tooltip => WaylandWindowType::Popup,
-            }
-        };
-
-        let parent_if_toplevel = parent.clone();
-        let parent_if_popup = parent.clone().or_else(|| fallback_parent.clone());
-        let parent_if_subsurface = parent.or_else(|| fallback_parent.clone());
-
         match wayland_window_type {
             WaylandWindowType::Toplevel => {
                 debug!("creating xdg_toplevel for {self:?}");
-                self.parent.clone_from(&parent_if_toplevel);
+                self.parent_id = None;
                 XWaylandXdgToplevel::set_role(
                     self,
                     xdg_shell_state,
@@ -314,57 +306,78 @@ impl XWaylandSurface {
                 )
                 .location(loc!())?;
             },
-            WaylandWindowType::Popup if parent_if_popup.is_none() => {
-                debug!(
-                    "creating xdg_toplevel for {self:?} instead of popup because parent was None"
-                );
-                self.parent = None;
-                XWaylandXdgToplevel::set_role(
-                    self,
-                    xdg_shell_state,
-                    shm_state,
-                    subcompositor_state,
-                    qh,
-                    decoration_behavior,
-                )
-                .location(loc!())?;
+            WaylandWindowType::Popup => match parent {
+                None => {
+                    debug!(
+                        "creating xdg_toplevel for {self:?} instead of popup because parent was None"
+                    );
+                    self.parent_id = None;
+                    XWaylandXdgToplevel::set_role(
+                        self,
+                        xdg_shell_state,
+                        shm_state,
+                        subcompositor_state,
+                        qh,
+                        decoration_behavior,
+                    )
+                    .location(loc!())?;
+                },
+                Some(X11Parent {
+                    for_popup: Some(popup_parent),
+                    ..
+                }) => {
+                    debug!("creating xdg_popup for {self:?}");
+                    self.parent_id = Some(popup_parent.surface_id.clone());
+                    XWaylandXdgPopup::set_role(self, &popup_parent, xdg_shell_state, qh)
+                        .location(loc!())?;
+                },
+                Some(X11Parent {
+                    surface_id,
+                    for_popup: None,
+                    for_subsurface,
+                }) => {
+                    debug!(
+                        "creating subsurface for {self:?} instead of popup because parent has no xdg_surface ancestor"
+                    );
+                    self.parent_id = Some(surface_id);
+                    XWaylandSubSurface::set_role(
+                        self,
+                        for_subsurface,
+                        shm_state,
+                        subcompositor_state,
+                        qh,
+                    )
+                    .location(loc!())?;
+                },
             },
-            WaylandWindowType::Popup if parent_if_popup.clone().unwrap().for_popup.is_none() => {
-                debug!(
-                    "creating subsurface for {self:?} instead of popup because parent was subsurface"
-                );
-                self.parent.clone_from(&parent_if_subsurface);
-                XWaylandSubSurface::set_role(
-                    self,
-                    parent_if_subsurface.unwrap().for_subsurface,
-                    shm_state,
-                    subcompositor_state,
-                    qh,
-                )
-                .location(loc!())?;
-            },
-            WaylandWindowType::Popup => {
-                debug!("creating xdg_popup for {self:?}");
-                self.parent.clone_from(&parent_if_popup);
-                XWaylandXdgPopup::set_role(
-                    self,
-                    &parent_if_popup.unwrap().for_popup.unwrap(),
-                    xdg_shell_state,
-                    qh,
-                )
-                .location(loc!())?;
-            },
-            WaylandWindowType::SubSurface => {
-                debug!("creating subsurface for {self:?}");
-                self.parent.clone_from(&parent_if_subsurface);
-                XWaylandSubSurface::set_role(
-                    self,
-                    parent_if_subsurface.unwrap().for_subsurface,
-                    shm_state,
-                    subcompositor_state,
-                    qh,
-                )
-                .location(loc!())?;
+            WaylandWindowType::SubSurface => match parent {
+                Some(parent) => {
+                    debug!("creating subsurface for {self:?}");
+                    self.parent_id = Some(parent.surface_id);
+                    XWaylandSubSurface::set_role(
+                        self,
+                        parent.for_subsurface,
+                        shm_state,
+                        subcompositor_state,
+                        qh,
+                    )
+                    .location(loc!())?;
+                },
+                None => {
+                    debug!(
+                        "creating xdg_toplevel for {self:?} instead of subsurface because parent was None"
+                    );
+                    self.parent_id = None;
+                    XWaylandXdgToplevel::set_role(
+                        self,
+                        xdg_shell_state,
+                        shm_state,
+                        subcompositor_state,
+                        qh,
+                        decoration_behavior,
+                    )
+                    .location(loc!())?;
+                },
             },
             // TODO: do we need a None for hidden helper windows?
         }
@@ -441,13 +454,25 @@ impl WprsState {
             self.remove_surface(&child);
         }
 
-        if let Some(xwayland_surface) = self.surfaces.remove(surface_id)
-            && let Some(parent) = xwayland_surface.parent
+        let removed_parent_id = self
+            .surfaces
+            .remove(surface_id)
+            .and_then(|xwayland_surface| xwayland_surface.parent_id);
+
+        if let Some(parent_id) = &removed_parent_id
+            && let Some(parent_xwayland_surface) = self.surfaces.get_mut(parent_id)
         {
-            let parent_xwayland_surface = self.surfaces.get_mut(&parent.surface_id).unwrap();
             parent_xwayland_surface
                 .children
                 .retain(|child_surface_id| child_surface_id != surface_id);
+        }
+
+        let fallback_focus = removed_parent_id.filter(|id| self.surfaces.contains_key(id));
+        if self.client_state.last_pointer_surface.as_ref() == Some(surface_id) {
+            self.client_state.last_pointer_surface = fallback_focus.clone();
+        }
+        if self.client_state.last_keyboard_surface.as_ref() == Some(surface_id) {
+            self.client_state.last_keyboard_surface = fallback_focus;
         }
 
         // this MUST come after removing xwayland_surface, because xwayland_surface's role needs
@@ -676,4 +701,71 @@ pub fn xsurface_from_x11_surface<'a>(
             .map(|s| s == surface)
             .unwrap_or(false)
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_classify_wayland_window_type() {
+        // Override-redirect windows ALWAYS map to Popup even when
+        // WM_TRANSIENT_FOR is set (GTK/Qt/Java/Chromium context menus).
+        for window_type in [
+            None,
+            Some(WmWindowType::Normal),
+            Some(WmWindowType::Dialog),
+            Some(WmWindowType::Utility),
+            Some(WmWindowType::PopupMenu),
+            Some(WmWindowType::DropdownMenu),
+            Some(WmWindowType::Tooltip),
+        ] {
+            for has_transient in [false, true] {
+                assert_eq!(
+                    classify_wayland_window_type(window_type, true, has_transient),
+                    WaylandWindowType::Popup,
+                    "override-redirect {window_type:?} transient={has_transient}"
+                );
+            }
+        }
+
+        // EWMH popup types also always map to Popup even when non-OR + transient.
+        for window_type in [
+            WmWindowType::DropdownMenu,
+            WmWindowType::Menu,
+            WmWindowType::Notification,
+            WmWindowType::PopupMenu,
+            WmWindowType::Toolbar,
+            WmWindowType::Tooltip,
+        ] {
+            for has_transient in [false, true] {
+                assert_eq!(
+                    classify_wayland_window_type(Some(window_type), false, has_transient),
+                    WaylandWindowType::Popup,
+                    "non-OR {window_type:?} transient={has_transient}"
+                );
+            }
+        }
+
+        // Non-override-redirect normal/dialog/utility/splash windows become
+        // SubSurface only when explicitly transient, otherwise Toplevel.
+        for window_type in [
+            None,
+            Some(WmWindowType::Normal),
+            Some(WmWindowType::Dialog),
+            Some(WmWindowType::Utility),
+            Some(WmWindowType::Splash),
+        ] {
+            assert_eq!(
+                classify_wayland_window_type(window_type, false, true),
+                WaylandWindowType::SubSurface,
+                "transient non-OR {window_type:?}"
+            );
+            assert_eq!(
+                classify_wayland_window_type(window_type, false, false),
+                WaylandWindowType::Toplevel,
+                "standalone non-OR {window_type:?}"
+            );
+        }
+    }
 }

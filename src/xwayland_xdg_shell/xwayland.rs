@@ -33,6 +33,7 @@ use smithay::xwayland::xwm::XwmId;
 use crate::prelude::*;
 use crate::xwayland_xdg_shell::WprsState;
 use crate::xwayland_xdg_shell::client::Role;
+use crate::xwayland_xdg_shell::compositor::popup_parent_origin;
 use crate::xwayland_xdg_shell::xsurface_from_x11_surface;
 
 impl XwmHandler for WprsState {
@@ -174,11 +175,52 @@ impl XwmHandler for WprsState {
         geometry: Rectangle<i32, Logical>,
         _above: Option<u32>,
     ) {
-        if let Some(xwayland_surface) = xsurface_from_x11_surface(&mut self.surfaces, &window)
-            && let Some(Role::SubSurface(subsurface)) = &mut xwayland_surface.role
-            && !subsurface.move_active
-        {
-            subsurface.move_(geometry.loc.x, geometry.loc.y, &self.client_state.qh);
+        let Some(surface_id) = self.surfaces.iter().find_map(|(id, xws)| {
+            xws.x11_surface
+                .as_ref()
+                .is_some_and(|s| s == &window)
+                .then(|| id.clone())
+        }) else {
+            return;
+        };
+
+        let parent_origin = self
+            .surfaces
+            .get(&surface_id)
+            .and_then(|xws| match &xws.role {
+                Some(Role::XdgPopup(popup)) => popup_parent_origin(&self.surfaces, &popup.parent),
+                Some(Role::SubSurface(_)) => xws
+                    .parent_id
+                    .as_ref()
+                    .and_then(|pid| self.surfaces.get(pid))
+                    .and_then(|p| p.get_x11_surface().ok())
+                    .map(|s| (s.geometry().loc.into(), (0, 0).into())),
+                _ => None,
+            });
+
+        let Some(xwayland_surface) = self.surfaces.get_mut(&surface_id) else {
+            return;
+        };
+        match &mut xwayland_surface.role {
+            Some(Role::SubSurface(subsurface)) if !subsurface.move_active => {
+                if let Some((parent_x11_loc, _)) = parent_origin {
+                    subsurface.offset = (-parent_x11_loc.x, -parent_x11_loc.y).into();
+                }
+                subsurface.move_(geometry.loc.x, geometry.loc.y, &self.client_state.qh);
+            },
+            Some(Role::XdgPopup(popup)) => {
+                if let Some((parent_x11_loc, parent_frame_offset)) = parent_origin {
+                    popup
+                        .reposition(
+                            &self.client_state.xdg_shell_state,
+                            geometry,
+                            parent_x11_loc,
+                            parent_frame_offset,
+                        )
+                        .log_and_ignore(loc!());
+                }
+            },
+            _ => {},
         }
     }
 

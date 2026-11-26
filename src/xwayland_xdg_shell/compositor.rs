@@ -261,6 +261,7 @@ pub struct WprsCompositorState {
     pub outputs: HashMap<u32, (Output, GlobalId)>,
     pub(crate) serial_map: SerialMap,
     pub(crate) pressed_keys: HashSet<u32>,
+    pub(crate) pressed_buttons: HashSet<u32>,
 
     pub xwm: Option<X11Wm>,
 
@@ -344,6 +345,7 @@ impl WprsCompositorState {
             outputs: HashMap::new(),
             serial_map: SerialMap::new(),
             pressed_keys: HashSet::new(),
+            pressed_buttons: HashSet::new(),
             xwm: None,
             x11_surfaces: Vec::new(),
         }
@@ -503,14 +505,14 @@ pub fn commit(surface: &WlSurface, state: &mut WprsState) -> Result<()> {
 pub(crate) struct X11ParentForPopup {
     pub(crate) surface_id: ObjectId,
     pub(crate) xdg_surface: xdg_surface::XdgSurface,
-    pub(crate) x11_offset: Point<i32>,
-    pub(crate) wl_offset: Point<i32>,
+    pub(crate) x11_loc: Point<i32>,
+    pub(crate) frame_offset: Point<i32>,
 }
 
 #[derive(Debug, Clone)]
 pub(crate) struct X11ParentForSubsurface {
     pub(crate) surface: SctkWlSurface,
-    pub(crate) x11_offset: Point<i32>,
+    pub(crate) x11_loc: Point<i32>,
 }
 
 #[derive(Debug, Clone)]
@@ -520,78 +522,333 @@ pub(crate) struct X11Parent {
     pub(crate) for_subsurface: X11ParentForSubsurface,
 }
 
-pub(crate) fn find_x11_parent(
-    state: &WprsState,
-    x11_surface: Option<X11Surface>,
-) -> Option<X11Parent> {
-    if let Some(x11_surface) = &x11_surface {
-        if let Some(parent_id) = x11_surface.is_transient_for() {
-            let Some((parent_id, parent)) = state.surfaces.iter().find(|(_, xwls)| {
-                xwls.x11_surface
-                    .as_ref()
-                    .is_some_and(|s| s.window_id() == parent_id)
-            }) else {
-                error!("parent_id {parent_id:?} not found");
-                return None;
-            };
+#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+pub(crate) enum CandidateRole {
+    Toplevel,
+    Popup,
+    SubSurface,
+}
 
-            let Ok(parent_x11_surface) = parent.get_x11_surface() else {
-                error!("parent {parent:?} has no attached x11 surface");
-                return None;
-            };
-            let parent_geo = parent_x11_surface.geometry();
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct ParentCandidate<Id> {
+    pub(crate) id: Id,
+    pub(crate) x11_window_id: u32,
+    pub(crate) pid: Option<u32>,
+    pub(crate) geometry: Rectangle<i32, Logical>,
+    pub(crate) role: CandidateRole,
+}
 
-            match &parent.role {
-                Some(Role::XdgToplevel(toplevel)) => Some(X11Parent {
-                    surface_id: parent_id.clone(),
-                    for_popup: Some(X11ParentForPopup {
-                        surface_id: parent_id.clone(),
-                        xdg_surface: toplevel.xdg_surface().clone(),
-                        x11_offset: (
-                            -parent_geo.loc.x + toplevel.frame_offset.x,
-                            -parent_geo.loc.y + toplevel.frame_offset.y,
-                        )
-                            .into(),
-                        wl_offset: toplevel.frame_offset,
-                    }),
-                    for_subsurface: X11ParentForSubsurface {
-                        surface: toplevel.wl_surface().clone(),
-                        x11_offset: (-parent_geo.loc.x, -parent_geo.loc.y).into(),
-                    },
-                }),
-                Some(Role::XdgPopup(popup)) => Some(X11Parent {
-                    surface_id: parent_id.clone(),
-                    for_popup: Some(X11ParentForPopup {
-                        surface_id: parent_id.clone(),
-                        xdg_surface: popup.xdg_surface().clone(),
-                        x11_offset: (-parent_geo.loc.x, -parent_geo.loc.y).into(),
-                        wl_offset: (-parent_geo.loc.x, -parent_geo.loc.y).into(),
-                    }),
-                    for_subsurface: X11ParentForSubsurface {
-                        surface: popup.wl_surface().clone(),
-                        x11_offset: (-parent_geo.loc.x, -parent_geo.loc.y).into(),
-                    },
-                }),
-                Some(Role::SubSurface(subsurface)) => Some(X11Parent {
-                    surface_id: parent_id.clone(),
-                    for_popup: None, // subsurface cannot be parent to popup
-                    for_subsurface: X11ParentForSubsurface {
-                        surface: subsurface.wl_surface().clone(),
-                        x11_offset: (-parent_geo.loc.x, -parent_geo.loc.y).into(),
-                    },
-                }),
-                Some(Role::Cursor) => unreachable!("Cursors cannot have child surfaces."),
-                // TODO: fix this
-                None => unreachable!(
-                    "Parent doesn't yet have a role assigned. This is a race condition."
-                ),
-            }
-        } else {
-            None
-        }
-    } else {
-        None
+fn role_priority(role: CandidateRole) -> u8 {
+    match role {
+        CandidateRole::Popup => 0,
+        CandidateRole::Toplevel => 1,
+        CandidateRole::SubSurface => 2,
     }
+}
+
+fn point_distance_sq_to_rect(p: Point<i32>, rect: Rectangle<i32, Logical>) -> i64 {
+    let min_x = i64::from(rect.loc.x);
+    let max_x = i64::from(rect.loc.x) + i64::from(rect.size.w.max(0));
+    let min_y = i64::from(rect.loc.y);
+    let max_y = i64::from(rect.loc.y) + i64::from(rect.size.h.max(0));
+    let px = i64::from(p.x);
+    let py = i64::from(p.y);
+    let dx = if px < min_x {
+        min_x - px
+    } else if px > max_x {
+        px - max_x
+    } else {
+        0
+    };
+    let dy = if py < min_y {
+        min_y - py
+    } else if py > max_y {
+        py - max_y
+    } else {
+        0
+    };
+    dx * dx + dy * dy
+}
+
+fn rect_contains_point(rect: Rectangle<i32, Logical>, p: Point<i32>) -> bool {
+    p.x >= rect.loc.x
+        && p.x < rect.loc.x + rect.size.w
+        && p.y >= rect.loc.y
+        && p.y < rect.loc.y + rect.size.h
+}
+
+fn rects_intersect(a: Rectangle<i32, Logical>, b: Rectangle<i32, Logical>) -> bool {
+    let aw = a.size.w.max(1);
+    let ah = a.size.h.max(1);
+    let bw = b.size.w.max(1);
+    let bh = b.size.h.max(1);
+    a.loc.x < b.loc.x + bw
+        && a.loc.x + aw > b.loc.x
+        && a.loc.y < b.loc.y + bh
+        && a.loc.y + ah > b.loc.y
+}
+
+fn candidate_near_child(
+    candidate: Rectangle<i32, Logical>,
+    child: Rectangle<i32, Logical>,
+) -> bool {
+    // Allow a small margin so popups flipped or offset slightly past a parent's
+    // border still match the parent that spawned them.
+    const PROXIMITY_MARGIN_PX: i64 = 64;
+    rect_contains_point(candidate, child.loc.into())
+        || rects_intersect(candidate, child)
+        || point_distance_sq_to_rect(child.loc.into(), candidate)
+            <= PROXIMITY_MARGIN_PX * PROXIMITY_MARGIN_PX
+}
+
+fn best_candidate_by_geometry<'a, Id: Copy + 'a>(
+    child_geometry: Rectangle<i32, Logical>,
+    pool: impl Iterator<Item = &'a ParentCandidate<Id>>,
+) -> Option<Id> {
+    let child_loc: Point<i32> = child_geometry.loc.into();
+    pool.min_by_key(|c| {
+        let overlap_rank = if rect_contains_point(c.geometry, child_loc) {
+            0u8
+        } else if rects_intersect(c.geometry, child_geometry) {
+            1u8
+        } else {
+            2u8
+        };
+        (
+            overlap_rank,
+            point_distance_sq_to_rect(child_loc, c.geometry),
+            role_priority(c.role),
+        )
+    })
+    .map(|c| c.id)
+}
+
+/// Selects the best mapped parent surface for an X11 popup or transient window.
+///
+/// Priority order:
+/// 1. Explicit `WM_TRANSIENT_FOR` (never self).
+/// 2. Focused surface (`last_pointer`, then `last_keyboard`) matching `child_pid`
+///    whose geometry is near `child_geometry`.
+/// 3. Focused surface (`last_pointer`, then `last_keyboard`) matching `child_pid`
+///    (handles popups mapped at `(0, 0)` before their initial `ConfigureNotify`).
+/// 4. Closest/containing mapped surface matching `child_pid`.
+/// 5. Focused surface (`last_pointer`, then `last_keyboard`) regardless of PID
+///    (for clients without `_NET_WM_PID`), preferring one near `child_geometry`.
+/// 6. Closest/containing mapped surface regardless of PID.
+pub(crate) fn select_x11_parent_id<Id: Eq + Copy>(
+    child_id: Id,
+    child_transient_for: Option<u32>,
+    child_pid: Option<u32>,
+    child_geometry: Rectangle<i32, Logical>,
+    last_pointer: Option<Id>,
+    last_keyboard: Option<Id>,
+    candidates: &[ParentCandidate<Id>],
+) -> Option<Id> {
+    let valid = |c: &&ParentCandidate<Id>| c.id != child_id;
+
+    if let Some(transient_window_id) = child_transient_for
+        && let Some(parent) = candidates
+            .iter()
+            .filter(valid)
+            .find(|c| c.x11_window_id == transient_window_id)
+    {
+        return Some(parent.id);
+    }
+
+    let focused_candidates = |pid_filter: Option<u32>| -> Vec<&ParentCandidate<Id>> {
+        [last_pointer, last_keyboard]
+            .into_iter()
+            .flatten()
+            .filter(|&id| id != child_id)
+            .filter_map(|id| {
+                candidates
+                    .iter()
+                    .find(|c| c.id == id && pid_filter.is_none_or(|pid| c.pid == Some(pid)))
+            })
+            .collect()
+    };
+
+    if let Some(pid) = child_pid {
+        let focused_same_pid = focused_candidates(Some(pid));
+        if let Some(near) = focused_same_pid
+            .iter()
+            .find(|c| candidate_near_child(c.geometry, child_geometry))
+        {
+            return Some(near.id);
+        }
+        if let Some(first) = focused_same_pid.first() {
+            return Some(first.id);
+        }
+        if let Some(by_geo) = best_candidate_by_geometry(
+            child_geometry,
+            candidates
+                .iter()
+                .filter(valid)
+                .filter(|c| c.pid == Some(pid)),
+        ) {
+            return Some(by_geo);
+        }
+    }
+
+    let focused_any = focused_candidates(None);
+    if let Some(near) = focused_any
+        .iter()
+        .find(|c| candidate_near_child(c.geometry, child_geometry))
+    {
+        return Some(near.id);
+    }
+    if let Some(first) = focused_any.first() {
+        return Some(first.id);
+    }
+
+    best_candidate_by_geometry(child_geometry, candidates.iter().filter(valid))
+}
+
+fn find_xdg_ancestor_for_popup(
+    state: &WprsState,
+    start_id: &ObjectId,
+) -> Option<X11ParentForPopup> {
+    let mut cur_id = Some(start_id.clone());
+    for _ in 0..64 {
+        let id = cur_id?;
+        let surface = state.surfaces.get(&id)?;
+        let parent_geo = surface.get_x11_surface().ok()?.geometry();
+        match &surface.role {
+            Some(Role::XdgToplevel(toplevel)) => {
+                return Some(X11ParentForPopup {
+                    surface_id: id,
+                    xdg_surface: toplevel.xdg_surface().clone(),
+                    x11_loc: parent_geo.loc.into(),
+                    frame_offset: toplevel.frame_offset,
+                });
+            },
+            Some(Role::XdgPopup(popup)) => {
+                return Some(X11ParentForPopup {
+                    surface_id: id,
+                    xdg_surface: popup.xdg_surface().clone(),
+                    x11_loc: parent_geo.loc.into(),
+                    frame_offset: (0, 0).into(),
+                });
+            },
+            Some(Role::SubSurface(_)) => {
+                cur_id = surface.parent_id.clone();
+            },
+            _ => return None,
+        }
+    }
+    None
+}
+
+fn build_x11_parent(state: &WprsState, parent_id: &ObjectId) -> Option<X11Parent> {
+    let parent = state.surfaces.get(parent_id)?;
+    let parent_geo = parent.get_x11_surface().ok()?.geometry();
+    let parent_loc: Point<i32> = parent_geo.loc.into();
+
+    match &parent.role {
+        Some(Role::XdgToplevel(toplevel)) => Some(X11Parent {
+            surface_id: parent_id.clone(),
+            for_popup: Some(X11ParentForPopup {
+                surface_id: parent_id.clone(),
+                xdg_surface: toplevel.xdg_surface().clone(),
+                x11_loc: parent_loc,
+                frame_offset: toplevel.frame_offset,
+            }),
+            for_subsurface: X11ParentForSubsurface {
+                surface: toplevel.wl_surface().clone(),
+                x11_loc: parent_loc,
+            },
+        }),
+        Some(Role::XdgPopup(popup)) => Some(X11Parent {
+            surface_id: parent_id.clone(),
+            for_popup: Some(X11ParentForPopup {
+                surface_id: parent_id.clone(),
+                xdg_surface: popup.xdg_surface().clone(),
+                x11_loc: parent_loc,
+                frame_offset: (0, 0).into(),
+            }),
+            for_subsurface: X11ParentForSubsurface {
+                surface: popup.wl_surface().clone(),
+                x11_loc: parent_loc,
+            },
+        }),
+        Some(Role::SubSurface(subsurface)) => Some(X11Parent {
+            surface_id: parent_id.clone(),
+            for_popup: find_xdg_ancestor_for_popup(state, parent_id),
+            for_subsurface: X11ParentForSubsurface {
+                surface: subsurface.wl_surface().clone(),
+                x11_loc: parent_loc,
+            },
+        }),
+        Some(Role::Cursor) | None => None,
+    }
+}
+
+pub(crate) fn popup_parent_origin(
+    surfaces: &HashMap<ObjectId, XWaylandSurface>,
+    parent_id: &ObjectId,
+) -> Option<(Point<i32>, Point<i32>)> {
+    let parent = surfaces.get(parent_id)?;
+    let parent_loc: Point<i32> = parent.get_x11_surface().ok()?.geometry().loc.into();
+    let frame_offset = match &parent.role {
+        Some(Role::XdgToplevel(toplevel)) => toplevel.frame_offset,
+        Some(Role::XdgPopup(_)) => (0, 0).into(),
+        _ => return None,
+    };
+    Some((parent_loc, frame_offset))
+}
+
+fn parent_candidates(state: &WprsState) -> Vec<ParentCandidate<&ObjectId>> {
+    state
+        .surfaces
+        .iter()
+        .filter_map(|(id, xwls)| {
+            let role = match &xwls.role {
+                Some(Role::XdgToplevel(_)) => CandidateRole::Toplevel,
+                Some(Role::XdgPopup(_)) => CandidateRole::Popup,
+                Some(Role::SubSurface(_)) => CandidateRole::SubSurface,
+                Some(Role::Cursor) | None => return None,
+            };
+            let x11_surface = xwls.x11_surface.as_ref()?;
+            Some(ParentCandidate {
+                id,
+                x11_window_id: x11_surface.window_id(),
+                pid: x11_surface.pid(),
+                geometry: x11_surface.geometry(),
+                role,
+            })
+        })
+        .collect()
+}
+
+fn find_explicit_transient_parent_id(
+    state: &WprsState,
+    child_id: &ObjectId,
+    x11_surface: &X11Surface,
+) -> Option<ObjectId> {
+    let transient_window_id = x11_surface.is_transient_for()?;
+    parent_candidates(state)
+        .into_iter()
+        .find(|c| c.id != child_id && c.x11_window_id == transient_window_id)
+        .map(|c| c.id.clone())
+}
+
+fn resolve_x11_parent(
+    state: &WprsState,
+    child_id: &ObjectId,
+    x11_surface: &X11Surface,
+) -> Option<X11Parent> {
+    let candidates = parent_candidates(state);
+    let parent_id = select_x11_parent_id(
+        child_id,
+        x11_surface.is_transient_for(),
+        x11_surface.pid(),
+        x11_surface.geometry(),
+        state.client_state.last_pointer_surface.as_ref(),
+        state.client_state.last_keyboard_surface.as_ref(),
+        &candidates,
+    )?
+    .clone();
+    build_x11_parent(state, &parent_id)
 }
 
 #[instrument(skip(state), level = "debug")]
@@ -612,52 +869,83 @@ pub fn commit_inner(
         .map(|pos| state.compositor_state.x11_surfaces.swap_remove(pos));
     debug!("matched x11 surface: {x11_surface:?}");
 
-    let parent = find_x11_parent(state, x11_surface.clone());
+    let role_plan = x11_surface.as_ref().map(|x11_surface| {
+        let explicit_parent_id =
+            find_explicit_transient_parent_id(state, &surface.id(), x11_surface);
+        let wayland_window_type = crate::xwayland_xdg_shell::classify_wayland_window_type(
+            x11_surface.window_type(),
+            x11_surface.is_override_redirect(),
+            explicit_parent_id.is_some(),
+        );
+        let parent = match wayland_window_type {
+            crate::xwayland_xdg_shell::WaylandWindowType::Toplevel => None,
+            crate::xwayland_xdg_shell::WaylandWindowType::Popup => {
+                resolve_x11_parent(state, &surface.id(), x11_surface)
+            },
+            crate::xwayland_xdg_shell::WaylandWindowType::SubSurface => explicit_parent_id
+                .as_ref()
+                .and_then(|id| build_x11_parent(state, id)),
+        };
+        (wayland_window_type, parent)
+    });
 
-    if let (Some(parent), Some(_)) = (&parent, &x11_surface) {
+    let mut assigned_parent_id: Option<ObjectId> = None;
+    {
+        let xwayland_surface = state.surfaces.entry(surface.id()).or_default();
+
+        if let (Some(x11_surface), Some((wayland_window_type, parent))) = (x11_surface, role_plan) {
+            if xwayland_surface.local_surface.is_none() {
+                let needs_subsurface_parent =
+                    matches!(
+                        wayland_window_type,
+                        crate::xwayland_xdg_shell::WaylandWindowType::SubSurface
+                    ) || (matches!(
+                        wayland_window_type,
+                        crate::xwayland_xdg_shell::WaylandWindowType::Popup
+                    ) && parent.as_ref().is_some_and(|p| p.for_popup.is_none()));
+                let subsurface_parent = needs_subsurface_parent
+                    .then(|| parent.as_ref().map(|p| &p.for_subsurface.surface))
+                    .flatten();
+                xwayland_surface
+                    .update_local_surface(
+                        surface,
+                        subsurface_parent,
+                        &state.client_state.compositor_state,
+                        &state.client_state.qh,
+                        &mut state.surface_bimap,
+                    )
+                    .location(loc!())?;
+            }
+
+            xwayland_surface
+                .update_x11_surface(
+                    x11_surface,
+                    wayland_window_type,
+                    parent,
+                    &state.client_state.xdg_shell_state,
+                    &state.client_state.shm_state,
+                    state.client_state.subcompositor_state.clone(),
+                    &state.client_state.qh,
+                    state.compositor_state.decoration_behavior,
+                )
+                .location(loc!())?;
+            assigned_parent_id = xwayland_surface.parent_id.clone();
+        }
+    }
+
+    if let Some(parent_id) = assigned_parent_id
+        && parent_id != surface.id()
+        && let Some(parent_xwayland_surface) = state.surfaces.get_mut(&parent_id)
+    {
         debug!(
             "registering child {:?} with parent {:?}",
             surface.id(),
-            &parent.surface_id
+            &parent_id
         );
-        // We can still get cycles in the case of bugs in find_x11_parent, but
-        // this is a start.
-        assert!(
-            surface.id() != parent.surface_id,
-            "tried to register a surface as a child of itself"
-        );
-        let parent_xwayland_surface = state.surfaces.get_mut(&parent.surface_id).unwrap();
         parent_xwayland_surface.children.insert(surface.id());
     }
 
     let xwayland_surface = state.surfaces.entry(surface.id()).or_default();
-
-    if let Some(x11_surface) = x11_surface {
-        if xwayland_surface.local_surface.is_none() {
-            xwayland_surface
-                .update_local_surface(
-                    surface,
-                    parent.as_ref().map(|parent| &parent.for_subsurface.surface),
-                    &state.client_state.compositor_state,
-                    &state.client_state.qh,
-                    &mut state.surface_bimap,
-                )
-                .location(loc!())?;
-        }
-
-        xwayland_surface
-            .update_x11_surface(
-                x11_surface,
-                parent,
-                &state.client_state.last_focused_window,
-                &state.client_state.xdg_shell_state,
-                &state.client_state.shm_state,
-                state.client_state.subcompositor_state.clone(),
-                &state.client_state.qh,
-                state.compositor_state.decoration_behavior,
-            )
-            .location(loc!())?;
-    }
 
     let client_transform: SctkTransform =
         SerTransform::from(surface_attributes.buffer_transform).into();
@@ -1329,5 +1617,178 @@ mod tests {
         wl_surface.commit();
         roundtrip(&mut display, &mut server, &conn, &mut queue, &mut client);
         assert_eq!(server.last_commit, Some((2, SmithayWlTransform::_180)));
+    }
+
+    #[test]
+    fn test_select_x11_parent_id_priority_and_edge_cases() {
+        let win_a = ParentCandidate {
+            id: 1u32,
+            x11_window_id: 101,
+            pid: Some(1000),
+            geometry: rect(560, 240, 800, 600),
+            role: CandidateRole::Toplevel,
+        };
+        let win_b_same_pos_other_app = ParentCandidate {
+            id: 2u32,
+            x11_window_id: 102,
+            pid: Some(2000),
+            geometry: rect(560, 240, 800, 600),
+            role: CandidateRole::Toplevel,
+        };
+        let win_a2_monitor2 = ParentCandidate {
+            id: 3u32,
+            x11_window_id: 103,
+            pid: Some(1000),
+            geometry: rect(2800, 420, 800, 600),
+            role: CandidateRole::Toplevel,
+        };
+        let popup_a = ParentCandidate {
+            id: 4u32,
+            x11_window_id: 104,
+            pid: Some(1000),
+            geometry: rect(700, 350, 200, 180),
+            role: CandidateRole::Popup,
+        };
+        let candidates = [win_a, win_b_same_pos_other_app, win_a2_monitor2, popup_a];
+
+        // 1. Explicit WM_TRANSIENT_FOR always wins (unless self).
+        assert_eq!(
+            select_x11_parent_id(
+                99,
+                Some(101),
+                Some(1000),
+                rect(2900, 500, 150, 100),
+                Some(3),
+                Some(2),
+                &candidates,
+            ),
+            Some(1)
+        );
+        // Self-transient does not return self.
+        assert_eq!(
+            select_x11_parent_id(
+                1,
+                Some(101),
+                Some(1000),
+                rect(600, 300, 150, 100),
+                Some(2),
+                Some(1),
+                &candidates,
+            ),
+            Some(4)
+        );
+        // Unmapped/roleless WM_TRANSIENT_FOR (unknown window id) falls back cleanly.
+        assert_eq!(
+            select_x11_parent_id(
+                99,
+                Some(9999),
+                Some(2000),
+                rect(620, 310, 150, 100),
+                Some(2),
+                Some(1),
+                &candidates,
+            ),
+            Some(2)
+        );
+
+        // 2. Stale pointer on another app (PID 2000) must NOT steal a menu
+        // spawned by PID 1000: falls back to keyboard focus / PID match.
+        assert_eq!(
+            select_x11_parent_id(
+                99,
+                None,
+                Some(1000),
+                rect(620, 310, 150, 100),
+                Some(2),
+                Some(1),
+                &candidates,
+            ),
+            Some(1)
+        );
+        assert_eq!(
+            select_x11_parent_id(
+                99,
+                None,
+                Some(1000),
+                rect(2850, 480, 150, 100),
+                Some(2),
+                Some(2),
+                &candidates,
+            ),
+            Some(3)
+        );
+
+        // 3. Keyboard-triggered context menu on monitor 1 (win_a) while pointer
+        // hovers a second window of the SAME PID on monitor 2 (win_a2_monitor2):
+        // proximity check picks win_a instead of monitor 2!
+        assert_eq!(
+            select_x11_parent_id(
+                99,
+                None,
+                Some(1000),
+                rect(620, 310, 150, 100),
+                Some(3),
+                Some(1),
+                &candidates,
+            ),
+            Some(1)
+        );
+
+        // 4. Popup mapped at (0, 0) before initial ConfigureNotify still picks
+        // the focused same-PID window (last_pointer first).
+        assert_eq!(
+            select_x11_parent_id(
+                99,
+                None,
+                Some(1000),
+                rect(0, 0, 150, 100),
+                Some(3),
+                Some(1),
+                &candidates,
+            ),
+            Some(3)
+        );
+
+        // 5. Nested submenu spawned while pointer is inside `popup_a` parents
+        // to `popup_a` rather than the toplevel behind it.
+        assert_eq!(
+            select_x11_parent_id(
+                99,
+                None,
+                Some(1000),
+                rect(895, 380, 140, 120),
+                Some(4),
+                Some(1),
+                &candidates,
+            ),
+            Some(4)
+        );
+
+        // 6. PID-less client (e.g. forwarded X11 app without _NET_WM_PID) uses
+        // live pointer/keyboard focus, then geometry fallback.
+        assert_eq!(
+            select_x11_parent_id(
+                99,
+                None,
+                None,
+                rect(600, 300, 100, 80),
+                Some(2),
+                Some(1),
+                &candidates,
+            ),
+            Some(2)
+        );
+        assert_eq!(
+            select_x11_parent_id(
+                99,
+                None,
+                None,
+                rect(2850, 480, 100, 80),
+                None,
+                None,
+                &candidates,
+            ),
+            Some(3)
+        );
     }
 }

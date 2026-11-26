@@ -48,48 +48,48 @@ pub fn handle_window_frame_pointer_event(
     conn: &Connection,
     qh: &QueueHandle<WprsState>,
     pointer: &WlPointer,
-    events: &[PointerEvent],
+    event: &PointerEvent,
 ) -> Result<()> {
-    for event in events {
-        let parent_surface = parent(&event.surface).unwrap_or(surface_tree_root(&event.surface));
-        let Some(xwayland_surface) =
-            xsurface_from_client_surface(&state.surface_bimap, &mut state.surfaces, parent_surface)
-        else {
-            info!("frame owner not found");
-            return Ok(());
-        };
+    let parent_surface = parent(&event.surface).unwrap_or(surface_tree_root(&event.surface));
+    let Some(xwayland_surface) =
+        xsurface_from_client_surface(&state.surface_bimap, &mut state.surfaces, parent_surface)
+    else {
+        info!("frame owner not found");
+        return Ok(());
+    };
 
-        let x11_surface = &xwayland_surface.x11_surface.as_ref().unwrap().clone();
-        match &mut xwayland_surface.role {
-            Some(Role::SubSurface(subsurface)) => {
-                subsurface
-                    .handle_pointer_event(
-                        &mut state.client_state,
-                        x11_surface,
-                        conn,
-                        qh,
-                        pointer,
-                        event,
-                    )
-                    .location(loc!())?;
-            },
-            Some(Role::XdgToplevel(toplevel)) => {
-                toplevel
-                    .handle_pointer_event(
-                        &mut state.client_state,
-                        x11_surface,
-                        conn,
-                        qh,
-                        pointer,
-                        event,
-                    )
-                    .location(loc!())?;
-            },
-            _ => unreachable!(
-                "expected role xdg_toplevel or subsurface, found role {:?}",
-                &xwayland_surface.role
-            ),
-        }
+    let Some(x11_surface) = xwayland_surface.x11_surface.as_ref().cloned() else {
+        return Ok(());
+    };
+    match &mut xwayland_surface.role {
+        Some(Role::SubSurface(subsurface)) => {
+            subsurface
+                .handle_pointer_event(
+                    &mut state.client_state,
+                    &x11_surface,
+                    conn,
+                    qh,
+                    pointer,
+                    event,
+                )
+                .location(loc!())?;
+        },
+        Some(Role::XdgToplevel(toplevel)) => {
+            toplevel
+                .handle_pointer_event(
+                    &mut state.client_state,
+                    &x11_surface,
+                    conn,
+                    qh,
+                    pointer,
+                    event,
+                )
+                .location(loc!())?;
+        },
+        _ => unreachable!(
+            "expected role xdg_toplevel or subsurface, found role {:?}",
+            &xwayland_surface.role
+        ),
     }
     Ok(())
 }

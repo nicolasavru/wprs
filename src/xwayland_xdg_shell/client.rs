@@ -27,6 +27,8 @@ use smithay::reexports::wayland_protocols::wp::primary_selection::zv1::client::z
 use smithay::reexports::wayland_protocols::wp::primary_selection::zv1::client::zwp_primary_selection_source_v1::ZwpPrimarySelectionSourceV1;
 use smithay::reexports::wayland_server::backend::ObjectId;
 use smithay::reexports::wayland_server::Resource;
+use smithay::utils::Logical;
+use smithay::utils::Point as SmithayPoint;
 use smithay::utils::Rectangle;
 use smithay::utils::SERIAL_COUNTER;
 use smithay::wayland::compositor;
@@ -77,6 +79,7 @@ use smithay_client_toolkit::reexports::csd_frame::CursorIcon;
 use smithay_client_toolkit::reexports::csd_frame::DecorationsFrame;
 use smithay_client_toolkit::reexports::csd_frame::WindowManagerCapabilities;
 use smithay_client_toolkit::reexports::protocols::xdg::shell::client::xdg_positioner::Anchor;
+use smithay_client_toolkit::reexports::protocols::xdg::shell::client::xdg_positioner::ConstraintAdjustment;
 use smithay_client_toolkit::reexports::protocols::xdg::shell::client::xdg_positioner::Gravity;
 use smithay_client_toolkit::reexports::protocols::xdg::shell::client::xdg_surface::XdgSurface as SctkXdgSurface;
 use smithay_client_toolkit::registry::ProvidesRegistryState;
@@ -134,15 +137,93 @@ use crate::serialization::geometry::Rectangle as SerRectangle;
 use crate::serialization::wayland::BufferMetadata;
 use crate::serialization::wayland::KeyState;
 use crate::xwayland_xdg_shell::compositor::DecorationBehavior;
-use crate::xwayland_xdg_shell::compositor::X11Parent;
 use crate::xwayland_xdg_shell::compositor::X11ParentForPopup;
 use crate::xwayland_xdg_shell::compositor::X11ParentForSubsurface;
+use crate::xwayland_xdg_shell::compositor::popup_parent_origin;
 use crate::xwayland_xdg_shell::decoration::handle_window_frame_pointer_event;
 use crate::xwayland_xdg_shell::xsurface_from_client_surface;
 use crate::xwayland_xdg_shell::WprsState;
 use crate::xwayland_xdg_shell::XWaylandSurface;
 
 const DEFAULT_WINDOW_SIZE: (i32, i32) = (512, 256);
+
+pub(crate) const POPUP_CONSTRAINT_ADJUSTMENT: ConstraintAdjustment = ConstraintAdjustment::SlideX
+    .union(ConstraintAdjustment::SlideY)
+    .union(ConstraintAdjustment::FlipX)
+    .union(ConstraintAdjustment::FlipY);
+
+/// Translates an X11 popup top-left coordinate into an `xdg_positioner` anchor
+/// coordinate relative to the parent's `xdg_surface` window geometry.
+pub(crate) fn popup_anchor_point(
+    popup_x11_loc: Point<i32>,
+    parent_x11_loc: Point<i32>,
+    parent_frame_offset: Point<i32>,
+) -> Point<i32> {
+    (
+        popup_x11_loc.x - parent_x11_loc.x + parent_frame_offset.x,
+        popup_x11_loc.y - parent_x11_loc.y + parent_frame_offset.y,
+    )
+        .into()
+}
+
+/// Inverse of [`popup_anchor_point`]: translates a parent-window-geometry-relative
+/// `xdg_popup.configure` position back to X11 root coordinates.
+pub(crate) fn popup_configure_to_x11_loc(
+    configure_pos: (i32, i32),
+    parent_x11_loc: Point<i32>,
+    parent_frame_offset: Point<i32>,
+) -> Point<i32> {
+    (
+        parent_x11_loc.x - parent_frame_offset.x + configure_pos.0,
+        parent_x11_loc.y - parent_frame_offset.y + configure_pos.1,
+    )
+        .into()
+}
+
+/// Converts a surface-local Wayland pointer position into global X11 root
+/// coordinates so Smithay's `ClickGrab` keeps pointer coordinates aligned when
+/// dragging from a parent window onto an override-redirect popup.
+pub(crate) fn pointer_global_location(
+    surface_loc: SmithayPoint<i32, Logical>,
+    position: (f64, f64),
+) -> SmithayPoint<f64, Logical> {
+    (
+        f64::from(surface_loc.x) + position.0,
+        f64::from(surface_loc.y) + position.1,
+    )
+        .into()
+}
+
+/// Returns whether entering an X11 surface should call `X11Wm::raise_window`.
+///
+/// Override-redirect popups must never be pushed into `_NET_CLIENT_LIST_STACKING`,
+/// and a parent with mapped child popups/subsurfaces must not be raised above
+/// its own open children.
+pub(crate) fn should_raise_window_on_enter(
+    is_override_redirect: bool,
+    has_mapped_children: bool,
+) -> bool {
+    !is_override_redirect && !has_mapped_children
+}
+
+fn configure_popup_positioner(
+    xdg_shell_state: &XdgShell,
+    geometry: Rectangle<i32, Logical>,
+    parent_x11_loc: Point<i32>,
+    parent_frame_offset: Point<i32>,
+) -> Result<XdgPositioner> {
+    let positioner = XdgPositioner::new(xdg_shell_state).location(loc!())?;
+    positioner.set_size(geometry.size.w.max(1), geometry.size.h.max(1));
+    let anchor = popup_anchor_point(geometry.loc.into(), parent_x11_loc, parent_frame_offset);
+    positioner.set_anchor_rect(anchor.x, anchor.y, 1, 1);
+    positioner.set_anchor(Anchor::TopLeft);
+    positioner.set_gravity(Gravity::BottomRight);
+    // Allow sliding/flipping at screen edges without resizing override-redirect
+    // X11 popups, which cannot be resized by the window manager.
+    positioner.set_constraint_adjustment(POPUP_CONSTRAINT_ADJUSTMENT);
+    positioner.set_reactive();
+    Ok(positioner)
+}
 
 #[derive(Debug)]
 pub struct WprsClientState {
@@ -165,7 +246,8 @@ pub struct WprsClientState {
 
     pub last_enter_serial: u32,
     pub(crate) last_implicit_grab_serial: u32,
-    pub(crate) last_focused_window: Option<X11Parent>,
+    pub(crate) last_pointer_surface: Option<ObjectId>,
+    pub(crate) last_keyboard_surface: Option<ObjectId>,
 
     pub(crate) seat_objects: Vec<SeatObject<ThemedPointer>>,
     pub(crate) cursor_icon: Option<CursorIcon>,
@@ -210,7 +292,8 @@ impl WprsClientState {
 
             last_enter_serial: 0,
             last_implicit_grab_serial: 0,
-            last_focused_window: None,
+            last_pointer_surface: None,
+            last_keyboard_surface: None,
 
             seat_objects: Vec::new(),
             cursor_icon: None,
@@ -422,19 +505,43 @@ impl PopupHandler for WprsState {
         popup: &Popup,
         configure: PopupConfigure,
     ) {
-        let compositor_surface_id = self
+        let Some(compositor_surface_id) = self
             .surface_bimap
             .get_by_right(&popup.wl_surface().id())
-            .unwrap();
+            .cloned()
+        else {
+            warn!("Received configure for already-destroyed popup {popup:?}.");
+            return;
+        };
 
-        let xwayland_surface = self.surfaces.get_mut(compositor_surface_id).unwrap();
+        let parent_origin = self
+            .surfaces
+            .get(&compositor_surface_id)
+            .and_then(|s| match &s.role {
+                Some(Role::XdgPopup(xdg_popup)) => {
+                    popup_parent_origin(&self.surfaces, &xdg_popup.parent)
+                },
+                _ => None,
+            });
+
+        let Some(xwayland_surface) = self.surfaces.get_mut(&compositor_surface_id) else {
+            return;
+        };
 
         let x11_surface = log_and_return!(xwayland_surface.get_x11_surface());
         let geo = if x11_surface.is_override_redirect() {
             None
         } else {
+            let x11_loc = match parent_origin {
+                Some((parent_x11_loc, parent_frame_offset)) => popup_configure_to_x11_loc(
+                    configure.position,
+                    parent_x11_loc,
+                    parent_frame_offset,
+                ),
+                None => configure.position.into(),
+            };
             Some(Rectangle::new(
-                configure.position.into(),
+                x11_loc.into(),
                 (configure.width, configure.height).into(),
             ))
         };
@@ -448,6 +555,9 @@ impl PopupHandler for WprsState {
                 &xwayland_surface.role
             ),
         };
+        if let Some(geo) = geo {
+            xdg_popup.last_geometry = geo;
+        }
 
         // The code below commits the buffer we received but couldn't attach
         // because we hadn't received our initial commit. In the normal
@@ -459,19 +569,27 @@ impl PopupHandler for WprsState {
 
         xdg_popup.configured = true;
 
-        // TODO: maybe don't do this... most popups shouldn't need this and this
-        // will be a problem for override_redirect windows when they try to
-        // resize themselves.
-        // xdg_popup
-        //     .local_popup
-        //     .xdg_surface()
-        //     .set_window_geometry(0, 0, geo.size.w, geo.size.h);
-
         xwayland_surface.commit_buffer(&self.client_state.qh);
     }
 
-    fn done(&mut self, _conn: &Connection, _qh: &QueueHandle<Self>, _popup: &Popup) {
-        // TODO?
+    #[instrument(skip(self, _conn, _qh), level = "debug")]
+    fn done(&mut self, _conn: &Connection, _qh: &QueueHandle<Self>, popup: &Popup) {
+        let Some(compositor_surface_id) = self
+            .surface_bimap
+            .get_by_right(&popup.wl_surface().id())
+            .cloned()
+        else {
+            return;
+        };
+        if let Some(x11_surface) = self
+            .surfaces
+            .get(&compositor_surface_id)
+            .and_then(|s| s.x11_surface.as_ref())
+            && !x11_surface.is_override_redirect()
+        {
+            x11_surface.close().log_and_ignore(loc!());
+        }
+        self.remove_surface(&compositor_surface_id);
     }
 }
 
@@ -618,10 +736,13 @@ impl KeyboardHandler for WprsState {
                 SERIAL_COUNTER.next_serial()
             ));
         }
-        let Some(xwayland_surface) =
-            xsurface_from_client_surface(&self.surface_bimap, &mut self.surfaces, surface)
+        let Some(compositor_surface_id) = self.surface_bimap.get_by_right(&surface.id()).cloned()
         else {
             // surface was already destroyed
+            return;
+        };
+        self.client_state.last_keyboard_surface = Some(compositor_surface_id.clone());
+        let Some(xwayland_surface) = self.surfaces.get(&compositor_surface_id) else {
             return;
         };
         let x11_surface = log_and_return!(xwayland_surface.get_x11_surface()).clone();
@@ -845,59 +966,53 @@ impl PointerHandler for WprsState {
     ) {
         let compositor_seat = self.compositor_state.seat.clone();
         let compositor_pointer = compositor_seat.get_pointer().unwrap();
+        let has_xwayland_enter = events.iter().any(|event| {
+            matches!(event.kind, PointerEventKind::Enter { .. })
+                && self
+                    .surface_bimap
+                    .get_by_right(&event.surface.id())
+                    .is_some()
+        });
+        let mut handled_xwayland_event = false;
 
         for event in events {
-            let Some(xwayland_surface) = xsurface_from_client_surface(
-                &self.surface_bimap,
-                &mut self.surfaces,
-                &event.surface,
-            ) else {
-                handle_window_frame_pointer_event(self, conn, qh, pointer, events)
+            let Some(compositor_surface_id) = self
+                .surface_bimap
+                .get_by_right(&event.surface.id())
+                .cloned()
+            else {
+                handle_window_frame_pointer_event(self, conn, qh, pointer, event)
                     .log_and_ignore(loc!());
-                return;
+                continue;
             };
-            let x11_surface = log_and_return!(xwayland_surface.get_x11_surface()).clone();
+            let Some(xwayland_surface) = self.surfaces.get(&compositor_surface_id) else {
+                continue;
+            };
+            let Ok(x11_surface) = xwayland_surface.get_x11_surface().cloned() else {
+                continue;
+            };
+            let has_mapped_children = !xwayland_surface.children.is_empty();
+            let surface_loc = x11_surface.geometry().loc;
+            let global_loc = pointer_global_location(surface_loc, event.position);
+            handled_xwayland_event = true;
 
             match event.kind {
                 PointerEventKind::Enter { serial } => {
                     self.client_state.last_enter_serial = serial;
-                    // TODO: allow this to be a popup?
-                    if let Some(Role::XdgToplevel(toplevel)) = &xwayland_surface.role {
-                        let parent_id = self
-                            .surface_bimap
-                            .get_by_right(&event.surface.id())
-                            .unwrap();
-                        let parent_loc = x11_surface.geometry().loc;
-                        self.client_state.last_focused_window = Some(X11Parent {
-                            surface_id: parent_id.clone(),
-                            for_popup: Some(X11ParentForPopup {
-                                surface_id: parent_id.clone(),
-                                xdg_surface: toplevel.xdg_surface().clone(),
-                                x11_offset: (
-                                    toplevel.frame_offset.x - parent_loc.x,
-                                    toplevel.frame_offset.y - parent_loc.y,
-                                )
-                                    .into(),
-                                wl_offset: toplevel.frame_offset,
-                            }),
-                            for_subsurface: X11ParentForSubsurface {
-                                surface: toplevel.wl_surface().clone(),
-                                x11_offset: (-parent_loc.x, -parent_loc.y).into(),
-                            },
-                        });
+                    self.client_state.last_pointer_surface = Some(compositor_surface_id);
+                    if should_raise_window_on_enter(
+                        x11_surface.is_override_redirect(),
+                        has_mapped_children,
+                    ) && let Some(xwm) = self.compositor_state.xwm.as_mut()
+                    {
+                        xwm.raise_window(&x11_surface).log_and_ignore(loc!());
                     }
-                    self.compositor_state
-                        .xwm
-                        .as_mut()
-                        .unwrap()
-                        .raise_window(&x11_surface)
-                        .unwrap();
                     let serial = self.compositor_state.serial_map.insert(serial);
                     compositor_pointer.motion(
                         self,
-                        Some((x11_surface, (0 as f64, 0 as f64).into())),
+                        Some((x11_surface, surface_loc.to_f64())),
                         &MotionEvent {
-                            location: event.position.into(),
+                            location: global_loc,
                             serial,
                             time: 0, // unused
                         },
@@ -905,11 +1020,27 @@ impl PointerHandler for WprsState {
                 },
                 PointerEventKind::Leave { serial } => {
                     let serial = self.compositor_state.serial_map.insert(serial);
+                    if !has_xwayland_enter && !self.compositor_state.pressed_buttons.is_empty() {
+                        let time = self.compositor_state.start_time.elapsed().as_millis() as u32;
+                        let buttons: Vec<u32> =
+                            self.compositor_state.pressed_buttons.drain().collect();
+                        for button in buttons {
+                            compositor_pointer.button(
+                                self,
+                                &ButtonEvent {
+                                    time,
+                                    button,
+                                    serial,
+                                    state: ButtonState::Released,
+                                },
+                            );
+                        }
+                    }
                     compositor_pointer.motion(
                         self,
                         None,
                         &MotionEvent {
-                            location: event.position.into(),
+                            location: global_loc,
                             serial,
                             time: 0, // unused
                         },
@@ -918,9 +1049,9 @@ impl PointerHandler for WprsState {
                 PointerEventKind::Motion { time } => {
                     compositor_pointer.motion(
                         self,
-                        Some((x11_surface, (0 as f64, 0 as f64).into())),
+                        Some((x11_surface, surface_loc.to_f64())),
                         &MotionEvent {
-                            location: event.position.into(),
+                            location: global_loc,
                             serial: 0.into(), // unused
                             time,
                         },
@@ -931,6 +1062,8 @@ impl PointerHandler for WprsState {
                     button,
                     serial,
                 } => {
+                    self.client_state.last_implicit_grab_serial = serial;
+                    self.compositor_state.pressed_buttons.insert(button);
                     let serial = self.compositor_state.serial_map.insert(serial);
                     compositor_pointer.button(
                         self,
@@ -947,6 +1080,7 @@ impl PointerHandler for WprsState {
                     button,
                     serial,
                 } => {
+                    self.compositor_state.pressed_buttons.remove(&button);
                     let serial = self.compositor_state.serial_map.insert(serial);
                     compositor_pointer.button(
                         self,
@@ -957,6 +1091,19 @@ impl PointerHandler for WprsState {
                             state: ButtonState::Released,
                         },
                     );
+                    if !compositor_pointer.is_grabbed()
+                        && compositor_pointer.current_focus().as_ref() != Some(&x11_surface)
+                    {
+                        compositor_pointer.motion(
+                            self,
+                            Some((x11_surface, surface_loc.to_f64())),
+                            &MotionEvent {
+                                location: global_loc,
+                                serial,
+                                time,
+                            },
+                        );
+                    }
                 },
                 PointerEventKind::Axis {
                     time,
@@ -975,7 +1122,9 @@ impl PointerHandler for WprsState {
                 ),
             }
         }
-        compositor_pointer.frame(self);
+        if handled_xwayland_event {
+            compositor_pointer.frame(self);
+        }
     }
 }
 
@@ -1494,11 +1643,10 @@ impl XWaylandSubSurface {
 
         x11_surface.configure(None).location(loc!())?;
 
-        // TODO: it seems like we should probably also include frame offset of our window decorations somehwere
         let new_subsurface = Self {
             local_subsurface,
             parent_surface: parent.surface,
-            offset: parent.x11_offset,
+            offset: (-parent.x11_loc.x, -parent.x11_loc.y).into(),
             frame,
             move_active: false,
             move_pointer_location: (0 as f64, 0 as f64),
@@ -1549,6 +1697,8 @@ pub struct XWaylandXdgPopup {
     pub local_popup: Popup,
     pub parent: ObjectId,
     pub configured: bool,
+    pub last_geometry: Rectangle<i32, Logical>,
+    pub reposition_token: u32,
 }
 
 impl XWaylandXdgPopup {
@@ -1559,49 +1709,16 @@ impl XWaylandXdgPopup {
         qh: &QueueHandle<WprsState>,
     ) -> Result<()> {
         let x11_surface = &surface.get_x11_surface().location(loc!())?;
-        // TODO: move into function
-        let positioner = XdgPositioner::new(xdg_shell_state).unwrap();
         let geometry = x11_surface.geometry();
-        positioner.set_size(geometry.size.w, geometry.size.h);
-        positioner.set_anchor_rect(
-            geometry.loc.x + parent.x11_offset.x,
-            geometry.loc.y + parent.x11_offset.y,
-            1,
-            1,
-        );
-        positioner.set_anchor(Anchor::TopLeft);
-        positioner.set_gravity(Gravity::BottomRight);
+        let positioner = configure_popup_positioner(
+            xdg_shell_state,
+            geometry,
+            parent.x11_loc,
+            parent.frame_offset,
+        )
+        .location(loc!())?;
 
-        let configure_rect = if x11_surface.is_override_redirect() {
-            None
-        } else {
-            Some(Rectangle::new(
-                (
-                    geometry.loc.x + parent.wl_offset.x,
-                    geometry.loc.y + parent.wl_offset.x,
-                )
-                    .into(),
-                (geometry.size.w, geometry.size.h).into(),
-            ))
-        };
-
-        x11_surface.configure(configure_rect).location(loc!())?;
-
-        // TODO: send this data over from server
-        // positioner.set_constraint_adjustment(popup_state.positioner.constraint_adjustment);
-        // positioner.set_offset(
-        //     popup_state.positioner.offset.x,
-        //     popup_state.positioner.offset.y,
-        // );
-        // if popup_state.positioner.reactive {
-        //     positioner.set_reactive();
-        // }
-        // if let Some(parent_size) = &popup_state.positioner.parent_size {
-        //     positioner.set_parent_size(parent_size.w, parent_size.h);
-        // };
-        // if let Some(parent_configure) = popup_state.positioner.parent_configure {
-        //     positioner.set_parent_configure(parent_configure);
-        // };
+        x11_surface.configure(None).location(loc!())?;
 
         let local_popup = Popup::from_surface(
             Some(&parent.xdg_surface),
@@ -1610,21 +1727,40 @@ impl XWaylandXdgPopup {
             surface.local_surface.take().unwrap(),
             xdg_shell_state,
         )
-        .unwrap();
-
-        // TODO: finish with popup grabs.
-        // if popup_state.grab_requested {
-        //     local_popup
-        //         .xdg_popup()
-        //         .grab(&seat_state.seats().next().unwrap(), 0); // TODO: serial
-        // }
+        .location(loc!())?;
 
         let new_popup = Self {
             local_popup,
             parent: parent.surface_id.clone(),
             configured: false,
+            last_geometry: geometry,
+            reposition_token: 0,
         };
         surface.role = Some(Role::XdgPopup(new_popup));
+        Ok(())
+    }
+
+    pub(crate) fn reposition(
+        &mut self,
+        xdg_shell_state: &XdgShell,
+        geometry: Rectangle<i32, Logical>,
+        parent_x11_loc: Point<i32>,
+        parent_frame_offset: Point<i32>,
+    ) -> Result<()> {
+        if geometry == self.last_geometry {
+            return Ok(());
+        }
+        let positioner = configure_popup_positioner(
+            xdg_shell_state,
+            geometry,
+            parent_x11_loc,
+            parent_frame_offset,
+        )
+        .location(loc!())?;
+        self.reposition_token = self.reposition_token.wrapping_add(1);
+        self.last_geometry = geometry;
+        self.local_popup
+            .reposition(&positioner, self.reposition_token);
         Ok(())
     }
 }
@@ -2220,5 +2356,82 @@ mod tests {
         assert_eq!(slots.len(), 3);
         assert_eq!(slots[active], frame);
         assert_eq!(back, Some((1, Some(vec![b(5, 7)]))));
+    }
+
+    #[test]
+    fn test_popup_coordinate_roundtrip_and_constraints() {
+        // Must allow sliding and flipping at screen edges without resizing
+        // X11 override-redirect windows.
+        assert!(POPUP_CONSTRAINT_ADJUSTMENT.contains(ConstraintAdjustment::SlideX));
+        assert!(POPUP_CONSTRAINT_ADJUSTMENT.contains(ConstraintAdjustment::SlideY));
+        assert!(POPUP_CONSTRAINT_ADJUSTMENT.contains(ConstraintAdjustment::FlipX));
+        assert!(POPUP_CONSTRAINT_ADJUSTMENT.contains(ConstraintAdjustment::FlipY));
+        assert!(!POPUP_CONSTRAINT_ADJUSTMENT.contains(ConstraintAdjustment::ResizeX));
+        assert!(!POPUP_CONSTRAINT_ADJUSTMENT.contains(ConstraintAdjustment::ResizeY));
+
+        // Asymmetric `frame_offset` catches `.x` vs `.y` axis mix-ups.
+        for (popup_loc, parent_loc, frame_offset) in [
+            ((660, 340), (560, 240), (0, 0)),
+            ((660, 340), (560, 240), (4, 30)),
+            ((2100, 120), (1920, 0), (8, 36)),
+            ((10, 5), (0, 0), (6, 28)),
+        ] {
+            let anchor =
+                popup_anchor_point(popup_loc.into(), parent_loc.into(), frame_offset.into());
+            assert_eq!(
+                anchor,
+                (
+                    popup_loc.0 - parent_loc.0 + frame_offset.0,
+                    popup_loc.1 - parent_loc.1 + frame_offset.1,
+                )
+                    .into()
+            );
+            assert_eq!(
+                popup_configure_to_x11_loc(
+                    (anchor.x, anchor.y),
+                    parent_loc.into(),
+                    frame_offset.into(),
+                ),
+                popup_loc.into()
+            );
+
+            // A host slide/flip offset must shift X11 root coordinates by the
+            // exact same delta.
+            let slid = (anchor.x - 45, anchor.y - 120);
+            assert_eq!(
+                popup_configure_to_x11_loc(slid, parent_loc.into(), frame_offset.into()),
+                (popup_loc.0 - 45, popup_loc.1 - 120).into()
+            );
+        }
+    }
+
+    #[test]
+    fn test_pointer_global_location_preserves_click_grab_coordinates() {
+        let parent_loc = SmithayPoint::<i32, Logical>::from((560, 240));
+        let menu_loc = SmithayPoint::<i32, Logical>::from((660, 340));
+
+        // Right-click on parent at local (100, 100) starts ClickGrab at global (660, 340).
+        let press_global = pointer_global_location(parent_loc, (100.0, 100.0));
+        assert_eq!(press_global, (660.0, 340.0).into());
+
+        // Drag onto override-redirect menu at menu-local (20, 35) while ClickGrab
+        // keeps focus on parent: `global - parent_loc` lands at parent-local (120, 135),
+        // which Xwayland maps to X11 root (680, 375) == menu-local (20, 35).
+        let menu_global = pointer_global_location(menu_loc, (20.0, 35.0));
+        assert_eq!(menu_global, (680.0, 375.0).into());
+        let delivered_to_parent = menu_global - parent_loc.to_f64();
+        assert_eq!(delivered_to_parent, (120.0, 135.0).into());
+        assert_eq!(
+            delivered_to_parent + parent_loc.to_f64() - menu_loc.to_f64(),
+            (20.0, 35.0).into()
+        );
+    }
+
+    #[test]
+    fn test_should_raise_window_on_enter() {
+        assert!(!should_raise_window_on_enter(true, false));
+        assert!(!should_raise_window_on_enter(true, true));
+        assert!(!should_raise_window_on_enter(false, true));
+        assert!(should_raise_window_on_enter(false, false));
     }
 }
