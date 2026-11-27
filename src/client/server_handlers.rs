@@ -703,6 +703,7 @@ impl WprsClientState {
 
     #[instrument(skip(self), level = "debug")]
     fn handle_capabilities(&mut self, caps: Capabilities) -> Result<()> {
+        self.tile_cache.clear();
         self.capabilities.set(caps).location(loc!())
     }
 
@@ -711,6 +712,9 @@ impl WprsClientState {
         let client_id = buffer_stream.header.client;
         let surface_id = buffer_stream.header.surface;
         let frame_seq = buffer_stream.header.frame_seq;
+        if buffer_stream.header.reset_tile_cache {
+            self.tile_cache.clear();
+        }
 
         let decode_res = (|| -> Result<()> {
             let validated = ValidatedTileStream::new(buffer_stream).location(loc!())?;
@@ -731,18 +735,36 @@ impl WprsClientState {
                 })
                 .location(loc!())?;
 
-            let canvas = remote_surface
-                .prepare_buffer_canvas(
-                    metadata,
-                    validated.incremental_tile_rects(),
-                    validated.scroll_rect(),
-                    &mut self.pool,
-                    &mut self.slot_copy_scratch,
-                    &mut self.decompressor,
-                )
-                .location(loc!())?;
-            filtering::decompress_and_unfilter_streaming(validated, &mut self.decompressor, canvas)
-                .location(loc!())
+            let canvas = match remote_surface.prepare_buffer_canvas(
+                metadata,
+                validated.incremental_tile_rects(),
+                validated.scroll_rect(),
+                &mut self.pool,
+                &mut self.slot_copy_scratch,
+                &mut self.decompressor,
+            ) {
+                Ok(canvas) => canvas,
+                Err(err) => {
+                    // Apply connection-wide tile cache updates (`reset`, `evict`,
+                    // and `CachePut` tiles) even when this surface cannot apply
+                    // the frame so other surfaces and already-pipelined frames
+                    // stay in exact lockstep with `wprsd`.
+                    filtering::decompress_cache_puts_only(
+                        validated,
+                        &mut self.decompressor,
+                        &mut self.tile_cache,
+                    )
+                    .log_and_ignore(loc!());
+                    return Err(err).location(loc!());
+                },
+            };
+            filtering::decompress_and_unfilter_streaming(
+                validated,
+                &mut self.decompressor,
+                canvas,
+                Some(&mut self.tile_cache),
+            )
+            .location(loc!())
         })();
 
         if let Err(err) = decode_res {
@@ -2513,6 +2535,7 @@ mod tests {
                 meta,
                 CompressionMode::Lossless,
                 None,
+                None,
                 &mut compressor,
                 |stream| streams.push(stream),
             );
@@ -2827,6 +2850,7 @@ mod tests {
             meta,
             CompressionMode::Lossless,
             None,
+            None,
             &mut compressor,
             |mut stream| {
                 stream.header.frame_seq = 11;
@@ -2853,6 +2877,7 @@ mod tests {
         let (tx, rx) = crossbeam_channel::unbounded();
         tx.send(Ok(CompressedTile {
             tile_idx: 0,
+            cache_put: None,
             payload: TilePayload::Leaf(LeafPayload::Solid([0xDE, 0xAD, 0xBE, 0xFF])),
         }))
         .unwrap();
@@ -2866,6 +2891,8 @@ mod tests {
                     metadata: meta,
                     incremental: false,
                     scroll_rect: None,
+                    reset_tile_cache: false,
+                    evict_slots: Vec::new(),
                     tile_rects: vec![TileRect {
                         x: 0,
                         y: 0,
@@ -3175,6 +3202,7 @@ mod tests {
                 meta,
                 CompressionMode::Lossless,
                 Some(&mut shadow),
+                None,
                 &mut compressor,
                 |s| streaming = Some(s),
             );
@@ -3214,6 +3242,7 @@ mod tests {
                 CompressionMode::Lossless,
                 None,
                 &mut shadow,
+                None,
                 &mut compressor,
                 |s| streaming = Some(s),
             );
@@ -3309,6 +3338,8 @@ mod tests {
                         height: height as u32,
                         dy: -16,
                     }),
+                    reset_tile_cache: false,
+                    evict_slots: Vec::new(),
                     tile_rects: vec![],
                 },
                 tiles: rx,
@@ -3323,5 +3354,447 @@ mod tests {
                 Event::FrameAck { seq: 555 },
             ]
         );
+    }
+
+    #[test]
+    #[cfg_attr(miri, ignore)]
+    fn test_wprsc_tile_cache_aba_swapchain_damage_resync_lockstep_and_reconnect() {
+        use std::num::NonZeroUsize;
+
+        use crate::buffer_pointer::BufferPointer;
+        use crate::filtering::ServerTileCache;
+        use crate::serialization::framing::CacheHitRef;
+        use crate::serialization::framing::CacheHitRegion;
+        use crate::serialization::framing::CompressedTile;
+        use crate::serialization::framing::LeafPayload;
+        use crate::serialization::framing::RawBufferHeader;
+        use crate::serialization::framing::SubTile;
+        use crate::serialization::framing::TilePayload;
+        use crate::serialization::framing::TileRect;
+        use crate::serialization::geometry::Rectangle;
+        use crate::serialization::wayland::BufferFormat;
+        use crate::serialization::wayland::BufferMetadata;
+        use crate::sharding_compression::ShardingCompressor;
+
+        let mut h = ClientDndHarness::new();
+        // Force real 2-slot `SlotPool` swapchain ping-pong with compositor-held buffers.
+        h.host.hold_committed_buffers = true;
+
+        let client_id = ClientId(4);
+        let sid_a = WlSurfaceId(401);
+        let sid_b = WlSurfaceId(402);
+        let width = 512usize;
+        let height = 256usize;
+        let stride = width * 4;
+        let len = height * stride;
+        let meta = BufferMetadata {
+            width: width as i32,
+            height: height as i32,
+            stride: stride as i32,
+            format: BufferFormat::Xrgb8888,
+        };
+
+        let make_frame = |seed: u8| -> Vec<u8> {
+            let mut out = vec![0u8; len];
+            for y in 0..height {
+                for x in 0..width {
+                    let off = y * stride + x * 4;
+                    let tile_salt = (x >> 8) * 37 + (y >> 8) * 53;
+                    out[off] = seed.wrapping_add(((x * 13 + y * 7 + tile_salt) & 0xFF) as u8);
+                    out[off + 1] = seed
+                        .wrapping_mul(3)
+                        .wrapping_add(((x * 5 + y * 11 + tile_salt * 3) & 0xFF) as u8);
+                    out[off + 2] = seed
+                        .wrapping_mul(7)
+                        .wrapping_add(((x * 17 + y * 3 + tile_salt * 5) & 0xFF) as u8);
+                    out[off + 3] = 0xFF;
+                }
+            }
+            out
+        };
+        let frame_a = make_frame(1);
+        let frame_b = make_frame(2);
+
+        let mut compressor = ShardingCompressor::new(NonZeroUsize::new(4).unwrap(), 1).unwrap();
+        let mut server_cache = ServerTileCache::new();
+        let mut shadow_a = Vec::new();
+
+        let send_wire_stream =
+            |h: &mut ClientDndHarness,
+             mut streaming: crate::serialization::framing::StreamingCompressedTiles,
+             seq: u64| {
+                streaming.header.frame_seq = seq;
+                let mut wire = Vec::new();
+                streaming.framed_write(&mut wire).unwrap();
+                let (tx, rx) = crossbeam_channel::bounded(1);
+                let reader = std::thread::spawn(move || {
+                    CompressedTileStream::read_from_stream(&mut wire.as_slice(), |stream| {
+                        tx.send(stream).unwrap();
+                        Ok(())
+                    })
+                    .unwrap();
+                });
+                let stream = rx.recv().unwrap();
+                h.client.handle_request(RecvType::RawBuffer(stream));
+                reader.join().unwrap();
+            };
+
+        let commit_surface =
+            |h: &mut ClientDndHarness, sid: WlSurfaceId, damage: Option<Vec<Rectangle<i32>>>| {
+                let state = SurfaceState {
+                    client: client_id,
+                    id: sid,
+                    buffer: Some(BufferAssignment::New(meta)),
+                    role: None,
+                    buffer_delta: None,
+                    buffer_scale: 1,
+                    buffer_transform: None,
+                    opaque_region: None,
+                    input_region: None,
+                    z_ordered_children: vec![wayland::SubsurfacePosition {
+                        id: sid,
+                        position: (0, 0).into(),
+                    }],
+                    damage,
+                    output_ids: Vec::new(),
+                    viewport_state: None,
+                    xdg_surface_state: None,
+                };
+                h.client
+                    .handle_request(RecvType::Object(Request::Surface(SurfaceRequest {
+                        client: client_id,
+                        surface: sid,
+                        payload: SurfaceRequestPayload::Commit(state),
+                    })));
+                h.sync();
+                h.fire_frame_callbacks();
+            };
+
+        // 1. A -> B -> A over real 2-slot `SlotPool` swapchain: return-to-A uses
+        //    `CacheHit` tiles, accurately updates `stale_regions` + `damage_buffer`,
+        //    and reconstructs bit-exact pixels in `SlotPool`.
+        for (step, (frame, full)) in [(&frame_a, true), (&frame_b, false), (&frame_a, false)]
+            .into_iter()
+            .enumerate()
+        {
+            h.host.damage_buffers.clear();
+            let ptr = frame.as_ptr();
+            let bp = unsafe { BufferPointer::new(&ptr, len) };
+            let mut streaming = None;
+            let damage = if full {
+                filtering::filter_and_compress_full_streaming(
+                    bp,
+                    client_id,
+                    sid_a,
+                    meta,
+                    CompressionMode::Lossless,
+                    Some(&mut shadow_a),
+                    Some(&mut server_cache),
+                    &mut compressor,
+                    |s| streaming = Some(s),
+                );
+                None
+            } else {
+                let diff = filtering::filter_and_compress_incremental_streaming(
+                    bp,
+                    client_id,
+                    sid_a,
+                    meta,
+                    CompressionMode::Lossless,
+                    None,
+                    &mut shadow_a,
+                    Some(&mut server_cache),
+                    &mut compressor,
+                    |s| streaming = Some(s),
+                );
+                Some(
+                    diff.dirty_tiles
+                        .iter()
+                        .map(|r| Rectangle::new(r.x as i32, r.y as i32, r.w as i32, r.h as i32))
+                        .collect(),
+                )
+            };
+            let seq = step as u64 + 1;
+            send_wire_stream(&mut h, streaming.unwrap(), seq);
+            assert_eq!(h.drain_events(), vec![Event::FrameAck { seq }]);
+            commit_surface(&mut h, sid_a, damage.clone());
+
+            let host_sid = h
+                .client
+                .remote_display
+                .client(&client_id)
+                .surfaces
+                .get(&sid_a)
+                .unwrap()
+                .wl_surface()
+                .id()
+                .protocol_id();
+            if let Some(exp_dmg) = &damage {
+                let got_dmg: Vec<Rectangle<i32>> = h
+                    .host
+                    .damage_buffers
+                    .iter()
+                    .filter(|&&(id, ..)| id == host_sid)
+                    .map(|&(_, x, y, w, hh)| Rectangle::new(x, y, w, hh))
+                    .collect();
+                for r in exp_dmg {
+                    assert!(
+                        got_dmg.contains(r),
+                        "step {step}: missing CacheHit tile damage {r:?} in {got_dmg:?}"
+                    );
+                }
+            }
+            let active_slot = h
+                .client
+                .remote_display
+                .client(&client_id)
+                .surfaces
+                .get(&sid_a)
+                .unwrap()
+                .buffer
+                .as_ref()
+                .unwrap()
+                .active_buffer
+                .slot();
+            assert_eq!(
+                &h.client.pool.raw_data_mut(&active_slot)[..len],
+                frame.as_slice(),
+                "SlotPool pixel mismatch on step {step}"
+            );
+        }
+        assert!(h.client.tile_cache.occupied_slots() >= 4);
+
+        // 2. `BufferResyncRequested` lockstep test: an incremental frame for an
+        //    unknown surface `sid_missing` triggers `prepare_buffer_canvas` failure,
+        //    emits `BufferResyncRequested` BEFORE `FrameAck`, AND still populates
+        //    its `CachePut` slot (using a non-zero-origin `Split` tile!) via
+        //    `decompress_cache_puts_only` so an already-pipelined frame for `sid_b`
+        //    referencing that slot via `CacheHit` succeeds bit-exact!
+        let sid_missing = WlSurfaceId(499);
+        let put_slot = 500u16;
+        let put_rect = TileRect {
+            x: 256,
+            y: 0,
+            w: 256,
+            h: 256,
+        };
+        let split_tile = CompressedTile {
+            tile_idx: 0,
+            cache_put: Some(put_slot),
+            payload: TilePayload::Split(vec![
+                SubTile {
+                    rect: TileRect {
+                        x: 256,
+                        y: 0,
+                        w: 128,
+                        h: 128,
+                    },
+                    payload: LeafPayload::Solid([0x11, 0x22, 0x33, 0xFF]),
+                },
+                SubTile {
+                    rect: TileRect {
+                        x: 384,
+                        y: 0,
+                        w: 128,
+                        h: 128,
+                    },
+                    payload: LeafPayload::Solid([0x44, 0x55, 0x66, 0xFF]),
+                },
+                SubTile {
+                    rect: TileRect {
+                        x: 256,
+                        y: 128,
+                        w: 128,
+                        h: 128,
+                    },
+                    payload: LeafPayload::Solid([0x77, 0x88, 0x99, 0xFF]),
+                },
+                SubTile {
+                    rect: TileRect {
+                        x: 384,
+                        y: 128,
+                        w: 128,
+                        h: 128,
+                    },
+                    payload: LeafPayload::Solid([0xAA, 0xBB, 0xCC, 0xFF]),
+                },
+            ]),
+        };
+        let (tx, rx) = crossbeam_channel::unbounded();
+        tx.send(Ok(split_tile)).unwrap();
+        drop(tx);
+        h.client
+            .handle_request(RecvType::RawBuffer(CompressedTileStream {
+                header: RawBufferHeader {
+                    frame_seq: 901,
+                    client: client_id,
+                    surface: sid_missing,
+                    metadata: meta,
+                    incremental: true,
+                    scroll_rect: None,
+                    reset_tile_cache: false,
+                    evict_slots: Vec::new(),
+                    tile_rects: vec![put_rect],
+                },
+                tiles: rx,
+            }));
+        assert_eq!(
+            h.drain_events(),
+            vec![
+                Event::Surface(SurfaceEvent {
+                    surface_id: sid_missing,
+                    payload: SurfaceEventPayload::BufferResyncRequested,
+                }),
+                Event::FrameAck { seq: 901 },
+            ]
+        );
+
+        // Now pipelined surface `sid_b` arrives as a full frame referencing `put_slot`
+        // for both `(0,0,256,256)` and `(256,0,256,256)` via `CacheHit` -> MUST succeed!
+        let (tx, rx) = crossbeam_channel::unbounded();
+        for tile_idx in 0..2u32 {
+            tx.send(Ok(CompressedTile {
+                tile_idx,
+                cache_put: None,
+                payload: TilePayload::CacheHit(CacheHitRef {
+                    slot_id: put_slot,
+                    region: CacheHitRegion::Full,
+                }),
+            }))
+            .unwrap();
+        }
+        drop(tx);
+        h.client
+            .handle_request(RecvType::RawBuffer(CompressedTileStream {
+                header: RawBufferHeader {
+                    frame_seq: 902,
+                    client: client_id,
+                    surface: sid_b,
+                    metadata: meta,
+                    incremental: false,
+                    scroll_rect: None,
+                    reset_tile_cache: false,
+                    evict_slots: Vec::new(),
+                    tile_rects: vec![
+                        TileRect {
+                            x: 0,
+                            y: 0,
+                            w: 256,
+                            h: 256,
+                        },
+                        put_rect,
+                    ],
+                },
+                tiles: rx,
+            }));
+        assert_eq!(h.drain_events(), vec![Event::FrameAck { seq: 902 }]);
+        let b_slot = h
+            .client
+            .remote_display
+            .client(&client_id)
+            .surfaces
+            .get(&sid_b)
+            .unwrap()
+            .buffer
+            .as_ref()
+            .unwrap()
+            .active_buffer
+            .slot();
+        let b_bytes = h.client.pool.raw_data_mut(&b_slot);
+        // Spot-check all 4 quadrants of the Split tile decoded via `puts_only` and blitted via `CacheHit`.
+        assert_eq!(&b_bytes[0..4], &[0x11, 0x22, 0x33, 0xFF]);
+        assert_eq!(&b_bytes[128 * 4..128 * 4 + 4], &[0x44, 0x55, 0x66, 0xFF]);
+        assert_eq!(
+            &b_bytes[128 * stride..128 * stride + 4],
+            &[0x77, 0x88, 0x99, 0xFF]
+        );
+        assert_eq!(
+            &b_bytes[128 * stride + 128 * 4..128 * stride + 128 * 4 + 4],
+            &[0xAA, 0xBB, 0xCC, 0xFF]
+        );
+
+        // 3. Missing `CacheHit` slot triggers clean `BufferResyncRequested` (never panics).
+        let (tx, rx) = crossbeam_channel::unbounded();
+        tx.send(Ok(CompressedTile {
+            tile_idx: 0,
+            cache_put: None,
+            payload: TilePayload::CacheHit(CacheHitRef {
+                slot_id: 999,
+                region: CacheHitRegion::Full,
+            }),
+        }))
+        .unwrap();
+        drop(tx);
+        h.client
+            .handle_request(RecvType::RawBuffer(CompressedTileStream {
+                header: RawBufferHeader {
+                    frame_seq: 903,
+                    client: client_id,
+                    surface: sid_a,
+                    metadata: meta,
+                    incremental: true,
+                    scroll_rect: None,
+                    reset_tile_cache: false,
+                    evict_slots: Vec::new(),
+                    tile_rects: vec![TileRect {
+                        x: 0,
+                        y: 0,
+                        w: 256,
+                        h: 256,
+                    }],
+                },
+                tiles: rx,
+            }));
+        assert_eq!(
+            h.drain_events(),
+            vec![
+                Event::Surface(SurfaceEvent {
+                    surface_id: sid_a,
+                    payload: SurfaceEventPayload::BufferResyncRequested,
+                }),
+                Event::FrameAck { seq: 903 },
+            ]
+        );
+
+        // 4. `header.reset_tile_cache` clears `wprsc.tile_cache` in-band, and
+        //    `Request::Capabilities` clears `wprsc.tile_cache` on reconnect.
+        assert!(h.client.tile_cache.occupied_slots() > 0);
+        let (tx, rx) = crossbeam_channel::unbounded();
+        tx.send(Ok(CompressedTile {
+            tile_idx: 0,
+            cache_put: Some(0),
+            payload: TilePayload::Leaf(LeafPayload::Solid([1, 2, 3, 0xFF])),
+        }))
+        .unwrap();
+        drop(tx);
+        h.client
+            .handle_request(RecvType::RawBuffer(CompressedTileStream {
+                header: RawBufferHeader {
+                    frame_seq: 904,
+                    client: client_id,
+                    surface: sid_b,
+                    metadata: meta,
+                    incremental: true,
+                    scroll_rect: None,
+                    reset_tile_cache: true,
+                    evict_slots: Vec::new(),
+                    tile_rects: vec![TileRect {
+                        x: 0,
+                        y: 0,
+                        w: 64,
+                        h: 64,
+                    }],
+                },
+                tiles: rx,
+            }));
+        assert_eq!(h.drain_events(), vec![Event::FrameAck { seq: 904 }]);
+        assert_eq!(h.client.tile_cache.occupied_slots(), 1);
+
+        h.client
+            .handle_request(RecvType::Object(Request::Capabilities(Capabilities {
+                xwayland: false,
+            })));
+        assert_eq!(h.client.tile_cache.occupied_slots(), 0);
+        assert_eq!(h.client.tile_cache.used_bytes(), 0);
     }
 }

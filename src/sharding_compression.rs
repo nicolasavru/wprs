@@ -259,6 +259,7 @@ pub(crate) struct CompressorWorkerState {
     jpeg_subsamp: JpegSubsamp,
     pub(crate) jpeg_pixels: Vec<u8>,
     jpeg_out: Vec<u8>,
+    pub(crate) hash_buf: Vec<u8>,
 }
 
 impl CompressorWorkerState {
@@ -287,6 +288,7 @@ impl CompressorWorkerState {
             jpeg_subsamp: JpegSubsamp::Sub444,
             jpeg_pixels: Vec::new(),
             jpeg_out: Vec::new(),
+            hash_buf: Vec::new(),
         })
     }
 

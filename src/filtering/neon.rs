@@ -54,15 +54,21 @@ use std::arch::aarch64::vst3q_u8;
 use std::arch::aarch64::vst4q_u8;
 use std::arch::aarch64::vsubq_u8;
 use std::borrow::Cow;
+use std::mem::MaybeUninit;
+use std::ptr;
 use std::sync::Mutex;
 use std::sync::atomic::AtomicBool;
 use std::sync::atomic::AtomicUsize;
 
 use crate::buffer_pointer::BufferPointer;
+use crate::filtering::ClientTileCache;
+use crate::filtering::DecodeCacheCtx;
 use crate::filtering::FrameRows;
 use crate::filtering::RowKernel;
 use crate::filtering::ScanSubBand;
 use crate::filtering::ShadowRows;
+use crate::filtering::tile_cache::SlotHashes;
+use crate::filtering::tile_cache::ValidatedCacheHit;
 use crate::prelude::*;
 use crate::serialization::framing::AlphaChannel;
 use crate::serialization::framing::CompressedTile;
@@ -363,7 +369,7 @@ impl RowKernel for Kernel {
         src_bgr: &[u8],
         alpha_row: &[u8],
         const_alpha: u8,
-        dst: &mut [Vec4u8],
+        dst: &mut [MaybeUninit<Vec4u8>],
     ) {
         let tw = dst.len();
         debug_assert_eq!(src_bgr.len(), tw * 3);
@@ -399,17 +405,17 @@ impl RowKernel for Kernel {
             } else {
                 alpha_row[i]
             };
-            *out = Vec4u8(
+            out.write(Vec4u8(
                 src_bgr[s].wrapping_add(g),
                 g,
                 src_bgr[s + 2].wrapping_add(g),
                 a,
-            );
+            ));
         }
     }
 
     #[inline(always)]
-    unsafe fn splat_row<const STREAM: bool>(self, dst: &mut [Vec4u8], pixel: Vec4u8) {
+    unsafe fn splat_row<const STREAM: bool>(self, dst: &mut [MaybeUninit<Vec4u8>], pixel: Vec4u8) {
         let lim = (dst.len() / 4) * 4;
         // SAFETY: `x + 4 <= dst.len()`, so `vst1q_u8` writes 16 bytes in bounds.
         unsafe {
@@ -422,7 +428,16 @@ impl RowKernel for Kernel {
                 x += 4;
             }
         }
-        dst[lim..].fill(pixel);
+        dst[lim..].fill(MaybeUninit::new(pixel));
+    }
+
+    #[inline(always)]
+    unsafe fn copy_row_stream(self, src: &[Vec4u8], dst: &mut [MaybeUninit<Vec4u8>]) {
+        debug_assert_eq!(src.len(), dst.len());
+        // SAFETY: `src` and `dst` have equal lengths and cannot overlap.
+        unsafe {
+            ptr::copy_nonoverlapping(src.as_ptr(), dst.as_mut_ptr().cast::<Vec4u8>(), src.len());
+        }
     }
 
     #[inline(always)]
@@ -622,6 +637,7 @@ impl Tier {
         claimed: &[AtomicBool],
         completed: &AtomicUsize,
         first_err: &Mutex<Option<anyhow::Error>>,
+        cache_ctx: Option<&DecodeCacheCtx>,
         next_tile: &F,
         state: &mut DecompressorWorkerState,
     ) where
@@ -631,15 +647,32 @@ impl Tier {
         unsafe {
             if has_alpha {
                 super::unfilter_tiles_worker_with::<Kernel, true, F>(
-                    Kernel, self, tile_rects, frame, claimed, completed, first_err, next_tile,
-                    state,
+                    Kernel, self, tile_rects, frame, claimed, completed, first_err, cache_ctx,
+                    next_tile, state,
                 );
             } else {
                 super::unfilter_tiles_worker_with::<Kernel, false, F>(
-                    Kernel, self, tile_rects, frame, claimed, completed, first_err, next_tile,
-                    state,
+                    Kernel, self, tile_rects, frame, claimed, completed, first_err, cache_ctx,
+                    next_tile, state,
                 );
             }
+        }
+    }
+
+    /// # Safety
+    /// Caller must uphold [`super::blit_hits_worker_with`] invariants.
+    #[inline(always)]
+    pub(super) unsafe fn blit_hits_worker(
+        self,
+        cache: &ClientTileCache,
+        hits: &[ValidatedCacheHit],
+        tile_rects: &[TileRect],
+        frame: &FrameRows,
+        next_hit: &AtomicUsize,
+    ) {
+        // SAFETY: Caller upholds validated-hit and disjoint-tile invariants.
+        unsafe {
+            super::blit_hits_worker_with(Kernel, cache, hits, tile_rects, frame, next_hit);
         }
     }
 
@@ -690,7 +723,9 @@ impl Tier {
         n_qx: usize,
         sub_bands: &[ScanSubBand],
         dirty_flags: &[AtomicBool],
+        slot_hashes: Option<&SlotHashes>,
         next_sub: &AtomicUsize,
+        hash_buf: &mut Vec<u8>,
     ) {
         // SAFETY: Caller upholds disjoint-band shadow invariants.
         unsafe {
@@ -706,7 +741,9 @@ impl Tier {
                     n_qx,
                     sub_bands,
                     dirty_flags,
+                    slot_hashes,
                     next_sub,
+                    hash_buf,
                 );
             } else {
                 super::diff_and_update_worker_with::<Kernel, false>(
@@ -720,7 +757,9 @@ impl Tier {
                     n_qx,
                     sub_bands,
                     dirty_flags,
+                    slot_hashes,
                     next_sub,
+                    hash_buf,
                 );
             }
         }
@@ -740,7 +779,9 @@ impl Tier {
         sub_bands: &[ScanSubBand],
         sr: ScrollRect,
         dirty_flags: &[AtomicBool],
+        slot_hashes: Option<&SlotHashes>,
         next_sub: &AtomicUsize,
+        hash_buf: &mut Vec<u8>,
     ) {
         // SAFETY: Caller upholds disjoint-band and scroll-band shadow invariants.
         unsafe {
@@ -757,7 +798,9 @@ impl Tier {
                     sub_bands,
                     sr,
                     dirty_flags,
+                    slot_hashes,
                     next_sub,
+                    hash_buf,
                 );
             } else {
                 super::diff_and_update_scroll_worker_with::<Kernel, false>(
@@ -772,7 +815,9 @@ impl Tier {
                     sub_bands,
                     sr,
                     dirty_flags,
+                    slot_hashes,
                     next_sub,
+                    hash_buf,
                 );
             }
         }
@@ -808,6 +853,7 @@ impl Tier {
     ) {
         // SAFETY: Caller upholds disjoint-row shadow invariants.
         unsafe {
+            let mut hash_buf = Vec::new();
             super::diff_and_update_row_band_2d_with::<Kernel, HAS_ALPHA>(
                 Kernel,
                 data,
@@ -817,7 +863,10 @@ impl Tier {
                 stride,
                 y0,
                 y1,
+                0,
                 dirty_slots,
+                None,
+                &mut hash_buf,
             );
         }
     }

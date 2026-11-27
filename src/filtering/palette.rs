@@ -18,6 +18,8 @@
 //! counter to avoid per-tile clearing, bailing out immediately on the 257th
 //! unique color so photo tiles exit within a few hundred pixels.
 
+use std::mem::MaybeUninit;
+
 use crate::buffer_pointer::BufferPointer;
 use crate::prelude::*;
 use crate::serialization::framing::TILE_PIXELS;
@@ -451,13 +453,13 @@ pub(crate) fn decode_palette_row(
     n_colors: usize,
     packed: &[u8],
     idx_pos: &mut usize,
-    dst_row: &mut [Vec4u8],
+    dst_row: &mut [MaybeUninit<Vec4u8>],
 ) -> Result<()> {
     let mut pos = *idx_pos;
     if n_colors <= 2 {
         for dst in dst_row.iter_mut() {
             let b = packed[pos >> 3];
-            *dst = lut[usize::from((b >> (pos & 7)) & 1)];
+            dst.write(lut[usize::from((b >> (pos & 7)) & 1)]);
             pos += 1;
         }
     } else if n_colors <= 4 {
@@ -467,7 +469,7 @@ pub(crate) fn decode_palette_row(
             if v >= n_colors {
                 bail!("2-bpp palette index {v} >= {n_colors}");
             }
-            *dst = lut[v];
+            dst.write(lut[v]);
             pos += 1;
         }
     } else if n_colors <= 16 {
@@ -477,13 +479,13 @@ pub(crate) fn decode_palette_row(
             if v >= n_colors {
                 bail!("4-bpp palette index {v} >= {n_colors}");
             }
-            *dst = lut[v];
+            dst.write(lut[v]);
             pos += 1;
         }
     } else {
         let prow = &packed[pos..pos + dst_row.len()];
         for (dst, &v) in dst_row.iter_mut().zip(prow) {
-            *dst = lut[usize::from(v)];
+            dst.write(lut[usize::from(v)]);
         }
         pos += dst_row.len();
     }
@@ -547,7 +549,7 @@ mod tests {
         assert_eq!(dec_n, n_colors);
 
         let mut idx_pos = 0;
-        let mut out_row = vec![Vec4u8(0, 0, 0, 0); tw];
+        let mut out_row = vec![MaybeUninit::uninit(); tw];
         for ry in 0..th {
             decode_palette_row(&lut, dec_n, packed, &mut idx_pos, &mut out_row).unwrap();
             for rx in 0..tw {
@@ -555,7 +557,8 @@ mod tests {
                 if !has_alpha {
                     exp.3 = 0xFF;
                 }
-                assert_eq!(out_row[rx], exp);
+                // SAFETY: `decode_palette_row` initializes every element on `Ok`.
+                assert_eq!(unsafe { out_row[rx].assume_init() }, exp);
             }
         }
     }
@@ -608,7 +611,7 @@ mod tests {
         // Out-of-range 2-bpp index (3 for a 3-color palette).
         let pal3 = vec![1, 2, 3, 4, 5, 6, 7, 8, 9];
         let (lut3, n3) = prepare_palette_lut(false, &pal3, &[0b11], 1).unwrap();
-        let mut row = [Vec4u8(0, 0, 0, 0); 1];
+        let mut row = [MaybeUninit::uninit(); 1];
         assert!(decode_palette_row(&lut3, n3, &[0b11], &mut 0, &mut row).is_err());
 
         // Out-of-range 4-bpp index (10 for a 5-color palette).

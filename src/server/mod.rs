@@ -48,6 +48,7 @@ use smithay::wayland::shm::ShmState;
 use smithay::wayland::viewporter::ViewporterState;
 
 use crate::constants;
+use crate::filtering::ServerTileCache;
 use crate::prelude::*;
 use crate::serialization::CompressionMode;
 use crate::serialization::Event;
@@ -358,6 +359,9 @@ pub struct WprsServerState {
     pub serializer: Serializer<Request, Event>,
     pub compressor: ShardingCompressor,
     pub compression_mode: CompressionMode,
+    /// Metadata-only connection-wide inter-frame tile cache directory tracking
+    /// which content hashes live in `wprsc`'s bounded decoded pixel slots.
+    pub tile_cache: ServerTileCache,
     /// Reverse map from WlSurfaceId, which is the hash of ObjectId, back to its
     /// source ObjectId. We can't put this in SurfaceState because is
     /// serializable, while this only has meaning locally. We need this for
@@ -445,6 +449,7 @@ impl WprsServerState {
             // TODO: try tuning this based on the number of cpus the machine has.
             compressor: ShardingCompressor::new(NonZeroUsize::new(16).unwrap(), 1).unwrap(),
             compression_mode: CompressionMode::Lossless,
+            tile_cache: ServerTileCache::new(),
             object_map: HashMap::new(),
             synced_buffers: HashMap::new(),
             dirty_sync_surfaces: HashSet::new(),

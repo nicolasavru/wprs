@@ -158,6 +158,7 @@ impl WprsServerState {
         let writer = self.serializer.writer();
         let frame_backpressure = &mut self.frame_backpressure;
         let compressor = &mut self.compressor;
+        let tile_cache = &mut self.tile_cache;
         let compression_mode = self.compression_mode;
 
         let commit_buf_res =
@@ -210,6 +211,7 @@ impl WprsServerState {
                             compression_mode,
                             scan_bands.as_deref(),
                             &mut synced.pixels,
+                            Some(tile_cache),
                             compressor,
                             |mut raw_buffer_to_send| {
                                 raw_buffer_to_send.header.frame_seq =
@@ -249,6 +251,7 @@ impl WprsServerState {
                             metadata,
                             compression_mode,
                             Some(&mut pixels),
+                            Some(tile_cache),
                             compressor,
                             |mut raw_buffer_to_send| {
                                 raw_buffer_to_send.header.frame_seq =
@@ -288,6 +291,7 @@ impl WprsServerState {
                         "shm buffer faulted during commit ({err:?}); detaching remote surface buffer"
                     );
                     surface_state.buffer = None;
+                    self.tile_cache.reset_for_peer();
                     EncodeBufferOutcome::FaultedAfterSend
                 } else {
                     EncodeBufferOutcome::Failed(anyhow!(err))
@@ -4106,11 +4110,13 @@ mod tests {
             };
 
         let mut decompressor = ShardingDecompressor::new(NonZeroUsize::new(2).unwrap()).unwrap();
+        let mut tile_cache = filtering::ClientTileCache::new();
         let mut s1_canvas = vec![0u8; byte_len];
         let mut s2_canvas = vec![0u8; byte_len];
         let decode_into = |streaming: crate::serialization::framing::StreamingCompressedTiles,
                            canvas: &mut [u8],
-                           decompressor: &mut ShardingDecompressor|
+                           decompressor: &mut ShardingDecompressor,
+                           tile_cache: &mut filtering::ClientTileCache|
          -> u64 {
             let mut wire = Vec::new();
             streaming.framed_write(&mut wire).unwrap();
@@ -4125,7 +4131,13 @@ mod tests {
             let stream = rx.recv().unwrap();
             let seq = stream.header.frame_seq;
             let validated = ValidatedTileStream::new(stream).unwrap();
-            filtering::decompress_and_unfilter_streaming(validated, decompressor, canvas).unwrap();
+            filtering::decompress_and_unfilter_streaming(
+                validated,
+                decompressor,
+                canvas,
+                Some(tile_cache),
+            )
+            .unwrap();
             reader.join().unwrap();
             seq
         };
@@ -4153,7 +4165,7 @@ mod tests {
         let sid1 = h.server_surface_id(&s1);
         for msg in h.drain_messages() {
             if let SendType::RawBuffer(rb) = msg {
-                let seq = decode_into(rb, &mut s1_canvas, &mut decompressor);
+                let seq = decode_into(rb, &mut s1_canvas, &mut decompressor, &mut tile_cache);
                 in_flight_seqs.push(seq);
             }
         }
@@ -4225,7 +4237,12 @@ mod tests {
             match msg {
                 SendType::RawBuffer(rb) => {
                     assert_eq!(rb.header.surface, sid1);
-                    s1_flushed_seq = Some(decode_into(rb, &mut s1_canvas, &mut decompressor));
+                    s1_flushed_seq = Some(decode_into(
+                        rb,
+                        &mut s1_canvas,
+                        &mut decompressor,
+                        &mut tile_cache,
+                    ));
                 },
                 SendType::Object(Request::Surface(SurfaceRequest {
                     surface,
@@ -4253,7 +4270,12 @@ mod tests {
         for msg in msgs {
             if let SendType::RawBuffer(rb) = msg {
                 assert_eq!(rb.header.surface, sid2);
-                s2_flushed_seq = Some(decode_into(rb, &mut s2_canvas, &mut decompressor));
+                s2_flushed_seq = Some(decode_into(
+                    rb,
+                    &mut s2_canvas,
+                    &mut decompressor,
+                    &mut tile_cache,
+                ));
             }
         }
         in_flight_seqs.push(s2_flushed_seq.expect("S2 must flush RawBuffer"));
@@ -4585,6 +4607,7 @@ mod tests {
         );
         let surface = compositor.create_surface(&h.qh, ());
         let mut decompressor = ShardingDecompressor::new(NonZeroUsize::new(2).unwrap()).unwrap();
+        let mut tile_cache = filtering::ClientTileCache::new();
         let mut canvas = vec![0u8; byte_len];
 
         let mut decode_rb = |rb: crate::serialization::framing::StreamingCompressedTiles,
@@ -4611,8 +4634,13 @@ mod tests {
             if let Some(sr) = sr {
                 filtering::apply_scroll_rect_in_place(canvas, stride, sr);
             }
-            filtering::decompress_and_unfilter_streaming(validated, &mut decompressor, canvas)
-                .unwrap();
+            filtering::decompress_and_unfilter_streaming(
+                validated,
+                &mut decompressor,
+                canvas,
+                Some(&mut tile_cache),
+            )
+            .unwrap();
             reader.join().unwrap();
             (seq, sr, tiles, wire_len)
         };
@@ -4680,5 +4708,219 @@ mod tests {
             }
             assert_eq!(canvas, expected);
         }
+    }
+
+    #[test]
+    #[cfg_attr(miri, ignore)]
+    fn test_wprsd_tile_cache_aba_resync_disconnect_and_reconnect_wire() {
+        use std::io::Seek;
+        use std::io::Write;
+        use std::num::NonZeroUsize;
+
+        use crate::filtering::ClientTileCache;
+        use crate::filtering::ValidatedTileStream;
+        use crate::serialization::framing::CompressedTile;
+        use crate::serialization::framing::CompressedTileStream;
+        use crate::serialization::framing::TilePayload;
+        use crate::serialization::wayland::SurfaceEvent;
+        use crate::serialization::wayland::SurfaceEventPayload;
+        use crate::sharding_compression::ShardingDecompressor;
+
+        let mut h = WaylandTestHarness::new(true);
+        let compositor = h.client_data.compositor.clone().unwrap();
+        let shm = h.client_data.shm.clone().unwrap();
+
+        let width = 512usize;
+        let height = 256usize;
+        let stride = width * 4;
+        let byte_len = height * stride;
+
+        let make_frame = |seed: u8| -> Vec<u8> {
+            (0..byte_len)
+                .map(|i| {
+                    if i % 4 == 3 {
+                        0xFF
+                    } else {
+                        seed.wrapping_mul(37).wrapping_add(((i * 13) % 251) as u8)
+                    }
+                })
+                .collect()
+        };
+        let frame_a = make_frame(1);
+        let frame_b = make_frame(2);
+
+        let path = std::env::temp_dir().join(format!(
+            "wprs_tile_cache_srv_test_{}_{}.bin",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let mut file = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create_new(true)
+            .open(&path)
+            .unwrap();
+        file.write_all(&frame_a).unwrap();
+        _ = std::fs::remove_file(&path);
+        let pool = shm.create_pool(file.as_fd(), byte_len as i32, &h.qh, ());
+        let buf = pool.create_buffer(
+            0,
+            width as i32,
+            height as i32,
+            stride as i32,
+            wl_shm::Format::Xrgb8888,
+            &h.qh,
+            (),
+        );
+        let surface = compositor.create_surface(&h.qh, ());
+        let mut decompressor = ShardingDecompressor::new(NonZeroUsize::new(2).unwrap()).unwrap();
+        let mut client_cache = ClientTileCache::new();
+        let mut canvas = vec![0u8; byte_len];
+
+        let mut decode_rb = |rb: crate::serialization::framing::StreamingCompressedTiles,
+                             canvas: &mut [u8],
+                             cli: &mut ClientTileCache| {
+            let mut wire = Vec::new();
+            rb.framed_write(&mut wire).unwrap();
+            let mut rx_opt = None;
+            CompressedTileStream::read_from_stream(&mut wire.as_slice(), |stream| {
+                rx_opt = Some(stream);
+                Ok(())
+            })
+            .unwrap();
+            let stream = rx_opt.unwrap();
+            let header = stream.header.clone();
+            let tiles: Vec<CompressedTile> = stream
+                .tiles
+                .into_iter()
+                .collect::<Result<Vec<_>>>()
+                .unwrap();
+            let n_hits = tiles
+                .iter()
+                .filter(|t| matches!(t.payload, TilePayload::CacheHit(_)))
+                .count();
+            let (tx, rx) = crossbeam_channel::unbounded();
+            for t in tiles {
+                tx.send(Ok(t)).unwrap();
+            }
+            drop(tx);
+            let validated = ValidatedTileStream::new(CompressedTileStream {
+                header: header.clone(),
+                tiles: rx,
+            })
+            .unwrap();
+            filtering::decompress_and_unfilter_streaming(
+                validated,
+                &mut decompressor,
+                canvas,
+                Some(cli),
+            )
+            .unwrap();
+            (header, n_hits)
+        };
+
+        let mut commit_frame = |h: &mut WaylandTestHarness, pixels: &[u8]| {
+            file.rewind().unwrap();
+            file.write_all(pixels).unwrap();
+            surface.attach(Some(&buf), 0, 0);
+            surface.damage_buffer(0, 0, width as i32, height as i32);
+            surface.commit();
+            h.roundtrip();
+        };
+
+        // 1. Frame A -> first emitted header after connect sets `reset_tile_cache = true`.
+        commit_frame(&mut h, &frame_a);
+        let sid = h.server_surface_id(&surface);
+        let mut got_a1 = None;
+        for msg in h.drain_messages() {
+            if let SendType::RawBuffer(rb) = msg {
+                let (hdr, hits) = decode_rb(rb, &mut canvas, &mut client_cache);
+                h.ack_frame(hdr.frame_seq);
+                got_a1 = Some((hdr, hits));
+            }
+        }
+        let (hdr_a1, hits_a1) = got_a1.expect("expected RawBuffer for frame A1");
+        assert!(hdr_a1.reset_tile_cache);
+        assert_eq!(hits_a1, 0);
+        assert_eq!(canvas, frame_a);
+
+        // 2. Frame B -> Frame A: return-to-A hits 100% of cached tiles!
+        commit_frame(&mut h, &frame_b);
+        for msg in h.drain_messages() {
+            if let SendType::RawBuffer(rb) = msg {
+                let (hdr, _) = decode_rb(rb, &mut canvas, &mut client_cache);
+                assert!(!hdr.reset_tile_cache);
+                h.ack_frame(hdr.frame_seq);
+            }
+        }
+        assert_eq!(canvas, frame_b);
+
+        commit_frame(&mut h, &frame_a);
+        let mut got_a2 = None;
+        for msg in h.drain_messages() {
+            if let SendType::RawBuffer(rb) = msg {
+                let (hdr, hits) = decode_rb(rb, &mut canvas, &mut client_cache);
+                h.ack_frame(hdr.frame_seq);
+                got_a2 = Some((hdr, hits));
+            }
+        }
+        let (hdr_a2, hits_a2) = got_a2.expect("expected RawBuffer for frame A2");
+        assert!(!hdr_a2.reset_tile_cache);
+        assert_eq!(hits_a2, hdr_a2.tile_rects.len());
+        assert_eq!(canvas, frame_a);
+
+        // 3. `BufferResyncRequested` resets server tile cache and sets `reset_tile_cache = true`
+        //    on the next emitted full frame (self-healing, 0 CacheHits).
+        let conn_id = h.state.active_conn_id.unwrap();
+        h.state.handle_event(
+            conn_id,
+            crate::serialization::RecvType::Object(crate::serialization::Event::Surface(
+                SurfaceEvent {
+                    surface_id: sid,
+                    payload: SurfaceEventPayload::BufferResyncRequested,
+                },
+            )),
+        );
+        assert_eq!(h.state.tile_cache.occupied_slots(), 0);
+        commit_frame(&mut h, &frame_b);
+        let mut got_resync = None;
+        for msg in h.drain_messages() {
+            if let SendType::RawBuffer(rb) = msg {
+                let (hdr, hits) = decode_rb(rb, &mut canvas, &mut client_cache);
+                h.ack_frame(hdr.frame_seq);
+                got_resync = Some((hdr, hits));
+            }
+        }
+        let (hdr_resync, hits_resync) = got_resync.expect("expected RawBuffer after resync");
+        assert!(hdr_resync.reset_tile_cache);
+        assert!(!hdr_resync.incremental);
+        assert_eq!(hits_resync, 0);
+        assert_eq!(canvas, frame_b);
+
+        // 4. Disconnect clears server tile cache; reconnect starts fresh with `reset_tile_cache = true`.
+        assert!(h.state.tile_cache.occupied_slots() > 0);
+        h.disconnect_wprsc();
+        assert_eq!(h.state.tile_cache.occupied_slots(), 0);
+        assert_eq!(h.state.tile_cache.used_bytes(), 0);
+
+        h.connect_wprsc();
+        client_cache.clear();
+        let _ = h.drain_messages();
+        commit_frame(&mut h, &frame_a);
+        let mut got_reconn = None;
+        for msg in h.drain_messages() {
+            if let SendType::RawBuffer(rb) = msg {
+                let (hdr, hits) = decode_rb(rb, &mut canvas, &mut client_cache);
+                h.ack_frame(hdr.frame_seq);
+                got_reconn = Some((hdr, hits));
+            }
+        }
+        let (hdr_reconn, hits_reconn) = got_reconn.expect("expected RawBuffer after reconnect");
+        assert!(hdr_reconn.reset_tile_cache);
+        assert_eq!(hits_reconn, 0);
+        assert_eq!(canvas, frame_a);
     }
 }

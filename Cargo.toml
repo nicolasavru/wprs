@@ -21,6 +21,10 @@ inherits = "release-lto"
 [dependencies]
 anyhow = "1.0.104"
 bimap = "0.6.3"
+# `no_neon` keeps full x86_64 AVX-512/AVX2/SSE4.1/SSE2 assembly while avoiding
+# `<arm_neon.h>` C cross-compilation failures when checking aarch64 targets
+# without an ARM C toolchain.
+blake3 = { version = "1.8.7", features = ["no_neon"] }
 bpaf = "0.9.29"
 bytemuck = "1.25.2"
 calloop = { version = "0.14.5", features = ["signals"] }

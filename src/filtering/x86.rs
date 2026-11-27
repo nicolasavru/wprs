@@ -41,6 +41,8 @@ use std::sync::atomic::AtomicBool;
 use std::sync::atomic::AtomicUsize;
 
 use crate::buffer_pointer::BufferPointer;
+use crate::filtering::ClientTileCache;
+use crate::filtering::DecodeCacheCtx;
 use crate::filtering::FrameRows;
 #[cfg(all(
     not(target_feature = "ssse3"),
@@ -54,6 +56,8 @@ use crate::filtering::FrameRows;
 use crate::filtering::ScalarKernel;
 use crate::filtering::ScanSubBand;
 use crate::filtering::ShadowRows;
+use crate::filtering::tile_cache::SlotHashes;
+use crate::filtering::tile_cache::ValidatedCacheHit;
 use crate::prelude::*;
 use crate::serialization::framing::AlphaChannel;
 use crate::serialization::framing::CompressedTile;
@@ -209,6 +213,7 @@ mod avx512 {
     use std::arch::x86_64::_mm512_stream_si512;
     use std::arch::x86_64::_mm512_sub_epi8;
     use std::arch::x86_64::_mm512_zextsi128_si512;
+    use std::mem::MaybeUninit;
 
     use crate::buffer_pointer::BufferPointer;
     use crate::filtering::RowKernel;
@@ -660,7 +665,7 @@ mod avx512 {
         src_bgr: &[u8],
         alpha_row: &[u8],
         const_alpha: u8,
-        dst: &mut [Vec4u8],
+        dst: &mut [MaybeUninit<Vec4u8>],
     ) {
         let tw = dst.len();
         debug_assert_eq!(src_bgr.len(), tw * 3);
@@ -714,18 +719,18 @@ mod avx512 {
             } else {
                 alpha_row[i]
             };
-            dst[i] = Vec4u8(
+            dst[i].write(Vec4u8(
                 src_bgr[s].wrapping_add(g),
                 g,
                 src_bgr[s + 2].wrapping_add(g),
                 a,
-            );
+            ));
         }
     }
 
     #[target_feature(enable = "avx512bw,avx512vl,avx512vbmi")]
     #[inline]
-    unsafe fn splat_row_impl<const STREAM: bool>(dst: &mut [Vec4u8], pixel: Vec4u8) {
+    unsafe fn splat_row_impl<const STREAM: bool>(dst: &mut [MaybeUninit<Vec4u8>], pixel: Vec4u8) {
         debug_assert!(!STREAM || (dst.as_mut_ptr() as usize).is_multiple_of(64));
         let lim = (dst.len() / 16) * 16;
         // SAFETY: Caller guarantees AVX-512F; each iteration writes 16 `Vec4u8`
@@ -744,7 +749,25 @@ mod avx512 {
                 x += 16;
             }
         }
-        dst[lim..].fill(pixel);
+        dst[lim..].fill(MaybeUninit::new(pixel));
+    }
+
+    #[target_feature(enable = "avx512bw,avx512vl,avx512vbmi")]
+    #[inline]
+    unsafe fn copy_row_stream_impl(src: &[Vec4u8], dst: &mut [MaybeUninit<Vec4u8>]) {
+        let n = dst.len();
+        debug_assert_eq!(src.len(), n);
+        debug_assert!(n.is_multiple_of(16));
+        debug_assert!((dst.as_mut_ptr() as usize).is_multiple_of(64));
+        // SAFETY: Caller guarantees AVX-512F, 64-byte alignment on `dst`, and `n % 16 == 0`.
+        unsafe {
+            let mut x = 0usize;
+            while x < n {
+                let v = _mm512_loadu_si512(src.as_ptr().add(x).cast());
+                _mm512_stream_si512(dst.as_mut_ptr().add(x).cast::<__m512i>(), v);
+                x += 16;
+            }
+        }
     }
 
     #[target_feature(enable = "avx512bw,avx512vl,avx512vbmi")]
@@ -987,7 +1010,7 @@ mod avx512 {
             src_bgr: &[u8],
             alpha_row: &[u8],
             const_alpha: u8,
-            dst: &mut [Vec4u8],
+            dst: &mut [MaybeUninit<Vec4u8>],
         ) {
             // SAFETY: `self` witnesses `avx512bw + avx512vl + avx512vbmi` support,
             // and caller upholds 64-byte alignment on `dst` when `STREAM` is `true`.
@@ -1002,10 +1025,21 @@ mod avx512 {
         }
 
         #[inline(always)]
-        unsafe fn splat_row<const STREAM: bool>(self, dst: &mut [Vec4u8], pixel: Vec4u8) {
+        unsafe fn splat_row<const STREAM: bool>(
+            self,
+            dst: &mut [MaybeUninit<Vec4u8>],
+            pixel: Vec4u8,
+        ) {
             // SAFETY: `self` witnesses `avx512bw + avx512vl + avx512vbmi` support,
             // and caller upholds 64-byte alignment on `dst` when `STREAM` is `true`.
             unsafe { splat_row_impl::<STREAM>(dst, pixel) }
+        }
+
+        #[inline(always)]
+        unsafe fn copy_row_stream(self, src: &[Vec4u8], dst: &mut [MaybeUninit<Vec4u8>]) {
+            // SAFETY: `self` witnesses `avx512bw + avx512vl + avx512vbmi` support,
+            // and caller upholds 64-byte alignment and 16-pixel multiple length.
+            unsafe { copy_row_stream_impl(src, dst) }
         }
 
         #[inline(always)]
@@ -1093,6 +1127,7 @@ mod avx2 {
     use std::arch::x86_64::_mm256_sub_epi8;
     use std::arch::x86_64::_mm256_testz_si256;
     use std::arch::x86_64::_mm256_xor_si256;
+    use std::mem::MaybeUninit;
 
     use crate::buffer_pointer::BufferPointer;
     use crate::filtering::RowKernel;
@@ -1419,7 +1454,7 @@ mod avx2 {
         src_bgr: &[u8],
         alpha_row: &[u8],
         const_alpha: u8,
-        dst: &mut [Vec4u8],
+        dst: &mut [MaybeUninit<Vec4u8>],
     ) {
         let tw = dst.len();
         debug_assert_eq!(src_bgr.len(), tw * 3);
@@ -1516,18 +1551,18 @@ mod avx2 {
             } else {
                 alpha_row[i]
             };
-            dst[i] = Vec4u8(
+            dst[i].write(Vec4u8(
                 src_bgr[s].wrapping_add(g),
                 g,
                 src_bgr[s + 2].wrapping_add(g),
                 a,
-            );
+            ));
         }
     }
 
     #[target_feature(enable = "avx2")]
     #[inline]
-    unsafe fn splat_row_impl<const STREAM: bool>(dst: &mut [Vec4u8], pixel: Vec4u8) {
+    unsafe fn splat_row_impl<const STREAM: bool>(dst: &mut [MaybeUninit<Vec4u8>], pixel: Vec4u8) {
         debug_assert!(!STREAM || (dst.as_mut_ptr() as usize).is_multiple_of(32));
         let lim = (dst.len() / 8) * 8;
         // SAFETY: Caller guarantees AVX2; each iteration writes 8 `Vec4u8` (32 bytes),
@@ -1546,7 +1581,27 @@ mod avx2 {
                 x += 8;
             }
         }
-        dst[lim..].fill(pixel);
+        dst[lim..].fill(MaybeUninit::new(pixel));
+    }
+
+    #[target_feature(enable = "avx2")]
+    #[inline]
+    unsafe fn copy_row_stream_impl(src: &[Vec4u8], dst: &mut [MaybeUninit<Vec4u8>]) {
+        let n = dst.len();
+        debug_assert_eq!(src.len(), n);
+        debug_assert!(n.is_multiple_of(16));
+        debug_assert!((dst.as_mut_ptr() as usize).is_multiple_of(32));
+        // SAFETY: Caller guarantees AVX2, 32-byte alignment on `dst`, and `n % 16 == 0`.
+        unsafe {
+            let mut x = 0usize;
+            while x < n {
+                let v0 = _mm256_loadu_si256(src.as_ptr().add(x).cast::<__m256i>());
+                let v1 = _mm256_loadu_si256(src.as_ptr().add(x + 8).cast::<__m256i>());
+                _mm256_stream_si256(dst.as_mut_ptr().add(x).cast::<__m256i>(), v0);
+                _mm256_stream_si256(dst.as_mut_ptr().add(x + 8).cast::<__m256i>(), v1);
+                x += 16;
+            }
+        }
     }
 
     #[target_feature(enable = "avx2")]
@@ -1789,7 +1844,7 @@ mod avx2 {
             src_bgr: &[u8],
             alpha_row: &[u8],
             const_alpha: u8,
-            dst: &mut [Vec4u8],
+            dst: &mut [MaybeUninit<Vec4u8>],
         ) {
             // SAFETY: `self` witnesses `avx2` support, and caller upholds
             // 32-byte alignment on `dst` when `STREAM` is `true`.
@@ -1804,10 +1859,21 @@ mod avx2 {
         }
 
         #[inline(always)]
-        unsafe fn splat_row<const STREAM: bool>(self, dst: &mut [Vec4u8], pixel: Vec4u8) {
+        unsafe fn splat_row<const STREAM: bool>(
+            self,
+            dst: &mut [MaybeUninit<Vec4u8>],
+            pixel: Vec4u8,
+        ) {
             // SAFETY: `self` witnesses `avx2` support, and caller upholds
             // 32-byte alignment on `dst` when `STREAM` is `true`.
             unsafe { splat_row_impl::<STREAM>(dst, pixel) }
+        }
+
+        #[inline(always)]
+        unsafe fn copy_row_stream(self, src: &[Vec4u8], dst: &mut [MaybeUninit<Vec4u8>]) {
+            // SAFETY: `self` witnesses `avx2` support, and caller upholds
+            // 32-byte alignment and 16-pixel multiple length.
+            unsafe { copy_row_stream_impl(src, dst) }
         }
 
         #[inline(always)]
@@ -1886,6 +1952,7 @@ mod ssse3 {
     use std::arch::x86_64::_mm_stream_si128;
     use std::arch::x86_64::_mm_sub_epi8;
     use std::arch::x86_64::_mm_xor_si128;
+    use std::mem::MaybeUninit;
 
     use crate::buffer_pointer::BufferPointer;
     use crate::filtering::RowKernel;
@@ -2185,7 +2252,7 @@ mod ssse3 {
         src_bgr: &[u8],
         alpha_row: &[u8],
         const_alpha: u8,
-        dst: &mut [Vec4u8],
+        dst: &mut [MaybeUninit<Vec4u8>],
     ) {
         let tw = dst.len();
         debug_assert_eq!(src_bgr.len(), tw * 3);
@@ -2261,18 +2328,18 @@ mod ssse3 {
             } else {
                 alpha_row[i]
             };
-            dst[i] = Vec4u8(
+            dst[i].write(Vec4u8(
                 src_bgr[s].wrapping_add(g),
                 g,
                 src_bgr[s + 2].wrapping_add(g),
                 a,
-            );
+            ));
         }
     }
 
     #[target_feature(enable = "ssse3")]
     #[inline]
-    unsafe fn splat_row_impl<const STREAM: bool>(dst: &mut [Vec4u8], pixel: Vec4u8) {
+    unsafe fn splat_row_impl<const STREAM: bool>(dst: &mut [MaybeUninit<Vec4u8>], pixel: Vec4u8) {
         debug_assert!(!STREAM || (dst.as_mut_ptr() as usize).is_multiple_of(16));
         let lim = (dst.len() / 4) * 4;
         // SAFETY: SSE2 is mandatory on x86_64; each iteration writes 4 `Vec4u8` (16 bytes),
@@ -2291,7 +2358,32 @@ mod ssse3 {
                 x += 4;
             }
         }
-        dst[lim..].fill(pixel);
+        dst[lim..].fill(MaybeUninit::new(pixel));
+    }
+
+    #[target_feature(enable = "ssse3")]
+    #[inline]
+    unsafe fn copy_row_stream_impl(src: &[Vec4u8], dst: &mut [MaybeUninit<Vec4u8>]) {
+        let n = dst.len();
+        debug_assert_eq!(src.len(), n);
+        debug_assert!(n.is_multiple_of(16));
+        debug_assert!((dst.as_mut_ptr() as usize).is_multiple_of(16));
+        // SAFETY: SSE2 is mandatory on x86_64, caller guarantees 16-byte
+        // alignment on `dst` and `n % 16 == 0`.
+        unsafe {
+            let mut x = 0usize;
+            while x < n {
+                let v0 = _mm_loadu_si128(src.as_ptr().add(x).cast::<__m128i>());
+                let v1 = _mm_loadu_si128(src.as_ptr().add(x + 4).cast::<__m128i>());
+                let v2 = _mm_loadu_si128(src.as_ptr().add(x + 8).cast::<__m128i>());
+                let v3 = _mm_loadu_si128(src.as_ptr().add(x + 12).cast::<__m128i>());
+                _mm_stream_si128(dst.as_mut_ptr().add(x).cast::<__m128i>(), v0);
+                _mm_stream_si128(dst.as_mut_ptr().add(x + 4).cast::<__m128i>(), v1);
+                _mm_stream_si128(dst.as_mut_ptr().add(x + 8).cast::<__m128i>(), v2);
+                _mm_stream_si128(dst.as_mut_ptr().add(x + 12).cast::<__m128i>(), v3);
+                x += 16;
+            }
+        }
     }
 
     #[target_feature(enable = "ssse3")]
@@ -2527,7 +2619,7 @@ mod ssse3 {
             src_bgr: &[u8],
             alpha_row: &[u8],
             const_alpha: u8,
-            dst: &mut [Vec4u8],
+            dst: &mut [MaybeUninit<Vec4u8>],
         ) {
             // SAFETY: `self` witnesses `ssse3` support, and caller upholds
             // 16-byte alignment on `dst` when `STREAM` is `true`.
@@ -2542,10 +2634,21 @@ mod ssse3 {
         }
 
         #[inline(always)]
-        unsafe fn splat_row<const STREAM: bool>(self, dst: &mut [Vec4u8], pixel: Vec4u8) {
+        unsafe fn splat_row<const STREAM: bool>(
+            self,
+            dst: &mut [MaybeUninit<Vec4u8>],
+            pixel: Vec4u8,
+        ) {
             // SAFETY: `self` witnesses `ssse3` support, and caller upholds
             // 16-byte alignment on `dst` when `STREAM` is `true`.
             unsafe { splat_row_impl::<STREAM>(dst, pixel) }
+        }
+
+        #[inline(always)]
+        unsafe fn copy_row_stream(self, src: &[Vec4u8], dst: &mut [MaybeUninit<Vec4u8>]) {
+            // SAFETY: `self` witnesses `ssse3` support, and caller upholds
+            // 16-byte alignment and 16-pixel multiple length.
+            unsafe { copy_row_stream_impl(src, dst) }
         }
 
         #[inline(always)]
@@ -2606,9 +2709,13 @@ macro_rules! define_tier_wrappers {
 
             use super::X86Tier;
             use crate::buffer_pointer::BufferPointer;
+            use crate::filtering::ClientTileCache;
+            use crate::filtering::DecodeCacheCtx;
             use crate::filtering::FrameRows;
             use crate::filtering::ScanSubBand;
             use crate::filtering::ShadowRows;
+            use crate::filtering::tile_cache::SlotHashes;
+            use crate::filtering::tile_cache::ValidatedCacheHit;
             use crate::prelude::*;
             use crate::serialization::framing::AlphaChannel;
             use crate::serialization::framing::CompressedTile;
@@ -2654,6 +2761,7 @@ macro_rules! define_tier_wrappers {
                 claimed: &[AtomicBool],
                 completed: &AtomicUsize,
                 first_err: &Mutex<Option<anyhow::Error>>,
+                cache_ctx: Option<&DecodeCacheCtx>,
                 next_tile: &F,
                 state: &mut DecompressorWorkerState,
             ) where
@@ -2675,8 +2783,28 @@ macro_rules! define_tier_wrappers {
                         claimed,
                         completed,
                         first_err,
+                        cache_ctx,
                         next_tile,
                         state,
+                    );
+                }
+            }
+
+            #[target_feature(enable = $feat)]
+            #[inline]
+            pub(super) unsafe fn blit_hits_worker(
+                cache: &ClientTileCache,
+                hits: &[ValidatedCacheHit],
+                tile_rects: &[TileRect],
+                frame: &FrameRows,
+                next_hit: &AtomicUsize,
+            ) {
+                // SAFETY: Caller verified CPU feature support via `X86Tier::detect()`
+                // and upheld validated-hit and disjoint-tile invariants.
+                unsafe {
+                    let kernel = super::$tier_mod::Kernel::new_unchecked();
+                    crate::filtering::blit_hits_worker_with(
+                        kernel, cache, hits, tile_rects, frame, next_hit,
                     );
                 }
             }
@@ -2725,7 +2853,9 @@ macro_rules! define_tier_wrappers {
                 n_qx: usize,
                 sub_bands: &[ScanSubBand],
                 dirty_flags: &[AtomicBool],
+                slot_hashes: Option<&SlotHashes>,
                 next_sub: &AtomicUsize,
+                hash_buf: &mut Vec<u8>,
             ) {
                 // SAFETY: Caller verified CPU feature support via `X86Tier::detect()`
                 // and upheld disjoint-band shadow invariants.
@@ -2745,7 +2875,9 @@ macro_rules! define_tier_wrappers {
                         n_qx,
                         sub_bands,
                         dirty_flags,
+                        slot_hashes,
                         next_sub,
+                        hash_buf,
                     );
                 }
             }
@@ -2763,7 +2895,9 @@ macro_rules! define_tier_wrappers {
                 sub_bands: &[ScanSubBand],
                 sr: ScrollRect,
                 dirty_flags: &[AtomicBool],
+                slot_hashes: Option<&SlotHashes>,
                 next_sub: &AtomicUsize,
+                hash_buf: &mut Vec<u8>,
             ) {
                 // SAFETY: Caller verified CPU feature support via `X86Tier::detect()`
                 // and upheld disjoint-band and scroll-band shadow invariants.
@@ -2784,7 +2918,9 @@ macro_rules! define_tier_wrappers {
                         sub_bands,
                         sr,
                         dirty_flags,
+                        slot_hashes,
                         next_sub,
+                        hash_buf,
                     );
                 }
             }
@@ -2822,6 +2958,7 @@ macro_rules! define_tier_wrappers {
                 // SAFETY: Caller verified CPU feature support and disjoint-row invariants.
                 unsafe {
                     let kernel = super::$tier_mod::Kernel::new_unchecked();
+                    let mut hash_buf = Vec::new();
                     crate::filtering::diff_and_update_row_band_2d_with::<
                         super::$tier_mod::Kernel,
                         HAS_ALPHA,
@@ -2834,7 +2971,10 @@ macro_rules! define_tier_wrappers {
                         stride,
                         y0,
                         y1,
+                        0,
                         dirty_slots,
+                        None,
+                        &mut hash_buf,
                     );
                 }
             }
@@ -3009,6 +3149,7 @@ impl X86Tier {
         claimed: &[AtomicBool],
         completed: &AtomicUsize,
         first_err: &Mutex<Option<anyhow::Error>>,
+        cache_ctx: Option<&DecodeCacheCtx>,
         next_tile: &F,
         state: &mut DecompressorWorkerState,
     ) where
@@ -3037,6 +3178,7 @@ impl X86Tier {
                             claimed,
                             completed,
                             first_err,
+                            cache_ctx,
                             next_tile,
                             state,
                         );
@@ -3049,6 +3191,7 @@ impl X86Tier {
                             claimed,
                             completed,
                             first_err,
+                            cache_ctx,
                             next_tile,
                             state,
                         );
@@ -3065,11 +3208,13 @@ impl X86Tier {
                 Self::Ssse3 => {
                     if has_alpha {
                         dispatch_ssse3::unfilter_tiles_worker::<true, F>(
-                            tile_rects, frame, claimed, completed, first_err, next_tile, state,
+                            tile_rects, frame, claimed, completed, first_err, cache_ctx, next_tile,
+                            state,
                         );
                     } else {
                         dispatch_ssse3::unfilter_tiles_worker::<false, F>(
-                            tile_rects, frame, claimed, completed, first_err, next_tile, state,
+                            tile_rects, frame, claimed, completed, first_err, cache_ctx, next_tile,
+                            state,
                         );
                     }
                 },
@@ -3081,24 +3226,86 @@ impl X86Tier {
                 Self::Avx2 => {
                     if has_alpha {
                         dispatch_avx2::unfilter_tiles_worker::<true, F>(
-                            tile_rects, frame, claimed, completed, first_err, next_tile, state,
+                            tile_rects, frame, claimed, completed, first_err, cache_ctx, next_tile,
+                            state,
                         );
                     } else {
                         dispatch_avx2::unfilter_tiles_worker::<false, F>(
-                            tile_rects, frame, claimed, completed, first_err, next_tile, state,
+                            tile_rects, frame, claimed, completed, first_err, cache_ctx, next_tile,
+                            state,
                         );
                     }
                 },
                 Self::Avx512 => {
                     if has_alpha {
                         dispatch_avx512::unfilter_tiles_worker::<true, F>(
-                            tile_rects, frame, claimed, completed, first_err, next_tile, state,
+                            tile_rects, frame, claimed, completed, first_err, cache_ctx, next_tile,
+                            state,
                         );
                     } else {
                         dispatch_avx512::unfilter_tiles_worker::<false, F>(
-                            tile_rects, frame, claimed, completed, first_err, next_tile, state,
+                            tile_rects, frame, claimed, completed, first_err, cache_ctx, next_tile,
+                            state,
                         );
                     }
+                },
+            }
+        }
+    }
+
+    /// # Safety
+    /// Caller must uphold [`super::blit_hits_worker_with`] invariants.
+    #[inline(always)]
+    pub(super) unsafe fn blit_hits_worker(
+        self,
+        cache: &ClientTileCache,
+        hits: &[ValidatedCacheHit],
+        tile_rects: &[TileRect],
+        frame: &FrameRows,
+        next_hit: &AtomicUsize,
+    ) {
+        // SAFETY: Each arm's tier witness verifies required CPU features, and
+        // caller upholds validated-hit and disjoint-tile invariants.
+        unsafe {
+            match self {
+                #[cfg(all(
+                    not(target_feature = "ssse3"),
+                    not(target_feature = "avx2"),
+                    not(all(
+                        target_feature = "avx512bw",
+                        target_feature = "avx512vl",
+                        target_feature = "avx512vbmi",
+                    )),
+                ))]
+                Self::Scalar => super::blit_hits_worker_with(
+                    ScalarKernel,
+                    cache,
+                    hits,
+                    tile_rects,
+                    frame,
+                    next_hit,
+                ),
+                #[cfg(all(
+                    not(target_feature = "avx2"),
+                    not(all(
+                        target_feature = "avx512bw",
+                        target_feature = "avx512vl",
+                        target_feature = "avx512vbmi",
+                    )),
+                ))]
+                Self::Ssse3 => {
+                    dispatch_ssse3::blit_hits_worker(cache, hits, tile_rects, frame, next_hit);
+                },
+                #[cfg(not(all(
+                    target_feature = "avx512bw",
+                    target_feature = "avx512vl",
+                    target_feature = "avx512vbmi",
+                )))]
+                Self::Avx2 => {
+                    dispatch_avx2::blit_hits_worker(cache, hits, tile_rects, frame, next_hit);
+                },
+                Self::Avx512 => {
+                    dispatch_avx512::blit_hits_worker(cache, hits, tile_rects, frame, next_hit);
                 },
             }
         }
@@ -3209,7 +3416,9 @@ impl X86Tier {
         n_qx: usize,
         sub_bands: &[ScanSubBand],
         dirty_flags: &[AtomicBool],
+        slot_hashes: Option<&SlotHashes>,
         next_sub: &AtomicUsize,
+        hash_buf: &mut Vec<u8>,
     ) {
         // SAFETY: Each arm's tier witness verifies required CPU features, and
         // caller upholds disjoint-band shadow invariants.
@@ -3237,7 +3446,9 @@ impl X86Tier {
                             n_qx,
                             sub_bands,
                             dirty_flags,
+                            slot_hashes,
                             next_sub,
+                            hash_buf,
                         );
                     } else {
                         super::diff_and_update_worker_with::<ScalarKernel, false>(
@@ -3251,7 +3462,9 @@ impl X86Tier {
                             n_qx,
                             sub_bands,
                             dirty_flags,
+                            slot_hashes,
                             next_sub,
+                            hash_buf,
                         );
                     }
                 },
@@ -3275,7 +3488,9 @@ impl X86Tier {
                             n_qx,
                             sub_bands,
                             dirty_flags,
+                            slot_hashes,
                             next_sub,
+                            hash_buf,
                         );
                     } else {
                         dispatch_ssse3::diff_and_update_worker::<false>(
@@ -3288,7 +3503,9 @@ impl X86Tier {
                             n_qx,
                             sub_bands,
                             dirty_flags,
+                            slot_hashes,
                             next_sub,
+                            hash_buf,
                         );
                     }
                 },
@@ -3309,7 +3526,9 @@ impl X86Tier {
                             n_qx,
                             sub_bands,
                             dirty_flags,
+                            slot_hashes,
                             next_sub,
+                            hash_buf,
                         );
                     } else {
                         dispatch_avx2::diff_and_update_worker::<false>(
@@ -3322,7 +3541,9 @@ impl X86Tier {
                             n_qx,
                             sub_bands,
                             dirty_flags,
+                            slot_hashes,
                             next_sub,
+                            hash_buf,
                         );
                     }
                 },
@@ -3338,7 +3559,9 @@ impl X86Tier {
                             n_qx,
                             sub_bands,
                             dirty_flags,
+                            slot_hashes,
                             next_sub,
+                            hash_buf,
                         );
                     } else {
                         dispatch_avx512::diff_and_update_worker::<false>(
@@ -3351,7 +3574,9 @@ impl X86Tier {
                             n_qx,
                             sub_bands,
                             dirty_flags,
+                            slot_hashes,
                             next_sub,
+                            hash_buf,
                         );
                     }
                 },
@@ -3375,7 +3600,9 @@ impl X86Tier {
         sub_bands: &[ScanSubBand],
         sr: ScrollRect,
         dirty_flags: &[AtomicBool],
+        slot_hashes: Option<&SlotHashes>,
         next_sub: &AtomicUsize,
+        hash_buf: &mut Vec<u8>,
     ) {
         // SAFETY: Each arm's tier witness verifies required CPU features, and
         // caller upholds disjoint-band and scroll-band shadow invariants.
@@ -3404,7 +3631,9 @@ impl X86Tier {
                             sub_bands,
                             sr,
                             dirty_flags,
+                            slot_hashes,
                             next_sub,
+                            hash_buf,
                         );
                     } else {
                         super::diff_and_update_scroll_worker_with::<ScalarKernel, false>(
@@ -3419,7 +3648,9 @@ impl X86Tier {
                             sub_bands,
                             sr,
                             dirty_flags,
+                            slot_hashes,
                             next_sub,
+                            hash_buf,
                         );
                     }
                 },
@@ -3444,7 +3675,9 @@ impl X86Tier {
                             sub_bands,
                             sr,
                             dirty_flags,
+                            slot_hashes,
                             next_sub,
+                            hash_buf,
                         );
                     } else {
                         dispatch_ssse3::diff_and_update_scroll_worker::<false>(
@@ -3458,7 +3691,9 @@ impl X86Tier {
                             sub_bands,
                             sr,
                             dirty_flags,
+                            slot_hashes,
                             next_sub,
+                            hash_buf,
                         );
                     }
                 },
@@ -3480,7 +3715,9 @@ impl X86Tier {
                             sub_bands,
                             sr,
                             dirty_flags,
+                            slot_hashes,
                             next_sub,
+                            hash_buf,
                         );
                     } else {
                         dispatch_avx2::diff_and_update_scroll_worker::<false>(
@@ -3494,7 +3731,9 @@ impl X86Tier {
                             sub_bands,
                             sr,
                             dirty_flags,
+                            slot_hashes,
                             next_sub,
+                            hash_buf,
                         );
                     }
                 },
@@ -3511,7 +3750,9 @@ impl X86Tier {
                             sub_bands,
                             sr,
                             dirty_flags,
+                            slot_hashes,
                             next_sub,
+                            hash_buf,
                         );
                     } else {
                         dispatch_avx512::diff_and_update_scroll_worker::<false>(
@@ -3525,7 +3766,9 @@ impl X86Tier {
                             sub_bands,
                             sr,
                             dirty_flags,
+                            slot_hashes,
                             next_sub,
+                            hash_buf,
                         );
                     }
                 },
@@ -3610,17 +3853,23 @@ impl X86Tier {
                         target_feature = "avx512vbmi",
                     )),
                 ))]
-                Self::Scalar => super::diff_and_update_row_band_2d_with::<ScalarKernel, HAS_ALPHA>(
-                    ScalarKernel,
-                    data,
-                    aos,
-                    shadow,
-                    width,
-                    stride,
-                    y0,
-                    y1,
-                    dirty_slots,
-                ),
+                Self::Scalar => {
+                    let mut hash_buf = Vec::new();
+                    super::diff_and_update_row_band_2d_with::<ScalarKernel, HAS_ALPHA>(
+                        ScalarKernel,
+                        data,
+                        aos,
+                        shadow,
+                        width,
+                        stride,
+                        y0,
+                        y1,
+                        0,
+                        dirty_slots,
+                        None,
+                        &mut hash_buf,
+                    );
+                },
                 #[cfg(all(
                     not(target_feature = "avx2"),
                     not(all(

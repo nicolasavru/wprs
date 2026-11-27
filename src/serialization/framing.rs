@@ -59,6 +59,7 @@ pub const DEFAULT_JPEG_QUALITY: u8 = 90;
     Clone,
     Eq,
     PartialEq,
+    Hash,
     Default,
 )]
 pub enum JpegSubsamp {
@@ -167,6 +168,95 @@ pub const TILE_PIXELS: usize = TILE_W * TILE_H;
 /// down to `16x16` tiles while capping header memory at `<= 4 MiB`).
 pub const MAX_FRAME_TILES: usize = 262_144;
 
+/// Maximum number of slots in the connection-wide inter-frame tile cache.
+/// Holds two full 4K screens (`270` `256x256` tiles = `63.3 MiB`) or up to
+/// `1024` `128x128` quadrants (`64 MiB`).
+pub const MAX_TILE_CACHE_SLOTS: usize = 1024;
+
+/// Hard cap on total decoded pixel bytes stored across all tile cache slots
+/// (`64 MiB` = `16,777,216` BGRA pixels).
+pub const MAX_TILE_CACHE_BYTES: usize = 64 * 1024 * 1024;
+
+const_assert!(MAX_TILE_CACHE_SLOTS == 1024);
+
+/// Which region of a cached tile slot a [`TilePayload::CacheHit`] copies.
+#[derive(Debug, Copy, Clone, Eq, PartialEq, Hash)]
+#[repr(u8)]
+pub enum CacheHitRegion {
+    /// Entire cached tile (`rect.w == slot.w && rect.h == slot.h`).
+    Full = 0,
+    /// Top-left `<= 128x128` quadrant of a cached splittable tile.
+    TopLeft = 1,
+    /// Top-right `<= 128x128` quadrant of a cached tile with `slot.w > 128`.
+    TopRight = 2,
+    /// Bottom-left `<= 128x128` quadrant of a cached tile with `slot.h > 128`.
+    BottomLeft = 3,
+    /// Bottom-right `<= 128x128` quadrant of a cached tile with `slot.w > 128 && slot.h > 128`.
+    BottomRight = 4,
+}
+
+const CACHE_SLOT_MASK: u16 = (MAX_TILE_CACHE_SLOTS - 1) as u16;
+const CACHE_REGION_SHIFT: u32 = 10;
+
+/// Compact wire reference to a cached tile slot (or one of its `128x128`
+/// quadrants), packed into 16 bits (`10`-bit `slot_id` + `3`-bit `region`).
+#[derive(Debug, Copy, Clone, Eq, PartialEq, Hash)]
+pub struct CacheHitRef {
+    pub slot_id: u16,
+    pub region: CacheHitRegion,
+}
+
+impl CacheHitRef {
+    #[inline]
+    pub fn to_u16(self) -> Result<u16> {
+        if self.slot_id as usize >= MAX_TILE_CACHE_SLOTS {
+            bail!(
+                "tile cache slot_id {} out of range (max {})",
+                self.slot_id,
+                MAX_TILE_CACHE_SLOTS
+            );
+        }
+        Ok(self.slot_id | (u16::from(self.region as u8) << CACHE_REGION_SHIFT))
+    }
+
+    #[inline]
+    pub fn from_u16(raw: u16) -> Result<Self> {
+        let region_bits = raw >> CACHE_REGION_SHIFT;
+        let region = match region_bits {
+            0 => CacheHitRegion::Full,
+            1 => CacheHitRegion::TopLeft,
+            2 => CacheHitRegion::TopRight,
+            3 => CacheHitRegion::BottomLeft,
+            4 => CacheHitRegion::BottomRight,
+            _ => bail!("invalid CacheHitRef region bits: {region_bits} (raw={raw:#06x})"),
+        };
+        let slot_id = raw & CACHE_SLOT_MASK;
+        debug_assert!((slot_id as usize) < MAX_TILE_CACHE_SLOTS);
+        Ok(Self { slot_id, region })
+    }
+
+    /// Validates that `self` is compatible with destination tile `rect`.
+    #[inline]
+    pub fn validate_for_rect(self, rect: TileRect) -> Result<()> {
+        if self.slot_id as usize >= MAX_TILE_CACHE_SLOTS {
+            bail!(
+                "tile cache slot_id {} out of range (max {})",
+                self.slot_id,
+                MAX_TILE_CACHE_SLOTS
+            );
+        }
+        if self.region != CacheHitRegion::Full
+            && (rect.w > SUBTILE_W as u32 || rect.h > SUBTILE_H as u32)
+        {
+            bail!(
+                "quadrant CacheHitRegion::{:?} incompatible with tile rect {rect:?}",
+                self.region
+            );
+        }
+        Ok(())
+    }
+}
+
 /// Returns the exact bitpacked index byte length for `n_pixels` pixels indexed
 /// into an `n_colors`-entry palette (`1`/`2`/`4`/`8` bpp for `2`/`3..=4`/
 /// `5..=16`/`17..=256` colors).
@@ -191,6 +281,18 @@ pub trait Framed: Sized {
 }
 
 impl Framed for u8 {
+    fn framed_write<W: Write>(&self, stream: &mut W) -> Result<()> {
+        stream.write_all(&self.to_be_bytes()).location(loc!())
+    }
+
+    fn framed_read<R: Read>(stream: &mut R) -> Result<Self> {
+        let mut buf = [0u8; mem::size_of::<Self>()];
+        stream.read_exact(&mut buf).location(loc!())?;
+        Ok(Self::from_be_bytes(buf))
+    }
+}
+
+impl Framed for u16 {
     fn framed_write<W: Write>(&self, stream: &mut W) -> Result<()> {
         stream.write_all(&self.to_be_bytes()).location(loc!())
     }
@@ -597,12 +699,25 @@ pub struct RawBufferHeader {
     pub metadata: BufferMetadata,
     pub incremental: bool,
     pub scroll_rect: Option<ScrollRect>,
+    /// When `true`, `wprsc` clears its connection-wide tile cache before
+    /// decoding any tiles in this frame.
+    pub reset_tile_cache: bool,
+    /// Optional explicit tile cache slot evictions applied on `wprsc` before
+    /// decoding this frame so `wprsc` strictly honors [`MAX_TILE_CACHE_BYTES`]
+    /// when a larger tile replaces multiple smaller cached slots.
+    pub evict_slots: Vec<u16>,
     pub tile_rects: Vec<TileRect>,
 }
 
 const RAW_BUFFER_HEADER_LEN: usize = 42;
 const HEADER_FLAG_INCREMENTAL: u8 = 0x01;
 const HEADER_FLAG_SCROLL_RECT: u8 = 0x02;
+const HEADER_FLAG_RESET_TILE_CACHE: u8 = 0x04;
+const HEADER_FLAG_EVICT_SLOTS: u8 = 0x08;
+const HEADER_FLAGS_VALID: u8 = HEADER_FLAG_INCREMENTAL
+    | HEADER_FLAG_SCROLL_RECT
+    | HEADER_FLAG_RESET_TILE_CACHE
+    | HEADER_FLAG_EVICT_SLOTS;
 
 impl Framed for RawBufferHeader {
     fn framed_write<W: Write>(&self, stream: &mut W) -> Result<()> {
@@ -616,6 +731,28 @@ impl Framed for RawBufferHeader {
                 .context(loc!(), "negative BufferMetadata height")?;
             sr.validate_in_bounds(width, height).location(loc!())?;
         }
+        if self.reset_tile_cache && !self.evict_slots.is_empty() {
+            bail!("RawBufferHeader cannot set both reset_tile_cache and evict_slots");
+        }
+        if self.evict_slots.len() > MAX_TILE_CACHE_SLOTS {
+            bail!(
+                "evict_slots len {} exceeds MAX_TILE_CACHE_SLOTS ({MAX_TILE_CACHE_SLOTS})",
+                self.evict_slots.len()
+            );
+        }
+        if !self.evict_slots.is_empty() {
+            let mut seen = [false; MAX_TILE_CACHE_SLOTS];
+            for &slot_id in &self.evict_slots {
+                let idx = slot_id as usize;
+                if idx >= MAX_TILE_CACHE_SLOTS {
+                    bail!("evict_slots contains out-of-range slot_id {slot_id}");
+                }
+                if seen[idx] {
+                    bail!("evict_slots contains duplicate slot_id {slot_id}");
+                }
+                seen[idx] = true;
+            }
+        }
         let n_tiles = u32::try_from(self.tile_rects.len())
             .context(loc!(), "tile_rects length exceeds u32::MAX")?;
         let mut flags = 0u8;
@@ -624,6 +761,12 @@ impl Framed for RawBufferHeader {
         }
         if self.scroll_rect.is_some() {
             flags |= HEADER_FLAG_SCROLL_RECT;
+        }
+        if self.reset_tile_cache {
+            flags |= HEADER_FLAG_RESET_TILE_CACHE;
+        }
+        if !self.evict_slots.is_empty() {
+            flags |= HEADER_FLAG_EVICT_SLOTS;
         }
         let mut buf = [0u8; RAW_BUFFER_HEADER_LEN];
         buf[0..8].copy_from_slice(&self.frame_seq.to_be_bytes());
@@ -641,6 +784,14 @@ impl Framed for RawBufferHeader {
         stream.write_all(&buf).location(loc!())?;
         if let Some(sr) = self.scroll_rect {
             sr.write_framed(stream).location(loc!())?;
+        }
+        if !self.evict_slots.is_empty() {
+            (self.evict_slots.len() as u16)
+                .framed_write(stream)
+                .location(loc!())?;
+            for &slot_id in &self.evict_slots {
+                slot_id.framed_write(stream).location(loc!())?;
+            }
         }
         for &rect in &self.tile_rects {
             rect.write_framed(stream).location(loc!())?;
@@ -662,12 +813,20 @@ impl Framed for RawBufferHeader {
             1 => BufferFormat::Xrgb8888,
             tag => bail!("invalid BufferFormat tag: {tag}"),
         };
-        let (incremental, has_scroll_rect) = match buf[37] {
-            0 => (false, false),
-            HEADER_FLAG_INCREMENTAL => (true, false),
-            tag if tag == HEADER_FLAG_INCREMENTAL | HEADER_FLAG_SCROLL_RECT => (true, true),
-            tag => bail!("invalid RawBufferHeader flags: {tag}"),
-        };
+        let flags = buf[37];
+        if (flags & !HEADER_FLAGS_VALID) != 0 {
+            bail!("invalid RawBufferHeader flags: {flags}");
+        }
+        let incremental = (flags & HEADER_FLAG_INCREMENTAL) != 0;
+        let has_scroll_rect = (flags & HEADER_FLAG_SCROLL_RECT) != 0;
+        let reset_tile_cache = (flags & HEADER_FLAG_RESET_TILE_CACHE) != 0;
+        let has_evict_slots = (flags & HEADER_FLAG_EVICT_SLOTS) != 0;
+        if has_scroll_rect && !incremental {
+            bail!("invalid RawBufferHeader flags: {flags} (ScrollRect requires incremental)");
+        }
+        if reset_tile_cache && has_evict_slots {
+            bail!("invalid RawBufferHeader flags: {flags} (reset_tile_cache and evict_slots)");
+        }
         let n_tiles = u32::from_be_bytes(buf[38..42].try_into().unwrap()) as usize;
         let metadata = BufferMetadata {
             width,
@@ -690,6 +849,29 @@ impl Framed for RawBufferHeader {
         } else {
             None
         };
+        let evict_slots = if has_evict_slots {
+            let n_evict = u16::framed_read(stream).location(loc!())? as usize;
+            if n_evict == 0 || n_evict > MAX_TILE_CACHE_SLOTS {
+                bail!("invalid evict_slots count {n_evict}: expected 1..={MAX_TILE_CACHE_SLOTS}");
+            }
+            let mut seen = [false; MAX_TILE_CACHE_SLOTS];
+            let mut slots = Vec::with_capacity(n_evict);
+            for _ in 0..n_evict {
+                let slot_id = u16::framed_read(stream).location(loc!())?;
+                let idx = slot_id as usize;
+                if idx >= MAX_TILE_CACHE_SLOTS {
+                    bail!("evict_slots contains out-of-range slot_id {slot_id}");
+                }
+                if seen[idx] {
+                    bail!("evict_slots contains duplicate slot_id {slot_id}");
+                }
+                seen[idx] = true;
+                slots.push(slot_id);
+            }
+            slots
+        } else {
+            Vec::new()
+        };
         let mut tile_rects = Vec::with_capacity(n_tiles.min(1024));
         for _ in 0..n_tiles {
             let (rect, _) = TileRect::read_framed(stream).location(loc!())?;
@@ -704,6 +886,8 @@ impl Framed for RawBufferHeader {
             metadata,
             incremental,
             scroll_rect,
+            reset_tile_cache,
+            evict_slots,
             tile_rects,
         })
     }
@@ -960,6 +1144,7 @@ pub struct SubTile {
 pub enum TilePayload {
     Leaf(LeafPayload),
     Split(Vec<SubTile>),
+    CacheHit(CacheHitRef),
 }
 
 const PAYLOAD_TAG_SOLID_OPAQUE: u8 = 0;
@@ -971,6 +1156,8 @@ const PAYLOAD_TAG_AOS_ALPHA: u8 = 5;
 const PAYLOAD_TAG_JPEG_OPAQUE: u8 = 6;
 const PAYLOAD_TAG_JPEG_ALPHA: u8 = 7;
 const PAYLOAD_TAG_SPLIT: u8 = 8;
+const PAYLOAD_TAG_CACHE_HIT: u8 = 9;
+const PAYLOAD_FLAG_CACHE_PUT: u8 = 0x80;
 
 impl LeafPayload {
     fn payload_len(&self) -> usize {
@@ -992,27 +1179,36 @@ impl LeafPayload {
         }
     }
 
-    fn write_framed<W: Write>(
+    fn write_framed_with_put<W: Write>(
         &self,
         rect: TileRect,
         pixels: usize,
         has_alpha: bool,
+        cache_put: Option<u16>,
         stream: &mut W,
     ) -> Result<()> {
+        let put_flag = if cache_put.is_some() {
+            PAYLOAD_FLAG_CACHE_PUT
+        } else {
+            0
+        };
+        let write_tag = |tag: u8, stream: &mut W| -> Result<()> {
+            (tag | put_flag).framed_write(stream).location(loc!())?;
+            if let Some(slot_id) = cache_put {
+                slot_id.framed_write(stream).location(loc!())?;
+            }
+            Ok(())
+        };
         match self {
             Self::Solid(px) => {
                 if px[3] == 0xFF {
-                    PAYLOAD_TAG_SOLID_OPAQUE
-                        .framed_write(stream)
-                        .location(loc!())?;
+                    write_tag(PAYLOAD_TAG_SOLID_OPAQUE, stream)?;
                     stream.write_all(&px[0..3]).location(loc!())?;
                 } else {
                     if !has_alpha {
                         bail!("translucent Solid tile on Xrgb8888 buffer");
                     }
-                    PAYLOAD_TAG_SOLID_ALPHA
-                        .framed_write(stream)
-                        .location(loc!())?;
+                    write_tag(PAYLOAD_TAG_SOLID_ALPHA, stream)?;
                     stream.write_all(px).location(loc!())?;
                 }
             },
@@ -1040,7 +1236,7 @@ impl LeafPayload {
                 } else {
                     PAYLOAD_TAG_PALETTE_OPAQUE
                 };
-                tag.framed_write(stream).location(loc!())?;
+                write_tag(tag, stream)?;
                 ((n_colors - 2) as u8)
                     .framed_write(stream)
                     .location(loc!())?;
@@ -1062,18 +1258,14 @@ impl LeafPayload {
                 }
                 let color_bytes = pixels * 3;
                 if matches!(alpha, AlphaChannel::Omitted) {
-                    PAYLOAD_TAG_AOS_OPAQUE
-                        .framed_write(stream)
-                        .location(loc!())?;
+                    write_tag(PAYLOAD_TAG_AOS_OPAQUE, stream)?;
                     stream.write_all(predictors).location(loc!())?;
                     color.write_framed(color_bytes, stream).location(loc!())?;
                 } else {
                     if !has_alpha {
                         bail!("non-omitted AlphaChannel on Xrgb8888 buffer");
                     }
-                    PAYLOAD_TAG_AOS_ALPHA
-                        .framed_write(stream)
-                        .location(loc!())?;
+                    write_tag(PAYLOAD_TAG_AOS_ALPHA, stream)?;
                     stream.write_all(predictors).location(loc!())?;
                     color.write_framed(color_bytes, stream).location(loc!())?;
                     alpha.write_framed(pixels, stream).location(loc!())?;
@@ -1088,23 +1280,29 @@ impl LeafPayload {
                     );
                 }
                 if matches!(alpha, AlphaChannel::Omitted) {
-                    PAYLOAD_TAG_JPEG_OPAQUE
-                        .framed_write(stream)
-                        .location(loc!())?;
+                    write_tag(PAYLOAD_TAG_JPEG_OPAQUE, stream)?;
                     data.framed_write(stream).location(loc!())?;
                 } else {
                     if !has_alpha {
                         bail!("non-omitted AlphaChannel on Xrgb8888 buffer");
                     }
-                    PAYLOAD_TAG_JPEG_ALPHA
-                        .framed_write(stream)
-                        .location(loc!())?;
+                    write_tag(PAYLOAD_TAG_JPEG_ALPHA, stream)?;
                     data.framed_write(stream).location(loc!())?;
                     alpha.write_framed(pixels, stream).location(loc!())?;
                 }
             },
         }
         Ok(())
+    }
+
+    fn write_framed<W: Write>(
+        &self,
+        rect: TileRect,
+        pixels: usize,
+        has_alpha: bool,
+        stream: &mut W,
+    ) -> Result<()> {
+        self.write_framed_with_put(rect, pixels, has_alpha, None, stream)
     }
 
     fn read_framed_with_tag<R: Read>(
@@ -1241,6 +1439,7 @@ impl TilePayload {
                     .map(|s| TILE_RECT_LEN + 1 + s.payload.payload_len())
                     .sum::<usize>()
             },
+            Self::CacheHit(_) => 2,
         }
     }
 
@@ -1249,13 +1448,30 @@ impl TilePayload {
         rect: TileRect,
         pixels: usize,
         has_alpha: bool,
+        cache_put: Option<u16>,
         stream: &mut W,
     ) -> Result<()> {
+        if let Some(slot_id) = cache_put
+            && slot_id as usize >= MAX_TILE_CACHE_SLOTS
+        {
+            bail!("tile cache_put slot_id {slot_id} out of range (max {MAX_TILE_CACHE_SLOTS})");
+        }
         match self {
-            Self::Leaf(leaf) => leaf.write_framed(rect, pixels, has_alpha, stream),
+            Self::Leaf(leaf) => {
+                leaf.write_framed_with_put(rect, pixels, has_alpha, cache_put, stream)
+            },
             Self::Split(sub_tiles) => {
                 validate_split_rects(rect, sub_tiles).location(loc!())?;
-                PAYLOAD_TAG_SPLIT.framed_write(stream).location(loc!())?;
+                let tag = PAYLOAD_TAG_SPLIT
+                    | if cache_put.is_some() {
+                        PAYLOAD_FLAG_CACHE_PUT
+                    } else {
+                        0
+                    };
+                tag.framed_write(stream).location(loc!())?;
+                if let Some(slot_id) = cache_put {
+                    slot_id.framed_write(stream).location(loc!())?;
+                }
                 (sub_tiles.len() as u8)
                     .framed_write(stream)
                     .location(loc!())?;
@@ -1268,6 +1484,18 @@ impl TilePayload {
                 }
                 Ok(())
             },
+            Self::CacheHit(hit_ref) => {
+                if cache_put.is_some() {
+                    bail!("CacheHit payload cannot also carry cache_put");
+                }
+                hit_ref.validate_for_rect(rect).location(loc!())?;
+                let packed = hit_ref.to_u16().location(loc!())?;
+                PAYLOAD_TAG_CACHE_HIT
+                    .framed_write(stream)
+                    .location(loc!())?;
+                packed.framed_write(stream).location(loc!())?;
+                Ok(())
+            },
         }
     }
 
@@ -1276,8 +1504,31 @@ impl TilePayload {
         pixels: usize,
         has_alpha: bool,
         stream: &mut R,
-    ) -> Result<Self> {
-        let tag = u8::framed_read(stream).location(loc!())?;
+    ) -> Result<(Option<u16>, Self)> {
+        let raw_tag = u8::framed_read(stream).location(loc!())?;
+        let is_put = (raw_tag & PAYLOAD_FLAG_CACHE_PUT) != 0;
+        let tag = raw_tag & !PAYLOAD_FLAG_CACHE_PUT;
+        if tag == PAYLOAD_TAG_CACHE_HIT {
+            if is_put {
+                bail!("CacheHit payload cannot also carry CachePut flag");
+            }
+            let packed = u16::framed_read(stream).location(loc!())?;
+            let hit_ref = CacheHitRef::from_u16(packed).location(loc!())?;
+            hit_ref.validate_for_rect(rect).location(loc!())?;
+            return Ok((None, Self::CacheHit(hit_ref)));
+        }
+        if tag > PAYLOAD_TAG_SPLIT {
+            bail!("invalid TilePayload tag: {raw_tag}");
+        }
+        let cache_put = if is_put {
+            let slot_id = u16::framed_read(stream).location(loc!())?;
+            if slot_id as usize >= MAX_TILE_CACHE_SLOTS {
+                bail!("tile cache_put slot_id {slot_id} out of range (max {MAX_TILE_CACHE_SLOTS})");
+            }
+            Some(slot_id)
+        } else {
+            None
+        };
         if tag == PAYLOAD_TAG_SPLIT {
             if !is_splittable_rect(rect) {
                 bail!("unexpected Split payload on non-splittable tile {rect:?}");
@@ -1304,11 +1555,14 @@ impl TilePayload {
                     "Split sub-tiles cover {covered_area} pixels, expected {pixels} for {rect:?}"
                 );
             }
-            Ok(Self::Split(sub_tiles))
+            Ok((cache_put, Self::Split(sub_tiles)))
         } else {
-            Ok(Self::Leaf(
-                LeafPayload::read_framed_with_tag(tag, rect, pixels, has_alpha, stream)
-                    .location(loc!())?,
+            Ok((
+                cache_put,
+                Self::Leaf(
+                    LeafPayload::read_framed_with_tag(tag, rect, pixels, has_alpha, stream)
+                        .location(loc!())?,
+                ),
             ))
         }
     }
@@ -1319,6 +1573,7 @@ impl fmt::Debug for TilePayload {
         match self {
             Self::Leaf(leaf) => fmt::Debug::fmt(leaf, f),
             Self::Split(subs) => f.debug_tuple("Split").field(subs).finish(),
+            Self::CacheHit(hit_ref) => f.debug_tuple("CacheHit").field(hit_ref).finish(),
         }
     }
 }
@@ -1326,12 +1581,13 @@ impl fmt::Debug for TilePayload {
 #[derive(Debug, Clone, Eq, PartialEq)]
 pub struct CompressedTile {
     pub tile_idx: u32,
+    pub cache_put: Option<u16>,
     pub payload: TilePayload,
 }
 
 impl CompressedTile {
     pub fn compressed_len(&self) -> usize {
-        self.payload.payload_len()
+        usize::from(self.cache_put.is_some()) * 2 + self.payload.payload_len()
     }
 
     fn write_framed<W: Write>(
@@ -1343,7 +1599,7 @@ impl CompressedTile {
         let pixels = rect.checked_pixels().location(loc!())?;
         self.tile_idx.framed_write(stream).location(loc!())?;
         self.payload
-            .write_framed(rect, pixels, has_alpha, stream)
+            .write_framed(rect, pixels, has_alpha, self.cache_put, stream)
             .location(loc!())
     }
 
@@ -1360,8 +1616,13 @@ impl CompressedTile {
             )
         })?;
         let pixels = rect.checked_pixels().location(loc!())?;
-        let payload = TilePayload::read_framed(rect, pixels, has_alpha, stream).location(loc!())?;
-        Ok(Self { tile_idx, payload })
+        let (cache_put, payload) =
+            TilePayload::read_framed(rect, pixels, has_alpha, stream).location(loc!())?;
+        Ok(Self {
+            tile_idx,
+            cache_put,
+            payload,
+        })
     }
 }
 
@@ -1652,6 +1913,8 @@ mod tests {
                     },
                     incremental,
                     scroll_rect: None,
+                    reset_tile_cache: false,
+                    evict_slots: Vec::new(),
                     tile_rects,
                 };
                 let mut wire = Vec::new();
@@ -1748,10 +2011,12 @@ mod tests {
         let opaque_tiles = [
             CompressedTile {
                 tile_idx: 0,
+                cache_put: None,
                 payload: TilePayload::Leaf(LeafPayload::Solid([10, 20, 30, 0xFF])),
             },
             CompressedTile {
                 tile_idx: 0,
+                cache_put: None,
                 payload: TilePayload::Leaf(LeafPayload::Palette {
                     has_alpha: false,
                     palette: vec![1, 2, 3, 4, 5, 6],
@@ -1760,6 +2025,7 @@ mod tests {
             },
             CompressedTile {
                 tile_idx: 0,
+                cache_put: None,
                 payload: TilePayload::Leaf(LeafPayload::Palette {
                     has_alpha: false,
                     palette: vec![1; 17 * 3],
@@ -1768,6 +2034,7 @@ mod tests {
             },
             CompressedTile {
                 tile_idx: 0,
+                cache_put: None,
                 payload: TilePayload::Leaf(LeafPayload::AosZstd {
                     predictors: vec![0b00_10_01_00],
                     color: EncodedBytes::Uncompressed(vec![7u8; 4 * 3 * 3]),
@@ -1776,6 +2043,7 @@ mod tests {
             },
             CompressedTile {
                 tile_idx: 0,
+                cache_put: None,
                 payload: TilePayload::Leaf(LeafPayload::Jpeg {
                     data: vec![0xFF, 0xD8, 0xFF, 0xD9],
                     alpha: AlphaChannel::Omitted,
@@ -1796,10 +2064,12 @@ mod tests {
         let translucent_tiles = [
             CompressedTile {
                 tile_idx: 0,
+                cache_put: None,
                 payload: TilePayload::Leaf(LeafPayload::Solid([10, 20, 30, 0x80])),
             },
             CompressedTile {
                 tile_idx: 0,
+                cache_put: None,
                 payload: TilePayload::Leaf(LeafPayload::Palette {
                     has_alpha: true,
                     palette: vec![1, 2, 3, 0x40, 4, 5, 6, 0xFF],
@@ -1808,6 +2078,7 @@ mod tests {
             },
             CompressedTile {
                 tile_idx: 0,
+                cache_put: None,
                 payload: TilePayload::Leaf(LeafPayload::AosZstd {
                     predictors: vec![0],
                     color: EncodedBytes::Zstd(vec![1, 2, 3, 4]),
@@ -1816,6 +2087,7 @@ mod tests {
             },
             CompressedTile {
                 tile_idx: 0,
+                cache_put: None,
                 payload: TilePayload::Leaf(LeafPayload::AosZstd {
                     predictors: vec![0],
                     color: EncodedBytes::Zstd(vec![1, 2, 3, 4]),
@@ -1824,6 +2096,7 @@ mod tests {
             },
             CompressedTile {
                 tile_idx: 0,
+                cache_put: None,
                 payload: TilePayload::Leaf(LeafPayload::AosZstd {
                     predictors: vec![0],
                     color: EncodedBytes::Zstd(vec![1, 2, 3, 4]),
@@ -1832,6 +2105,7 @@ mod tests {
             },
             CompressedTile {
                 tile_idx: 0,
+                cache_put: None,
                 payload: TilePayload::Leaf(LeafPayload::Jpeg {
                     data: vec![0xFF, 0xD8, 0xAA, 0xFF, 0xD9],
                     alpha: AlphaChannel::Constant(0x80),
@@ -1839,6 +2113,7 @@ mod tests {
             },
             CompressedTile {
                 tile_idx: 0,
+                cache_put: None,
                 payload: TilePayload::Leaf(LeafPayload::Jpeg {
                     data: vec![0xFF, 0xD8, 0xBB, 0xFF, 0xD9],
                     alpha: AlphaChannel::Uncompressed(vec![0x42; 12]),
@@ -1846,6 +2121,7 @@ mod tests {
             },
             CompressedTile {
                 tile_idx: 0,
+                cache_put: None,
                 payload: TilePayload::Leaf(LeafPayload::Jpeg {
                     data: vec![0xFF, 0xD8, 0xCC, 0xFF, 0xD9],
                     alpha: AlphaChannel::Zstd(vec![7, 8, 9]),
@@ -1963,14 +2239,18 @@ mod tests {
             },
             incremental: true,
             scroll_rect: None,
+            reset_tile_cache: false,
+            evict_slots: Vec::new(),
             tile_rects: vec![rect0, rect1],
         };
         let tile0 = CompressedTile {
             tile_idx: 0,
+            cache_put: None,
             payload: TilePayload::Leaf(LeafPayload::Solid([1, 2, 3, 0xFF])),
         };
         let tile1 = CompressedTile {
             tile_idx: 1,
+            cache_put: None,
             payload: TilePayload::Leaf(LeafPayload::AosZstd {
                 predictors: vec![0, 0],
                 color: EncodedBytes::Zstd(vec![1, 2, 3, 4, 5]),
@@ -2105,6 +2385,7 @@ mod tests {
         let pred_len = 256usize.div_ceil(4);
         let large0 = CompressedTile {
             tile_idx: 0,
+            cache_put: None,
             payload: TilePayload::Leaf(LeafPayload::AosZstd {
                 predictors: vec![0; pred_len],
                 color: EncodedBytes::Zstd(vec![0xAA; half_cap - pred_len]),
@@ -2113,6 +2394,7 @@ mod tests {
         };
         let large1 = CompressedTile {
             tile_idx: 1,
+            cache_put: None,
             payload: TilePayload::Leaf(LeafPayload::AosZstd {
                 predictors: vec![0; pred_len],
                 color: EncodedBytes::Zstd(vec![0xBB; half_cap - pred_len]),
@@ -2121,10 +2403,12 @@ mod tests {
         };
         let small2 = CompressedTile {
             tile_idx: 2,
+            cache_put: None,
             payload: TilePayload::Leaf(LeafPayload::Solid([5, 6, 7, 0xFF])),
         };
         let small3 = CompressedTile {
             tile_idx: 3,
+            cache_put: None,
             payload: TilePayload::Leaf(LeafPayload::Solid([8, 9, 10, 0xFF])),
         };
         assert_eq!(
@@ -2144,6 +2428,8 @@ mod tests {
             },
             incremental: false,
             scroll_rect: None,
+            reset_tile_cache: false,
+            evict_slots: Vec::new(),
             tile_rects: large_rects.to_vec(),
         };
         let mut expected_hdr_wire = Vec::new();
@@ -2412,6 +2698,7 @@ mod tests {
         // 4-quadrant Split roundtrip (mixed Solid + Palette + AosZstd + Jpeg).
         let split4 = CompressedTile {
             tile_idx: 0,
+            cache_put: None,
             payload: TilePayload::Split(vec![
                 SubTile {
                     rect: tr(256, 0, 128, 128),
@@ -2457,6 +2744,7 @@ mod tests {
         // 2-quadrant Split on `256x128` roundtrip.
         let split2 = CompressedTile {
             tile_idx: 0,
+            cache_put: None,
             payload: TilePayload::Split(vec![
                 SubTile {
                     rect: tr(0, 256, 128, 128),
@@ -2498,6 +2786,7 @@ mod tests {
         // Empty JPEG payload rejected on both write and read.
         let empty_jpeg = CompressedTile {
             tile_idx: 0,
+            cache_put: None,
             payload: TilePayload::Leaf(LeafPayload::Jpeg {
                 data: Vec::new(),
                 alpha: AlphaChannel::Omitted,
@@ -2678,6 +2967,8 @@ mod tests {
                 metadata: meta,
                 incremental: true,
                 scroll_rect: Some(sr),
+                reset_tile_cache: false,
+                evict_slots: Vec::new(),
                 tile_rects: tiles.clone(),
             };
             let mut wire = Vec::new();
@@ -2699,6 +2990,8 @@ mod tests {
             metadata: meta,
             incremental: true,
             scroll_rect: None,
+            reset_tile_cache: false,
+            evict_slots: Vec::new(),
             tile_rects: vec![],
         };
         let mut plain_wire = Vec::new();
@@ -2720,6 +3013,8 @@ mod tests {
             metadata: meta,
             incremental: false,
             scroll_rect: Some(valid_sr),
+            reset_tile_cache: false,
+            evict_slots: Vec::new(),
             tile_rects: vec![],
         };
         assert!(bad_non_inc.framed_write(&mut Vec::new()).is_err());
@@ -2822,9 +3117,14 @@ mod tests {
             );
         }
 
-        // Invalid flags (`0x02` = non-incremental + scroll, `0x04` = reserved bit)
-        // and truncated ScrollRect payload must fail cleanly.
-        for bad_flag in [HEADER_FLAG_SCROLL_RECT, 0x04, 0xFF] {
+        // Invalid flags (`0x02` = non-incremental + scroll, `0x10` = reserved bit,
+        // `reset_tile_cache | evict_slots`) and truncated ScrollRect payload must fail cleanly.
+        for bad_flag in [
+            HEADER_FLAG_SCROLL_RECT,
+            HEADER_FLAG_RESET_TILE_CACHE | HEADER_FLAG_EVICT_SLOTS,
+            0x10,
+            0xFF,
+        ] {
             let mut wire = [0u8; RAW_BUFFER_HEADER_LEN].to_vec();
             wire[24..28].copy_from_slice(&640i32.to_be_bytes());
             wire[28..32].copy_from_slice(&480i32.to_be_bytes());
@@ -2841,5 +3141,292 @@ mod tests {
         truncated[36] = 1;
         truncated[37] = HEADER_FLAG_INCREMENTAL | HEADER_FLAG_SCROLL_RECT;
         assert!(RawBufferHeader::framed_read(&mut truncated.as_slice()).is_err());
+    }
+
+    #[test]
+    fn test_tile_cache_framing_and_malformed_bounds() {
+        let meta = BufferMetadata {
+            width: 512,
+            height: 512,
+            stride: 512 * 4,
+            format: BufferFormat::Argb8888,
+        };
+        let rect_256 = TileRect {
+            x: 0,
+            y: 0,
+            w: 256,
+            h: 256,
+        };
+        let rect_128 = TileRect {
+            x: 256,
+            y: 0,
+            w: 128,
+            h: 128,
+        };
+
+        // 1. Header roundtrip with `reset_tile_cache` and with `evict_slots`.
+        let reset_hdr = RawBufferHeader {
+            frame_seq: 1,
+            client: ClientId(2),
+            surface: WlSurfaceId(3),
+            metadata: meta,
+            incremental: false,
+            scroll_rect: None,
+            reset_tile_cache: true,
+            evict_slots: Vec::new(),
+            tile_rects: vec![rect_256],
+        };
+        let mut wire = Vec::new();
+        reset_hdr.framed_write(&mut wire).unwrap();
+        assert_eq!(wire.len(), RAW_BUFFER_HEADER_LEN + TILE_RECT_LEN);
+        assert_eq!(wire[37], HEADER_FLAG_RESET_TILE_CACHE);
+        assert_eq!(
+            RawBufferHeader::framed_read(&mut wire.as_slice()).unwrap(),
+            reset_hdr
+        );
+
+        let evict_hdr = RawBufferHeader {
+            frame_seq: 2,
+            client: ClientId(2),
+            surface: WlSurfaceId(3),
+            metadata: meta,
+            incremental: true,
+            scroll_rect: None,
+            reset_tile_cache: false,
+            evict_slots: vec![0, 511, (MAX_TILE_CACHE_SLOTS - 1) as u16],
+            tile_rects: vec![rect_128],
+        };
+        let mut evict_wire = Vec::new();
+        evict_hdr.framed_write(&mut evict_wire).unwrap();
+        assert_eq!(
+            evict_wire.len(),
+            RAW_BUFFER_HEADER_LEN + 2 + 3 * 2 + TILE_RECT_LEN
+        );
+        assert_eq!(
+            evict_wire[37],
+            HEADER_FLAG_INCREMENTAL | HEADER_FLAG_EVICT_SLOTS
+        );
+        assert_eq!(
+            RawBufferHeader::framed_read(&mut evict_wire.as_slice()).unwrap(),
+            evict_hdr
+        );
+
+        // Contradictory `reset_tile_cache + evict_slots`, out-of-range, and
+        // duplicate `evict_slots` must fail on write AND read.
+        for bad_hdr in [
+            RawBufferHeader {
+                reset_tile_cache: true,
+                evict_slots: vec![1],
+                ..evict_hdr.clone()
+            },
+            RawBufferHeader {
+                evict_slots: vec![MAX_TILE_CACHE_SLOTS as u16],
+                ..evict_hdr.clone()
+            },
+            RawBufferHeader {
+                evict_slots: vec![7, 7],
+                ..evict_hdr.clone()
+            },
+        ] {
+            assert!(bad_hdr.framed_write(&mut Vec::new()).is_err());
+        }
+
+        // Malformed wire `evict_slots`: count=0, count=1025, slot=1024, duplicate slot.
+        let make_evict_wire = |count: u16, slots: &[u16]| {
+            let mut w = [0u8; RAW_BUFFER_HEADER_LEN].to_vec();
+            w[24..28].copy_from_slice(&512i32.to_be_bytes());
+            w[28..32].copy_from_slice(&512i32.to_be_bytes());
+            w[32..36].copy_from_slice(&(512i32 * 4).to_be_bytes());
+            w[36] = 1;
+            w[37] = HEADER_FLAG_EVICT_SLOTS;
+            count.framed_write(&mut w).unwrap();
+            for &s in slots {
+                s.framed_write(&mut w).unwrap();
+            }
+            w
+        };
+        for bad_wire in [
+            make_evict_wire(0, &[]),
+            make_evict_wire((MAX_TILE_CACHE_SLOTS + 1) as u16, &[]),
+            make_evict_wire(1, &[MAX_TILE_CACHE_SLOTS as u16]),
+            make_evict_wire(2, &[5, 5]),
+        ] {
+            assert!(RawBufferHeader::framed_read(&mut bad_wire.as_slice()).is_err());
+        }
+
+        // 2. Roundtrip `CacheHit` (all 5 regions) and `CachePut` (Leaf + Split).
+        for region in [
+            CacheHitRegion::Full,
+            CacheHitRegion::TopLeft,
+            CacheHitRegion::TopRight,
+            CacheHitRegion::BottomLeft,
+            CacheHitRegion::BottomRight,
+        ] {
+            let target_rect = if region == CacheHitRegion::Full {
+                rect_256
+            } else {
+                rect_128
+            };
+            let hit = CompressedTile {
+                tile_idx: 0,
+                cache_put: None,
+                payload: TilePayload::CacheHit(CacheHitRef {
+                    slot_id: (MAX_TILE_CACHE_SLOTS - 1) as u16,
+                    region,
+                }),
+            };
+            let mut w = Vec::new();
+            hit.write_framed(target_rect, true, &mut w).unwrap();
+            assert_eq!(w.len(), 4 + 1 + 2);
+            let dec = CompressedTile::read_framed(&[target_rect], true, &mut w.as_slice()).unwrap();
+            assert_eq!(dec, hit);
+        }
+
+        let put_solid = CompressedTile {
+            tile_idx: 0,
+            cache_put: Some(42),
+            payload: TilePayload::Leaf(LeafPayload::Solid([10, 20, 30, 0xFF])),
+        };
+        let mut w = Vec::new();
+        put_solid.write_framed(rect_128, false, &mut w).unwrap();
+        assert_eq!(w.len(), 4 + 1 + 2 + 3);
+        assert_eq!(
+            CompressedTile::read_framed(&[rect_128], false, &mut w.as_slice()).unwrap(),
+            put_solid
+        );
+
+        let put_split = CompressedTile {
+            tile_idx: 0,
+            cache_put: Some(1023),
+            payload: TilePayload::Split(vec![
+                SubTile {
+                    rect: TileRect {
+                        x: 0,
+                        y: 0,
+                        w: 128,
+                        h: 256,
+                    },
+                    payload: LeafPayload::Solid([1, 2, 3, 0xFF]),
+                },
+                SubTile {
+                    rect: TileRect {
+                        x: 128,
+                        y: 0,
+                        w: 128,
+                        h: 256,
+                    },
+                    payload: LeafPayload::Solid([4, 5, 6, 0xFF]),
+                },
+            ]),
+        };
+        let mut ws = Vec::new();
+        put_split.write_framed(rect_256, false, &mut ws).unwrap();
+        assert_eq!(
+            CompressedTile::read_framed(&[rect_256], false, &mut ws.as_slice()).unwrap(),
+            put_split
+        );
+
+        // 3. Reject malformed `CacheHit` / `CachePut` combinations on write & read.
+        // CacheHit + CachePut together.
+        assert!(
+            CompressedTile {
+                tile_idx: 0,
+                cache_put: Some(0),
+                payload: TilePayload::CacheHit(CacheHitRef {
+                    slot_id: 0,
+                    region: CacheHitRegion::Full,
+                }),
+            }
+            .write_framed(rect_128, false, &mut Vec::new())
+            .is_err()
+        );
+        // Out-of-range `cache_put` slot_id.
+        assert!(
+            CompressedTile {
+                tile_idx: 0,
+                cache_put: Some(MAX_TILE_CACHE_SLOTS as u16),
+                payload: TilePayload::Leaf(LeafPayload::Solid([0, 0, 0, 0xFF])),
+            }
+            .write_framed(rect_128, false, &mut Vec::new())
+            .is_err()
+        );
+        // Out-of-range `CacheHit` slot_id.
+        assert!(
+            CompressedTile {
+                tile_idx: 0,
+                cache_put: None,
+                payload: TilePayload::CacheHit(CacheHitRef {
+                    slot_id: MAX_TILE_CACHE_SLOTS as u16,
+                    region: CacheHitRegion::Full,
+                }),
+            }
+            .write_framed(rect_128, false, &mut Vec::new())
+            .is_err()
+        );
+        // Quadrant `CacheHitRegion` targeting a `256x256` rect must fail.
+        assert!(
+            CompressedTile {
+                tile_idx: 0,
+                cache_put: None,
+                payload: TilePayload::CacheHit(CacheHitRef {
+                    slot_id: 0,
+                    region: CacheHitRegion::TopLeft,
+                }),
+            }
+            .write_framed(rect_256, false, &mut Vec::new())
+            .is_err()
+        );
+
+        // Wire-level malformed checks:
+        // - `PAYLOAD_FLAG_CACHE_PUT | PAYLOAD_TAG_CACHE_HIT`
+        let mut hit_with_put = Vec::new();
+        0u32.framed_write(&mut hit_with_put).unwrap();
+        (PAYLOAD_FLAG_CACHE_PUT | PAYLOAD_TAG_CACHE_HIT)
+            .framed_write(&mut hit_with_put)
+            .unwrap();
+        0u16.framed_write(&mut hit_with_put).unwrap();
+        assert!(
+            CompressedTile::read_framed(&[rect_128], false, &mut hit_with_put.as_slice()).is_err()
+        );
+
+        // - Invalid `CacheHitRef` region bits (`5`, `7`, high reserved bits set)
+        for bad_packed in [5u16 << 10, 7u16 << 10, 0x8000u16] {
+            assert!(CacheHitRef::from_u16(bad_packed).is_err());
+            let mut bw = Vec::new();
+            0u32.framed_write(&mut bw).unwrap();
+            PAYLOAD_TAG_CACHE_HIT.framed_write(&mut bw).unwrap();
+            bad_packed.framed_write(&mut bw).unwrap();
+            assert!(CompressedTile::read_framed(&[rect_128], false, &mut bw.as_slice()).is_err());
+        }
+
+        // - Wire `CachePut` with `slot_id == 1024`
+        let mut bad_put = Vec::new();
+        0u32.framed_write(&mut bad_put).unwrap();
+        (PAYLOAD_FLAG_CACHE_PUT | PAYLOAD_TAG_SOLID_OPAQUE)
+            .framed_write(&mut bad_put)
+            .unwrap();
+        (MAX_TILE_CACHE_SLOTS as u16)
+            .framed_write(&mut bad_put)
+            .unwrap();
+        bad_put.extend_from_slice(&[1, 2, 3]);
+        assert!(CompressedTile::read_framed(&[rect_128], false, &mut bad_put.as_slice()).is_err());
+
+        // - Wire quadrant `CacheHit` for a `256x256` rect
+        let mut quad_on_256 = Vec::new();
+        0u32.framed_write(&mut quad_on_256).unwrap();
+        PAYLOAD_TAG_CACHE_HIT
+            .framed_write(&mut quad_on_256)
+            .unwrap();
+        CacheHitRef {
+            slot_id: 0,
+            region: CacheHitRegion::BottomRight,
+        }
+        .to_u16()
+        .unwrap()
+        .framed_write(&mut quad_on_256)
+        .unwrap();
+        assert!(
+            CompressedTile::read_framed(&[rect_256], false, &mut quad_on_256.as_slice()).is_err()
+        );
     }
 }

@@ -500,6 +500,7 @@ impl WprsServerState {
         self.serial_map.clear();
         self.frame_backpressure.reset();
         self.deferred_sync_ancestors.clear();
+        self.tile_cache.clear();
         self.for_each_mapped_surface(|_, tracked| {
             tracked.pending_buffer_delta = None;
             tracked.pending_damage = PendingDamage::None;
@@ -1255,6 +1256,7 @@ impl WprsServerState {
         // lossless client never inherits a prior hybrid client's setting.
         self.compression_mode = CompressionMode::Lossless;
         self.synced_buffers.clear();
+        self.tile_cache.reset_for_peer();
         self.dirty_sync_surfaces.clear();
         self.committed_surfaces.clear();
 
@@ -1477,7 +1479,10 @@ impl WprsServerState {
                 // Clear `synced_buffers` unconditionally before resolving the
                 // surface so the next application commit transmits a full frame
                 // without triggering an eager retry loop if client `/dev/shm` is full.
+                // Also reset the peer tile cache in band so any client-side cache
+                // desync self-heals on the next emitted frame.
                 self.synced_buffers.remove(&surface_event.surface_id);
+                self.tile_cache.reset_for_peer();
                 return Ok(());
             },
             SurfaceEventPayload::OutputsChanged(outputs) => outputs,

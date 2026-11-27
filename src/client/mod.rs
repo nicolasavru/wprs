@@ -264,6 +264,7 @@ pub struct WprsClientState {
     title_prefix: String,
 
     decompressor: ShardingDecompressor,
+    pub(crate) tile_cache: filtering::ClientTileCache,
     slot_copy_scratch: Vec<u8>,
 }
 
@@ -344,6 +345,7 @@ impl WprsClientState {
             timed_out: false,
             title_prefix: options.title_prefix,
             decompressor,
+            tile_cache: filtering::ClientTileCache::new(),
             slot_copy_scratch: Vec::new(),
         };
         state
