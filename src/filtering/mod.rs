@@ -460,6 +460,7 @@ use crate::filtering::tile_cache::SlotScans;
 use crate::filtering::tile_cache::SyncClientSlots;
 use crate::filtering::tile_cache::TileCacheAction;
 use crate::filtering::tile_cache::TileEncodeMeta;
+use crate::filtering::tile_cache::TileQuality;
 use crate::filtering::tile_cache::ValidatedCacheHit;
 use crate::filtering::tile_cache::payload_lossless_promotion_mask;
 use crate::filtering::tile_hash::RectScanMeta;
@@ -2068,7 +2069,12 @@ unsafe fn decode_one_tile<'a, K: RowKernel, const HAS_ALPHA: bool>(
                 // `wl_shm` RFO traffic and cache pollution.
                 // SAFETY: `put_claimed[slot_idx]` grants exclusive ownership of `slot_id`.
                 let slot_frame = unsafe {
-                    ClientTileCache::prepare_slot_target_uninit(&ctx.slots, slot_id, rect)
+                    ClientTileCache::prepare_slot_target_uninit(
+                        &ctx.slots,
+                        state.worker_idx,
+                        slot_id,
+                        rect,
+                    )
                 };
                 // SAFETY: `slot_frame` has capacity for `rect.w * rect.h` pixels and is
                 // exclusively owned; shifting by `dst_origin = (rect.x, rect.y)` maps
@@ -3512,11 +3518,13 @@ fn filter_and_compress_full_streaming_with_tier(
 
     if let Some(cache) = tile_cache {
         if cache.occupied_slots() == 0 {
-            // Fast single-pass cold-fill: when the cache starts empty, no
-            // inter-frame hits or partial quadrant un-coalescing can occur, so
-            // `tile_rects` is known upfront and each worker fuses
-            // copy-to-shadow + keyed 128-bit hashing + intra-frame dedup +
-            // encoding while the tile's `<= 256 KiB` pixels stay hot in L2.
+            // Fast single-pass direct cold-fill: when the cache starts empty,
+            // no inter-frame hits or partial quadrant un-coalescing can occur,
+            // so `tile_rects` is known upfront and each worker fuses
+            // copy-to-shadow + keyed 128-bit hashing + direct `cache.index`
+            // claim + immediate encoding while the tile's `<= 256 KiB` pixels
+            // stay hot in private L2 cache, with zero head-of-line stalling and
+            // zero lock acquisition for solid tiles.
             let hash_key = *cache.hash_key();
             let tile_rects: Vec<TileRect> = base_entries
                 .iter()
@@ -3525,6 +3533,7 @@ fn filter_and_compress_full_streaming_with_tier(
                 .collect();
             let n_tiles = tile_rects.len();
             let reset_tile_cache = cache.take_reset_pending();
+            cache.begin_cold_fill();
             let (tiles_tx, tiles_rx) = crossbeam_channel::unbounded();
             let header = RawBufferHeader {
                 frame_seq: 0,
@@ -3546,6 +3555,7 @@ fn filter_and_compress_full_streaming_with_tier(
                 base: shadow.as_mut_ptr(),
                 stride,
             });
+            let initial_quality = TileQuality::initial_for_mode(mode);
             let is_hybrid = matches!(mode, CompressionMode::Hybrid { .. });
             let promotions: Vec<AtomicU8> = if is_hybrid {
                 (0..MAX_TILE_CACHE_SLOTS)
@@ -3554,92 +3564,31 @@ fn filter_and_compress_full_streaming_with_tier(
             } else {
                 Vec::new()
             };
-            let cold_state = Mutex::new(cache.new_cold_fill_state(n_tiles, total_slots));
-            let frontier = tile_cache::ColdFillFrontier::new(n_tiles);
-            let next_hash = AtomicUsize::new(0);
+            let cache_lock = Mutex::new(&mut *cache);
+            let next_tile = AtomicUsize::new(0);
             let disconnected = AtomicBool::new(false);
             compressor.pool.execute(n_tiles, |state| {
                 let shadow_ptr;
                 let encode_aos = if let Some(shadow) = &shadow_rows {
                     shadow_ptr = shadow.base.cast_const().cast::<Vec4u8>();
                     // SAFETY: `shadow.base` points to `total_pixels * 4` bytes of
-                    // allocated capacity; each tile's rect is read only after its
-                    // `publish_hash` -> `advance` -> `planned_up_to` Release/Acquire
-                    // happens-before edge completes its exclusive write.
+                    // allocated capacity; this worker exclusively initializes
+                    // `rect` in `shadow` immediately before reading `rect` from
+                    // `encode_aos`.
                     unsafe { BufferPointer::new(&shadow_ptr, total_pixels) }
                 } else {
                     aos
                 };
 
-                let encode_and_send =
-                    |enc_idx: usize,
-                     action: TileCacheAction,
-                     meta: &TileEncodeMeta,
-                     state: &mut CompressorWorkerState| {
-                        let rect = base_entries[enc_idx].rect();
-                        let tile = match action {
-                            TileCacheAction::Hit(hit_ref) => CompressedTile {
-                                tile_idx: enc_idx as u32,
-                                cache_put: None,
-                                payload: TilePayload::CacheHit(hit_ref),
-                            },
-                            TileCacheAction::Solid(px) => CompressedTile {
-                                tile_idx: enc_idx as u32,
-                                cache_put: None,
-                                payload: TilePayload::Leaf(LeafPayload::Solid(px)),
-                            },
-                            TileCacheAction::Put(slot_id) => {
-                                let payload = if has_alpha {
-                                    filter_tile::<true>(
-                                        tier, encode_aos, stride_px, rect, mode, meta, state,
-                                    )
-                                } else {
-                                    filter_tile::<false>(
-                                        tier, encode_aos, stride_px, rect, mode, meta, state,
-                                    )
-                                };
-                                if is_hybrid {
-                                    promotions[slot_id as usize].store(
-                                        payload_lossless_promotion_mask(rect, &payload),
-                                        Ordering::Relaxed,
-                                    );
-                                }
-                                CompressedTile {
-                                    tile_idx: enc_idx as u32,
-                                    cache_put: Some(slot_id),
-                                    payload,
-                                }
-                            },
-                            TileCacheAction::Uncached => {
-                                let payload = if has_alpha {
-                                    filter_tile::<true>(
-                                        tier, encode_aos, stride_px, rect, mode, meta, state,
-                                    )
-                                } else {
-                                    filter_tile::<false>(
-                                        tier, encode_aos, stride_px, rect, mode, meta, state,
-                                    )
-                                };
-                                CompressedTile {
-                                    tile_idx: enc_idx as u32,
-                                    cache_put: None,
-                                    payload,
-                                }
-                            },
-                        };
-                        if tiles_tx.send(tile).is_err() {
-                            disconnected.store(true, Ordering::Relaxed);
-                        }
-                    };
-
                 loop {
+                    let h = next_tile.fetch_add(1, Ordering::Relaxed);
+                    if h >= n_tiles {
+                        break;
+                    }
+                    let entry = base_entries[h];
                     if disconnected.load(Ordering::Relaxed) {
                         if let Some(shadow) = &shadow_rows {
-                            let h = next_hash.fetch_add(1, Ordering::Relaxed);
-                            if h >= n_tiles {
-                                break;
-                            }
-                            let rect = base_entries[h].rect();
+                            let rect = entry.rect();
                             // SAFETY: `base_entries` are pairwise disjoint and in-bounds,
                             // and each `h` is claimed once.
                             unsafe {
@@ -3651,21 +3600,59 @@ fn filter_and_compress_full_streaming_with_tier(
                         break;
                     }
 
-                    let h = next_hash.fetch_add(1, Ordering::Relaxed);
-                    if h < n_tiles {
-                        let entry = base_entries[h];
-                        let (hash, meta, sub_quads) = match entry {
-                            BaseScanEntry::Strip1D { rect, .. } => {
+                    let (hash, meta, sub_quads) = match entry {
+                        BaseScanEntry::Strip1D { rect, .. } => {
+                            let scan = if let Some(shadow) = &shadow_rows {
+                                // SAFETY: `base_entries` are pairwise disjoint and in-bounds.
+                                unsafe {
+                                    let scan = if has_alpha {
+                                        tile_hash::copy_and_hash_rect_to_shadow::<true>(
+                                            &hash_key,
+                                            data,
+                                            shadow.base,
+                                            stride,
+                                            rect,
+                                            0,
+                                        )
+                                    } else {
+                                        tile_hash::copy_and_hash_rect_to_shadow::<false>(
+                                            &hash_key,
+                                            data,
+                                            shadow.base,
+                                            stride,
+                                            rect,
+                                            0,
+                                        )
+                                    };
+                                    zero_shadow_row_padding(shadow, width_bytes, rect);
+                                    scan
+                                }
+                            } else if has_alpha {
+                                tile_hash::hash_rect_from_ptr::<true>(
+                                    &hash_key, aos, stride_px, rect,
+                                )
+                            } else {
+                                tile_hash::hash_rect_from_ptr::<false>(
+                                    &hash_key, aos, stride_px, rect,
+                                )
+                            };
+                            (scan.hash, scan.meta, None)
+                        },
+                        BaseScanEntry::Tile2D { rect, n_quads, .. } => {
+                            let (quads, _) = tile_quadrants(rect);
+                            let mut quad_hashes = [[0u8; 16]; 4];
+                            let mut quad_metas = [RectScanMeta::UNKNOWN; 4];
+                            for q in 0..n_quads {
                                 let scan = if let Some(shadow) = &shadow_rows {
-                                    // SAFETY: `base_entries` are pairwise disjoint and in-bounds.
+                                    // SAFETY: `quads[q]` lies inside exclusively owned `rect`.
                                     unsafe {
-                                        let scan = if has_alpha {
+                                        if has_alpha {
                                             tile_hash::copy_and_hash_rect_to_shadow::<true>(
                                                 &hash_key,
                                                 data,
                                                 shadow.base,
                                                 stride,
-                                                rect,
+                                                quads[q],
                                                 0,
                                             )
                                         } else {
@@ -3674,123 +3661,138 @@ fn filter_and_compress_full_streaming_with_tier(
                                                 data,
                                                 shadow.base,
                                                 stride,
-                                                rect,
+                                                quads[q],
                                                 0,
                                             )
-                                        };
-                                        zero_shadow_row_padding(shadow, width_bytes, rect);
-                                        scan
+                                        }
                                     }
                                 } else if has_alpha {
                                     tile_hash::hash_rect_from_ptr::<true>(
-                                        &hash_key, aos, stride_px, rect,
+                                        &hash_key, aos, stride_px, quads[q],
                                     )
                                 } else {
                                     tile_hash::hash_rect_from_ptr::<false>(
-                                        &hash_key, aos, stride_px, rect,
+                                        &hash_key, aos, stride_px, quads[q],
                                     )
                                 };
-                                (scan.hash, scan.meta, None)
-                            },
-                            BaseScanEntry::Tile2D { rect, n_quads, .. } => {
-                                let (quads, _) = tile_quadrants(rect);
-                                let mut quad_hashes = [[0u8; 16]; 4];
-                                let mut quad_metas = [RectScanMeta::UNKNOWN; 4];
-                                for q in 0..n_quads {
-                                    let scan = if let Some(shadow) = &shadow_rows {
-                                        // SAFETY: `quads[q]` lies inside exclusively owned `rect`.
-                                        unsafe {
-                                            if has_alpha {
-                                                tile_hash::copy_and_hash_rect_to_shadow::<true>(
-                                                    &hash_key,
-                                                    data,
-                                                    shadow.base,
-                                                    stride,
-                                                    quads[q],
-                                                    0,
-                                                )
-                                            } else {
-                                                tile_hash::copy_and_hash_rect_to_shadow::<false>(
-                                                    &hash_key,
-                                                    data,
-                                                    shadow.base,
-                                                    stride,
-                                                    quads[q],
-                                                    0,
-                                                )
-                                            }
-                                        }
-                                    } else if has_alpha {
-                                        tile_hash::hash_rect_from_ptr::<true>(
-                                            &hash_key, aos, stride_px, quads[q],
-                                        )
-                                    } else {
-                                        tile_hash::hash_rect_from_ptr::<false>(
-                                            &hash_key, aos, stride_px, quads[q],
-                                        )
-                                    };
-                                    quad_hashes[q] = scan.hash;
-                                    quad_metas[q] = scan.meta;
-                                }
-                                if let Some(shadow) = &shadow_rows {
-                                    // SAFETY: `rect` is exclusively owned by this worker and
-                                    // disjoint from all other `base_entries`.
-                                    unsafe { zero_shadow_row_padding(shadow, width_bytes, rect) };
-                                }
-                                if n_quads == 1 {
-                                    (quad_hashes[0], quad_metas[0], None)
+                                quad_hashes[q] = scan.hash;
+                                quad_metas[q] = scan.meta;
+                            }
+                            if let Some(shadow) = &shadow_rows {
+                                // SAFETY: `rect` is exclusively owned by this worker and
+                                // disjoint from all other `base_entries`.
+                                unsafe { zero_shadow_row_padding(shadow, width_bytes, rect) };
+                            }
+                            if n_quads == 1 {
+                                (quad_hashes[0], quad_metas[0], None)
+                            } else {
+                                let parent_meta = RectScanMeta::combine(&quad_metas[..n_quads]);
+                                if parent_meta.solid_px.is_some() {
+                                    ([0u8; 16], parent_meta, None)
                                 } else {
-                                    let parent_meta = RectScanMeta::combine(&quad_metas[..n_quads]);
-                                    if parent_meta.solid_px.is_some() {
-                                        ([0u8; 16], parent_meta, None)
-                                    } else {
-                                        let parent_hash = tile_hash::combine_quad_hashes(
-                                            &hash_key,
-                                            rect.w,
-                                            rect.h,
-                                            &quad_hashes[..n_quads],
-                                        );
-                                        (
-                                            parent_hash,
-                                            parent_meta,
-                                            Some(ColdSubQuads {
-                                                hashes: quad_hashes,
-                                                metas: quad_metas,
-                                                n_quads: n_quads as u8,
-                                            }),
-                                        )
-                                    }
+                                    let parent_hash = tile_hash::combine_quad_hashes(
+                                        &hash_key,
+                                        rect.w,
+                                        rect.h,
+                                        &quad_hashes[..n_quads],
+                                    );
+                                    (
+                                        parent_hash,
+                                        parent_meta,
+                                        Some(ColdSubQuads {
+                                            hashes: quad_hashes,
+                                            metas: quad_metas,
+                                            n_quads: n_quads as u8,
+                                        }),
+                                    )
+                                }
+                            }
+                        },
+                    };
+
+                    let rect = entry.rect();
+                    let tile = if let Some(px) = meta.solid_px {
+                        CompressedTile {
+                            tile_idx: h as u32,
+                            cache_put: None,
+                            payload: TilePayload::Leaf(LeafPayload::Solid(px)),
+                        }
+                    } else {
+                        let action = cache_lock.lock().unwrap().claim_cold_tile(
+                            rect,
+                            hash,
+                            sub_quads,
+                            has_alpha,
+                            initial_quality,
+                        );
+                        match action {
+                            TileCacheAction::Hit(hit_ref) => CompressedTile {
+                                tile_idx: h as u32,
+                                cache_put: None,
+                                payload: TilePayload::CacheHit(hit_ref),
+                            },
+                            TileCacheAction::Solid(px) => CompressedTile {
+                                tile_idx: h as u32,
+                                cache_put: None,
+                                payload: TilePayload::Leaf(LeafPayload::Solid(px)),
+                            },
+                            TileCacheAction::Put(slot_id) => {
+                                let enc_meta = TileEncodeMeta {
+                                    tile: meta,
+                                    quads: sub_quads
+                                        .map_or([RectScanMeta::UNKNOWN; 4], |sq| sq.metas),
+                                };
+                                let payload = if has_alpha {
+                                    filter_tile::<true>(
+                                        tier, encode_aos, stride_px, rect, mode, &enc_meta, state,
+                                    )
+                                } else {
+                                    filter_tile::<false>(
+                                        tier, encode_aos, stride_px, rect, mode, &enc_meta, state,
+                                    )
+                                };
+                                if is_hybrid {
+                                    promotions[slot_id as usize].store(
+                                        payload_lossless_promotion_mask(rect, &payload),
+                                        Ordering::Relaxed,
+                                    );
+                                }
+                                CompressedTile {
+                                    tile_idx: h as u32,
+                                    cache_put: Some(slot_id),
+                                    payload,
                                 }
                             },
-                        };
-
-                        // SAFETY: `h` was uniquely claimed from `next_hash`.
-                        unsafe { frontier.publish_scan(h, hash, meta, sub_quads) };
-                        frontier.advance(&cold_state, &base_entries);
-
-                        // Fast path: if the deterministic frontier already passed `h`,
-                        // encode `h` immediately while its pixels sit hot in L2 cache.
-                        if let Some((action, enc_meta)) = frontier.try_claim_encode(h) {
-                            encode_and_send(h, action, &enc_meta, state);
-                        } else if let Some((enc_idx, action, enc_meta)) =
-                            frontier.try_claim_next_planned()
-                        {
-                            encode_and_send(enc_idx, action, &enc_meta, state);
+                            TileCacheAction::Uncached => {
+                                let enc_meta = TileEncodeMeta {
+                                    tile: meta,
+                                    quads: sub_quads
+                                        .map_or([RectScanMeta::UNKNOWN; 4], |sq| sq.metas),
+                                };
+                                let payload = if has_alpha {
+                                    filter_tile::<true>(
+                                        tier, encode_aos, stride_px, rect, mode, &enc_meta, state,
+                                    )
+                                } else {
+                                    filter_tile::<false>(
+                                        tier, encode_aos, stride_px, rect, mode, &enc_meta, state,
+                                    )
+                                };
+                                CompressedTile {
+                                    tile_idx: h as u32,
+                                    cache_put: None,
+                                    payload,
+                                }
+                            },
                         }
-                        continue;
+                    };
+                    if tiles_tx.send(tile).is_err() {
+                        disconnected.store(true, Ordering::Relaxed);
                     }
-
-                    if let Some((enc_idx, action, enc_meta)) = frontier.try_claim_next_planned() {
-                        encode_and_send(enc_idx, action, &enc_meta, state);
-                        continue;
-                    }
-                    if frontier.is_done() {
-                        break;
-                    }
-                    std::hint::spin_loop();
                 }
             });
 
+            let cache = cache_lock.into_inner().unwrap();
             if let Some(shadow) = shadow_opt {
                 // SAFETY: `base_entries` partitions `[0, width) x [0, height)`,
                 // every tile was written (even on early stream disconnect), and
@@ -3802,12 +3804,15 @@ fn filter_and_compress_full_streaming_with_tier(
             if disconnected.load(Ordering::Relaxed) {
                 cache.reset_for_peer();
             } else {
-                cache.commit_cold_fill(
-                    cold_state.into_inner().unwrap().into_pending(),
-                    has_alpha,
-                    mode,
-                    &promotions,
-                );
+                cache.finish_cold_fill();
+                if is_hybrid {
+                    for (slot_id, cell) in promotions.into_iter().enumerate() {
+                        let mask = cell.into_inner();
+                        if mask != 0 {
+                            cache.promote_slot_lossless(slot_id as u16, mask);
+                        }
+                    }
+                }
             }
             return;
         }
@@ -3815,7 +3820,7 @@ fn filter_and_compress_full_streaming_with_tier(
         // Phase A: copy all base tiles to `shadow` (when requested) and compute
         // keyed 128-bit digests and scan metadata for every quadrant directly in
         // registers.
-        let slot_scans = SlotScans::new(total_slots, *cache.hash_key());
+        let mut slot_scans = SlotScans::new(total_slots, *cache.hash_key());
         {
             let _hash_span = debug_span!("tile_cache_hash_full").entered();
             let shadow_rows = shadow_opt.as_deref_mut().map(|shadow| ShadowRows {
@@ -3958,8 +3963,7 @@ fn filter_and_compress_full_streaming_with_tier(
             unsafe { shadow.set_len(byte_len) };
         }
 
-        let scans = slot_scans.into_vec();
-        let plan = cache.plan_frame(&base_entries, None, &scans, has_alpha, mode);
+        let plan = cache.plan_frame(&base_entries, None, slot_scans.as_slice(), has_alpha, mode);
         let n_tiles = plan.tile_rects.len();
         let (tiles_tx, tiles_rx) = crossbeam_channel::unbounded();
         let header = RawBufferHeader {
@@ -4257,7 +4261,7 @@ fn filter_and_compress_incremental_streaming_with_tier(
     let dirty_slots: Vec<AtomicU32> = (0..total_slots)
         .map(|_| AtomicU32::new(SlotDirty::CLEAN_RAW))
         .collect();
-    let slot_scans = tile_cache
+    let mut slot_scans = tile_cache
         .as_deref()
         .map(|c| SlotScans::new(total_slots, *c.hash_key()));
     let cache_non_empty = tile_cache
@@ -4343,9 +4347,10 @@ fn filter_and_compress_incremental_streaming_with_tier(
         tile_cache.as_deref_mut()
     {
         let scans = slot_scans
+            .as_mut()
             .expect("slot_scans allocated when tile_cache is Some")
-            .into_vec();
-        let plan = cache.plan_frame(&base_entries, Some(&dirty_slots), &scans, has_alpha, mode);
+            .as_slice();
+        let plan = cache.plan_frame(&base_entries, Some(&dirty_slots), scans, has_alpha, mode);
         (
             plan.tile_rects,
             Some(plan.actions),
@@ -4703,15 +4708,30 @@ unsafe fn unfilter_tiles_parallel_with_tier<'a>(
             }
         });
 
-        cache_ctx.map(|ctx| (ctx.hit_refs, ctx.hit_count.into_inner()))
+        cache_ctx.map(|ctx| {
+            (
+                ctx.hit_refs,
+                ctx.hit_count.into_inner(),
+                ctx.frame_put_bytes.into_inner(),
+            )
+        })
     };
 
-    // Always recompute cache byte accounting after Step 1 joins so even a
-    // partially failed frame never leaves stale byte accounting.
-    let cache_budget_res = tile_cache
-        .as_deref_mut()
-        .map(ClientTileCache::recompute_and_verify_bytes)
-        .transpose();
+    // Recompute cache byte accounting after Step 1 joins whenever any `CachePut`
+    // touched the cache (including partially failed frames so stale byte
+    // accounting can never survive). Hit-only / solid-only frames modify zero
+    // cache slots and skip the 1024-slot scan in O(1).
+    let had_puts = step1_hits
+        .as_ref()
+        .is_some_and(|(_, _, put_bytes)| *put_bytes != 0);
+    let cache_budget_res = if had_puts {
+        tile_cache
+            .as_deref_mut()
+            .map(ClientTileCache::recompute_and_verify_bytes)
+            .transpose()
+    } else {
+        Ok(None)
+    };
 
     if let Some(err) = first_err.into_inner().unwrap() {
         return Err(err);
@@ -4725,7 +4745,7 @@ unsafe fn unfilter_tiles_parallel_with_tier<'a>(
     // Step 2: validate and blit all `CacheHit` tiles in parallel from
     // immutable `ClientTileCache` slots into disjoint rects of `frame`.
     if !puts_only
-        && let Some((hit_refs, hit_count)) = step1_hits
+        && let Some((hit_refs, hit_count, _)) = step1_hits
         && hit_count > 0
         && let Some(cache) = tile_cache.as_deref()
     {
@@ -9427,7 +9447,7 @@ mod tests {
             };
 
             // 1. Intra-frame dedup: `1024x256` frame with 4 identical `256x256` tiles ->
-            //    first tile is `CachePut(slot)`, other 3 are `CacheHit(slot)` in the SAME frame!
+            //    exactly 1 tile is `CachePut(0)`, other 3 are `CacheHit(0)` in the SAME frame!
             let mut srv = ServerTileCache::new();
             let mut cli = ClientTileCache::new();
             let meta_dup = BufferMetadata {
@@ -9455,20 +9475,28 @@ mod tests {
             );
             tiles.sort_by_key(|t| t.tile_idx);
             assert_eq!(tiles.len(), 4);
-            let put_slot = tiles[0].cache_put.expect("tile 0 must be CachePut");
-            assert_eq!(put_slot, 0, "deterministic raster-order slot 0 for tile 0");
-            for t in &tiles[1..] {
-                assert_eq!(t.cache_put, None);
+            let put_tiles: Vec<&CompressedTile> =
+                tiles.iter().filter(|t| t.cache_put.is_some()).collect();
+            assert_eq!(put_tiles.len(), 1, "exactly 1 tile must be CachePut");
+            let put_slot = put_tiles[0].cache_put.unwrap();
+            assert_eq!(put_slot, 0, "first cold-fill slot must be 0");
+            let hit_tiles: Vec<&CompressedTile> =
+                tiles.iter().filter(|t| t.cache_put.is_none()).collect();
+            assert_eq!(hit_tiles.len(), 3);
+            for t in hit_tiles {
                 assert_matches!(
                     t.payload,
                     TilePayload::CacheHit(href) if href.slot_id == put_slot
                 );
             }
+            assert_eq!(srv.occupied_slots(), 1);
+            assert_eq!(cli.occupied_slots(), 1);
             assert_canvas_matches_frame(&out, &dup_frame, meta_dup, 0);
 
-            // Repeat cold-fill encode on an 8-tile mixed frame (unique +
-            // duplicates) to verify deterministic raster-order slot IDs and
-            // dedup winners across parallel worker scheduling.
+            // Repeat direct concurrent cold-fill encode on an 8-tile mixed frame
+            // (5 unique + 3 duplicates) across parallel worker schedules: each
+            // equivalence class must yield exactly 1 CachePut + matching
+            // CacheHits, unique slots `0..5`, and bit-exact decode.
             let meta_det = BufferMetadata {
                 width: 1024,
                 height: 512,
@@ -9486,16 +9514,6 @@ mod tests {
                 det_frame[row1 + 256 * 4..row1 + 512 * 4].copy_from_slice(&t0);
                 det_frame[row1 + 768 * 4..row1 + 1024 * 4].copy_from_slice(&t1);
             }
-            let expected_decisions = [
-                (0u32, Some(0u16), None),
-                (1, Some(1), None),
-                (2, None, Some(0u16)),
-                (3, Some(2), None),
-                (4, Some(3), None),
-                (5, None, Some(0)),
-                (6, Some(4), None),
-                (7, None, Some(1)),
-            ];
             for _ in 0..4 {
                 srv.clear();
                 cli.clear();
@@ -9508,17 +9526,37 @@ mod tests {
                     decompressor,
                 );
                 det_tiles.sort_by_key(|t| t.tile_idx);
-                let got: Vec<(u32, Option<u16>, Option<u16>)> = det_tiles
-                    .iter()
-                    .map(|t| {
-                        let hit_slot = match t.payload {
-                            TilePayload::CacheHit(href) => Some(href.slot_id),
-                            _ => None,
-                        };
-                        (t.tile_idx, t.cache_put, hit_slot)
-                    })
-                    .collect();
-                assert_eq!(got, expected_decisions);
+                assert_eq!(det_tiles.len(), 8);
+                assert_eq!(srv.occupied_slots(), 5);
+                assert_eq!(cli.occupied_slots(), 5);
+
+                let mut used_slots = Vec::new();
+                let check_group = |group: &[usize], used: &mut Vec<u16>| {
+                    let mut group_put = None;
+                    for &idx in group {
+                        if let Some(s) = det_tiles[idx].cache_put {
+                            assert!(group_put.is_none(), "duplicate Put in equivalence group");
+                            group_put = Some(s);
+                            used.push(s);
+                        }
+                    }
+                    let slot = group_put.expect("equivalence group must have 1 CachePut");
+                    for &idx in group {
+                        if det_tiles[idx].cache_put.is_none() {
+                            assert_matches!(
+                                det_tiles[idx].payload,
+                                TilePayload::CacheHit(href) if href.slot_id == slot
+                            );
+                        }
+                    }
+                };
+                check_group(&[0, 2, 5], &mut used_slots);
+                check_group(&[1, 7], &mut used_slots);
+                check_group(&[3], &mut used_slots);
+                check_group(&[4], &mut used_slots);
+                check_group(&[6], &mut used_slots);
+                used_slots.sort_unstable();
+                assert_eq!(used_slots, vec![0, 1, 2, 3, 4]);
                 assert_canvas_matches_frame(&det_out, &det_frame, meta_det, 0);
             }
 
@@ -11072,7 +11110,7 @@ mod tests {
             let slots = cli.sync_slots();
             // SAFETY: Single-threaded exclusive ownership of slot 3.
             let slot_frame =
-                unsafe { ClientTileCache::prepare_slot_target_uninit(&slots, 3, rect) };
+                unsafe { ClientTileCache::prepare_slot_target_uninit(&slots, 0, 3, rect) };
             for ry in 0..rect.h as usize {
                 // SAFETY: Row lies strictly inside `slot_frame` (`12x6`).
                 let row = unsafe {
@@ -11090,17 +11128,73 @@ mod tests {
         assert_eq!(cli.occupied_slots(), 1);
         assert_eq!(cli.used_bytes(), (rect.w * rect.h * 4) as usize);
 
+        // `evict()` retains Vec capacity and reuses the exact same backing
+        // allocation on a subsequent `CachePut` of the same tile size.
+        let (ptr_before, cap_before, occ_before) = cli.slot_buf_info(3);
+        assert!(occ_before);
+        assert!(cap_before >= (rect.w * rect.h) as usize);
+        cli.evict(3).unwrap();
+        assert_eq!(cli.occupied_slots(), 0);
+        assert_eq!(cli.used_bytes(), 0);
+        let (ptr_evicted, cap_evicted, occ_evicted) = cli.slot_buf_info(3);
+        assert!(!occ_evicted);
+        assert_eq!(ptr_evicted, ptr_before);
+        assert_eq!(cap_evicted, cap_before);
+        {
+            let slots = cli.sync_slots();
+            // SAFETY: Single-threaded exclusive ownership of slot 3.
+            let slot_frame =
+                unsafe { ClientTileCache::prepare_slot_target_uninit(&slots, 0, 3, rect) };
+            for ry in 0..rect.h as usize {
+                // SAFETY: Row lies strictly inside `slot_frame` (`12x6`).
+                let row = unsafe {
+                    slice::from_raw_parts_mut(slot_frame.row_ptr(ry, 0), rect.w as usize)
+                };
+                // SAFETY: `STREAM = false` has no alignment requirement.
+                unsafe { ScalarKernel.splat_row::<false>(row, px) };
+            }
+            // SAFETY: All `12 * 6` pixels were initialized above.
+            let _ = unsafe { ClientTileCache::commit_slot(&slots, 3, rect, false) };
+        }
+        cli.recompute_and_verify_bytes().unwrap();
+        let (ptr_reused, cap_reused, occ_reused) = cli.slot_buf_info(3);
+        assert!(occ_reused);
+        assert_eq!(ptr_reused, ptr_before);
+        assert_eq!(cap_reused, cap_before);
+
+        // In-band `reset_tile_cache` preserves capacity; `clear()` releases it.
+        cli.apply_header_ops(true, &[]).unwrap();
+        assert_eq!(cli.occupied_slots(), 0);
+        assert_eq!(cli.used_bytes(), 0);
+        assert_eq!(cli.slot_buf_info(3), (ptr_before, cap_before, false));
+        cli.clear();
+        assert_eq!(cli.capacity_bytes(), 0);
+
+        // `SlotScans::as_slice` zero-copy read after writes under Miri.
+        let mut scans = SlotScans::new(3, tile_hash::TileHashKey::from_seed(42));
+        let sample = tile_hash::TileHashResult {
+            hash: [7u8; 16],
+            meta: RectScanMeta {
+                solid_px: Some([1, 2, 3, 0xFF]),
+                all_opaque: true,
+            },
+        };
+        // SAFETY: Exclusive single-threaded write to slot 1.
+        unsafe { scans.write(1, sample) };
+        assert_eq!(scans.as_slice()[1], sample);
+
         {
             let slots = cli.sync_slots();
             // SAFETY: Single-threaded exclusive ownership of slot 3.
             let _slot_frame =
-                unsafe { ClientTileCache::prepare_slot_target_uninit(&slots, 3, rect) };
+                unsafe { ClientTileCache::prepare_slot_target_uninit(&slots, 0, 3, rect) };
             // Simulate decode error before `commit_slot`.
             unsafe { ClientTileCache::invalidate_slot(&slots, 3) };
         }
         cli.recompute_and_verify_bytes().unwrap();
         assert_eq!(cli.occupied_slots(), 0);
         assert_eq!(cli.used_bytes(), 0);
+        assert_eq!(cli.capacity_bytes(), 0);
 
         // 3. `select_and_filter_row` with reusable candidate scratch across
         //    short cropped (`tw < 256`), full `256`, and wide 1D strip (`tw > 256`).
@@ -12183,6 +12277,525 @@ mod tests {
                     }
                 }
             }
+        });
+    }
+
+    #[test]
+    #[cfg_attr(miri, ignore)]
+    fn test_client_tile_cache_evict_resync_capacity_retention_and_rss_cap() {
+        let mut cli = ClientTileCache::new();
+        let rect_256 = TileRect {
+            x: 0,
+            y: 0,
+            w: 256,
+            h: 256,
+        };
+        let rect_128 = TileRect {
+            x: 0,
+            y: 0,
+            w: 128,
+            h: 128,
+        };
+        let rect_160 = TileRect {
+            x: 0,
+            y: 0,
+            w: 160,
+            h: 256,
+        };
+        let put_solid = |cli: &mut ClientTileCache,
+                         worker_idx: usize,
+                         slot_id: u16,
+                         rect: TileRect,
+                         px: Vec4u8| {
+            let slots = cli.sync_slots();
+            // SAFETY: Exclusive single-threaded ownership of `slot_id`.
+            let sf = unsafe {
+                ClientTileCache::prepare_slot_target_uninit(&slots, worker_idx, slot_id, rect)
+            };
+            for ry in 0..rect.h as usize {
+                // SAFETY: Row lies strictly inside `sf`.
+                let row = unsafe { slice::from_raw_parts_mut(sf.row_ptr(ry, 0), rect.w as usize) };
+                // SAFETY: `STREAM = false` requires no extra alignment.
+                unsafe { ScalarKernel.splat_row::<false>(row, px) };
+            }
+            // SAFETY: Every pixel in `rect` was initialized above.
+            let _ = unsafe { ClientTileCache::commit_slot(&slots, slot_id, rect, false) };
+        };
+
+        // 1. `evict()` retains backing `Vec` capacity and reuses the exact same
+        //    backing allocation on subsequent `CachePut` of the same tile size
+        //    (via per-worker LIFO recycle shards for `256 KiB` tiles and in-place
+        //    for smaller edge/quadrant tiles).
+        put_solid(&mut cli, 0, 10, rect_256, Vec4u8(1, 2, 3, 0xFF));
+        put_solid(&mut cli, 0, 12, rect_128, Vec4u8(9, 8, 7, 0xFF));
+        cli.recompute_and_verify_bytes().unwrap();
+        let (ptr0, cap0, occ0) = cli.slot_buf_info(10);
+        let (ptr12, cap12, occ12) = cli.slot_buf_info(12);
+        assert!(occ0 && occ12);
+        assert_eq!(cap0, 256 * 256);
+        assert_eq!(cap12, 128 * 128);
+
+        cli.evict(10).unwrap();
+        cli.evict(12).unwrap();
+        assert_eq!(cli.occupied_slots(), 0);
+        assert_eq!(cli.used_bytes(), 0);
+        assert!(!cli.slot_buf_info(10).2);
+        assert_eq!(cli.slot_buf_info(12), (ptr12, cap12, false));
+        assert_eq!(cli.capacity_bytes(), (256 * 256 + 128 * 128) * 4);
+
+        put_solid(&mut cli, 0, 10, rect_256, Vec4u8(4, 5, 6, 0xFF));
+        put_solid(&mut cli, 0, 12, rect_128, Vec4u8(6, 5, 4, 0xFF));
+        cli.recompute_and_verify_bytes().unwrap();
+        assert_eq!(
+            cli.slot_buf_info(10),
+            (ptr0, cap0, true),
+            "evicted 256 KiB slot must reuse exact backing allocation with zero reallocation"
+        );
+        assert_eq!(
+            cli.slot_buf_info(12),
+            (ptr12, cap12, true),
+            "evicted 64 KiB slot must reuse exact backing allocation in place"
+        );
+
+        // Cross-slot 256 KiB reuse and 256 KiB -> smaller tile overwrite
+        // recycling back into the worker's LIFO shard.
+        cli.evict(10).unwrap();
+        put_solid(&mut cli, 0, 42, rect_256, Vec4u8(3, 3, 3, 0xFF));
+        cli.recompute_and_verify_bytes().unwrap();
+        assert_eq!(cli.slot_buf_info(42), (ptr0, cap0, true));
+        put_solid(&mut cli, 0, 42, rect_128, Vec4u8(5, 5, 5, 0xFF));
+        put_solid(&mut cli, 0, 10, rect_256, Vec4u8(4, 5, 6, 0xFF));
+        cli.recompute_and_verify_bytes().unwrap();
+        assert_eq!(cli.slot_buf_info(10), (ptr0, cap0, true));
+        cli.evict(42).unwrap();
+
+        // 2. In-band `reset_tile_cache = true` retains capacity across resync
+        //    and returns each `256 KiB` buffer to its owning worker's shard
+        //    (preserving L2/L3 worker affinity even when slot IDs swap).
+        put_solid(&mut cli, 1, 11, rect_256, Vec4u8(7, 8, 9, 0xFF));
+        cli.recompute_and_verify_bytes().unwrap();
+        let (ptr11, cap11, _) = cli.slot_buf_info(11);
+        cli.apply_header_ops(true, &[]).unwrap();
+        assert_eq!(cli.occupied_slots(), 0);
+        assert_eq!(cli.used_bytes(), 0);
+        assert_eq!(cli.capacity_bytes(), (2 * 256 * 256 + 2 * 128 * 128) * 4);
+
+        put_solid(&mut cli, 1, 10, rect_256, Vec4u8(10, 11, 12, 0xFF));
+        put_solid(&mut cli, 0, 11, rect_256, Vec4u8(13, 14, 15, 0xFF));
+        cli.recompute_and_verify_bytes().unwrap();
+        assert_eq!(
+            cli.slot_buf_info(10),
+            (ptr11, cap11, true),
+            "worker 1 must reclaim its own L2-hot buffer even on a different slot"
+        );
+        assert_eq!(
+            cli.slot_buf_info(11),
+            (ptr0, cap0, true),
+            "worker 0 must reclaim its own L2-hot buffer even on a different slot"
+        );
+
+        // 3. `ClientTileCache::clear()` releases ALL backing memory (even when
+        //    slots were already marked empty via `reset_in_band()`).
+        cli.reset_in_band();
+        assert_eq!(cli.occupied_slots(), 0);
+        assert!(cli.capacity_bytes() > 0);
+        cli.clear();
+        assert_eq!(cli.occupied_slots(), 0);
+        assert_eq!(cli.used_bytes(), 0);
+        assert_eq!(cli.capacity_bytes(), 0);
+
+        // 4. `recompute_and_verify_bytes()` strictly trims recycled stacks and
+        //    unoccupied warm slot capacities whenever total capacity exceeds
+        //    `MAX_TILE_CACHE_BYTES`.
+        for s in 500u16..540 {
+            put_solid(&mut cli, 0, s, rect_128, Vec4u8(0x11, 0x22, 0x33, 0xFF));
+        }
+        for s in 540u16..550 {
+            put_solid(
+                &mut cli,
+                (s as usize) % 4,
+                s,
+                rect_256,
+                Vec4u8(0x22, 0x33, 0x44, 0xFF),
+            );
+        }
+        cli.recompute_and_verify_bytes().unwrap();
+        for s in 500u16..550 {
+            cli.evict(s).unwrap();
+        }
+        assert_eq!(cli.occupied_slots(), 0);
+        assert_eq!(cli.capacity_bytes(), 40 * 64 * 1024 + 10 * 256 * 1024);
+
+        for s in 0u16..256 {
+            put_solid(
+                &mut cli,
+                (s as usize) % 4,
+                s,
+                rect_256,
+                Vec4u8(0x44, 0x55, 0x66, 0xFF),
+            );
+        }
+        assert!(
+            cli.capacity_bytes() > MAX_TILE_CACHE_BYTES,
+            "precondition: warm unoccupied slots push raw capacity over 64 MiB"
+        );
+        cli.recompute_and_verify_bytes().unwrap();
+        assert_eq!(cli.occupied_slots(), 256);
+        assert_eq!(cli.used_bytes(), MAX_TILE_CACHE_BYTES);
+        assert!(
+            cli.capacity_bytes() <= MAX_TILE_CACHE_BYTES,
+            "recompute_and_verify_bytes must enforce capacity_bytes <= MAX_TILE_CACHE_BYTES, got {}",
+            cli.capacity_bytes()
+        );
+
+        // 5. Occupied slack cap: overwrite 160 slots (256 KiB cap -> 160 KiB
+        //    live, recycling the 256 KiB buffers into worker shards) and fill
+        //    60 new 256 KiB slots within the 64 MiB live budget -> raw capacity
+        //    exceeds 64 MiB; `recompute_and_verify_bytes()` must strictly
+        //    enforce `capacity_bytes <= MAX_TILE_CACHE_BYTES` while preserving
+        //    every occupied slot's pixels.
+        for s in 0u16..160 {
+            put_solid(&mut cli, 0, s, rect_160, Vec4u8(0x77, 0x88, 0x99, 0xFF));
+        }
+        for s in 256u16..316 {
+            put_solid(&mut cli, 0, s, rect_256, Vec4u8(0xAA, 0xBB, 0xCC, 0xFF));
+        }
+        assert!(cli.capacity_bytes() > MAX_TILE_CACHE_BYTES);
+        cli.recompute_and_verify_bytes().unwrap();
+        assert!(cli.used_bytes() <= MAX_TILE_CACHE_BYTES);
+        assert!(cli.capacity_bytes() <= MAX_TILE_CACHE_BYTES);
+        let hit = cli
+            .validate_hit(
+                0,
+                CacheHitRef {
+                    slot_id: 0,
+                    region: crate::serialization::framing::CacheHitRegion::Full,
+                },
+                rect_160,
+                false,
+            )
+            .unwrap();
+        let (src, stride_px) = cli.slot_hit_src(hit);
+        assert_eq!(stride_px, 160);
+        assert!(src.iter().all(|&p| p == Vec4u8(0x77, 0x88, 0x99, 0xFF)));
+
+        // 6. Occupied non-256 KiB slack shrink_to_fit(): fill 400 slots with
+        //    `160x256` (`160 KiB` = `64 MiB` total), overwrite 200 of them with
+        //    `128x256` (`128 KiB` live, below the 2x shrink threshold -> keeps
+        //    `160 KiB` capacity), and fill 50 new `128x256` slots (`6.4 MiB`).
+        //    Live bytes = `60.8 MiB <= 64 MiB`, raw capacity = `70.4 MiB > 64 MiB`
+        //    with zero recycled or unoccupied buffers; `recompute_and_verify_bytes`
+        //    must shrink occupied slack to enforce `<= 64 MiB` with bit-exact pixels.
+        cli.clear();
+        let rect_128x256 = TileRect {
+            x: 0,
+            y: 0,
+            w: 128,
+            h: 256,
+        };
+        for s in 0u16..400 {
+            put_solid(&mut cli, 0, s, rect_160, Vec4u8(0x12, 0x34, 0x56, 0xFF));
+        }
+        cli.recompute_and_verify_bytes().unwrap();
+        for s in 0u16..200 {
+            put_solid(&mut cli, 0, s, rect_128x256, Vec4u8(0x65, 0x43, 0x21, 0xFF));
+        }
+        for s in 400u16..450 {
+            put_solid(&mut cli, 0, s, rect_128x256, Vec4u8(0x98, 0x76, 0x54, 0xFF));
+        }
+        assert!(cli.capacity_bytes() > MAX_TILE_CACHE_BYTES);
+        cli.recompute_and_verify_bytes().unwrap();
+        assert!(cli.used_bytes() <= MAX_TILE_CACHE_BYTES);
+        assert!(cli.capacity_bytes() <= MAX_TILE_CACHE_BYTES);
+        let hit2 = cli
+            .validate_hit(
+                0,
+                CacheHitRef {
+                    slot_id: 0,
+                    region: crate::serialization::framing::CacheHitRegion::Full,
+                },
+                rect_128x256,
+                false,
+            )
+            .unwrap();
+        let (src2, stride2) = cli.slot_hit_src(hit2);
+        assert_eq!(stride2, 128);
+        assert!(src2.iter().all(|&p| p == Vec4u8(0x65, 0x43, 0x21, 0xFF)));
+
+        cli.clear();
+        assert_eq!(cli.capacity_bytes(), 0);
+    }
+
+    #[test]
+    #[cfg_attr(miri, ignore)]
+    fn test_direct_cold_fill_concurrent_dedup_hybrid_disconnect_and_overflow() {
+        with_test_codec(|compressor, decompressor| {
+            let tr = |x, y, w, h| TileRect { x, y, w, h };
+
+            // 1. Concurrent direct cold-fill with Hybrid lossless promotion:
+            //    text tiles & text quadrants promote to Lossless, photo JPEG
+            //    tiles remain Lossy, solid tiles allocate 0 slots, and duplicate
+            //    tiles deduplicate intra-frame.
+            let width = 768usize;
+            let height = 512usize;
+            let stride = width * 4;
+            let len = height * stride;
+            let meta = BufferMetadata {
+                width: width as i32,
+                height: height as i32,
+                stride: stride as i32,
+                format: BufferFormat::Xrgb8888,
+            };
+            let mut frame = vec![0u8; len];
+            // (0,0): UI text 256x256 (promotes Lossless)
+            fill_ui_text(&mut frame, width, tr(0, 0, 256, 256), false);
+            // (256,0): exact duplicate of (0,0) -> intra-frame CacheHit!
+            for y in 0..256 {
+                let row = y * stride;
+                let copy: Vec<u8> = frame[row..row + 256 * 4].to_vec();
+                frame[row + 256 * 4..row + 512 * 4].copy_from_slice(&copy);
+            }
+            // (512,0): wholly solid -> 0 cache slots!
+            for y in 0..256 {
+                for x in 512..768 {
+                    let off = y * stride + x * 4;
+                    frame[off..off + 4].copy_from_slice(&[0x20, 0x40, 0x60, 0xFF]);
+                }
+            }
+            // (0,256): pure smooth photo -> JPEG (stays Lossy)
+            fill_smooth_photo(&mut frame, width, tr(0, 256, 256, 256), 0xFF);
+            // (256,256): mixed Split (TL text promotes Lossless, rest photo JPEG)
+            fill_ui_text(&mut frame, width, tr(256, 256, 128, 128), false);
+            fill_smooth_photo(&mut frame, width, tr(384, 256, 128, 128), 0xFF);
+            fill_smooth_photo(&mut frame, width, tr(256, 384, 256, 128), 0xFF);
+            // (512,256): unique UI text
+            fill_ui_text(&mut frame, width, tr(512, 256, 256, 256), false);
+            frame[(260 * width + 520) * 4] ^= 0x7F;
+
+            let hybrid = CompressionMode::Hybrid {
+                quality: 85,
+                subsamp: JpegSubsamp::Sub420,
+            };
+            let mut srv = ServerTileCache::new();
+            let mut cli = ClientTileCache::new();
+            let mut shadow = Vec::new();
+            let mut canvas = vec![0xAAu8; len];
+
+            let send_recv = |f: &[u8],
+                             full: bool,
+                             mode: CompressionMode,
+                             sh: &mut Vec<u8>,
+                             srv: &mut ServerTileCache,
+                             cli: &mut ClientTileCache,
+                             canv: &mut [u8],
+                             comp: &mut ShardingCompressor,
+                             decomp: &mut ShardingDecompressor|
+             -> (RawBufferHeader, Vec<CompressedTile>) {
+                let p = f.as_ptr();
+                let bp = unsafe { BufferPointer::new(&p, len) };
+                let mut st = None;
+                if full {
+                    filter_and_compress_full_streaming(
+                        bp,
+                        ClientId(1),
+                        WlSurfaceId(11),
+                        meta,
+                        mode,
+                        Some(sh),
+                        Some(srv),
+                        comp,
+                        |s| st = Some(s),
+                    );
+                } else {
+                    filter_and_compress_incremental_streaming(
+                        bp,
+                        ClientId(1),
+                        WlSurfaceId(11),
+                        meta,
+                        mode,
+                        None,
+                        sh,
+                        Some(srv),
+                        comp,
+                        |s| st = Some(s),
+                    );
+                }
+                let mut wire = Vec::new();
+                st.unwrap().framed_write(&mut wire).unwrap();
+                let mut rx_opt = None;
+                CompressedTileStream::read_from_stream(&mut wire.as_slice(), |s| {
+                    rx_opt = Some(s);
+                    Ok(())
+                })
+                .unwrap();
+                let stream = rx_opt.unwrap();
+                let hdr = stream.header.clone();
+                let tiles: Vec<CompressedTile> = stream
+                    .tiles
+                    .into_iter()
+                    .collect::<Result<Vec<_>>>()
+                    .unwrap();
+                let (tx, rx) = crossbeam_channel::unbounded();
+                for t in &tiles {
+                    tx.send(Ok(t.clone())).unwrap();
+                }
+                drop(tx);
+                let validated = ValidatedTileStream::new(CompressedTileStream {
+                    header: hdr.clone(),
+                    tiles: rx,
+                })
+                .unwrap();
+                decompress_and_unfilter_streaming(validated, decomp, canv, Some(cli)).unwrap();
+                (hdr, tiles)
+            };
+
+            let (_, tiles_cold) = send_recv(
+                &frame,
+                true,
+                hybrid,
+                &mut shadow,
+                &mut srv,
+                &mut cli,
+                &mut canvas,
+                compressor,
+                decompressor,
+            );
+            // 6 base tiles: 1 solid (0 slots), 2 identical text (1 slot + 1 hit),
+            // 1 photo, 1 split, 1 unique text -> exactly 4 slots!
+            assert_eq!(srv.occupied_slots(), 4);
+            assert_eq!(cli.occupied_slots(), 4);
+            assert_eq!(
+                tiles_cold
+                    .iter()
+                    .filter(|t| matches!(t.payload, TilePayload::CacheHit(_)))
+                    .count(),
+                1
+            );
+            assert_eq!(
+                tiles_cold
+                    .iter()
+                    .filter(|t| matches!(t.payload, TilePayload::Leaf(LeafPayload::Solid(_))))
+                    .count(),
+                1
+            );
+
+            // Switch to solid screen (no cache pollution), then return in
+            // Lossless mode: promoted text tiles & promoted Split TL quadrant
+            // MUST hit, while JPEG photo tile MUST miss and decode bit-exact!
+            let solid_bg = [0x10u8, 0x10, 0x10, 0xFF].repeat(width * height);
+            send_recv(
+                &solid_bg,
+                false,
+                CompressionMode::Lossless,
+                &mut shadow,
+                &mut srv,
+                &mut cli,
+                &mut canvas,
+                compressor,
+                decompressor,
+            );
+            let (hdr_ll, tiles_ll) = send_recv(
+                &frame,
+                false,
+                CompressionMode::Lossless,
+                &mut shadow,
+                &mut srv,
+                &mut cli,
+                &mut canvas,
+                compressor,
+                decompressor,
+            );
+            let hit_rects: Vec<TileRect> = tiles_ll
+                .iter()
+                .filter(|t| matches!(t.payload, TilePayload::CacheHit(_)))
+                .map(|t| hdr_ll.tile_rects[t.tile_idx as usize])
+                .collect();
+            assert!(hit_rects.contains(&tr(0, 0, 256, 256)));
+            assert!(hit_rects.contains(&tr(256, 0, 256, 256)));
+            assert!(hit_rects.contains(&tr(512, 256, 256, 256)));
+            assert!(hit_rects.contains(&tr(256, 256, 128, 128)));
+            assert!(!hit_rects.contains(&tr(0, 256, 256, 256)));
+            assert_canvas_matches_frame(&canvas, &frame, meta, 0);
+
+            // 2. Early disconnect mid-cold-fill resets `ServerTileCache` and
+            //    marks `reset_tile_cache = true` on the next frame while still
+            //    completely initializing `shadow`.
+            let mut srv_disc = ServerTileCache::new();
+            let mut sh_disc = Vec::new();
+            {
+                let p = frame.as_ptr();
+                let bp = unsafe { BufferPointer::new(&p, len) };
+                filter_and_compress_full_streaming(
+                    bp,
+                    ClientId(1),
+                    WlSurfaceId(11),
+                    meta,
+                    CompressionMode::Lossless,
+                    Some(&mut sh_disc),
+                    Some(&mut srv_disc),
+                    compressor,
+                    drop,
+                );
+            }
+            assert_eq!(sh_disc.as_slice(), frame.as_slice());
+            assert_eq!(srv_disc.occupied_slots(), 0);
+            assert_eq!(srv_disc.used_bytes(), 0);
+            let mut cli_disc = ClientTileCache::new();
+            let (hdr_after_disc, _) = send_recv(
+                &frame,
+                true,
+                CompressionMode::Lossless,
+                &mut sh_disc,
+                &mut srv_disc,
+                &mut cli_disc,
+                &mut canvas,
+                compressor,
+                decompressor,
+            );
+            assert!(
+                hdr_after_disc.reset_tile_cache,
+                "first frame after mid-cold-fill disconnect must set reset_tile_cache = true"
+            );
+            assert_canvas_matches_frame(&canvas, &frame, meta, 0);
+
+            // 3. Direct cold-fill overflow: > MAX_TILE_CACHE_SLOTS and
+            //    > MAX_TILE_CACHE_BYTES cleanly return `TileCacheAction::Uncached`.
+            let mut srv_slots = ServerTileCache::new();
+            srv_slots.begin_cold_fill();
+            let r16 = tr(0, 0, 16, 16);
+            let mut puts = 0usize;
+            let mut uncached = 0usize;
+            for i in 0..(MAX_TILE_CACHE_SLOTS + 8) {
+                let mut h = [0u8; 16];
+                h[..8].copy_from_slice(&(i as u64 + 1).to_le_bytes());
+                match srv_slots.claim_cold_tile(r16, h, None, false, TileQuality::Lossless) {
+                    TileCacheAction::Put(_) => puts += 1,
+                    TileCacheAction::Uncached => uncached += 1,
+                    other => panic!("unexpected action {other:?}"),
+                }
+            }
+            assert_eq!(puts, MAX_TILE_CACHE_SLOTS);
+            assert_eq!(uncached, 8);
+            assert_eq!(srv_slots.occupied_slots(), MAX_TILE_CACHE_SLOTS);
+
+            let mut srv_bytes = ServerTileCache::new();
+            srv_bytes.begin_cold_fill();
+            let r256 = tr(0, 0, 256, 256);
+            let max_256_slots = MAX_TILE_CACHE_BYTES / (256 * 256 * 4);
+            let mut b_puts = 0usize;
+            let mut b_uncached = 0usize;
+            for i in 0..(max_256_slots + 5) {
+                let mut h = [0u8; 16];
+                h[..8].copy_from_slice(&(i as u64 + 10_000).to_le_bytes());
+                match srv_bytes.claim_cold_tile(r256, h, None, false, TileQuality::Lossless) {
+                    TileCacheAction::Put(_) => b_puts += 1,
+                    TileCacheAction::Uncached => b_uncached += 1,
+                    other => panic!("unexpected action {other:?}"),
+                }
+            }
+            assert_eq!(b_puts, max_256_slots);
+            assert_eq!(b_uncached, 5);
+            assert_eq!(srv_bytes.used_bytes(), MAX_TILE_CACHE_BYTES);
         });
     }
 }

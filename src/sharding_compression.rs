@@ -366,6 +366,7 @@ pub(crate) fn compress_bytes(
 const MAX_JPEG_PROGRESSIVE_SCANS: u32 = 100;
 
 pub(crate) struct DecompressorWorkerState {
+    pub(crate) worker_idx: usize,
     pub(crate) decompressor: Decompressor<'static>,
     pub(crate) filt_bgr: Vec<u8>,
     pub(crate) dec_row_a: Vec<u8>,
@@ -378,8 +379,9 @@ pub(crate) struct DecompressorWorkerState {
 }
 
 impl DecompressorWorkerState {
-    fn new() -> Result<Self> {
+    fn new(worker_idx: usize) -> Result<Self> {
         Ok(Self {
+            worker_idx,
             decompressor: Decompressor::new().location(loc!())?,
             filt_bgr: vec![0u8; TILE_PIXELS * 3],
             dec_row_a: vec![0u8; TILE_W * 3],
@@ -454,8 +456,13 @@ pub struct ShardingDecompressor {
 
 impl ShardingDecompressor {
     pub fn new(n_decompressors: NonZeroUsize) -> Result<Self> {
-        let pool =
-            WorkerPool::new(n_decompressors, DecompressorWorkerState::new).location(loc!())?;
+        let mut next_worker_idx = 0usize;
+        let pool = WorkerPool::new(n_decompressors, || {
+            let worker_idx = next_worker_idx;
+            next_worker_idx += 1;
+            DecompressorWorkerState::new(worker_idx)
+        })
+        .location(loc!())?;
         Ok(Self { pool })
     }
 }

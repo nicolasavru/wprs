@@ -713,7 +713,7 @@ impl WprsClientState {
         let surface_id = buffer_stream.header.surface;
         let frame_seq = buffer_stream.header.frame_seq;
         if buffer_stream.header.reset_tile_cache {
-            self.tile_cache.clear();
+            self.tile_cache.reset_in_band();
         }
 
         let decode_res = (|| -> Result<()> {
