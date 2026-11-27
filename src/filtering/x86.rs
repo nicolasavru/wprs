@@ -182,6 +182,293 @@ mod detect {
     }
 }
 
+/// Defines a single-pass `SIMD + aes` active `RowBand2D` finisher inside an
+/// x86 SIMD tier module (`avx512`, `avx2`, or `ssse3`). Walks each remaining
+/// row strictly contiguously from `x = 0..width` (zero 512 B prefetcher holes),
+/// executing `CopyAndAbsorb` in-place on `bbox.full` quadrants and absorbing
+/// `!bbox.full` active quadrants directly from the L1d-hot 512 B `shadow` chunk
+/// just scanned by `diff_and_update_row_impl`, with VEX `vaesenc` (zero
+/// `vzeroupper` transitions on AVX2/AVX-512) and a `copy_and_absorb` fast exit
+/// once `full_count == n_qx`.
+macro_rules! impl_finish_active_row_band_aes {
+    ($base_feat:literal, $aes_feat:literal) => {
+        #[inline(never)]
+        #[target_feature(enable = $base_feat)]
+        unsafe fn diff_and_update_row_band_2d_impl<const HAS_ALPHA: bool>(
+            kernel: Kernel,
+            ctx: &crate::filtering::ActiveRowBandCtx<'_>,
+        ) {
+            // SAFETY: Caller upholds disjoint-row shadow bounds invariants.
+            unsafe {
+                crate::filtering::diff_and_update_row_band_2d_with::<Kernel, HAS_ALPHA>(
+                    kernel, ctx,
+                );
+            }
+        }
+
+        #[cold]
+        #[inline(never)]
+        #[target_feature(enable = $base_feat)]
+        unsafe fn diff_and_update_active_band_fallback<const HAS_ALPHA: bool>(
+            kernel: Kernel,
+            ctx: &crate::filtering::ActiveRowBandCtx<'_>,
+            qx_bboxes: &mut [crate::filtering::QuadBbox],
+            trigger_y: usize,
+            full_count: usize,
+        ) {
+            // SAFETY: Caller upholds disjoint-row shadow bounds invariants.
+            unsafe {
+                crate::filtering::finish_active_row_band_2d_with::<Kernel, HAS_ALPHA>(
+                    kernel, ctx, qx_bboxes, trigger_y, full_count,
+                );
+            }
+        }
+
+        #[inline(never)]
+        #[target_feature(enable = $aes_feat)]
+        unsafe fn diff_and_update_active_band_aes<const HAS_ALPHA: bool>(
+            ctx: &crate::filtering::ActiveRowBandCtx<'_>,
+            scans: &crate::filtering::SlotScans,
+            qx_bboxes: &mut [crate::filtering::QuadBbox],
+            trigger_y: usize,
+            mut full_count: usize,
+        ) {
+            use std::arch::x86_64::_mm_set1_epi32;
+            use std::mem::MaybeUninit;
+            use std::ptr;
+            use std::slice;
+            use std::sync::atomic::Ordering;
+
+            use crate::filtering::CROP_CACHE_LOOKUP_MIN_PIXELS;
+            use crate::filtering::CROP_MAX_AREA_PCT;
+            use crate::filtering::STACK_HASH_CAP;
+            use crate::filtering::SUBTILE_W;
+            use crate::filtering::SlotDirty;
+            use crate::filtering::tile_hash::BandRowAction;
+            use crate::filtering::tile_hash::RowTileHasher;
+            use crate::filtering::tile_hash::XRGB_ALPHA_MASK_U32;
+            use crate::filtering::tile_hash::x86_aes;
+            use crate::vec4u8::Vec4u8;
+
+            let width = ctx.width;
+            let stride = ctx.stride;
+            let stride_px = stride / 4;
+            let y0 = ctx.y0;
+            let y1 = ctx.y1;
+            let ch = y1 - y0;
+            let n_qx = ctx.dirty_slots.len();
+            let key = scans.key();
+
+            let mut stack_actions = [BandRowAction::Skip; STACK_HASH_CAP];
+            let mut heap_actions;
+            let qx_actions: &mut [BandRowAction] = if n_qx <= STACK_HASH_CAP {
+                &mut stack_actions[..n_qx]
+            } else {
+                heap_actions = vec![BandRowAction::Skip; n_qx];
+                &mut heap_actions
+            };
+            let mut stack_hashers = [MaybeUninit::<RowTileHasher>::uninit(); STACK_HASH_CAP];
+            let mut heap_hashers;
+            let qx_hashers: &mut [MaybeUninit<RowTileHasher>] = if n_qx <= STACK_HASH_CAP {
+                &mut stack_hashers[..n_qx]
+            } else {
+                heap_hashers = vec![MaybeUninit::<RowTileHasher>::uninit(); n_qx];
+                &mut heap_hashers
+            };
+
+            let absorbed_init = (trigger_y - y0) + 1;
+            let mut x = 0usize;
+            for ((bbox, act), slot_h) in qx_bboxes
+                .iter()
+                .zip(qx_actions.iter_mut())
+                .zip(qx_hashers.iter_mut())
+            {
+                let cw = (width - x).min(SUBTILE_W);
+                let start_next = if bbox.full {
+                    Some(BandRowAction::CopyAndAbsorb)
+                } else if ctx.cache_non_empty && bbox.is_dirty() {
+                    let area =
+                        usize::from(bbox.max_x - bbox.min_x) * usize::from(bbox.max_y - bbox.min_y);
+                    (area >= CROP_CACHE_LOOKUP_MIN_PIXELS).then_some(BandRowAction::AbsorbShadow)
+                } else {
+                    None
+                };
+                if let Some(next) = start_next {
+                    // SAFETY: Rows `[y0, trigger_y]` are finalized in `shadow`.
+                    let h = unsafe {
+                        x86_aes::start_row_hasher_from_shadow::<HAS_ALPHA>(
+                            key,
+                            ctx.shadow.base.cast_const(),
+                            stride,
+                            x * 4,
+                            y0,
+                            cw,
+                            ch,
+                            absorbed_init,
+                        )
+                    };
+                    slot_h.write(h);
+                    *act = next;
+                }
+                x += cw;
+            }
+
+            if trigger_y + 1 < y1 && width > 0 {
+                let last_end = (y1 - 1) * stride + width * 4;
+                assert!(last_end <= ctx.data.len());
+            }
+
+            let rk = x86_aes::load_key_block(&key.round_key);
+            let alpha_mask = _mm_set1_epi32(XRGB_ALPHA_MASK_U32 as i32);
+            let src_base = ctx.data.ptr();
+
+            for y in (trigger_y + 1)..y1 {
+                if full_count == n_qx {
+                    // SAFETY: Bounds validated above; every hasher slot is initialized.
+                    unsafe {
+                        x86_aes::copy_and_absorb_band_rows::<HAS_ALPHA>(
+                            key,
+                            src_base,
+                            ctx.shadow.base,
+                            stride,
+                            width,
+                            y,
+                            y1,
+                            qx_hashers,
+                        );
+                    }
+                    break;
+                }
+
+                let ry = y - y0;
+                let row_off = y * stride;
+                // SAFETY: `[y0, y1)` bounds validated above; `shadow` is exclusively owned.
+                let src_row_base = unsafe { src_base.add(row_off) };
+                let sh_row_base = unsafe { ctx.shadow.base.add(row_off) };
+                let (_, row_after) = ctx.aos.split_at(y * stride_px);
+                let (mut rem_aos, _) = row_after.split_at(width);
+                let dst_row =
+                    unsafe { slice::from_raw_parts_mut(sh_row_base.cast::<Vec4u8>(), width) };
+
+                let mut x = 0usize;
+                for ((bbox, act), slot_h) in qx_bboxes
+                    .iter_mut()
+                    .zip(qx_actions.iter_mut())
+                    .zip(qx_hashers.iter_mut())
+                {
+                    let cw = (width - x).min(SUBTILE_W);
+                    let (src_chunk, rest_aos) = rem_aos.split_at(cw);
+                    rem_aos = rest_aos;
+                    let x_bytes = x * 4;
+                    if bbox.full {
+                        // SAFETY: `bbox.full` guarantees `slot_h` was initialized and
+                        // transitioned to `CopyAndAbsorb` on an earlier row.
+                        let h = unsafe { slot_h.assume_init_mut() };
+                        unsafe {
+                            x86_aes::x86_absorb_one_hasher_row!(
+                                HAS_ALPHA,
+                                true,
+                                h,
+                                src_row_base.add(x_bytes),
+                                sh_row_base.add(x_bytes),
+                                rk,
+                                alpha_mask
+                            );
+                        }
+                    } else {
+                        let dst_chunk = &mut dst_row[x..x + cw];
+                        let mut became_full = false;
+                        let mut dirty = false;
+                        // SAFETY: Caller guarantees this tier's SIMD feature is enabled.
+                        if let Some((fx, lx)) =
+                            unsafe { diff_and_update_row_impl::<HAS_ALPHA>(src_chunk, dst_chunk) }
+                        {
+                            dirty = true;
+                            let max_crop_area = (cw * ch * CROP_MAX_AREA_PCT) / 100;
+                            became_full = bbox.record_row(ry, fx, lx, max_crop_area);
+                            if became_full {
+                                full_count += 1;
+                            }
+                        }
+                        if *act != BandRowAction::Skip {
+                            // SAFETY: Non-`Skip` guarantees `slot_h` is initialized;
+                            // `sh_row_base + x_bytes` is L1d-hot from the diff above.
+                            let h = unsafe { slot_h.assume_init_mut() };
+                            unsafe {
+                                x86_aes::x86_absorb_one_hasher_row!(
+                                    HAS_ALPHA,
+                                    false,
+                                    h,
+                                    sh_row_base.cast_const().add(x_bytes),
+                                    ptr::null_mut(),
+                                    rk,
+                                    alpha_mask
+                                );
+                            }
+                            if became_full {
+                                *act = BandRowAction::CopyAndAbsorb;
+                            }
+                        } else if dirty {
+                            let area = usize::from(bbox.max_x - bbox.min_x)
+                                * usize::from(bbox.max_y - bbox.min_y);
+                            if became_full
+                                || (ctx.cache_non_empty && area >= CROP_CACHE_LOOKUP_MIN_PIXELS)
+                            {
+                                // SAFETY: Rows `[y0, y]` are finalized in `shadow`.
+                                let h = unsafe {
+                                    x86_aes::start_row_hasher_from_shadow::<HAS_ALPHA>(
+                                        key,
+                                        ctx.shadow.base.cast_const(),
+                                        stride,
+                                        x_bytes,
+                                        y0,
+                                        cw,
+                                        ch,
+                                        ry + 1,
+                                    )
+                                };
+                                slot_h.write(h);
+                                *act = if became_full {
+                                    BandRowAction::CopyAndAbsorb
+                                } else {
+                                    BandRowAction::AbsorbShadow
+                                };
+                            }
+                        }
+                    }
+                    x += cw;
+                }
+            }
+
+            // SAFETY: Every non-`Skip` slot was initialized and absorbed all `ch` rows.
+            unsafe {
+                x86_aes::finish_band_hashers(key, qx_actions, qx_hashers, ctx.slot_base, scans);
+            }
+
+            for (slot, bbox) in ctx.dirty_slots.iter().zip(qx_bboxes.iter()) {
+                if bbox.full {
+                    slot.store(SlotDirty::FULL_RAW, Ordering::Relaxed);
+                } else if bbox.is_dirty() {
+                    let crop_area =
+                        usize::from(bbox.max_x - bbox.min_x) * usize::from(bbox.max_y - bbox.min_y);
+                    let has_quad_hash =
+                        ctx.cache_non_empty && crop_area >= CROP_CACHE_LOOKUP_MIN_PIXELS;
+                    slot.store(
+                        SlotDirty::encode_cropped(
+                            bbox.min_x,
+                            bbox.max_x,
+                            bbox.min_y,
+                            bbox.max_y,
+                            has_quad_hash,
+                        ),
+                        Ordering::Relaxed,
+                    );
+                }
+            }
+        }
+    };
+}
+
 mod avx512 {
     use std::arch::x86_64::__m128i;
     use std::arch::x86_64::__m256i;
@@ -213,8 +500,8 @@ mod avx512 {
     use std::arch::x86_64::_mm512_madd_epi16;
     use std::arch::x86_64::_mm512_maddubs_epi16;
     use std::arch::x86_64::_mm512_mask_blend_epi32;
-    use std::arch::x86_64::_mm512_mask_cmpneq_epi8_mask;
     use std::arch::x86_64::_mm512_mask_storeu_epi8;
+    use std::arch::x86_64::_mm512_mask_test_epi8_mask;
     use std::arch::x86_64::_mm512_maskz_loadu_epi8;
     use std::arch::x86_64::_mm512_maskz_permutexvar_epi8;
     use std::arch::x86_64::_mm512_maskz_sub_epi8;
@@ -242,6 +529,8 @@ mod avx512 {
     use std::mem::MaybeUninit;
 
     use crate::buffer_pointer::BufferPointer;
+    use crate::filtering::ActiveRowBandCtx;
+    use crate::filtering::QuadBbox;
     use crate::filtering::RowKernel;
     use crate::filtering::palette::MAX_PALETTE_COLORS;
     use crate::filtering::palette::PaletteLut4;
@@ -251,6 +540,7 @@ mod avx512 {
     use crate::filtering::palette::decode_palette_8bpp_scalar;
     use crate::filtering::palette::pack_palette_indices_scalar;
     use crate::filtering::palette::validate_palette_indices_scalar;
+    use crate::filtering::tile_hash;
     use crate::filtering::tile_hash::XRGB_ALPHA_MASK_U32;
     use crate::serialization::framing::packed_palette_indices_len;
     use crate::vec4u8::Vec4u8;
@@ -1075,6 +1365,16 @@ mod avx512 {
 
     #[target_feature(enable = "avx512bw,avx512vl,avx512vbmi")]
     #[inline]
+    fn avx512_diff_mask<const HAS_ALPHA: bool>(diff: __m512i) -> u64 {
+        if HAS_ALPHA {
+            _mm512_test_epi8_mask(diff, diff)
+        } else {
+            _mm512_mask_test_epi8_mask(MASK_RGB, diff, diff)
+        }
+    }
+
+    #[target_feature(enable = "avx512bw,avx512vl,avx512vbmi")]
+    #[inline]
     unsafe fn diff_and_update_row_impl<const HAS_ALPHA: bool>(
         src: BufferPointer<Vec4u8>,
         shadow: &mut [Vec4u8],
@@ -1083,22 +1383,71 @@ mod avx512 {
         debug_assert_eq!(shadow.len(), n);
         let src_p = src.ptr();
         let dst_p = shadow.as_mut_ptr();
-        let lim = (n / 16) * 16;
+        let lim64 = n & !63;
+        let lim16 = n & !15;
         let mut first = usize::MAX;
         let mut last_end = 0usize;
         // SAFETY: Caller guarantees AVX-512BW, `src_p` and `dst_p` are valid
         // for `n` `Vec4u8`s and non-overlapping (`src` is shm/caller, `shadow`
-        // is exclusively borrowed), and `i + 16 <= n`.
+        // is exclusively borrowed), and all offsets remain strictly `< n`.
         unsafe {
             let mut i = 0usize;
-            while i < lim {
+
+            // 4-vector OR-screened scan (256 B = 64 px/iter). Keeps `s0..s3` in
+            // ZMM registers so a mismatch commits those exact loads without
+            // ever re-reading `src_p` (TOCTOU-safe under concurrent `wl_shm`
+            // mutation).
+            while i < lim64 {
+                let s0 = _mm512_loadu_si512(src_p.add(i).cast());
+                let x0 = _mm512_xor_si512(s0, _mm512_loadu_si512(dst_p.add(i).cast()));
+                let s1 = _mm512_loadu_si512(src_p.add(i + 16).cast());
+                let x1 = _mm512_xor_si512(s1, _mm512_loadu_si512(dst_p.add(i + 16).cast()));
+                let s2 = _mm512_loadu_si512(src_p.add(i + 32).cast());
+                let x2 = _mm512_xor_si512(s2, _mm512_loadu_si512(dst_p.add(i + 32).cast()));
+                let s3 = _mm512_loadu_si512(src_p.add(i + 48).cast());
+                let x3 = _mm512_xor_si512(s3, _mm512_loadu_si512(dst_p.add(i + 48).cast()));
+                let any = _mm512_or_si512(_mm512_or_si512(x0, x1), _mm512_or_si512(x2, x3));
+                if avx512_diff_mask::<HAS_ALPHA>(any) != 0 {
+                    let m0 = avx512_diff_mask::<HAS_ALPHA>(x0);
+                    let m1 = avx512_diff_mask::<HAS_ALPHA>(x1);
+                    let m2 = avx512_diff_mask::<HAS_ALPHA>(x2);
+                    let m3 = avx512_diff_mask::<HAS_ALPHA>(x3);
+                    if m0 != 0 {
+                        _mm512_storeu_si512(dst_p.add(i).cast(), s0);
+                        if first == usize::MAX {
+                            first = i + (m0.trailing_zeros() as usize >> 2);
+                        }
+                        last_end = i + ((63 - m0.leading_zeros() as usize) >> 2) + 1;
+                    }
+                    if m1 != 0 {
+                        _mm512_storeu_si512(dst_p.add(i + 16).cast(), s1);
+                        if first == usize::MAX {
+                            first = i + 16 + (m1.trailing_zeros() as usize >> 2);
+                        }
+                        last_end = i + 16 + ((63 - m1.leading_zeros() as usize) >> 2) + 1;
+                    }
+                    if m2 != 0 {
+                        _mm512_storeu_si512(dst_p.add(i + 32).cast(), s2);
+                        if first == usize::MAX {
+                            first = i + 32 + (m2.trailing_zeros() as usize >> 2);
+                        }
+                        last_end = i + 32 + ((63 - m2.leading_zeros() as usize) >> 2) + 1;
+                    }
+                    if m3 != 0 {
+                        _mm512_storeu_si512(dst_p.add(i + 48).cast(), s3);
+                        if first == usize::MAX {
+                            first = i + 48 + (m3.trailing_zeros() as usize >> 2);
+                        }
+                        last_end = i + 48 + ((63 - m3.leading_zeros() as usize) >> 2) + 1;
+                    }
+                }
+                i += 64;
+            }
+
+            while i < lim16 {
                 let s = _mm512_loadu_si512(src_p.add(i).cast());
-                let d = _mm512_loadu_si512(dst_p.add(i).cast());
-                let neq = if HAS_ALPHA {
-                    _mm512_cmpneq_epi8_mask(s, d)
-                } else {
-                    _mm512_mask_cmpneq_epi8_mask(MASK_RGB, s, d)
-                };
+                let x = _mm512_xor_si512(s, _mm512_loadu_si512(dst_p.add(i).cast()));
+                let neq = avx512_diff_mask::<HAS_ALPHA>(x);
                 if neq != 0 {
                     _mm512_storeu_si512(dst_p.add(i).cast(), s);
                     if first == usize::MAX {
@@ -1108,7 +1457,7 @@ mod avx512 {
                 }
                 i += 16;
             }
-            for j in lim..n {
+            for j in lim16..n {
                 let s = src_p.add(j).read();
                 let d = dst_p.add(j).read();
                 let differs = if HAS_ALPHA {
@@ -1820,7 +2169,52 @@ mod avx512 {
             // SAFETY: `_mm_sfence` is baseline SSE (mandatory on all x86_64 CPUs).
             unsafe { _mm_sfence() };
         }
+
+        #[inline(always)]
+        unsafe fn diff_and_update_row_band_2d<const HAS_ALPHA: bool>(
+            self,
+            ctx: &ActiveRowBandCtx<'_>,
+        ) {
+            // SAFETY: `self` witnesses this tier's SIMD support, and caller upholds
+            // disjoint-row shadow bounds invariants.
+            unsafe {
+                diff_and_update_row_band_2d_impl::<HAS_ALPHA>(self, ctx);
+            }
+        }
+
+        #[inline(always)]
+        unsafe fn finish_active_row_band_2d<const HAS_ALPHA: bool>(
+            self,
+            ctx: &ActiveRowBandCtx<'_>,
+            qx_bboxes: &mut [QuadBbox],
+            trigger_y: usize,
+            full_count: usize,
+        ) {
+            if let Some(scans) = ctx.slot_scans
+                && tile_hash::has_hw_aes()
+            {
+                // SAFETY: `self` witnesses this tier's SIMD support, `has_hw_aes()`
+                // verified `aes`, and caller upholds disjoint-row shadow bounds.
+                unsafe {
+                    diff_and_update_active_band_aes::<HAS_ALPHA>(
+                        ctx, scans, qx_bboxes, trigger_y, full_count,
+                    );
+                }
+                return;
+            }
+            // SAFETY: Caller upholds disjoint-row shadow bounds invariants.
+            unsafe {
+                diff_and_update_active_band_fallback::<HAS_ALPHA>(
+                    self, ctx, qx_bboxes, trigger_y, full_count,
+                );
+            }
+        }
     }
+
+    impl_finish_active_row_band_aes!(
+        "avx512bw,avx512vl,avx512vbmi",
+        "avx512bw,avx512vl,avx512vbmi,aes"
+    );
 }
 
 #[cfg(not(all(
@@ -1877,6 +2271,7 @@ mod avx2 {
     use std::arch::x86_64::_mm256_maddubs_epi16;
     use std::arch::x86_64::_mm256_max_epu8;
     use std::arch::x86_64::_mm256_movemask_epi8;
+    use std::arch::x86_64::_mm256_movemask_ps;
     use std::arch::x86_64::_mm256_or_si256;
     use std::arch::x86_64::_mm256_packus_epi16;
     use std::arch::x86_64::_mm256_permute2x128_si256;
@@ -1914,6 +2309,8 @@ mod avx2 {
     use std::mem::MaybeUninit;
 
     use crate::buffer_pointer::BufferPointer;
+    use crate::filtering::ActiveRowBandCtx;
+    use crate::filtering::QuadBbox;
     use crate::filtering::RowKernel;
     use crate::filtering::palette::MAX_PALETTE_COLORS;
     use crate::filtering::palette::PaletteLut4;
@@ -1923,6 +2320,7 @@ mod avx2 {
     use crate::filtering::palette::decode_palette_8bpp_scalar;
     use crate::filtering::palette::pack_palette_indices_scalar;
     use crate::filtering::palette::validate_palette_indices_scalar;
+    use crate::filtering::tile_hash;
     use crate::filtering::tile_hash::XRGB_ALPHA_MASK_U32;
     use crate::serialization::framing::packed_palette_indices_len;
     use crate::vec4u8::Vec4u8;
@@ -3152,6 +3550,22 @@ mod avx2 {
 
     #[target_feature(enable = "avx2")]
     #[inline]
+    fn avx2_px_neq_mask8<const HAS_ALPHA: bool>(
+        diff: __m256i,
+        rgb_mask: __m256i,
+        zero: __m256i,
+    ) -> u32 {
+        let masked = if HAS_ALPHA {
+            diff
+        } else {
+            _mm256_and_si256(diff, rgb_mask)
+        };
+        let eq = _mm256_movemask_ps(_mm256_castsi256_ps(_mm256_cmpeq_epi32(masked, zero))) as u32;
+        (!eq) & 0xFF
+    }
+
+    #[target_feature(enable = "avx2")]
+    #[inline]
     unsafe fn diff_and_update_row_impl<const HAS_ALPHA: bool>(
         src: BufferPointer<Vec4u8>,
         shadow: &mut [Vec4u8],
@@ -3160,38 +3574,88 @@ mod avx2 {
         debug_assert_eq!(shadow.len(), n);
         let src_p = src.ptr();
         let dst_p = shadow.as_mut_ptr();
-        let lim = (n / 8) * 8;
+        let lim32 = n & !31;
+        let lim8 = n & !7;
         let mut first = usize::MAX;
         let mut last_end = 0usize;
         // SAFETY: Caller guarantees AVX2, `src_p` and `dst_p` are valid for `n`
         // `Vec4u8`s and non-overlapping (`src` is shm/caller, `shadow` is
-        // exclusively borrowed), and `i + 8 <= n`.
+        // exclusively borrowed), and all offsets remain strictly `< n`.
         unsafe {
-            let zero = _mm256_setzero_si256();
             let rgb_mask = _mm256_set1_epi32(0x00FF_FFFFu32 as i32);
+            let zero = _mm256_setzero_si256();
             let mut i = 0usize;
-            while i < lim {
-                let s = _mm256_loadu_si256(src_p.add(i).cast::<__m256i>());
-                let d = _mm256_loadu_si256(dst_p.add(i).cast::<__m256i>());
-                let diff = _mm256_xor_si256(s, d);
-                let masked = if HAS_ALPHA {
-                    diff
+
+            // 4-vector OR-screened scan (128 B = 32 px/iter). Keeps `s0..s3` in
+            // YMM registers so a mismatch commits those exact loads without
+            // ever re-reading `src_p` (TOCTOU-safe under concurrent `wl_shm`
+            // mutation), and packs all 32 pixel-diff bits into a single `u32`
+            // via `vmovmskps` for branchless `first`/`last_end` extraction.
+            while i < lim32 {
+                let s0 = _mm256_loadu_si256(src_p.add(i).cast::<__m256i>());
+                let x0 = _mm256_xor_si256(s0, _mm256_loadu_si256(dst_p.add(i).cast::<__m256i>()));
+                let s1 = _mm256_loadu_si256(src_p.add(i + 8).cast::<__m256i>());
+                let x1 =
+                    _mm256_xor_si256(s1, _mm256_loadu_si256(dst_p.add(i + 8).cast::<__m256i>()));
+                let s2 = _mm256_loadu_si256(src_p.add(i + 16).cast::<__m256i>());
+                let x2 =
+                    _mm256_xor_si256(s2, _mm256_loadu_si256(dst_p.add(i + 16).cast::<__m256i>()));
+                let s3 = _mm256_loadu_si256(src_p.add(i + 24).cast::<__m256i>());
+                let x3 =
+                    _mm256_xor_si256(s3, _mm256_loadu_si256(dst_p.add(i + 24).cast::<__m256i>()));
+                let any = _mm256_or_si256(_mm256_or_si256(x0, x1), _mm256_or_si256(x2, x3));
+                let is_dirty = if HAS_ALPHA {
+                    _mm256_testz_si256(any, any) == 0
                 } else {
-                    _mm256_and_si256(diff, rgb_mask)
+                    _mm256_testz_si256(any, rgb_mask) == 0
                 };
-                if _mm256_testz_si256(masked, masked) == 0 {
+                if is_dirty {
+                    let m0 = avx2_px_neq_mask8::<HAS_ALPHA>(x0, rgb_mask, zero);
+                    let m1 = avx2_px_neq_mask8::<HAS_ALPHA>(x1, rgb_mask, zero);
+                    let m2 = avx2_px_neq_mask8::<HAS_ALPHA>(x2, rgb_mask, zero);
+                    let m3 = avx2_px_neq_mask8::<HAS_ALPHA>(x3, rgb_mask, zero);
+                    if m0 != 0 {
+                        _mm256_storeu_si256(dst_p.add(i).cast::<__m256i>(), s0);
+                    }
+                    if m1 != 0 {
+                        _mm256_storeu_si256(dst_p.add(i + 8).cast::<__m256i>(), s1);
+                    }
+                    if m2 != 0 {
+                        _mm256_storeu_si256(dst_p.add(i + 16).cast::<__m256i>(), s2);
+                    }
+                    if m3 != 0 {
+                        _mm256_storeu_si256(dst_p.add(i + 24).cast::<__m256i>(), s3);
+                    }
+                    let mask32 = m0 | (m1 << 8) | (m2 << 16) | (m3 << 24);
+                    debug_assert_ne!(mask32, 0);
+                    if first == usize::MAX {
+                        first = i + mask32.trailing_zeros() as usize;
+                    }
+                    last_end = i + (32 - mask32.leading_zeros() as usize);
+                }
+                i += 32;
+            }
+
+            while i < lim8 {
+                let s = _mm256_loadu_si256(src_p.add(i).cast::<__m256i>());
+                let diff = _mm256_xor_si256(s, _mm256_loadu_si256(dst_p.add(i).cast::<__m256i>()));
+                let is_dirty = if HAS_ALPHA {
+                    _mm256_testz_si256(diff, diff) == 0
+                } else {
+                    _mm256_testz_si256(diff, rgb_mask) == 0
+                };
+                if is_dirty {
                     _mm256_storeu_si256(dst_p.add(i).cast::<__m256i>(), s);
-                    let eq = _mm256_movemask_epi8(_mm256_cmpeq_epi32(masked, zero)) as u32;
-                    let neq = !eq;
+                    let neq = avx2_px_neq_mask8::<HAS_ALPHA>(diff, rgb_mask, zero);
                     debug_assert_ne!(neq, 0);
                     if first == usize::MAX {
-                        first = i + (neq.trailing_zeros() as usize >> 2);
+                        first = i + neq.trailing_zeros() as usize;
                     }
-                    last_end = i + ((31 - neq.leading_zeros() as usize) >> 2) + 1;
+                    last_end = i + (32 - neq.leading_zeros() as usize);
                 }
                 i += 8;
             }
-            for j in lim..n {
+            for j in lim8..n {
                 let s = src_p.add(j).read();
                 let d = dst_p.add(j).read();
                 let differs = if HAS_ALPHA {
@@ -4042,7 +4506,49 @@ mod avx2 {
             // SAFETY: `_mm_sfence` is baseline SSE (mandatory on all x86_64 CPUs).
             unsafe { _mm_sfence() };
         }
+
+        #[inline(always)]
+        unsafe fn diff_and_update_row_band_2d<const HAS_ALPHA: bool>(
+            self,
+            ctx: &ActiveRowBandCtx<'_>,
+        ) {
+            // SAFETY: `self` witnesses this tier's SIMD support, and caller upholds
+            // disjoint-row shadow bounds invariants.
+            unsafe {
+                diff_and_update_row_band_2d_impl::<HAS_ALPHA>(self, ctx);
+            }
+        }
+
+        #[inline(always)]
+        unsafe fn finish_active_row_band_2d<const HAS_ALPHA: bool>(
+            self,
+            ctx: &ActiveRowBandCtx<'_>,
+            qx_bboxes: &mut [QuadBbox],
+            trigger_y: usize,
+            full_count: usize,
+        ) {
+            if let Some(scans) = ctx.slot_scans
+                && tile_hash::has_hw_aes()
+            {
+                // SAFETY: `self` witnesses this tier's SIMD support, `has_hw_aes()`
+                // verified `aes`, and caller upholds disjoint-row shadow bounds.
+                unsafe {
+                    diff_and_update_active_band_aes::<HAS_ALPHA>(
+                        ctx, scans, qx_bboxes, trigger_y, full_count,
+                    );
+                }
+                return;
+            }
+            // SAFETY: Caller upholds disjoint-row shadow bounds invariants.
+            unsafe {
+                diff_and_update_active_band_fallback::<HAS_ALPHA>(
+                    self, ctx, qx_bboxes, trigger_y, full_count,
+                );
+            }
+        }
     }
+
+    impl_finish_active_row_band_aes!("avx2", "avx2,aes");
 }
 
 #[cfg(all(
@@ -4061,6 +4567,7 @@ mod ssse3 {
     use std::arch::x86_64::_mm_alignr_epi8;
     use std::arch::x86_64::_mm_and_si128;
     use std::arch::x86_64::_mm_andnot_si128;
+    use std::arch::x86_64::_mm_castsi128_ps;
     use std::arch::x86_64::_mm_cmpeq_epi8;
     use std::arch::x86_64::_mm_cmpeq_epi32;
     use std::arch::x86_64::_mm_cvtsi32_si128;
@@ -4072,6 +4579,7 @@ mod ssse3 {
     use std::arch::x86_64::_mm_maddubs_epi16;
     use std::arch::x86_64::_mm_max_epu8;
     use std::arch::x86_64::_mm_movemask_epi8;
+    use std::arch::x86_64::_mm_movemask_ps;
     use std::arch::x86_64::_mm_or_si128;
     use std::arch::x86_64::_mm_packus_epi16;
     use std::arch::x86_64::_mm_sad_epu8;
@@ -4104,6 +4612,8 @@ mod ssse3 {
     use std::mem::MaybeUninit;
 
     use crate::buffer_pointer::BufferPointer;
+    use crate::filtering::ActiveRowBandCtx;
+    use crate::filtering::QuadBbox;
     use crate::filtering::RowKernel;
     use crate::filtering::palette::MAX_PALETTE_COLORS;
     use crate::filtering::palette::PaletteLut4;
@@ -4113,6 +4623,7 @@ mod ssse3 {
     use crate::filtering::palette::decode_palette_8bpp_scalar;
     use crate::filtering::palette::pack_palette_indices_scalar;
     use crate::filtering::palette::validate_palette_indices_scalar;
+    use crate::filtering::tile_hash;
     use crate::filtering::tile_hash::XRGB_ALPHA_MASK_U32;
     use crate::serialization::framing::packed_palette_indices_len;
     use crate::vec4u8::Vec4u8;
@@ -4882,6 +5393,22 @@ mod ssse3 {
 
     #[target_feature(enable = "ssse3")]
     #[inline]
+    fn ssse3_px_neq_mask4<const HAS_ALPHA: bool>(
+        diff: __m128i,
+        rgb_mask: __m128i,
+        zero: __m128i,
+    ) -> u32 {
+        let masked = if HAS_ALPHA {
+            diff
+        } else {
+            _mm_and_si128(diff, rgb_mask)
+        };
+        let eq = _mm_movemask_ps(_mm_castsi128_ps(_mm_cmpeq_epi32(masked, zero))) as u32;
+        (!eq) & 0xF
+    }
+
+    #[target_feature(enable = "ssse3")]
+    #[inline]
     unsafe fn diff_and_update_row_impl<const HAS_ALPHA: bool>(
         src: BufferPointer<Vec4u8>,
         shadow: &mut [Vec4u8],
@@ -4890,37 +5417,71 @@ mod ssse3 {
         debug_assert_eq!(shadow.len(), n);
         let src_p = src.ptr();
         let dst_p = shadow.as_mut_ptr();
-        let lim = (n / 4) * 4;
+        let lim16 = n & !15;
+        let lim4 = n & !3;
         let mut first = usize::MAX;
         let mut last_end = 0usize;
         // SAFETY: Caller guarantees SSSE3, `src_p` and `dst_p` are valid for
-        // `n` `Vec4u8`s and non-overlapping, and `i + 4 <= n`.
+        // `n` `Vec4u8`s and non-overlapping, and all offsets remain `< n`.
         unsafe {
             let zero = _mm_setzero_si128();
             let rgb_mask = _mm_set1_epi32(0x00FF_FFFFu32 as i32);
             let mut i = 0usize;
-            while i < lim {
-                let s = _mm_loadu_si128(src_p.add(i).cast::<__m128i>());
-                let d = _mm_loadu_si128(dst_p.add(i).cast::<__m128i>());
-                let diff = _mm_xor_si128(s, d);
-                let masked = if HAS_ALPHA {
-                    diff
-                } else {
-                    _mm_and_si128(diff, rgb_mask)
-                };
-                let eq_mask = _mm_movemask_epi8(_mm_cmpeq_epi8(masked, zero)) as u32;
-                if eq_mask != 0xFFFF {
-                    _mm_storeu_si128(dst_p.add(i).cast::<__m128i>(), s);
-                    let neq = (!eq_mask) & 0xFFFF;
-                    debug_assert_ne!(neq, 0);
-                    if first == usize::MAX {
-                        first = i + (neq.trailing_zeros() as usize >> 2);
+
+            // 4-vector OR-screened scan (64 B = 16 px/iter). Keeps `s0..s3` in
+            // XMM registers so a mismatch commits those exact loads without
+            // ever re-reading `src_p` (TOCTOU-safe).
+            while i < lim16 {
+                let s0 = _mm_loadu_si128(src_p.add(i).cast::<__m128i>());
+                let x0 = _mm_xor_si128(s0, _mm_loadu_si128(dst_p.add(i).cast::<__m128i>()));
+                let s1 = _mm_loadu_si128(src_p.add(i + 4).cast::<__m128i>());
+                let x1 = _mm_xor_si128(s1, _mm_loadu_si128(dst_p.add(i + 4).cast::<__m128i>()));
+                let s2 = _mm_loadu_si128(src_p.add(i + 8).cast::<__m128i>());
+                let x2 = _mm_xor_si128(s2, _mm_loadu_si128(dst_p.add(i + 8).cast::<__m128i>()));
+                let s3 = _mm_loadu_si128(src_p.add(i + 12).cast::<__m128i>());
+                let x3 = _mm_xor_si128(s3, _mm_loadu_si128(dst_p.add(i + 12).cast::<__m128i>()));
+                let any = _mm_or_si128(_mm_or_si128(x0, x1), _mm_or_si128(x2, x3));
+                if ssse3_px_neq_mask4::<HAS_ALPHA>(any, rgb_mask, zero) != 0 {
+                    let m0 = ssse3_px_neq_mask4::<HAS_ALPHA>(x0, rgb_mask, zero);
+                    let m1 = ssse3_px_neq_mask4::<HAS_ALPHA>(x1, rgb_mask, zero);
+                    let m2 = ssse3_px_neq_mask4::<HAS_ALPHA>(x2, rgb_mask, zero);
+                    let m3 = ssse3_px_neq_mask4::<HAS_ALPHA>(x3, rgb_mask, zero);
+                    if m0 != 0 {
+                        _mm_storeu_si128(dst_p.add(i).cast::<__m128i>(), s0);
                     }
-                    last_end = i + ((31 - neq.leading_zeros() as usize) >> 2) + 1;
+                    if m1 != 0 {
+                        _mm_storeu_si128(dst_p.add(i + 4).cast::<__m128i>(), s1);
+                    }
+                    if m2 != 0 {
+                        _mm_storeu_si128(dst_p.add(i + 8).cast::<__m128i>(), s2);
+                    }
+                    if m3 != 0 {
+                        _mm_storeu_si128(dst_p.add(i + 12).cast::<__m128i>(), s3);
+                    }
+                    let mask16 = m0 | (m1 << 4) | (m2 << 8) | (m3 << 12);
+                    debug_assert_ne!(mask16, 0);
+                    if first == usize::MAX {
+                        first = i + mask16.trailing_zeros() as usize;
+                    }
+                    last_end = i + (32 - mask16.leading_zeros() as usize);
+                }
+                i += 16;
+            }
+
+            while i < lim4 {
+                let s = _mm_loadu_si128(src_p.add(i).cast::<__m128i>());
+                let diff = _mm_xor_si128(s, _mm_loadu_si128(dst_p.add(i).cast::<__m128i>()));
+                let neq = ssse3_px_neq_mask4::<HAS_ALPHA>(diff, rgb_mask, zero);
+                if neq != 0 {
+                    _mm_storeu_si128(dst_p.add(i).cast::<__m128i>(), s);
+                    if first == usize::MAX {
+                        first = i + neq.trailing_zeros() as usize;
+                    }
+                    last_end = i + (32 - neq.leading_zeros() as usize);
                 }
                 i += 4;
             }
-            for j in lim..n {
+            for j in lim4..n {
                 let s = src_p.add(j).read();
                 let d = dst_p.add(j).read();
                 let differs = if HAS_ALPHA {
@@ -5738,7 +6299,49 @@ mod ssse3 {
             // SAFETY: `_mm_sfence` is baseline SSE (mandatory on all x86_64 CPUs).
             unsafe { _mm_sfence() };
         }
+
+        #[inline(always)]
+        unsafe fn diff_and_update_row_band_2d<const HAS_ALPHA: bool>(
+            self,
+            ctx: &ActiveRowBandCtx<'_>,
+        ) {
+            // SAFETY: `self` witnesses this tier's SIMD support, and caller upholds
+            // disjoint-row shadow bounds invariants.
+            unsafe {
+                diff_and_update_row_band_2d_impl::<HAS_ALPHA>(self, ctx);
+            }
+        }
+
+        #[inline(always)]
+        unsafe fn finish_active_row_band_2d<const HAS_ALPHA: bool>(
+            self,
+            ctx: &ActiveRowBandCtx<'_>,
+            qx_bboxes: &mut [QuadBbox],
+            trigger_y: usize,
+            full_count: usize,
+        ) {
+            if let Some(scans) = ctx.slot_scans
+                && tile_hash::has_hw_aes()
+            {
+                // SAFETY: `self` witnesses this tier's SIMD support, `has_hw_aes()`
+                // verified `aes`, and caller upholds disjoint-row shadow bounds.
+                unsafe {
+                    diff_and_update_active_band_aes::<HAS_ALPHA>(
+                        ctx, scans, qx_bboxes, trigger_y, full_count,
+                    );
+                }
+                return;
+            }
+            // SAFETY: Caller upholds disjoint-row shadow bounds invariants.
+            unsafe {
+                diff_and_update_active_band_fallback::<HAS_ALPHA>(
+                    self, ctx, qx_bboxes, trigger_y, full_count,
+                );
+            }
+        }
     }
+
+    impl_finish_active_row_band_aes!("ssse3", "ssse3,aes");
 }
 
 macro_rules! define_tier_wrappers {
@@ -6084,25 +6687,24 @@ macro_rules! define_tier_wrappers {
                 y1: usize,
                 dirty_slots: &[AtomicU32],
             ) {
+                let ctx = crate::filtering::ActiveRowBandCtx {
+                    data,
+                    aos,
+                    shadow,
+                    width,
+                    stride,
+                    y0,
+                    y1,
+                    slot_base: 0,
+                    dirty_slots,
+                    slot_scans: None,
+                    cache_non_empty: false,
+                };
                 // SAFETY: Caller verified CPU feature support and disjoint-row invariants.
                 unsafe {
                     let kernel = super::$tier_mod::Kernel::new_unchecked();
-                    crate::filtering::diff_and_update_row_band_2d_with::<
-                        super::$tier_mod::Kernel,
-                        HAS_ALPHA,
-                    >(
-                        kernel,
-                        data,
-                        aos,
-                        shadow,
-                        width,
-                        stride,
-                        y0,
-                        y1,
-                        0,
-                        dirty_slots,
-                        None,
-                        false,
+                    crate::filtering::RowKernel::diff_and_update_row_band_2d::<HAS_ALPHA>(
+                        kernel, &ctx,
                     );
                 }
             }
@@ -7229,8 +7831,7 @@ impl X86Tier {
                     )),
                 ))]
                 Self::Scalar => {
-                    super::diff_and_update_row_band_2d_with::<ScalarKernel, HAS_ALPHA>(
-                        ScalarKernel,
+                    let ctx = super::ActiveRowBandCtx {
                         data,
                         aos,
                         shadow,
@@ -7238,10 +7839,14 @@ impl X86Tier {
                         stride,
                         y0,
                         y1,
-                        0,
+                        slot_base: 0,
                         dirty_slots,
-                        None,
-                        false,
+                        slot_scans: None,
+                        cache_non_empty: false,
+                    };
+                    super::diff_and_update_row_band_2d_with::<ScalarKernel, HAS_ALPHA>(
+                        ScalarKernel,
+                        &ctx,
                     );
                 },
                 #[cfg(all(

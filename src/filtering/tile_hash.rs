@@ -35,8 +35,11 @@
 
 use std::collections::hash_map::RandomState;
 use std::hash::BuildHasher;
+use std::mem::MaybeUninit;
 
 use crate::buffer_pointer::BufferPointer;
+use crate::filtering::SUBTILE_W;
+use crate::filtering::tile_cache::SlotScans;
 use crate::serialization::framing::TileRect;
 use crate::vec4u8::Vec4u8;
 
@@ -100,6 +103,48 @@ impl TileHashResult {
     };
 }
 
+/// Incremental row-oriented 128-bit keyed tile hasher state (`80 B`, 16-byte
+/// aligned so `30` quadrants across a 4K band fit in `< 2.4 KiB` of L1d).
+///
+/// Produces bit-identical [`TileHashResult`] to [`hash_rect_from_shadow`] and
+/// [`copy_and_hash_rect_to_shadow`] across all backends (`x86_aes`,
+/// `aarch64_aes`, `portable`) while keeping `RowBand2D` scanning strictly
+/// linear row-major with zero vertical-stride re-reads.
+#[repr(C, align(16))]
+#[derive(Copy, Clone)]
+pub(crate) struct RowTileHasher {
+    lanes: [[u64; 2]; 4],
+    pub(crate) first_word: u32,
+    pub(crate) w: u16,
+    h: u16,
+    pub(crate) still_solid: bool,
+    pub(crate) still_opaque: bool,
+}
+
+/// Per-quadrant row action tag for [`process_band_row`].
+#[repr(u8)]
+#[derive(Copy, Clone, Eq, PartialEq, Debug)]
+pub(crate) enum BandRowAction {
+    /// Clean or below hash threshold — skip.
+    Skip = 0,
+    /// Active hasher, `!bbox.full`: absorb row `y` from L1d-hot `shadow`.
+    AbsorbShadow = 1,
+    /// Active hasher that just escalated to `bbox.full` on row `y`: absorb
+    /// row `y` from L1d-hot `shadow`, then transition to `CopyAndAbsorb`.
+    AbsorbShadowThenFull = 2,
+    /// Active hasher, `bbox.full`: copy row `y` from `src` to `shadow` and
+    /// absorb in-register in one linear pass.
+    CopyAndAbsorb = 3,
+    /// Newly crossed hash threshold on row `y` (`!bbox.full`): initialize
+    /// hasher, absorb L2-hot rows `0..=ry` from `shadow`, then transition to
+    /// `AbsorbShadow`.
+    StartAbsorb = 4,
+    /// Newly escalated to `bbox.full` on row `y` without a prior hasher:
+    /// initialize hasher, absorb L2-hot rows `0..=ry` from `shadow`, then
+    /// transition to `CopyAndAbsorb`.
+    StartFull = 5,
+}
+
 const DOMAIN_LEAF: u64 = b'L' as u64;
 const DOMAIN_PARENT: u64 = b'P' as u64;
 
@@ -161,7 +206,7 @@ pub(crate) struct TileHashKey {
     /// Four independent 128-bit lane IVs.
     iv: [[u64; 2]; 4],
     /// 128-bit secret round key mixed into every absorption step.
-    round_key: [u64; 2],
+    pub(crate) round_key: [u64; 2],
     /// Six independent 128-bit secret keys for lane folding and finalization.
     final_keys: [[u64; 2]; 6],
 }
@@ -237,7 +282,7 @@ fn parent_meta(w: u32, h: u32, n_quads: usize) -> (u64, u64) {
 
 #[cfg(all(target_arch = "x86_64", not(miri)))]
 #[inline(always)]
-fn has_hw_aes() -> bool {
+pub(crate) fn has_hw_aes() -> bool {
     #[cfg(target_feature = "aes")]
     {
         true
@@ -262,7 +307,7 @@ fn has_hw_aes() -> bool {
 }
 
 #[cfg(all(target_arch = "x86_64", not(miri)))]
-mod x86_aes {
+pub(crate) mod x86_aes {
     use std::arch::x86_64::__m128i;
     use std::arch::x86_64::_mm_aesenc_si128;
     use std::arch::x86_64::_mm_and_si128;
@@ -278,9 +323,14 @@ mod x86_aes {
     use std::arch::x86_64::_mm_setzero_si128;
     use std::arch::x86_64::_mm_storeu_si128;
     use std::arch::x86_64::_mm_xor_si128;
+    use std::mem::MaybeUninit;
     use std::ptr;
 
+    use super::BandRowAction;
     use super::RectScanMeta;
+    use super::RowTileHasher;
+    use super::SUBTILE_W;
+    use super::SlotScans;
     use super::TileHash;
     use super::TileHashKey;
     use super::TileHashResult;
@@ -292,7 +342,7 @@ mod x86_aes {
 
     #[inline]
     #[target_feature(enable = "aes")]
-    fn load_key_block(block: &[u64; 2]) -> __m128i {
+    pub(crate) fn load_key_block(block: &[u64; 2]) -> __m128i {
         // SAFETY: `[u64; 2]` is 16 readable initialized bytes.
         unsafe { _mm_loadu_si128(block.as_ptr().cast::<__m128i>()) }
     }
@@ -346,7 +396,7 @@ mod x86_aes {
 
     #[inline]
     #[target_feature(enable = "aes")]
-    fn alpha_lanes_all_opaque(aand0: __m128i, aand1: __m128i) -> bool {
+    pub(crate) unsafe fn alpha_lanes_all_opaque(aand0: __m128i, aand1: __m128i) -> bool {
         let combined = _mm_and_si128(aand0, aand1);
         (_mm_movemask_epi8(_mm_cmpeq_epi8(combined, _mm_set1_epi8(-1))) & 0x8888) == 0x8888
     }
@@ -364,7 +414,7 @@ mod x86_aes {
     /// from `src_row`.
     #[inline]
     #[target_feature(enable = "aes")]
-    unsafe fn absorb_row<
+    pub(crate) unsafe fn absorb_row<
         const HAS_ALPHA: bool,
         const COPY: bool,
         const TRACK_SOLID: bool,
@@ -1226,6 +1276,384 @@ mod x86_aes {
         }
     }
 
+    #[inline]
+    #[target_feature(enable = "aes")]
+    pub(crate) unsafe fn load_hasher_lanes(h: &RowTileHasher) -> [__m128i; 4] {
+        // SAFETY: `h.lanes` is `[ [u64; 2]; 4 ]` (64 readable bytes, 16-byte aligned).
+        unsafe {
+            [
+                _mm_loadu_si128(h.lanes[0].as_ptr().cast::<__m128i>()),
+                _mm_loadu_si128(h.lanes[1].as_ptr().cast::<__m128i>()),
+                _mm_loadu_si128(h.lanes[2].as_ptr().cast::<__m128i>()),
+                _mm_loadu_si128(h.lanes[3].as_ptr().cast::<__m128i>()),
+            ]
+        }
+    }
+
+    #[inline]
+    #[target_feature(enable = "aes")]
+    pub(crate) unsafe fn store_hasher_lanes(h: &mut RowTileHasher, lanes: [__m128i; 4]) {
+        // SAFETY: `h.lanes` is `[ [u64; 2]; 4 ]` (64 writable bytes, 16-byte aligned).
+        unsafe {
+            _mm_storeu_si128(h.lanes[0].as_mut_ptr().cast::<__m128i>(), lanes[0]);
+            _mm_storeu_si128(h.lanes[1].as_mut_ptr().cast::<__m128i>(), lanes[1]);
+            _mm_storeu_si128(h.lanes[2].as_mut_ptr().cast::<__m128i>(), lanes[2]);
+            _mm_storeu_si128(h.lanes[3].as_mut_ptr().cast::<__m128i>(), lanes[3]);
+        }
+    }
+
+    #[cold]
+    #[inline(never)]
+    #[target_feature(enable = "aes")]
+    pub(crate) unsafe fn start_row_hasher_from_shadow<const HAS_ALPHA: bool>(
+        key: &TileHashKey,
+        shadow_base: *const u8,
+        stride: usize,
+        x_bytes: usize,
+        y0: usize,
+        cw: usize,
+        ch: usize,
+        absorbed_rows: usize,
+    ) -> RowTileHasher {
+        let rk = load_key_block(&key.round_key);
+        let alpha_mask = _mm_set1_epi32(XRGB_ALPHA_MASK_U32 as i32);
+        let row_bytes = cw * 4;
+        let full64 = row_bytes & !63;
+        let rem = row_bytes & 63;
+        let (meta_lo, meta_hi) = leaf_meta(cw as u32, ch as u32);
+        let (mut lanes, _) = init_lanes(key, meta_lo, meta_hi);
+
+        // SAFETY: Caller guarantees `absorbed_rows > 0`, `cw > 0`, and
+        // `[y0..y0 + absorbed_rows)` is readable for `row_bytes` at `x_bytes`.
+        let sh_ptr = unsafe { shadow_base.add(y0 * stride + x_bytes) };
+        let first_raw = unsafe { sh_ptr.cast::<u32>().read_unaligned() };
+        let first_word = if HAS_ALPHA {
+            first_raw
+        } else {
+            first_raw | XRGB_ALPHA_MASK_U32
+        };
+        let probe_ry = absorbed_rows - 1;
+        let probe_rx = if absorbed_rows > 1 { cw >> 1 } else { cw - 1 };
+        let probe_raw = unsafe {
+            sh_ptr
+                .add(probe_ry * stride + probe_rx * 4)
+                .cast::<u32>()
+                .read_unaligned()
+        };
+        let probe_word = if HAS_ALPHA {
+            probe_raw
+        } else {
+            probe_raw | XRGB_ALPHA_MASK_U32
+        };
+        let maybe_solid = first_word == probe_word;
+        let maybe_opaque =
+            !HAS_ALPHA || ((first_word & probe_word & XRGB_ALPHA_MASK_U32) == XRGB_ALPHA_MASK_U32);
+
+        let (still_solid, still_opaque) = if maybe_solid {
+            // SAFETY: `sh_ptr` is readable for `absorbed_rows` rows of `row_bytes`.
+            unsafe {
+                x86_absorb_rows_solid_then_fast!(
+                    sh_ptr,
+                    ptr::null_mut(),
+                    absorbed_rows,
+                    stride,
+                    full64,
+                    rem,
+                    HAS_ALPHA,
+                    false,
+                    rk,
+                    alpha_mask,
+                    first_word,
+                    &mut lanes,
+                    maybe_opaque
+                )
+            }
+        } else {
+            // SAFETY: `sh_ptr` is readable for `absorbed_rows` rows of `row_bytes`.
+            let opq = unsafe {
+                x86_absorb_rows_fast!(
+                    sh_ptr,
+                    ptr::null_mut(),
+                    absorbed_rows,
+                    stride,
+                    full64,
+                    rem,
+                    HAS_ALPHA,
+                    false,
+                    rk,
+                    alpha_mask,
+                    &mut lanes,
+                    maybe_opaque
+                )
+            };
+            (false, opq)
+        };
+
+        let mut out = RowTileHasher {
+            lanes: [[0; 2]; 4],
+            first_word,
+            w: cw as u16,
+            h: ch as u16,
+            still_solid,
+            still_opaque,
+        };
+        // SAFETY: `out.lanes` is valid for 64 bytes.
+        unsafe { store_hasher_lanes(&mut out, lanes) };
+        out
+    }
+
+    /// Expands one quadrant row absorption inline inside a
+    /// `#[target_feature(enable = "aes")]` loop so LLVM never outlines a
+    /// per-quadrant call or spills `rk`/`alpha_mask` across quadrants.
+    macro_rules! x86_absorb_one_hasher_row {
+        ($has_alpha:expr, $copy:expr, $h:expr, $src_row:expr, $dst_row:expr, $rk:expr, $alpha_mask:expr) => {{
+            let h: &mut crate::filtering::tile_hash::RowTileHasher = $h;
+            let src_row: *const u8 = $src_row;
+            let dst_row: *mut u8 = $dst_row;
+            let rk = $rk;
+            let alpha_mask = $alpha_mask;
+            let row_bytes = usize::from(h.w) * 4;
+            let full64 = row_bytes & !63;
+            let rem = row_bytes & 63;
+            let mut lanes = crate::filtering::tile_hash::x86_aes::load_hasher_lanes(h);
+            if !h.still_solid {
+                let mut dummy_dacc = std::arch::x86_64::_mm_setzero_si128();
+                let zero_px = std::arch::x86_64::_mm_setzero_si128();
+                if $has_alpha && h.still_opaque {
+                    let mut aand0 = std::arch::x86_64::_mm_set1_epi8(-1);
+                    let mut aand1 = std::arch::x86_64::_mm_set1_epi8(-1);
+                    crate::filtering::tile_hash::x86_aes::absorb_row::<true, $copy, false, true>(
+                        src_row,
+                        dst_row,
+                        full64,
+                        rem,
+                        rk,
+                        alpha_mask,
+                        0,
+                        zero_px,
+                        &mut lanes,
+                        &mut dummy_dacc,
+                        &mut aand0,
+                        &mut aand1,
+                    );
+                    h.still_opaque =
+                        crate::filtering::tile_hash::x86_aes::alpha_lanes_all_opaque(aand0, aand1);
+                } else {
+                    let mut dummy_a0 = std::arch::x86_64::_mm_setzero_si128();
+                    let mut dummy_a1 = std::arch::x86_64::_mm_setzero_si128();
+                    crate::filtering::tile_hash::x86_aes::absorb_row::<
+                        $has_alpha,
+                        $copy,
+                        false,
+                        false,
+                    >(
+                        src_row,
+                        dst_row,
+                        full64,
+                        rem,
+                        rk,
+                        alpha_mask,
+                        0,
+                        zero_px,
+                        &mut lanes,
+                        &mut dummy_dacc,
+                        &mut dummy_a0,
+                        &mut dummy_a1,
+                    );
+                }
+            } else {
+                let first_word = h.first_word;
+                let first_px = std::arch::x86_64::_mm_set1_epi32(first_word as i32);
+                let mut dacc = std::arch::x86_64::_mm_setzero_si128();
+                let mut aand0 = std::arch::x86_64::_mm_set1_epi8(-1);
+                let mut aand1 = std::arch::x86_64::_mm_set1_epi8(-1);
+                crate::filtering::tile_hash::x86_aes::absorb_row::<
+                    $has_alpha,
+                    $copy,
+                    true,
+                    $has_alpha,
+                >(
+                    src_row, dst_row, full64, rem, rk, alpha_mask, first_word, first_px,
+                    &mut lanes, &mut dacc, &mut aand0, &mut aand1,
+                );
+                if std::arch::x86_64::_mm_movemask_epi8(std::arch::x86_64::_mm_cmpeq_epi8(
+                    dacc,
+                    std::arch::x86_64::_mm_setzero_si128(),
+                )) != 0xFFFF
+                {
+                    h.still_solid = false;
+                    if $has_alpha && h.still_opaque {
+                        h.still_opaque =
+                            crate::filtering::tile_hash::x86_aes::alpha_lanes_all_opaque(
+                                aand0, aand1,
+                            );
+                    }
+                }
+            }
+            crate::filtering::tile_hash::x86_aes::store_hasher_lanes(h, lanes);
+        }};
+    }
+    pub(crate) use x86_absorb_one_hasher_row;
+
+    #[inline(never)]
+    #[target_feature(enable = "aes")]
+    pub(super) unsafe fn process_band_row<const HAS_ALPHA: bool>(
+        key: &TileHashKey,
+        src_base: *const u8,
+        shadow_base: *mut u8,
+        stride: usize,
+        width: usize,
+        y0: usize,
+        ch: usize,
+        y: usize,
+        actions: &mut [BandRowAction],
+        hashers: &mut [MaybeUninit<RowTileHasher>],
+    ) {
+        let rk = load_key_block(&key.round_key);
+        let alpha_mask = _mm_set1_epi32(XRGB_ALPHA_MASK_U32 as i32);
+        let row_off = y * stride;
+        let absorbed_rows = (y - y0) + 1;
+        // SAFETY: Caller validated row `y` bounds in `src_base` and `shadow_base`.
+        let src_row_base = unsafe { src_base.add(row_off) };
+        let sh_row_base = unsafe { shadow_base.add(row_off) };
+
+        let mut x = 0usize;
+        for (act, slot_h) in actions.iter_mut().zip(hashers.iter_mut()) {
+            let cw = (width - x).min(SUBTILE_W);
+            let x_bytes = x * 4;
+            match *act {
+                BandRowAction::Skip => {},
+                BandRowAction::AbsorbShadow | BandRowAction::AbsorbShadowThenFull => {
+                    if *act == BandRowAction::AbsorbShadowThenFull {
+                        *act = BandRowAction::CopyAndAbsorb;
+                    }
+                    // SAFETY: Non-`Skip` guarantees `slot_h` is initialized.
+                    let h = unsafe { slot_h.assume_init_mut() };
+                    unsafe {
+                        x86_absorb_one_hasher_row!(
+                            HAS_ALPHA,
+                            false,
+                            h,
+                            sh_row_base.cast_const().add(x_bytes),
+                            ptr::null_mut(),
+                            rk,
+                            alpha_mask
+                        );
+                    }
+                },
+                BandRowAction::CopyAndAbsorb => {
+                    // SAFETY: `CopyAndAbsorb` guarantees `slot_h` is initialized.
+                    let h = unsafe { slot_h.assume_init_mut() };
+                    unsafe {
+                        x86_absorb_one_hasher_row!(
+                            HAS_ALPHA,
+                            true,
+                            h,
+                            src_row_base.add(x_bytes),
+                            sh_row_base.add(x_bytes),
+                            rk,
+                            alpha_mask
+                        );
+                    }
+                },
+                BandRowAction::StartAbsorb | BandRowAction::StartFull => {
+                    let next = if *act == BandRowAction::StartFull {
+                        BandRowAction::CopyAndAbsorb
+                    } else {
+                        BandRowAction::AbsorbShadow
+                    };
+                    // SAFETY: Rows `0..absorbed_rows` are finalized in `shadow_base`.
+                    let h = unsafe {
+                        start_row_hasher_from_shadow::<HAS_ALPHA>(
+                            key,
+                            shadow_base.cast_const(),
+                            stride,
+                            x_bytes,
+                            y0,
+                            cw,
+                            ch,
+                            absorbed_rows,
+                        )
+                    };
+                    slot_h.write(h);
+                    *act = next;
+                },
+            }
+            x += cw;
+        }
+    }
+
+    #[inline(never)]
+    #[target_feature(enable = "aes")]
+    pub(crate) unsafe fn copy_and_absorb_band_rows<const HAS_ALPHA: bool>(
+        key: &TileHashKey,
+        src_base: *const u8,
+        shadow_base: *mut u8,
+        stride: usize,
+        width: usize,
+        y_start: usize,
+        y_end: usize,
+        hashers: &mut [MaybeUninit<RowTileHasher>],
+    ) {
+        let rk = load_key_block(&key.round_key);
+        let alpha_mask = _mm_set1_epi32(XRGB_ALPHA_MASK_U32 as i32);
+        for y in y_start..y_end {
+            let row_off = y * stride;
+            // SAFETY: Caller validated `[y_start, y_end)` bounds and exclusive shadow access.
+            let src_row_base = unsafe { src_base.add(row_off) };
+            let sh_row_base = unsafe { shadow_base.add(row_off) };
+            let mut x = 0usize;
+            for slot_h in hashers.iter_mut() {
+                let cw = (width - x).min(SUBTILE_W);
+                let x_bytes = x * 4;
+                // SAFETY: Caller guarantees every slot in `hashers` is initialized.
+                let h = unsafe { slot_h.assume_init_mut() };
+                unsafe {
+                    x86_absorb_one_hasher_row!(
+                        HAS_ALPHA,
+                        true,
+                        h,
+                        src_row_base.add(x_bytes),
+                        sh_row_base.add(x_bytes),
+                        rk,
+                        alpha_mask
+                    );
+                }
+                x += cw;
+            }
+        }
+    }
+
+    #[inline(never)]
+    #[target_feature(enable = "aes")]
+    pub(crate) unsafe fn finish_band_hashers(
+        key: &TileHashKey,
+        actions: &[BandRowAction],
+        hashers: &[MaybeUninit<RowTileHasher>],
+        slot_base: usize,
+        scans: &SlotScans,
+    ) {
+        for (qx, (&act, slot_h)) in actions.iter().zip(hashers.iter()).enumerate() {
+            if act == BandRowAction::Skip {
+                continue;
+            }
+            // SAFETY: Every non-`Skip` slot was initialized by `process_band_row`.
+            let h = unsafe { slot_h.assume_init_ref() };
+            let lanes = unsafe { load_hasher_lanes(h) };
+            let (meta_lo, meta_hi) = leaf_meta(u32::from(h.w), u32::from(h.h));
+            let meta = _mm_set_epi64x(meta_hi as i64, meta_lo as i64);
+            let res = TileHashResult {
+                hash: finalize(key, lanes, meta),
+                meta: RectScanMeta {
+                    solid_px: h.still_solid.then(|| h.first_word.to_ne_bytes()),
+                    all_opaque: h.still_opaque,
+                },
+            };
+            // SAFETY: `slot_base + qx` is exclusively owned by this worker.
+            unsafe { scans.write(slot_base + qx, res) };
+        }
+    }
+
     /// # Safety
     /// Caller must verify CPU AES-NI support.
     #[target_feature(enable = "aes")]
@@ -1261,9 +1689,14 @@ mod aarch64_aes {
     use std::arch::aarch64::vorrq_u8;
     use std::arch::aarch64::vreinterpretq_u8_u32;
     use std::arch::aarch64::vst1q_u8;
+    use std::mem::MaybeUninit;
     use std::ptr;
 
+    use super::BandRowAction;
     use super::RectScanMeta;
+    use super::RowTileHasher;
+    use super::SUBTILE_W;
+    use super::SlotScans;
     use super::TileHash;
     use super::TileHashKey;
     use super::TileHashResult;
@@ -2203,6 +2636,362 @@ mod aarch64_aes {
         }
     }
 
+    #[inline]
+    #[target_feature(enable = "aes")]
+    unsafe fn load_hasher_lanes(h: &RowTileHasher) -> [uint8x16_t; 4] {
+        // SAFETY: `h.lanes` is `[ [u64; 2]; 4 ]` (64 readable bytes).
+        unsafe {
+            [
+                vld1q_u8(h.lanes[0].as_ptr().cast::<u8>()),
+                vld1q_u8(h.lanes[1].as_ptr().cast::<u8>()),
+                vld1q_u8(h.lanes[2].as_ptr().cast::<u8>()),
+                vld1q_u8(h.lanes[3].as_ptr().cast::<u8>()),
+            ]
+        }
+    }
+
+    #[inline]
+    #[target_feature(enable = "aes")]
+    unsafe fn store_hasher_lanes(h: &mut RowTileHasher, lanes: [uint8x16_t; 4]) {
+        // SAFETY: `h.lanes` is `[ [u64; 2]; 4 ]` (64 writable bytes).
+        unsafe {
+            vst1q_u8(h.lanes[0].as_mut_ptr().cast::<u8>(), lanes[0]);
+            vst1q_u8(h.lanes[1].as_mut_ptr().cast::<u8>(), lanes[1]);
+            vst1q_u8(h.lanes[2].as_mut_ptr().cast::<u8>(), lanes[2]);
+            vst1q_u8(h.lanes[3].as_mut_ptr().cast::<u8>(), lanes[3]);
+        }
+    }
+
+    #[cold]
+    #[inline(never)]
+    #[target_feature(enable = "aes")]
+    unsafe fn start_row_hasher_from_shadow<const HAS_ALPHA: bool>(
+        key: &TileHashKey,
+        shadow_base: *const u8,
+        stride: usize,
+        x_bytes: usize,
+        y0: usize,
+        cw: usize,
+        ch: usize,
+        absorbed_rows: usize,
+    ) -> RowTileHasher {
+        let rk = load_key_block(&key.round_key);
+        let alpha_mask = vreinterpretq_u8_u32(vdupq_n_u32(XRGB_ALPHA_MASK_U32));
+        let row_bytes = cw * 4;
+        let full64 = row_bytes & !63;
+        let rem = row_bytes & 63;
+        let (meta_lo, meta_hi) = leaf_meta(cw as u32, ch as u32);
+        let (mut lanes, _) = init_lanes(key, meta_lo, meta_hi);
+
+        // SAFETY: Caller guarantees `absorbed_rows > 0`, `cw > 0`, and
+        // `[y0..y0 + absorbed_rows)` is readable for `row_bytes` at `x_bytes`.
+        let sh_ptr = unsafe { shadow_base.add(y0 * stride + x_bytes) };
+        let first_raw = unsafe { sh_ptr.cast::<u32>().read_unaligned() };
+        let first_word = if HAS_ALPHA {
+            first_raw
+        } else {
+            first_raw | XRGB_ALPHA_MASK_U32
+        };
+        let probe_ry = absorbed_rows - 1;
+        let probe_rx = if absorbed_rows > 1 { cw >> 1 } else { cw - 1 };
+        let probe_raw = unsafe {
+            sh_ptr
+                .add(probe_ry * stride + probe_rx * 4)
+                .cast::<u32>()
+                .read_unaligned()
+        };
+        let probe_word = if HAS_ALPHA {
+            probe_raw
+        } else {
+            probe_raw | XRGB_ALPHA_MASK_U32
+        };
+        let maybe_solid = first_word == probe_word;
+        let maybe_opaque =
+            !HAS_ALPHA || ((first_word & probe_word & XRGB_ALPHA_MASK_U32) == XRGB_ALPHA_MASK_U32);
+
+        let (still_solid, still_opaque) = if maybe_solid {
+            // SAFETY: `sh_ptr` is readable for `absorbed_rows` rows of `row_bytes`.
+            unsafe {
+                a64_absorb_rows_solid_then_fast!(
+                    sh_ptr,
+                    ptr::null_mut(),
+                    absorbed_rows,
+                    stride,
+                    full64,
+                    rem,
+                    HAS_ALPHA,
+                    false,
+                    rk,
+                    alpha_mask,
+                    first_word,
+                    &mut lanes,
+                    maybe_opaque
+                )
+            }
+        } else {
+            // SAFETY: `sh_ptr` is readable for `absorbed_rows` rows of `row_bytes`.
+            let opq = unsafe {
+                a64_absorb_rows_fast!(
+                    sh_ptr,
+                    ptr::null_mut(),
+                    absorbed_rows,
+                    stride,
+                    full64,
+                    rem,
+                    HAS_ALPHA,
+                    false,
+                    rk,
+                    alpha_mask,
+                    &mut lanes,
+                    maybe_opaque
+                )
+            };
+            (false, opq)
+        };
+
+        let mut out = RowTileHasher {
+            lanes: [[0; 2]; 4],
+            first_word,
+            w: cw as u16,
+            h: ch as u16,
+            still_solid,
+            still_opaque,
+        };
+        // SAFETY: `out.lanes` is valid for 64 bytes.
+        unsafe { store_hasher_lanes(&mut out, lanes) };
+        out
+    }
+
+    macro_rules! a64_absorb_one_hasher_row {
+        ($has_alpha:expr, $copy:expr, $h:expr, $src_row:expr, $dst_row:expr, $rk:expr, $alpha_mask:expr) => {{
+            let h: &mut RowTileHasher = $h;
+            let src_row: *const u8 = $src_row;
+            let dst_row: *mut u8 = $dst_row;
+            let rk = $rk;
+            let alpha_mask = $alpha_mask;
+            let row_bytes = usize::from(h.w) * 4;
+            let full64 = row_bytes & !63;
+            let rem = row_bytes & 63;
+            let mut lanes = load_hasher_lanes(h);
+            if !h.still_solid {
+                let mut dummy_dacc = vdupq_n_u8(0);
+                let zero_px = vdupq_n_u8(0);
+                if $has_alpha && h.still_opaque {
+                    let mut aand0 = vdupq_n_u8(0xFF);
+                    let mut aand1 = vdupq_n_u8(0xFF);
+                    absorb_row::<true, $copy, false, true>(
+                        src_row,
+                        dst_row,
+                        full64,
+                        rem,
+                        rk,
+                        alpha_mask,
+                        0,
+                        zero_px,
+                        &mut lanes,
+                        &mut dummy_dacc,
+                        &mut aand0,
+                        &mut aand1,
+                    );
+                    h.still_opaque = alpha_lanes_all_opaque(aand0, aand1, alpha_mask);
+                } else {
+                    let mut dummy_a0 = vdupq_n_u8(0);
+                    let mut dummy_a1 = vdupq_n_u8(0);
+                    absorb_row::<$has_alpha, $copy, false, false>(
+                        src_row,
+                        dst_row,
+                        full64,
+                        rem,
+                        rk,
+                        alpha_mask,
+                        0,
+                        zero_px,
+                        &mut lanes,
+                        &mut dummy_dacc,
+                        &mut dummy_a0,
+                        &mut dummy_a1,
+                    );
+                }
+            } else {
+                let first_word = h.first_word;
+                let first_px = vreinterpretq_u8_u32(vdupq_n_u32(first_word));
+                let mut dacc = vdupq_n_u8(0);
+                let mut aand0 = vdupq_n_u8(0xFF);
+                let mut aand1 = vdupq_n_u8(0xFF);
+                absorb_row::<$has_alpha, $copy, true, $has_alpha>(
+                    src_row, dst_row, full64, rem, rk, alpha_mask, first_word, first_px,
+                    &mut lanes, &mut dacc, &mut aand0, &mut aand1,
+                );
+                if vmaxvq_u8(dacc) != 0 {
+                    h.still_solid = false;
+                    if $has_alpha && h.still_opaque {
+                        h.still_opaque = alpha_lanes_all_opaque(aand0, aand1, alpha_mask);
+                    }
+                }
+            }
+            store_hasher_lanes(h, lanes);
+        }};
+    }
+
+    #[inline(never)]
+    #[target_feature(enable = "aes")]
+    pub(super) unsafe fn process_band_row<const HAS_ALPHA: bool>(
+        key: &TileHashKey,
+        src_base: *const u8,
+        shadow_base: *mut u8,
+        stride: usize,
+        width: usize,
+        y0: usize,
+        ch: usize,
+        y: usize,
+        actions: &mut [BandRowAction],
+        hashers: &mut [MaybeUninit<RowTileHasher>],
+    ) {
+        let rk = load_key_block(&key.round_key);
+        let alpha_mask = vreinterpretq_u8_u32(vdupq_n_u32(XRGB_ALPHA_MASK_U32));
+        let row_off = y * stride;
+        let absorbed_rows = (y - y0) + 1;
+        // SAFETY: Caller validated row `y` bounds in `src_base` and `shadow_base`.
+        let src_row_base = unsafe { src_base.add(row_off) };
+        let sh_row_base = unsafe { shadow_base.add(row_off) };
+
+        let mut x = 0usize;
+        for (act, slot_h) in actions.iter_mut().zip(hashers.iter_mut()) {
+            let cw = (width - x).min(SUBTILE_W);
+            let x_bytes = x * 4;
+            match *act {
+                BandRowAction::Skip => {},
+                BandRowAction::AbsorbShadow | BandRowAction::AbsorbShadowThenFull => {
+                    if *act == BandRowAction::AbsorbShadowThenFull {
+                        *act = BandRowAction::CopyAndAbsorb;
+                    }
+                    // SAFETY: Non-`Skip` guarantees `slot_h` is initialized.
+                    let h = unsafe { slot_h.assume_init_mut() };
+                    unsafe {
+                        a64_absorb_one_hasher_row!(
+                            HAS_ALPHA,
+                            false,
+                            h,
+                            sh_row_base.cast_const().add(x_bytes),
+                            ptr::null_mut(),
+                            rk,
+                            alpha_mask
+                        );
+                    }
+                },
+                BandRowAction::CopyAndAbsorb => {
+                    // SAFETY: `CopyAndAbsorb` guarantees `slot_h` is initialized.
+                    let h = unsafe { slot_h.assume_init_mut() };
+                    unsafe {
+                        a64_absorb_one_hasher_row!(
+                            HAS_ALPHA,
+                            true,
+                            h,
+                            src_row_base.add(x_bytes),
+                            sh_row_base.add(x_bytes),
+                            rk,
+                            alpha_mask
+                        );
+                    }
+                },
+                BandRowAction::StartAbsorb | BandRowAction::StartFull => {
+                    let next = if *act == BandRowAction::StartFull {
+                        BandRowAction::CopyAndAbsorb
+                    } else {
+                        BandRowAction::AbsorbShadow
+                    };
+                    // SAFETY: Rows `0..absorbed_rows` are finalized in `shadow_base`.
+                    let h = unsafe {
+                        start_row_hasher_from_shadow::<HAS_ALPHA>(
+                            key,
+                            shadow_base.cast_const(),
+                            stride,
+                            x_bytes,
+                            y0,
+                            cw,
+                            ch,
+                            absorbed_rows,
+                        )
+                    };
+                    slot_h.write(h);
+                    *act = next;
+                },
+            }
+            x += cw;
+        }
+    }
+
+    #[inline(never)]
+    #[target_feature(enable = "aes")]
+    pub(super) unsafe fn copy_and_absorb_band_rows<const HAS_ALPHA: bool>(
+        key: &TileHashKey,
+        src_base: *const u8,
+        shadow_base: *mut u8,
+        stride: usize,
+        width: usize,
+        y_start: usize,
+        y_end: usize,
+        hashers: &mut [MaybeUninit<RowTileHasher>],
+    ) {
+        let rk = load_key_block(&key.round_key);
+        let alpha_mask = vreinterpretq_u8_u32(vdupq_n_u32(XRGB_ALPHA_MASK_U32));
+        for y in y_start..y_end {
+            let row_off = y * stride;
+            // SAFETY: Caller validated `[y_start, y_end)` bounds and exclusive shadow access.
+            let src_row_base = unsafe { src_base.add(row_off) };
+            let sh_row_base = unsafe { shadow_base.add(row_off) };
+            let mut x = 0usize;
+            for slot_h in hashers.iter_mut() {
+                let cw = (width - x).min(SUBTILE_W);
+                let x_bytes = x * 4;
+                // SAFETY: Caller guarantees every slot in `hashers` is initialized.
+                let h = unsafe { slot_h.assume_init_mut() };
+                unsafe {
+                    a64_absorb_one_hasher_row!(
+                        HAS_ALPHA,
+                        true,
+                        h,
+                        src_row_base.add(x_bytes),
+                        sh_row_base.add(x_bytes),
+                        rk,
+                        alpha_mask
+                    );
+                }
+                x += cw;
+            }
+        }
+    }
+
+    #[inline(never)]
+    #[target_feature(enable = "aes")]
+    pub(super) unsafe fn finish_band_hashers(
+        key: &TileHashKey,
+        actions: &[BandRowAction],
+        hashers: &[MaybeUninit<RowTileHasher>],
+        slot_base: usize,
+        scans: &SlotScans,
+    ) {
+        for (qx, (&act, slot_h)) in actions.iter().zip(hashers.iter()).enumerate() {
+            if act == BandRowAction::Skip {
+                continue;
+            }
+            // SAFETY: Every non-`Skip` slot was initialized by `process_band_row`.
+            let h = unsafe { slot_h.assume_init_ref() };
+            let lanes = unsafe { load_hasher_lanes(h) };
+            let (meta_lo, meta_hi) = leaf_meta(u32::from(h.w), u32::from(h.h));
+            let meta = load_key_block(&[meta_lo, meta_hi]);
+            let res = TileHashResult {
+                hash: finalize(key, lanes, meta),
+                meta: RectScanMeta {
+                    solid_px: h.still_solid.then(|| h.first_word.to_ne_bytes()),
+                    all_opaque: h.still_opaque,
+                },
+            };
+            // SAFETY: `slot_base + qx` is exclusively owned by this worker.
+            unsafe { scans.write(slot_base + qx, res) };
+        }
+    }
+
     /// # Safety
     /// Caller must verify CPU ARMv8 AES support.
     #[target_feature(enable = "aes")]
@@ -2227,9 +3016,14 @@ mod aarch64_aes {
 /// Always-compiled portable 128-bit keyed fallback (used on CPUs without
 /// hardware AES, under Miri, and exercised directly in unit tests).
 mod portable {
+    use std::mem::MaybeUninit;
     use std::ptr;
 
+    use super::BandRowAction;
     use super::RectScanMeta;
+    use super::RowTileHasher;
+    use super::SUBTILE_W;
+    use super::SlotScans;
     use super::TileHash;
     use super::TileHashKey;
     use super::TileHashResult;
@@ -2822,6 +3616,266 @@ mod portable {
         }
     }
 
+    #[cold]
+    #[inline(never)]
+    unsafe fn start_row_hasher_from_shadow<const HAS_ALPHA: bool>(
+        key: &TileHashKey,
+        shadow_base: *const u8,
+        stride: usize,
+        x_bytes: usize,
+        y0: usize,
+        cw: usize,
+        ch: usize,
+        absorbed_rows: usize,
+    ) -> RowTileHasher {
+        let row_bytes = cw * 4;
+        let full64 = row_bytes & !63;
+        let rem = row_bytes & 63;
+        let (meta_lo, meta_hi) = leaf_meta(cw as u32, ch as u32);
+        let mut lanes = init_lanes(key, meta_lo, meta_hi);
+        let [rk0, rk1] = key.round_key;
+
+        // SAFETY: Caller guarantees `absorbed_rows > 0`, `cw > 0`, and
+        // `[y0..y0 + absorbed_rows)` is readable for `row_bytes` at `x_bytes`.
+        let sh_ptr = unsafe { shadow_base.add(y0 * stride + x_bytes) };
+        let first_raw = unsafe { u32::from_ne_bytes(sh_ptr.cast::<[u8; 4]>().read()) };
+        let first_word = if HAS_ALPHA {
+            first_raw
+        } else {
+            first_raw | XRGB_ALPHA_MASK_U32
+        };
+        let probe_ry = absorbed_rows - 1;
+        let probe_rx = if absorbed_rows > 1 { cw >> 1 } else { cw - 1 };
+        let probe_raw = unsafe {
+            u32::from_ne_bytes(
+                sh_ptr
+                    .add(probe_ry * stride + probe_rx * 4)
+                    .cast::<[u8; 4]>()
+                    .read(),
+            )
+        };
+        let probe_word = if HAS_ALPHA {
+            probe_raw
+        } else {
+            probe_raw | XRGB_ALPHA_MASK_U32
+        };
+        let maybe_solid = first_word == probe_word;
+        let maybe_opaque =
+            !HAS_ALPHA || ((first_word & probe_word & XRGB_ALPHA_MASK_U32) == XRGB_ALPHA_MASK_U32);
+        let first_pair = dup_u32_to_u64(first_word);
+
+        // SAFETY: `sh_ptr` is readable for `absorbed_rows` rows of `row_bytes`.
+        let (still_solid, still_opaque) = unsafe {
+            absorb_rows_phased::<HAS_ALPHA, false>(
+                sh_ptr,
+                ptr::null_mut(),
+                absorbed_rows,
+                stride,
+                full64,
+                rem,
+                rk0,
+                rk1,
+                first_word,
+                first_pair,
+                &mut lanes,
+                maybe_solid,
+                maybe_opaque,
+            )
+        };
+
+        RowTileHasher {
+            lanes: [[lanes[0], 0], [lanes[1], 0], [lanes[2], 0], [lanes[3], 0]],
+            first_word,
+            w: cw as u16,
+            h: ch as u16,
+            still_solid,
+            still_opaque,
+        }
+    }
+
+    #[inline(always)]
+    unsafe fn absorb_one_hasher_row<const HAS_ALPHA: bool, const COPY: bool>(
+        h: &mut RowTileHasher,
+        src_row: *const u8,
+        dst_row: *mut u8,
+        rk0: u64,
+        rk1: u64,
+    ) {
+        let row_bytes = usize::from(h.w) * 4;
+        let full64 = row_bytes & !63;
+        let rem = row_bytes & 63;
+        let mut lanes = [h.lanes[0][0], h.lanes[1][0], h.lanes[2][0], h.lanes[3][0]];
+        let first_pair = dup_u32_to_u64(h.first_word);
+        // SAFETY: Caller guarantees `src_row` readable and (when `COPY`) `dst_row` writable.
+        let (still_solid, still_opaque) = unsafe {
+            absorb_rows_phased::<HAS_ALPHA, COPY>(
+                src_row,
+                dst_row,
+                1,
+                0,
+                full64,
+                rem,
+                rk0,
+                rk1,
+                h.first_word,
+                first_pair,
+                &mut lanes,
+                h.still_solid,
+                h.still_opaque,
+            )
+        };
+        h.lanes = [[lanes[0], 0], [lanes[1], 0], [lanes[2], 0], [lanes[3], 0]];
+        h.still_solid = still_solid;
+        h.still_opaque = still_opaque;
+    }
+
+    #[inline(never)]
+    pub(super) unsafe fn process_band_row<const HAS_ALPHA: bool>(
+        key: &TileHashKey,
+        src_base: *const u8,
+        shadow_base: *mut u8,
+        stride: usize,
+        width: usize,
+        y0: usize,
+        ch: usize,
+        y: usize,
+        actions: &mut [BandRowAction],
+        hashers: &mut [MaybeUninit<RowTileHasher>],
+    ) {
+        let [rk0, rk1] = key.round_key;
+        let row_off = y * stride;
+        let absorbed_rows = (y - y0) + 1;
+        // SAFETY: Caller validated row `y` bounds in `src_base` and `shadow_base`.
+        let src_row_base = unsafe { src_base.add(row_off) };
+        let sh_row_base = unsafe { shadow_base.add(row_off) };
+
+        let mut x = 0usize;
+        for (act, slot_h) in actions.iter_mut().zip(hashers.iter_mut()) {
+            let cw = (width - x).min(SUBTILE_W);
+            let x_bytes = x * 4;
+            match *act {
+                BandRowAction::Skip => {},
+                BandRowAction::AbsorbShadow | BandRowAction::AbsorbShadowThenFull => {
+                    if *act == BandRowAction::AbsorbShadowThenFull {
+                        *act = BandRowAction::CopyAndAbsorb;
+                    }
+                    // SAFETY: Non-`Skip` guarantees `slot_h` is initialized.
+                    let h = unsafe { slot_h.assume_init_mut() };
+                    unsafe {
+                        absorb_one_hasher_row::<HAS_ALPHA, false>(
+                            h,
+                            sh_row_base.cast_const().add(x_bytes),
+                            ptr::null_mut(),
+                            rk0,
+                            rk1,
+                        );
+                    }
+                },
+                BandRowAction::CopyAndAbsorb => {
+                    // SAFETY: `CopyAndAbsorb` guarantees `slot_h` is initialized.
+                    let h = unsafe { slot_h.assume_init_mut() };
+                    unsafe {
+                        absorb_one_hasher_row::<HAS_ALPHA, true>(
+                            h,
+                            src_row_base.add(x_bytes),
+                            sh_row_base.add(x_bytes),
+                            rk0,
+                            rk1,
+                        );
+                    }
+                },
+                BandRowAction::StartAbsorb | BandRowAction::StartFull => {
+                    let next = if *act == BandRowAction::StartFull {
+                        BandRowAction::CopyAndAbsorb
+                    } else {
+                        BandRowAction::AbsorbShadow
+                    };
+                    // SAFETY: Rows `0..absorbed_rows` are finalized in `shadow_base`.
+                    let h = unsafe {
+                        start_row_hasher_from_shadow::<HAS_ALPHA>(
+                            key,
+                            shadow_base.cast_const(),
+                            stride,
+                            x_bytes,
+                            y0,
+                            cw,
+                            ch,
+                            absorbed_rows,
+                        )
+                    };
+                    slot_h.write(h);
+                    *act = next;
+                },
+            }
+            x += cw;
+        }
+    }
+
+    #[inline(never)]
+    pub(super) unsafe fn copy_and_absorb_band_rows<const HAS_ALPHA: bool>(
+        key: &TileHashKey,
+        src_base: *const u8,
+        shadow_base: *mut u8,
+        stride: usize,
+        width: usize,
+        y_start: usize,
+        y_end: usize,
+        hashers: &mut [MaybeUninit<RowTileHasher>],
+    ) {
+        let [rk0, rk1] = key.round_key;
+        for y in y_start..y_end {
+            let row_off = y * stride;
+            // SAFETY: Caller validated `[y_start, y_end)` bounds and exclusive shadow access.
+            let src_row_base = unsafe { src_base.add(row_off) };
+            let sh_row_base = unsafe { shadow_base.add(row_off) };
+            let mut x = 0usize;
+            for slot_h in hashers.iter_mut() {
+                let cw = (width - x).min(SUBTILE_W);
+                let x_bytes = x * 4;
+                // SAFETY: Caller guarantees every slot in `hashers` is initialized.
+                let h = unsafe { slot_h.assume_init_mut() };
+                unsafe {
+                    absorb_one_hasher_row::<HAS_ALPHA, true>(
+                        h,
+                        src_row_base.add(x_bytes),
+                        sh_row_base.add(x_bytes),
+                        rk0,
+                        rk1,
+                    );
+                }
+                x += cw;
+            }
+        }
+    }
+
+    #[inline(never)]
+    pub(super) unsafe fn finish_band_hashers(
+        key: &TileHashKey,
+        actions: &[BandRowAction],
+        hashers: &[MaybeUninit<RowTileHasher>],
+        slot_base: usize,
+        scans: &SlotScans,
+    ) {
+        for (qx, (&act, slot_h)) in actions.iter().zip(hashers.iter()).enumerate() {
+            if act == BandRowAction::Skip {
+                continue;
+            }
+            // SAFETY: Every non-`Skip` slot was initialized by `process_band_row`.
+            let h = unsafe { slot_h.assume_init_ref() };
+            let lanes = [h.lanes[0][0], h.lanes[1][0], h.lanes[2][0], h.lanes[3][0]];
+            let (meta_lo, meta_hi) = leaf_meta(u32::from(h.w), u32::from(h.h));
+            let res = TileHashResult {
+                hash: finalize(key, lanes, meta_lo, meta_hi),
+                meta: RectScanMeta {
+                    solid_px: h.still_solid.then(|| h.first_word.to_ne_bytes()),
+                    all_opaque: h.still_opaque,
+                },
+            };
+            // SAFETY: `slot_base + qx` is exclusively owned by this worker.
+            unsafe { scans.write(slot_base + qx, res) };
+        }
+    }
+
     pub(super) fn combine_quad_hashes(
         key: &TileHashKey,
         w: u32,
@@ -2898,7 +3952,13 @@ pub(crate) unsafe fn copy_and_hash_rect_to_shadow<const HAS_ALPHA: bool>(
     let th = rect.h as usize;
     let row_bytes = rect.w as usize * 4;
     debug_assert!(copy_from_ry <= th);
-    if copy_from_ry < th && row_bytes > 0 {
+    if copy_from_ry >= th {
+        // SAFETY: All `th` rows are already finalized in `shadow_base`.
+        return unsafe {
+            hash_rect_from_shadow::<HAS_ALPHA>(key, shadow_base.cast_const(), stride, rect)
+        };
+    }
+    if row_bytes > 0 {
         let last_end = (rect.y as usize + th - 1) * stride + rect.x as usize * 4 + row_bytes;
         assert!(last_end <= src.len());
     }
@@ -2977,6 +4037,196 @@ pub(crate) fn hash_rect_from_ptr<const HAS_ALPHA: bool>(
     }
     // SAFETY: `aos` bounds validated above.
     unsafe { portable::hash_rect_raw::<HAS_ALPHA>(key, base, stride, rect) }
+}
+
+/// Processes one horizontal row `y` of active/starting quadrant hashers inside
+/// a `RowBand2D`, absorbing L1d-hot `shadow` rows for still-diffing quadrants,
+/// copying+absorbing `src -> shadow` linearly in-register for `bbox.full`
+/// quadrants, and initializing newly triggered quadrants from L2-hot `shadow`
+/// rows `0..=(y - y0)`.
+///
+/// # Safety
+/// `shadow_base` must be exclusively writable for `[y0, y0 + ch)` across
+/// `width * 4 <= stride` bytes, disjoint from `src`, `actions.len() ==
+/// hashers.len() == width.div_ceil(SUBTILE_W)`, and every non-`Skip`/non-`Start*`
+/// entry in `hashers` must already be initialized.
+#[inline]
+pub(crate) unsafe fn process_band_row<const HAS_ALPHA: bool>(
+    key: &TileHashKey,
+    src: BufferPointer<u8>,
+    shadow_base: *mut u8,
+    stride: usize,
+    width: usize,
+    y0: usize,
+    ch: usize,
+    y: usize,
+    actions: &mut [BandRowAction],
+    hashers: &mut [MaybeUninit<RowTileHasher>],
+) {
+    debug_assert_eq!(actions.len(), hashers.len());
+    debug_assert!(y >= y0 && y < y0 + ch);
+    if width > 0 {
+        let row_end = y * stride + width * 4;
+        assert!(row_end <= src.len());
+    }
+    #[cfg(all(target_arch = "x86_64", not(miri)))]
+    if has_hw_aes() {
+        // SAFETY: `has_hw_aes()` verified AES-NI; `src` bounds checked above.
+        unsafe {
+            x86_aes::process_band_row::<HAS_ALPHA>(
+                key,
+                src.ptr(),
+                shadow_base,
+                stride,
+                width,
+                y0,
+                ch,
+                y,
+                actions,
+                hashers,
+            );
+        }
+        return;
+    }
+    #[cfg(all(target_arch = "aarch64", not(miri)))]
+    if has_hw_aes() {
+        // SAFETY: `has_hw_aes()` verified ARMv8 AES; `src` bounds checked above.
+        unsafe {
+            aarch64_aes::process_band_row::<HAS_ALPHA>(
+                key,
+                src.ptr(),
+                shadow_base,
+                stride,
+                width,
+                y0,
+                ch,
+                y,
+                actions,
+                hashers,
+            );
+        }
+        return;
+    }
+    // SAFETY: `src` bounds checked above; caller upholds `shadow_base` invariants.
+    unsafe {
+        portable::process_band_row::<HAS_ALPHA>(
+            key,
+            src.ptr(),
+            shadow_base,
+            stride,
+            width,
+            y0,
+            ch,
+            y,
+            actions,
+            hashers,
+        );
+    }
+}
+
+/// Streams remaining rows `[y_start, y_end)` of a fully-escalated `RowBand2D`
+/// linearly row-major, copying `src -> shadow` and absorbing every quadrant
+/// hasher in-register in one contiguous pass.
+///
+/// # Safety
+/// Every entry in `hashers` must already be initialized, and `shadow_base`
+/// must be exclusively writable for `[y_start, y_end)` across `width * 4 <=
+/// stride` bytes, disjoint from `src`.
+#[inline]
+pub(crate) unsafe fn copy_and_absorb_band_rows<const HAS_ALPHA: bool>(
+    key: &TileHashKey,
+    src: BufferPointer<u8>,
+    shadow_base: *mut u8,
+    stride: usize,
+    width: usize,
+    y_start: usize,
+    y_end: usize,
+    hashers: &mut [MaybeUninit<RowTileHasher>],
+) {
+    if y_start >= y_end || width == 0 {
+        return;
+    }
+    let last_end = (y_end - 1) * stride + width * 4;
+    assert!(last_end <= src.len());
+    #[cfg(all(target_arch = "x86_64", not(miri)))]
+    if has_hw_aes() {
+        // SAFETY: `has_hw_aes()` verified AES-NI; `src` bounds checked above.
+        unsafe {
+            x86_aes::copy_and_absorb_band_rows::<HAS_ALPHA>(
+                key,
+                src.ptr(),
+                shadow_base,
+                stride,
+                width,
+                y_start,
+                y_end,
+                hashers,
+            );
+        }
+        return;
+    }
+    #[cfg(all(target_arch = "aarch64", not(miri)))]
+    if has_hw_aes() {
+        // SAFETY: `has_hw_aes()` verified ARMv8 AES; `src` bounds checked above.
+        unsafe {
+            aarch64_aes::copy_and_absorb_band_rows::<HAS_ALPHA>(
+                key,
+                src.ptr(),
+                shadow_base,
+                stride,
+                width,
+                y_start,
+                y_end,
+                hashers,
+            );
+        }
+        return;
+    }
+    // SAFETY: `src` bounds checked above; caller upholds `shadow_base` invariants.
+    unsafe {
+        portable::copy_and_absorb_band_rows::<HAS_ALPHA>(
+            key,
+            src.ptr(),
+            shadow_base,
+            stride,
+            width,
+            y_start,
+            y_end,
+            hashers,
+        );
+    }
+}
+
+/// Finalizes every active quadrant hasher in `hashers` directly from registers
+/// and writes its [`TileHashResult`] into `scans[slot_base + qx]`.
+///
+/// # Safety
+/// Every non-[`BandRowAction::Skip`] slot in `hashers` must be initialized,
+/// and `slot_base..slot_base + actions.len()` in `scans` must be exclusively
+/// owned by this worker.
+#[inline]
+pub(crate) unsafe fn finish_band_hashers(
+    key: &TileHashKey,
+    actions: &[BandRowAction],
+    hashers: &[MaybeUninit<RowTileHasher>],
+    slot_base: usize,
+    scans: &SlotScans,
+) {
+    debug_assert_eq!(actions.len(), hashers.len());
+    #[cfg(all(target_arch = "x86_64", not(miri)))]
+    if has_hw_aes() {
+        // SAFETY: `has_hw_aes()` verified AES-NI; caller upholds slot invariants.
+        unsafe { x86_aes::finish_band_hashers(key, actions, hashers, slot_base, scans) };
+        return;
+    }
+    #[cfg(all(target_arch = "aarch64", not(miri)))]
+    if has_hw_aes() {
+        // SAFETY: `has_hw_aes()` verified ARMv8 AES; caller upholds slot invariants.
+        unsafe { aarch64_aes::finish_band_hashers(key, actions, hashers, slot_base, scans) };
+        return;
+    }
+    // SAFETY: Caller upholds slot invariants.
+    unsafe { portable::finish_band_hashers(key, actions, hashers, slot_base, scans) };
 }
 
 /// Combines `2..=4` quadrant hashes into a single domain-separated keyed
@@ -4033,6 +5283,360 @@ mod tests {
             assert_ne!(p_ab, p_abc);
             assert_ne!(p_ab, p_dim);
             assert_ne!(p_ab, p_key_b);
+        }
+    }
+
+    /// Verifies that incremental row-major [`RowTileHasher`] streaming
+    /// (`process_band_row`, `copy_and_absorb_band_rows`, and
+    /// `finish_band_hashers`) produces bit-identical 128-bit digests,
+    /// [`RectScanMeta`], and raw shadow bytes to [`hash_rect_from_shadow`]
+    /// across every supported backend (`Portable`, `X86Aes`, `Aarch64Aes`) and
+    /// Miri.
+    #[test]
+    fn test_row_tile_hasher_streaming_parity() {
+        let key = TileHashKey::from_seed(0x9876_5432_10FE_DCBA);
+
+        #[cfg(not(miri))]
+        let shapes = [
+            (1usize, 1usize),
+            (7, 8),
+            (63, 19),
+            (128, 128),
+            (129, 17),
+            (300, 32),
+        ];
+        #[cfg(miri)]
+        let shapes = [(7usize, 4usize), (129, 6)];
+
+        for backend in Backend::all_supported() {
+            for &(width, ch) in &shapes {
+                let stride = (width + 3) * 4;
+                let y0 = 2usize;
+                let total_h = y0 + ch + 1;
+                let n_qx = width.div_ceil(SUBTILE_W);
+
+                for has_alpha in [false, true] {
+                    // Build a mixed source frame: Q0 non-solid, Q1 solid opaque,
+                    // Q2 solid translucent (or garbage-X when `!has_alpha`).
+                    let mut src = vec![0xAAu8; total_h * stride];
+                    fill_pseudo_random(&mut src, (width as u64) * 97 + ch as u64);
+                    if n_qx >= 2 {
+                        let cw1 = (width - SUBTILE_W).min(SUBTILE_W);
+                        for ry in 0..ch {
+                            for rx in 0..cw1 {
+                                let off = (y0 + ry) * stride + (SUBTILE_W + rx) * 4;
+                                src[off..off + 4].copy_from_slice(&[0x12, 0x34, 0x56, 0xFF]);
+                            }
+                        }
+                    }
+                    if n_qx >= 3 {
+                        let cw2 = (width - 2 * SUBTILE_W).min(SUBTILE_W);
+                        for ry in 0..ch {
+                            for rx in 0..cw2 {
+                                let off = (y0 + ry) * stride + (2 * SUBTILE_W + rx) * 4;
+                                src[off] = 0x77;
+                                src[off + 1] = 0x88;
+                                src[off + 2] = 0x99;
+                                src[off + 3] = if has_alpha {
+                                    0x80
+                                } else {
+                                    ((ry * 13 + rx * 7) & 0xFF) as u8
+                                };
+                            }
+                        }
+                    }
+
+                    // Reference hashes over `src` directly.
+                    let mut expected = Vec::with_capacity(n_qx);
+                    for qx in 0..n_qx {
+                        let x0 = qx * SUBTILE_W;
+                        let cw = (width - x0).min(SUBTILE_W);
+                        let qrect = TileRect {
+                            x: x0 as u32,
+                            y: y0 as u32,
+                            w: cw as u32,
+                            h: ch as u32,
+                        };
+                        let res = if has_alpha {
+                            unsafe {
+                                backend.hash_shadow::<true>(&key, src.as_ptr(), stride, qrect)
+                            }
+                        } else {
+                            unsafe {
+                                backend.hash_shadow::<false>(&key, src.as_ptr(), stride, qrect)
+                            }
+                        };
+                        expected.push(res);
+                    }
+
+                    // Test transitions: start at row 0, mid-band, or last row,
+                    // escalating to `CopyAndAbsorb` at `start_ry`, mid, or never.
+                    let start_rows = [0usize, ch / 2, ch - 1];
+                    for &start_ry in &start_rows {
+                        for &escalate_full in &[false, true] {
+                            let full_ry = if escalate_full {
+                                (start_ry + 1).min(ch - 1)
+                            } else {
+                                ch
+                            };
+                            let mut shadow = vec![0x55u8; total_h * stride];
+                            // Pre-populate rows `0..=start_ry` in shadow.
+                            for ry in 0..=start_ry {
+                                let off = (y0 + ry) * stride;
+                                shadow[off..off + width * 4]
+                                    .copy_from_slice(&src[off..off + width * 4]);
+                            }
+                            let mut actions = vec![
+                                if escalate_full && start_ry == full_ry {
+                                    BandRowAction::StartFull
+                                } else {
+                                    BandRowAction::StartAbsorb
+                                };
+                                n_qx
+                            ];
+                            let mut hashers = vec![MaybeUninit::<RowTileHasher>::uninit(); n_qx];
+
+                            let run_row =
+                                |y: usize,
+                                 acts: &mut [BandRowAction],
+                                 hs: &mut [MaybeUninit<RowTileHasher>],
+                                 sh: &mut [u8]| {
+                                    match backend {
+                                        Backend::Portable => unsafe {
+                                            if has_alpha {
+                                                portable::process_band_row::<true>(
+                                                    &key,
+                                                    src.as_ptr(),
+                                                    sh.as_mut_ptr(),
+                                                    stride,
+                                                    width,
+                                                    y0,
+                                                    ch,
+                                                    y,
+                                                    acts,
+                                                    hs,
+                                                );
+                                            } else {
+                                                portable::process_band_row::<false>(
+                                                    &key,
+                                                    src.as_ptr(),
+                                                    sh.as_mut_ptr(),
+                                                    stride,
+                                                    width,
+                                                    y0,
+                                                    ch,
+                                                    y,
+                                                    acts,
+                                                    hs,
+                                                );
+                                            }
+                                        },
+                                        #[cfg(all(target_arch = "x86_64", not(miri)))]
+                                        Backend::X86Aes => unsafe {
+                                            if has_alpha {
+                                                x86_aes::process_band_row::<true>(
+                                                    &key,
+                                                    src.as_ptr(),
+                                                    sh.as_mut_ptr(),
+                                                    stride,
+                                                    width,
+                                                    y0,
+                                                    ch,
+                                                    y,
+                                                    acts,
+                                                    hs,
+                                                );
+                                            } else {
+                                                x86_aes::process_band_row::<false>(
+                                                    &key,
+                                                    src.as_ptr(),
+                                                    sh.as_mut_ptr(),
+                                                    stride,
+                                                    width,
+                                                    y0,
+                                                    ch,
+                                                    y,
+                                                    acts,
+                                                    hs,
+                                                );
+                                            }
+                                        },
+                                        #[cfg(all(target_arch = "aarch64", not(miri)))]
+                                        Backend::Aarch64Aes => unsafe {
+                                            if has_alpha {
+                                                aarch64_aes::process_band_row::<true>(
+                                                    &key,
+                                                    src.as_ptr(),
+                                                    sh.as_mut_ptr(),
+                                                    stride,
+                                                    width,
+                                                    y0,
+                                                    ch,
+                                                    y,
+                                                    acts,
+                                                    hs,
+                                                );
+                                            } else {
+                                                aarch64_aes::process_band_row::<false>(
+                                                    &key,
+                                                    src.as_ptr(),
+                                                    sh.as_mut_ptr(),
+                                                    stride,
+                                                    width,
+                                                    y0,
+                                                    ch,
+                                                    y,
+                                                    acts,
+                                                    hs,
+                                                );
+                                            }
+                                        },
+                                    }
+                                };
+
+                            run_row(y0 + start_ry, &mut actions, &mut hashers, &mut shadow);
+
+                            let mut ry = start_ry + 1;
+                            while ry < ch {
+                                if escalate_full && ry > full_ry {
+                                    // Exercise `copy_and_absorb_band_rows` for the remaining tail.
+                                    match backend {
+                                        Backend::Portable => unsafe {
+                                            if has_alpha {
+                                                portable::copy_and_absorb_band_rows::<true>(
+                                                    &key,
+                                                    src.as_ptr(),
+                                                    shadow.as_mut_ptr(),
+                                                    stride,
+                                                    width,
+                                                    y0 + ry,
+                                                    y0 + ch,
+                                                    &mut hashers,
+                                                );
+                                            } else {
+                                                portable::copy_and_absorb_band_rows::<false>(
+                                                    &key,
+                                                    src.as_ptr(),
+                                                    shadow.as_mut_ptr(),
+                                                    stride,
+                                                    width,
+                                                    y0 + ry,
+                                                    y0 + ch,
+                                                    &mut hashers,
+                                                );
+                                            }
+                                        },
+                                        #[cfg(all(target_arch = "x86_64", not(miri)))]
+                                        Backend::X86Aes => unsafe {
+                                            if has_alpha {
+                                                x86_aes::copy_and_absorb_band_rows::<true>(
+                                                    &key,
+                                                    src.as_ptr(),
+                                                    shadow.as_mut_ptr(),
+                                                    stride,
+                                                    width,
+                                                    y0 + ry,
+                                                    y0 + ch,
+                                                    &mut hashers,
+                                                );
+                                            } else {
+                                                x86_aes::copy_and_absorb_band_rows::<false>(
+                                                    &key,
+                                                    src.as_ptr(),
+                                                    shadow.as_mut_ptr(),
+                                                    stride,
+                                                    width,
+                                                    y0 + ry,
+                                                    y0 + ch,
+                                                    &mut hashers,
+                                                );
+                                            }
+                                        },
+                                        #[cfg(all(target_arch = "aarch64", not(miri)))]
+                                        Backend::Aarch64Aes => unsafe {
+                                            if has_alpha {
+                                                aarch64_aes::copy_and_absorb_band_rows::<true>(
+                                                    &key,
+                                                    src.as_ptr(),
+                                                    shadow.as_mut_ptr(),
+                                                    stride,
+                                                    width,
+                                                    y0 + ry,
+                                                    y0 + ch,
+                                                    &mut hashers,
+                                                );
+                                            } else {
+                                                aarch64_aes::copy_and_absorb_band_rows::<false>(
+                                                    &key,
+                                                    src.as_ptr(),
+                                                    shadow.as_mut_ptr(),
+                                                    stride,
+                                                    width,
+                                                    y0 + ry,
+                                                    y0 + ch,
+                                                    &mut hashers,
+                                                );
+                                            }
+                                        },
+                                    }
+                                    break;
+                                }
+                                if ry <= full_ry {
+                                    let off = (y0 + ry) * stride;
+                                    shadow[off..off + width * 4]
+                                        .copy_from_slice(&src[off..off + width * 4]);
+                                    if escalate_full && ry == full_ry {
+                                        actions.fill(BandRowAction::AbsorbShadowThenFull);
+                                    }
+                                }
+                                run_row(y0 + ry, &mut actions, &mut hashers, &mut shadow);
+                                ry += 1;
+                            }
+
+                            let mut scans = SlotScans::new(n_qx, key);
+                            match backend {
+                                Backend::Portable => unsafe {
+                                    portable::finish_band_hashers(
+                                        &key, &actions, &hashers, 0, &scans,
+                                    );
+                                },
+                                #[cfg(all(target_arch = "x86_64", not(miri)))]
+                                Backend::X86Aes => unsafe {
+                                    x86_aes::finish_band_hashers(
+                                        &key, &actions, &hashers, 0, &scans,
+                                    );
+                                },
+                                #[cfg(all(target_arch = "aarch64", not(miri)))]
+                                Backend::Aarch64Aes => unsafe {
+                                    aarch64_aes::finish_band_hashers(
+                                        &key, &actions, &hashers, 0, &scans,
+                                    );
+                                },
+                            }
+
+                            let scans_slice = scans.as_slice();
+                            for (qx, &exp) in expected.iter().enumerate() {
+                                let got = scans_slice[qx];
+                                assert_eq!(
+                                    got,
+                                    exp,
+                                    "{}: RowTileHasher mismatch {width}x{ch} qx={qx} has_alpha={has_alpha} start_ry={start_ry} full={escalate_full}",
+                                    backend.name()
+                                );
+                            }
+                            for r in 0..ch {
+                                let off = (y0 + r) * stride;
+                                assert_eq!(
+                                    &shadow[off..off + width * 4],
+                                    &src[off..off + width * 4],
+                                    "{}: shadow copy mismatch {width}x{ch} ry={r}",
+                                    backend.name()
+                                );
+                            }
+                        }
+                    }
+                }
+            }
         }
     }
 }

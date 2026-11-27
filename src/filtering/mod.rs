@@ -450,21 +450,24 @@ mod arch {
             y1: usize,
             dirty_slots: &[AtomicU32],
         ) {
+            let ctx = super::ActiveRowBandCtx {
+                data,
+                aos,
+                shadow,
+                width,
+                stride,
+                y0,
+                y1,
+                slot_base: 0,
+                dirty_slots,
+                slot_scans: None,
+                cache_non_empty: false,
+            };
             // SAFETY: Caller upholds disjoint-row shadow invariants.
             unsafe {
                 super::diff_and_update_row_band_2d_with::<ScalarKernel, HAS_ALPHA>(
                     ScalarKernel,
-                    data,
-                    aos,
-                    shadow,
-                    width,
-                    stride,
-                    y0,
-                    y1,
-                    0,
-                    dirty_slots,
-                    None,
-                    false,
+                    &ctx,
                 );
             }
         }
@@ -603,6 +606,11 @@ const CROP_CACHE_LOOKUP_MIN_PIXELS: usize = 1024;
 /// Maximum horizontal quadrants tracked on the stack inside a single
 /// `RowBand2D` (`64 * 128 = 8192` px 8K width without heap allocation).
 const STACK_QX_CAP: usize = 64;
+
+/// Maximum per-quadrant incremental [`tile_hash::RowTileHasher`] slots stored
+/// on the stack inside an active `RowBand2D` (`32 * 128 = 4096` px covers up to
+/// 4K with zero heap allocation while keeping the stack frame under 4 KiB).
+const STACK_HASH_CAP: usize = 32;
 
 /// Architecture-specific row kernels operating on exact-length slices (no slack
 /// bytes required).
@@ -797,6 +805,43 @@ pub(crate) trait RowKernel: Copy {
     );
 
     fn fence_stream(self);
+
+    /// Scans a horizontal `<= 128`-row 2D sub-band linearly row-by-row.
+    ///
+    /// # Safety
+    /// Rows `[y0, y1)` must be strictly in-bounds within `shadow` and disjoint
+    /// from all rows concurrently accessed by other threads.
+    #[inline(always)]
+    unsafe fn diff_and_update_row_band_2d<const HAS_ALPHA: bool>(self, ctx: &ActiveRowBandCtx<'_>) {
+        // SAFETY: Caller upholds disjoint-row shadow bounds invariants.
+        unsafe {
+            diff_and_update_row_band_2d_with::<Self, HAS_ALPHA>(self, ctx);
+        }
+    }
+
+    /// Finishes a `RowBand2D` from trigger row `trigger_y` through `ctx.y1`
+    /// once at least one quadrant has either escalated to `bbox.full` or
+    /// crossed `CROP_CACHE_LOOKUP_MIN_PIXELS`.
+    ///
+    /// # Safety
+    /// Rows `[ctx.y0, ctx.y1)` must be strictly in-bounds within `ctx.shadow`
+    /// and exclusively owned by this worker, with rows `[ctx.y0, trigger_y]`
+    /// already updated in `ctx.shadow`.
+    #[inline(always)]
+    unsafe fn finish_active_row_band_2d<const HAS_ALPHA: bool>(
+        self,
+        ctx: &ActiveRowBandCtx<'_>,
+        qx_bboxes: &mut [QuadBbox],
+        trigger_y: usize,
+        full_count: usize,
+    ) {
+        // SAFETY: Caller upholds disjoint-row shadow bounds invariants.
+        unsafe {
+            finish_active_row_band_2d_with::<Self, HAS_ALPHA>(
+                self, ctx, qx_bboxes, trigger_y, full_count,
+            );
+        }
+    }
 }
 
 /// Portable scalar reference implementation of [`RowKernel`], also used as the
@@ -2729,7 +2774,7 @@ pub fn compute_partial_row_bands(
 
 /// Raw pointer handle to the server's per-surface shadow pixel buffer
 /// preserving provenance for disjoint per-tile mutable writes across workers.
-struct ShadowRows {
+pub(crate) struct ShadowRows {
     base: *mut u8,
     stride: usize,
 }
@@ -3146,7 +3191,7 @@ impl SlotDirty {
 }
 
 #[derive(Copy, Clone)]
-struct QuadBbox {
+pub(crate) struct QuadBbox {
     min_x: u8,
     max_x: u8,
     min_y: u8,
@@ -3285,20 +3330,69 @@ pub(crate) fn merge_cropped_quad_slots(grid: &mut [Option<(TileRect, RectScanMet
     }
 }
 
+/// Finalizes a quadrant that just escalated to `bbox.full` at quadrant-local
+/// row `ry` (so rows `0..=ry` are already updated in `shadow`), fusing the
+/// remaining copy (`ry + 1..ch`) and keyed 128-bit hashing in one register pass
+/// when `slot_scans` is present, or copying remaining rows directly into
+/// `shadow` otherwise.
+///
+/// # Safety
+/// `qrect` must be strictly in-bounds within `shadow`, exclusively owned by
+/// this worker, with rows `[0..=ry]` already initialized in `shadow`.
+#[inline(never)]
+unsafe fn finish_full_quadrant<const HAS_ALPHA: bool>(
+    data: BufferPointer<u8>,
+    shadow: &ShadowRows,
+    stride: usize,
+    qrect: TileRect,
+    copy_from_ry: usize,
+    slot_idx: usize,
+    slot: &AtomicU32,
+    slot_scans: Option<&SlotScans>,
+) {
+    if let Some(scans) = slot_scans {
+        // SAFETY: Caller guarantees `qrect` is in-bounds and exclusively owned,
+        // and rows `0..copy_from_ry` are already initialized in `shadow`.
+        let scan = unsafe {
+            tile_hash::copy_and_hash_rect_to_shadow::<HAS_ALPHA>(
+                scans.key(),
+                data,
+                shadow.base,
+                stride,
+                qrect,
+                copy_from_ry,
+            )
+        };
+        // SAFETY: `slot_idx` is exclusively owned by this worker.
+        unsafe { scans.write(slot_idx, scan) };
+    } else if copy_from_ry < qrect.h as usize {
+        let rem_rect = TileRect {
+            x: qrect.x,
+            y: qrect.y + copy_from_ry as u32,
+            w: qrect.w,
+            h: qrect.h - copy_from_ry as u32,
+        };
+        // SAFETY: Caller guarantees `qrect` is in-bounds and exclusively owned.
+        unsafe { copy_rect_to_shadow(data, shadow, stride, rem_rect) };
+    }
+    slot.store(SlotDirty::FULL_RAW, Ordering::Relaxed);
+}
+
 /// Scans a `< 8`-row 1D strip linearly against `shadow`, updating `shadow`
-/// from the first differing pixel onward.
+/// through the first differing row and returning `Some(ry + 1)` (the first
+/// remaining uncopied row index), or `None` when the strip is clean.
 ///
 /// # Safety
 /// `rect` must be strictly in-bounds within `shadow` and disjoint from all
 /// regions concurrently accessed by other threads.
 #[inline(always)]
-unsafe fn diff_and_update_strip_with<K: RowKernel, const HAS_ALPHA: bool>(
+unsafe fn diff_and_update_strip_prefix_with<K: RowKernel, const HAS_ALPHA: bool>(
     kernel: K,
     aos: BufferPointer<Vec4u8>,
     shadow: &ShadowRows,
     stride_px: usize,
     rect: TileRect,
-) -> bool {
+) -> Option<usize> {
     let x0 = rect.x as usize;
     let x_bytes = x0 * 4;
     let w = rect.w as usize;
@@ -3317,193 +3411,333 @@ unsafe fn diff_and_update_strip_with<K: RowKernel, const HAS_ALPHA: bool>(
             .diff_and_update_row::<HAS_ALPHA>(src_row, dst_row)
             .is_some()
         {
-            for rem_ry in (ry + 1)..h {
-                let (_, rem_after) = aos.split_at((y0 + rem_ry) * stride_px + x0);
-                let (rem_src, _) = rem_after.split_at(w);
-                // SAFETY: Caller guarantees `rect` is in-bounds and disjoint across workers.
-                let rem_dst = unsafe {
-                    slice::from_raw_parts_mut(
-                        shadow.row_ptr(y0 + rem_ry, x_bytes).cast::<Vec4u8>(),
-                        w,
-                    )
-                };
-                rem_src.copy_to_nonoverlapping(rem_dst);
-            }
-            return true;
+            return Some(ry + 1);
         }
     }
-    false
+    None
 }
 
-/// Scans a horizontal `<= 128`-row 2D sub-band linearly row-by-row across all
-/// `n_qx` horizontal quadrants, tracking tight dirty bounding boxes per
-/// quadrant and falling back to bulk contiguous `memcpy` / fused copy+hash once
-/// all quadrants in the band exceed the crop area threshold.
+/// Scans a `< 8`-row 1D strip linearly against `shadow`, updating `shadow`
+/// from the first differing pixel onward.
 ///
 /// # Safety
-/// Rows `[y0, y1)` must be strictly in-bounds within `shadow` and disjoint from
-/// all rows concurrently accessed by other threads.
+/// `rect` must be strictly in-bounds within `shadow` and disjoint from all
+/// regions concurrently accessed by other threads.
+#[cfg(test)]
 #[inline(always)]
-unsafe fn diff_and_update_row_band_2d_with<K: RowKernel, const HAS_ALPHA: bool>(
+unsafe fn diff_and_update_strip_with<K: RowKernel, const HAS_ALPHA: bool>(
+    kernel: K,
+    aos: BufferPointer<Vec4u8>,
+    shadow: &ShadowRows,
+    stride_px: usize,
+    rect: TileRect,
+) -> bool {
+    let Some(copy_from_ry) = (unsafe {
+        diff_and_update_strip_prefix_with::<K, HAS_ALPHA>(kernel, aos, shadow, stride_px, rect)
+    }) else {
+        return false;
+    };
+    let x0 = rect.x as usize;
+    let x_bytes = x0 * 4;
+    let w = rect.w as usize;
+    let y0 = rect.y as usize;
+    let h = rect.h as usize;
+    for rem_ry in copy_from_ry..h {
+        let (_, rem_after) = aos.split_at((y0 + rem_ry) * stride_px + x0);
+        let (rem_src, _) = rem_after.split_at(w);
+        // SAFETY: Caller guarantees `rect` is in-bounds and disjoint across workers.
+        let rem_dst = unsafe {
+            slice::from_raw_parts_mut(shadow.row_ptr(y0 + rem_ry, x_bytes).cast::<Vec4u8>(), w)
+        };
+        rem_src.copy_to_nonoverlapping(rem_dst);
+    }
+    true
+}
+
+/// Scans a `< 8`-row 1D strip linearly against `shadow`, updating `shadow`
+/// from the first differing pixel onward and fusing the remaining row copy with
+/// keyed 128-bit hashing when `slot_scans` is present.
+///
+/// # Safety
+/// `rect` must be strictly in-bounds within `shadow` and disjoint from all
+/// regions concurrently accessed by other threads.
+#[inline(always)]
+unsafe fn diff_and_update_strip_slot_with<K: RowKernel, const HAS_ALPHA: bool>(
     kernel: K,
     data: BufferPointer<u8>,
     aos: BufferPointer<Vec4u8>,
     shadow: &ShadowRows,
-    width: usize,
     stride: usize,
-    y0: usize,
-    y1: usize,
-    slot_base: usize,
-    dirty_slots: &[AtomicU32],
+    stride_px: usize,
+    rect: TileRect,
+    slot_idx: usize,
+    slot: &AtomicU32,
     slot_scans: Option<&SlotScans>,
-    cache_non_empty: bool,
 ) {
-    let stride_px = stride / 4;
-    let ch = y1 - y0;
-    let n_qx = dirty_slots.len();
-    let mut stack_bboxes = [QuadBbox::CLEAN; STACK_QX_CAP];
-    let mut heap_bboxes;
-    let qx_bboxes: &mut [QuadBbox] = if n_qx <= STACK_QX_CAP {
-        &mut stack_bboxes[..n_qx]
-    } else {
-        heap_bboxes = vec![QuadBbox::CLEAN; n_qx];
-        &mut heap_bboxes
-    };
-    let mut full_count = 0usize;
+    // SAFETY: Caller guarantees `rect` is in-bounds and disjoint across workers.
+    if let Some(copy_from_ry) = unsafe {
+        diff_and_update_strip_prefix_with::<K, HAS_ALPHA>(kernel, aos, shadow, stride_px, rect)
+    } {
+        // SAFETY: Rows `0..copy_from_ry` are updated in `shadow`; `rect` is
+        // exclusively owned by this worker.
+        unsafe {
+            finish_full_quadrant::<HAS_ALPHA>(
+                data,
+                shadow,
+                stride,
+                rect,
+                copy_from_ry,
+                slot_idx,
+                slot,
+                slot_scans,
+            );
+        }
+    }
+}
 
-    for y in y0..y1 {
-        if full_count == n_qx {
-            if let Some(scans) = slot_scans {
-                // Fuse remaining row copy (`y..y1`) and keyed 128-bit hashing
-                // per `<= 128x128` quadrant in registers without streaming the
-                // entire `RowBand2D` out of L2 first.
-                let copy_from_ry = y - y0;
-                let mut x = 0usize;
-                for (qx, slot) in dirty_slots.iter().enumerate() {
-                    let cw = (width - x).min(SUBTILE_W);
-                    let qrect = TileRect {
-                        x: x as u32,
-                        y: y0 as u32,
-                        w: cw as u32,
-                        h: ch as u32,
-                    };
-                    // SAFETY: `[y0, y1)` is strictly disjoint across workers.
-                    let scan = unsafe {
-                        tile_hash::copy_and_hash_rect_to_shadow::<HAS_ALPHA>(
-                            scans.key(),
-                            data,
-                            shadow.base,
-                            stride,
-                            qrect,
-                            copy_from_ry,
-                        )
-                    };
-                    // SAFETY: `slot_base + qx` is exclusively owned by this worker.
-                    unsafe { scans.write(slot_base + qx, scan) };
-                    slot.store(SlotDirty::FULL_RAW, Ordering::Relaxed);
-                    x += cw;
+/// Borrowed parameters for completing an active `RowBand2D` once at least one
+/// quadrant has escalated to `bbox.full` or crossed `CROP_CACHE_LOOKUP_MIN_PIXELS`.
+#[derive(Copy, Clone)]
+pub(crate) struct ActiveRowBandCtx<'a> {
+    pub(crate) data: BufferPointer<'a, u8>,
+    pub(crate) aos: BufferPointer<'a, Vec4u8>,
+    pub(crate) shadow: &'a ShadowRows,
+    pub(crate) width: usize,
+    pub(crate) stride: usize,
+    pub(crate) y0: usize,
+    pub(crate) y1: usize,
+    pub(crate) slot_base: usize,
+    pub(crate) dirty_slots: &'a [AtomicU32],
+    pub(crate) slot_scans: Option<&'a SlotScans>,
+    pub(crate) cache_non_empty: bool,
+}
+
+/// Portable fallback for [`RowKernel::finish_active_row_band_2d`], streaming
+/// remaining rows `[trigger_y + 1, ctx.y1)` linearly with incremental
+/// [`tile_hash::RowTileHasher`] updates (and `copy_and_absorb_band_rows` once
+/// all quadrants reach `bbox.full`).
+///
+/// # Safety
+/// Caller must uphold [`RowKernel::finish_active_row_band_2d`] invariants.
+#[inline(always)]
+pub(crate) unsafe fn finish_active_row_band_2d_with<K: RowKernel, const HAS_ALPHA: bool>(
+    kernel: K,
+    ctx: &ActiveRowBandCtx<'_>,
+    qx_bboxes: &mut [QuadBbox],
+    trigger_y: usize,
+    mut full_count: usize,
+) {
+    use tile_hash::BandRowAction;
+    use tile_hash::RowTileHasher;
+
+    let width = ctx.width;
+    let stride = ctx.stride;
+    let stride_px = stride / 4;
+    let y0 = ctx.y0;
+    let y1 = ctx.y1;
+    let ch = y1 - y0;
+    let n_qx = ctx.dirty_slots.len();
+
+    if let Some(scans) = ctx.slot_scans {
+        let mut stack_actions = [BandRowAction::Skip; STACK_HASH_CAP];
+        let mut heap_actions;
+        let qx_actions: &mut [BandRowAction] = if n_qx <= STACK_HASH_CAP {
+            &mut stack_actions[..n_qx]
+        } else {
+            heap_actions = vec![BandRowAction::Skip; n_qx];
+            &mut heap_actions
+        };
+        let mut stack_hashers = [MaybeUninit::<RowTileHasher>::uninit(); STACK_HASH_CAP];
+        let mut heap_hashers;
+        let qx_hashers: &mut [MaybeUninit<RowTileHasher>] = if n_qx <= STACK_HASH_CAP {
+            &mut stack_hashers[..n_qx]
+        } else {
+            heap_hashers = vec![MaybeUninit::<RowTileHasher>::uninit(); n_qx];
+            &mut heap_hashers
+        };
+
+        for (bbox, act) in qx_bboxes.iter().zip(qx_actions.iter_mut()) {
+            if bbox.full {
+                *act = BandRowAction::StartFull;
+            } else if ctx.cache_non_empty && bbox.is_dirty() {
+                let area =
+                    usize::from(bbox.max_x - bbox.min_x) * usize::from(bbox.max_y - bbox.min_y);
+                if area >= CROP_CACHE_LOOKUP_MIN_PIXELS {
+                    *act = BandRowAction::StartAbsorb;
                 }
-                return;
             }
-            let vis_bytes = width * 4;
-            if stride == vis_bytes {
-                let off = y * stride;
-                let bytes = (y1 - y) * stride;
-                let (_, after) = data.split_at(off);
-                let (chunk, _) = after.split_at(bytes);
-                // SAFETY: `[y0, y1)` is strictly disjoint across workers.
-                let dst = unsafe { slice::from_raw_parts_mut(shadow.row_ptr(y, 0), bytes) };
-                chunk.copy_to_nonoverlapping(dst);
-            } else {
-                for ry in y..y1 {
-                    let off = ry * stride;
-                    let (_, after) = data.split_at(off);
-                    let (chunk, _) = after.split_at(vis_bytes);
-                    // SAFETY: `[y0, y1)` is strictly disjoint across workers.
-                    let dst =
-                        unsafe { slice::from_raw_parts_mut(shadow.row_ptr(ry, 0), vis_bytes) };
-                    chunk.copy_to_nonoverlapping(dst);
-                }
-            }
-            break;
+        }
+        // SAFETY: Rows `[y0, trigger_y]` are finalized in `shadow`.
+        unsafe {
+            tile_hash::process_band_row::<HAS_ALPHA>(
+                scans.key(),
+                ctx.data,
+                ctx.shadow.base,
+                stride,
+                width,
+                y0,
+                ch,
+                trigger_y,
+                qx_actions,
+                qx_hashers,
+            );
         }
 
-        let ry = y - y0;
-        let (_, row_after) = aos.split_at(y * stride_px);
-        let (row_aos, _) = row_after.split_at(width);
-        // SAFETY: `[y0, y1)` is strictly disjoint across workers and `Vec4u8` has alignment 1.
-        let dst_row =
-            unsafe { slice::from_raw_parts_mut(shadow.row_ptr(y, 0).cast::<Vec4u8>(), width) };
-
-        let mut x = 0usize;
-        for bbox in qx_bboxes.iter_mut() {
-            let cw = (width - x).min(SUBTILE_W);
-            let (_, after_x) = row_aos.split_at(x);
-            let (src_chunk, _) = after_x.split_at(cw);
-            let dst_chunk = &mut dst_row[x..x + cw];
-            if bbox.full {
-                src_chunk.copy_to_nonoverlapping(dst_chunk);
-            } else if let Some((fx, lx)) =
-                kernel.diff_and_update_row::<HAS_ALPHA>(src_chunk, dst_chunk)
-            {
-                let max_crop_area = (cw * ch * CROP_MAX_AREA_PCT) / 100;
-                if bbox.record_row(ry, fx, lx, max_crop_area) {
-                    full_count += 1;
+        for y in (trigger_y + 1)..y1 {
+            if full_count == n_qx {
+                // SAFETY: Every quadrant reached `bbox.full` on an earlier row
+                // and transitioned its hasher to `CopyAndAbsorb`.
+                unsafe {
+                    tile_hash::copy_and_absorb_band_rows::<HAS_ALPHA>(
+                        scans.key(),
+                        ctx.data,
+                        ctx.shadow.base,
+                        stride,
+                        width,
+                        y,
+                        y1,
+                        qx_hashers,
+                    );
                 }
+                break;
             }
-            x += cw;
+
+            let ry = y - y0;
+            let (_, row_after) = ctx.aos.split_at(y * stride_px);
+            let (mut rem_aos, _) = row_after.split_at(width);
+            // SAFETY: `[y0, y1)` is strictly disjoint across workers and `Vec4u8` has alignment 1.
+            let dst_row = unsafe {
+                slice::from_raw_parts_mut(ctx.shadow.row_ptr(y, 0).cast::<Vec4u8>(), width)
+            };
+
+            let mut x = 0usize;
+            for (bbox, act) in qx_bboxes.iter_mut().zip(qx_actions.iter_mut()) {
+                let cw = (width - x).min(SUBTILE_W);
+                let (src_chunk, rest_aos) = rem_aos.split_at(cw);
+                rem_aos = rest_aos;
+                if !bbox.full {
+                    let dst_chunk = &mut dst_row[x..x + cw];
+                    if let Some((fx, lx)) =
+                        kernel.diff_and_update_row::<HAS_ALPHA>(src_chunk, dst_chunk)
+                    {
+                        let max_crop_area = (cw * ch * CROP_MAX_AREA_PCT) / 100;
+                        let became_full = bbox.record_row(ry, fx, lx, max_crop_area);
+                        if became_full {
+                            full_count += 1;
+                        }
+                        if *act == BandRowAction::Skip {
+                            let area = usize::from(bbox.max_x - bbox.min_x)
+                                * usize::from(bbox.max_y - bbox.min_y);
+                            if became_full
+                                || (ctx.cache_non_empty && area >= CROP_CACHE_LOOKUP_MIN_PIXELS)
+                            {
+                                *act = if became_full {
+                                    BandRowAction::StartFull
+                                } else {
+                                    BandRowAction::StartAbsorb
+                                };
+                            }
+                        } else if became_full {
+                            *act = BandRowAction::AbsorbShadowThenFull;
+                        }
+                    }
+                }
+                x += cw;
+            }
+
+            // SAFETY: `[y0, y1)` is exclusively owned and `dst_row` has updated
+            // all `!bbox.full` quadrants for row `y`.
+            unsafe {
+                tile_hash::process_band_row::<HAS_ALPHA>(
+                    scans.key(),
+                    ctx.data,
+                    ctx.shadow.base,
+                    stride,
+                    width,
+                    y0,
+                    ch,
+                    y,
+                    qx_actions,
+                    qx_hashers,
+                );
+            }
+        }
+
+        // SAFETY: Every non-`Skip` slot was initialized and absorbed all `ch` rows.
+        unsafe {
+            tile_hash::finish_band_hashers(
+                scans.key(),
+                qx_actions,
+                qx_hashers,
+                ctx.slot_base,
+                scans,
+            );
+        }
+    } else {
+        for y in (trigger_y + 1)..y1 {
+            if full_count == n_qx {
+                let vis_bytes = width * 4;
+                if stride == vis_bytes {
+                    let off = y * stride;
+                    let bytes = (y1 - y) * stride;
+                    let (_, after) = ctx.data.split_at(off);
+                    let (chunk, _) = after.split_at(bytes);
+                    // SAFETY: `[y0, y1)` is strictly disjoint across workers.
+                    let dst = unsafe { slice::from_raw_parts_mut(ctx.shadow.row_ptr(y, 0), bytes) };
+                    chunk.copy_to_nonoverlapping(dst);
+                } else {
+                    for ry in y..y1 {
+                        let off = ry * stride;
+                        let (_, after) = ctx.data.split_at(off);
+                        let (chunk, _) = after.split_at(vis_bytes);
+                        // SAFETY: `[y0, y1)` is strictly disjoint across workers.
+                        let dst = unsafe {
+                            slice::from_raw_parts_mut(ctx.shadow.row_ptr(ry, 0), vis_bytes)
+                        };
+                        chunk.copy_to_nonoverlapping(dst);
+                    }
+                }
+                break;
+            }
+
+            let ry = y - y0;
+            let (_, row_after) = ctx.aos.split_at(y * stride_px);
+            let (mut rem_aos, _) = row_after.split_at(width);
+            // SAFETY: `[y0, y1)` is strictly disjoint across workers and `Vec4u8` has alignment 1.
+            let dst_row = unsafe {
+                slice::from_raw_parts_mut(ctx.shadow.row_ptr(y, 0).cast::<Vec4u8>(), width)
+            };
+
+            let mut x = 0usize;
+            for bbox in qx_bboxes.iter_mut() {
+                let cw = (width - x).min(SUBTILE_W);
+                let (src_chunk, rest_aos) = rem_aos.split_at(cw);
+                rem_aos = rest_aos;
+                let dst_chunk = &mut dst_row[x..x + cw];
+                if bbox.full {
+                    src_chunk.copy_to_nonoverlapping(dst_chunk);
+                } else if let Some((fx, lx)) =
+                    kernel.diff_and_update_row::<HAS_ALPHA>(src_chunk, dst_chunk)
+                {
+                    let max_crop_area = (cw * ch * CROP_MAX_AREA_PCT) / 100;
+                    if bbox.record_row(ry, fx, lx, max_crop_area) {
+                        full_count += 1;
+                    }
+                }
+                x += cw;
+            }
         }
     }
 
-    let mut x = 0usize;
-    for (qx, (slot, bbox)) in dirty_slots.iter().zip(qx_bboxes.iter()).enumerate() {
-        let cw = (width - x).min(SUBTILE_W);
+    let has_scans = ctx.slot_scans.is_some();
+    for (slot, bbox) in ctx.dirty_slots.iter().zip(qx_bboxes.iter()) {
         if bbox.full {
-            if let Some(scans) = slot_scans {
-                let qrect = TileRect {
-                    x: x as u32,
-                    y: y0 as u32,
-                    w: cw as u32,
-                    h: ch as u32,
-                };
-                // SAFETY: `[y0, y1)` is in-bounds, finalized, and exclusively owned by this worker.
-                let scan = unsafe {
-                    tile_hash::hash_rect_from_shadow::<HAS_ALPHA>(
-                        scans.key(),
-                        shadow.base.cast_const(),
-                        stride,
-                        qrect,
-                    )
-                };
-                // SAFETY: `slot_base + qx` is exclusively owned by this worker.
-                unsafe { scans.write(slot_base + qx, scan) };
-            }
             slot.store(SlotDirty::FULL_RAW, Ordering::Relaxed);
         } else if bbox.is_dirty() {
             let crop_area =
                 usize::from(bbox.max_x - bbox.min_x) * usize::from(bbox.max_y - bbox.min_y);
-            let has_quad_hash = cache_non_empty
-                && slot_scans.is_some()
-                && crop_area >= CROP_CACHE_LOOKUP_MIN_PIXELS;
-            if has_quad_hash && let Some(scans) = slot_scans {
-                let qrect = TileRect {
-                    x: x as u32,
-                    y: y0 as u32,
-                    w: cw as u32,
-                    h: ch as u32,
-                };
-                // SAFETY: `[y0, y1)` is in-bounds, finalized, and exclusively owned by this worker.
-                let scan = unsafe {
-                    tile_hash::hash_rect_from_shadow::<HAS_ALPHA>(
-                        scans.key(),
-                        shadow.base.cast_const(),
-                        stride,
-                        qrect,
-                    )
-                };
-                // SAFETY: `slot_base + qx` is exclusively owned by this worker.
-                unsafe { scans.write(slot_base + qx, scan) };
-            }
+            let has_quad_hash =
+                ctx.cache_non_empty && has_scans && crop_area >= CROP_CACHE_LOOKUP_MIN_PIXELS;
             slot.store(
                 SlotDirty::encode_cropped(
                     bbox.min_x,
@@ -3515,7 +3749,269 @@ unsafe fn diff_and_update_row_band_2d_with<K: RowKernel, const HAS_ALPHA: bool>(
                 Ordering::Relaxed,
             );
         }
-        x += cw;
+    }
+}
+
+/// Scans a horizontal `<= 128`-row 2D sub-band linearly row-by-row across all
+/// `n_qx` horizontal quadrants, keeping clean / small-crop bands completely
+/// free of hasher state, `bbox.full` branches, and per-row function calls (so
+/// SIMD mask constants remain live in registers with zero stack spills), and
+/// handing off to [`RowKernel::finish_active_row_band_2d`] on the first row
+/// where any quadrant escalates to `bbox.full` or reaches
+/// `CROP_CACHE_LOOKUP_MIN_PIXELS`.
+///
+/// # Safety
+/// Rows `[y0, y1)` must be strictly in-bounds within `shadow` and disjoint from
+/// all rows concurrently accessed by other threads.
+#[inline(always)]
+pub(crate) unsafe fn diff_and_update_row_band_2d_with<K: RowKernel, const HAS_ALPHA: bool>(
+    kernel: K,
+    ctx: &ActiveRowBandCtx<'_>,
+) {
+    let width = ctx.width;
+    let stride = ctx.stride;
+    let stride_px = stride / 4;
+    let y0 = ctx.y0;
+    let y1 = ctx.y1;
+    let ch = y1 - y0;
+    let n_qx = ctx.dirty_slots.len();
+    let mut stack_bboxes = [QuadBbox::CLEAN; STACK_QX_CAP];
+    let mut heap_bboxes;
+    let qx_bboxes: &mut [QuadBbox] = if n_qx <= STACK_QX_CAP {
+        &mut stack_bboxes[..n_qx]
+    } else {
+        heap_bboxes = vec![QuadBbox::CLEAN; n_qx];
+        &mut heap_bboxes
+    };
+
+    let has_scans = ctx.slot_scans.is_some();
+    let mut full_count = 0usize;
+
+    for y in y0..y1 {
+        let ry = y - y0;
+        let (_, row_after) = ctx.aos.split_at(y * stride_px);
+        let (mut rem_aos, _) = row_after.split_at(width);
+        // SAFETY: `[y0, y1)` is strictly disjoint across workers and `Vec4u8` has alignment 1.
+        let dst_row =
+            unsafe { slice::from_raw_parts_mut(ctx.shadow.row_ptr(y, 0).cast::<Vec4u8>(), width) };
+
+        let mut row_triggered = false;
+        let mut x = 0usize;
+        for bbox in qx_bboxes.iter_mut() {
+            let cw = (width - x).min(SUBTILE_W);
+            let (src_chunk, rest_aos) = rem_aos.split_at(cw);
+            rem_aos = rest_aos;
+            let dst_chunk = &mut dst_row[x..x + cw];
+            if let Some((fx, lx)) = kernel.diff_and_update_row::<HAS_ALPHA>(src_chunk, dst_chunk) {
+                let max_crop_area = (cw * ch * CROP_MAX_AREA_PCT) / 100;
+                let became_full = bbox.record_row(ry, fx, lx, max_crop_area);
+                if became_full {
+                    full_count += 1;
+                    row_triggered = true;
+                } else if has_scans && ctx.cache_non_empty {
+                    let area =
+                        usize::from(bbox.max_x - bbox.min_x) * usize::from(bbox.max_y - bbox.min_y);
+                    if area >= CROP_CACHE_LOOKUP_MIN_PIXELS {
+                        row_triggered = true;
+                    }
+                }
+            }
+            x += cw;
+        }
+
+        if row_triggered {
+            // SAFETY: Rows `[y0, y]` are updated in `shadow` and `[y0, y1)` is exclusively owned.
+            unsafe {
+                kernel.finish_active_row_band_2d::<HAS_ALPHA>(ctx, qx_bboxes, y, full_count);
+            }
+            return;
+        }
+    }
+
+    for (slot, bbox) in ctx.dirty_slots.iter().zip(qx_bboxes.iter()) {
+        if bbox.is_dirty() {
+            slot.store(
+                SlotDirty::encode_cropped(bbox.min_x, bbox.max_x, bbox.min_y, bbox.max_y, false),
+                Ordering::Relaxed,
+            );
+        }
+    }
+}
+
+/// Processes a single `RowBand2D` inside one `SUBTILE_W`-wide vertical scroll
+/// column stripe without nested closure indirection, fusing in-place overlap-safe
+/// shadow scrolling, tight dirty bbox tracking, and (for `move_up`) immediate
+/// per-quadrant `copy_and_hash_rect_to_shadow` on `bbox.full` escalation.
+///
+/// # Safety
+/// Column stripe `[cx0, cx0 + cw)` over `[y0, y1)` must be in-bounds,
+/// exclusively owned by this worker, and traversed in overlap-safe order.
+#[inline(always)]
+unsafe fn diff_and_update_scroll_band_with<K: RowKernel, const HAS_ALPHA: bool>(
+    kernel: K,
+    data: BufferPointer<u8>,
+    aos: BufferPointer<Vec4u8>,
+    shadow: &ShadowRows,
+    stride: usize,
+    stride_px: usize,
+    sr_dy: isize,
+    sr_dst_y0: usize,
+    sr_dst_y1: usize,
+    move_up: bool,
+    cx0: usize,
+    cw: usize,
+    ov_x_bytes: usize,
+    ov_bytes: usize,
+    qx: usize,
+    band: &ScanSubBand,
+    dirty_slots: &[AtomicU32],
+    slot_scans: Option<&SlotScans>,
+    cache_non_empty: bool,
+) {
+    let ScanSubBand::RowBand2D { y0, y1, slot_base } = *band else {
+        unreachable!("scroll bands must be RowBand2D");
+    };
+    let y0 = y0 as usize;
+    let y1 = y1 as usize;
+    let ch = y1 - y0;
+    let cx0_bytes = cx0 * 4;
+    let max_crop_area = (cw * ch * CROP_MAX_AREA_PCT) / 100;
+    let mut bbox = QuadBbox::CLEAN;
+    let band_overlaps_dst = ov_bytes > 0 && y1 > sr_dst_y0 && y0 < sr_dst_y1;
+    let qrect = TileRect {
+        x: cx0 as u32,
+        y: y0 as u32,
+        w: cw as u32,
+        h: ch as u32,
+    };
+
+    if move_up {
+        for y in y0..y1 {
+            if band_overlaps_dst && y >= sr_dst_y0 && y < sr_dst_y1 {
+                let src_y = (y as isize - sr_dy) as usize;
+                // SAFETY: `src_y > y`, `[ov_start, ov_end)` lies inside this
+                // worker's exclusive column stripe, and top-to-bottom traversal
+                // guarantees `shadow[src_y]` has not yet been overwritten.
+                unsafe {
+                    ptr::copy_nonoverlapping(
+                        shadow.row_ptr(src_y, ov_x_bytes),
+                        shadow.row_ptr(y, ov_x_bytes),
+                        ov_bytes,
+                    );
+                }
+            }
+            let (_, row_after) = aos.split_at(y * stride_px + cx0);
+            let (src_chunk, _) = row_after.split_at(cw);
+            // SAFETY: Created after `ptr::copy_nonoverlapping`; exclusive column stripe.
+            let dst_chunk = unsafe {
+                slice::from_raw_parts_mut(shadow.row_ptr(y, cx0_bytes).cast::<Vec4u8>(), cw)
+            };
+            if let Some((fx, lx)) = kernel.diff_and_update_row::<HAS_ALPHA>(src_chunk, dst_chunk)
+                && bbox.record_row(y - y0, fx, lx, max_crop_area)
+            {
+                // Under `move_up` (`sr.dy < 0`), all later bands read `src_y >=
+                // y1 + |dy| > y1`, so rows `(y + 1)..y1` of this band are never
+                // read by later bands and can be overwritten & hashed directly.
+                // SAFETY: Rows `0..=(y - y0)` are finalized in `shadow`.
+                unsafe {
+                    finish_full_quadrant::<HAS_ALPHA>(
+                        data,
+                        shadow,
+                        stride,
+                        qrect,
+                        (y - y0) + 1,
+                        slot_base + qx,
+                        &dirty_slots[slot_base + qx],
+                        slot_scans,
+                    );
+                }
+                return;
+            }
+        }
+    } else {
+        for y in (y0..y1).rev() {
+            if band_overlaps_dst && y >= sr_dst_y0 && y < sr_dst_y1 {
+                let src_y = (y as isize - sr_dy) as usize;
+                // SAFETY: `src_y < y`, `[ov_start, ov_end)` lies inside this
+                // worker's exclusive column stripe, and bottom-to-top traversal
+                // guarantees `shadow[src_y]` has not yet been overwritten.
+                unsafe {
+                    ptr::copy_nonoverlapping(
+                        shadow.row_ptr(src_y, ov_x_bytes),
+                        shadow.row_ptr(y, ov_x_bytes),
+                        ov_bytes,
+                    );
+                }
+            }
+            let (_, row_after) = aos.split_at(y * stride_px + cx0);
+            let (src_chunk, _) = row_after.split_at(cw);
+            // SAFETY: Created after `ptr::copy_nonoverlapping`; exclusive column stripe.
+            let dst_chunk = unsafe {
+                slice::from_raw_parts_mut(shadow.row_ptr(y, cx0_bytes).cast::<Vec4u8>(), cw)
+            };
+            if let Some((fx, lx)) = kernel.diff_and_update_row::<HAS_ALPHA>(src_chunk, dst_chunk)
+                && bbox.record_row(y - y0, fx, lx, max_crop_area)
+            {
+                // Under `!move_up` (`sr.dy > 0`), all later bands read `src_y <
+                // y0`, so remaining rows `y0..y` of this band can be copied
+                // directly from `data` without scroll replay.
+                if y > y0 {
+                    let rem_rect = TileRect {
+                        x: cx0 as u32,
+                        y: y0 as u32,
+                        w: cw as u32,
+                        h: (y - y0) as u32,
+                    };
+                    // SAFETY: Exclusive column stripe in `shadow`.
+                    unsafe { copy_rect_to_shadow(data, shadow, stride, rem_rect) };
+                }
+                if let Some(scans) = slot_scans {
+                    // SAFETY: `qrect` is finalized and exclusively owned.
+                    let scan = unsafe {
+                        tile_hash::hash_rect_from_shadow::<HAS_ALPHA>(
+                            scans.key(),
+                            shadow.base.cast_const(),
+                            stride,
+                            qrect,
+                        )
+                    };
+                    // SAFETY: `slot_base + qx` is exclusively owned by this worker.
+                    unsafe { scans.write(slot_base + qx, scan) };
+                }
+                dirty_slots[slot_base + qx].store(SlotDirty::FULL_RAW, Ordering::Relaxed);
+                return;
+            }
+        }
+    }
+
+    if bbox.is_dirty() {
+        let crop_area = usize::from(bbox.max_x - bbox.min_x) * usize::from(bbox.max_y - bbox.min_y);
+        let has_quad_hash =
+            cache_non_empty && slot_scans.is_some() && crop_area >= CROP_CACHE_LOOKUP_MIN_PIXELS;
+        if has_quad_hash && let Some(scans) = slot_scans {
+            // SAFETY: Column stripe `[cx0, cx1)` over `[y0, y1)` is in-bounds,
+            // finalized, and exclusively owned by this worker.
+            let scan = unsafe {
+                tile_hash::hash_rect_from_shadow::<HAS_ALPHA>(
+                    scans.key(),
+                    shadow.base.cast_const(),
+                    stride,
+                    qrect,
+                )
+            };
+            // SAFETY: `slot_base + qx` is exclusively owned by this worker.
+            unsafe { scans.write(slot_base + qx, scan) };
+        }
+        dirty_slots[slot_base + qx].store(
+            SlotDirty::encode_cropped(
+                bbox.min_x,
+                bbox.max_x,
+                bbox.min_y,
+                bbox.max_y,
+                has_quad_hash,
+            ),
+            Ordering::Relaxed,
+        );
     }
 }
 
@@ -3531,6 +4027,7 @@ unsafe fn diff_and_update_row_band_2d_with<K: RowKernel, const HAS_ALPHA: bool>(
 #[inline(always)]
 unsafe fn diff_and_update_scroll_column_with<K: RowKernel, const HAS_ALPHA: bool>(
     kernel: K,
+    data: BufferPointer<u8>,
     aos: BufferPointer<Vec4u8>,
     shadow: &ShadowRows,
     width: usize,
@@ -3552,7 +4049,6 @@ unsafe fn diff_and_update_scroll_column_with<K: RowKernel, const HAS_ALPHA: bool
     let ov_end = cx1.min(sr_x1).max(ov_start);
     let ov_bytes = (ov_end - ov_start) * 4;
     let ov_x_bytes = ov_start * 4;
-    let cx0_bytes = cx0 * 4;
 
     let shift = sr.dy.unsigned_abs() as usize;
     let copy_h = sr.height as usize - shift;
@@ -3562,134 +4058,61 @@ unsafe fn diff_and_update_scroll_column_with<K: RowKernel, const HAS_ALPHA: bool
         (sr.y as usize + shift, sr.y as usize + sr.height as usize)
     };
     let move_up = sr.dy < 0;
-
-    let process_band = |band: &ScanSubBand| {
-        let ScanSubBand::RowBand2D { y0, y1, slot_base } = *band else {
-            unreachable!("scroll bands must be RowBand2D");
-        };
-        let y0 = y0 as usize;
-        let y1 = y1 as usize;
-        let ch = y1 - y0;
-        let max_crop_area = (cw * ch * CROP_MAX_AREA_PCT) / 100;
-        let mut bbox = QuadBbox::CLEAN;
-        let band_overlaps_dst = ov_bytes > 0 && y1 > sr_dst_y0 && y0 < sr_dst_y1;
-
-        let mut process_row = |y: usize| {
-            let (_, row_after) = aos.split_at(y * stride_px + cx0);
-            let (src_chunk, _) = row_after.split_at(cw);
-            if bbox.full {
-                // SAFETY: Column stripe `[cx0, cx1)` is exclusively owned by
-                // this worker across `scroll_bands`, and `Vec4u8` has align 1.
-                let dst_chunk = unsafe {
-                    slice::from_raw_parts_mut(shadow.row_ptr(y, cx0_bytes).cast::<Vec4u8>(), cw)
-                };
-                src_chunk.copy_to_nonoverlapping(dst_chunk);
-            } else {
-                if band_overlaps_dst && y >= sr_dst_y0 && y < sr_dst_y1 {
-                    let src_y = (y as isize - sr.dy as isize) as usize;
-                    // SAFETY: `src_y != y` (`dy != 0`), `[ov_start, ov_end)` lies
-                    // within this worker's exclusive column stripe `[cx0, cx1)`,
-                    // and overlap-safe row traversal guarantees `shadow[src_y]`
-                    // has not yet been overwritten.
-                    unsafe {
-                        ptr::copy_nonoverlapping(
-                            shadow.row_ptr(src_y, ov_x_bytes),
-                            shadow.row_ptr(y, ov_x_bytes),
-                            ov_bytes,
-                        );
-                    }
-                }
-                // SAFETY: Created after `ptr::copy_nonoverlapping` completes;
-                // column stripe `[cx0, cx1)` is exclusively owned by this worker.
-                let dst_chunk = unsafe {
-                    slice::from_raw_parts_mut(shadow.row_ptr(y, cx0_bytes).cast::<Vec4u8>(), cw)
-                };
-                if let Some((fx, lx)) =
-                    kernel.diff_and_update_row::<HAS_ALPHA>(src_chunk, dst_chunk)
-                {
-                    bbox.record_row(y - y0, fx, lx, max_crop_area);
-                }
-            }
-        };
-
-        if move_up {
-            for y in y0..y1 {
-                process_row(y);
-            }
-        } else {
-            for y in (y0..y1).rev() {
-                process_row(y);
-            }
-        }
-
-        if bbox.full {
-            if let Some(scans) = slot_scans {
-                let qrect = TileRect {
-                    x: cx0 as u32,
-                    y: y0 as u32,
-                    w: cw as u32,
-                    h: ch as u32,
-                };
-                // SAFETY: Column stripe `[cx0, cx1)` over `[y0, y1)` is in-bounds,
-                // finalized, and exclusively owned by this worker.
-                let scan = unsafe {
-                    tile_hash::hash_rect_from_shadow::<HAS_ALPHA>(
-                        scans.key(),
-                        shadow.base.cast_const(),
-                        stride,
-                        qrect,
-                    )
-                };
-                // SAFETY: `slot_base + qx` is exclusively owned by this worker.
-                unsafe { scans.write(slot_base + qx, scan) };
-            }
-            dirty_slots[slot_base + qx].store(SlotDirty::FULL_RAW, Ordering::Relaxed);
-        } else if bbox.is_dirty() {
-            let crop_area =
-                usize::from(bbox.max_x - bbox.min_x) * usize::from(bbox.max_y - bbox.min_y);
-            let has_quad_hash = cache_non_empty
-                && slot_scans.is_some()
-                && crop_area >= CROP_CACHE_LOOKUP_MIN_PIXELS;
-            if has_quad_hash && let Some(scans) = slot_scans {
-                let qrect = TileRect {
-                    x: cx0 as u32,
-                    y: y0 as u32,
-                    w: cw as u32,
-                    h: ch as u32,
-                };
-                // SAFETY: Column stripe `[cx0, cx1)` over `[y0, y1)` is in-bounds,
-                // finalized, and exclusively owned by this worker.
-                let scan = unsafe {
-                    tile_hash::hash_rect_from_shadow::<HAS_ALPHA>(
-                        scans.key(),
-                        shadow.base.cast_const(),
-                        stride,
-                        qrect,
-                    )
-                };
-                // SAFETY: `slot_base + qx` is exclusively owned by this worker.
-                unsafe { scans.write(slot_base + qx, scan) };
-            }
-            dirty_slots[slot_base + qx].store(
-                SlotDirty::encode_cropped(
-                    bbox.min_x,
-                    bbox.max_x,
-                    bbox.min_y,
-                    bbox.max_y,
-                    has_quad_hash,
-                ),
-                Ordering::Relaxed,
-            );
-        }
-    };
+    let sr_dy = sr.dy as isize;
 
     if move_up {
         for band in scroll_bands {
-            process_band(band);
+            // SAFETY: Caller guarantees exclusive column ownership and ascending band order.
+            unsafe {
+                diff_and_update_scroll_band_with::<K, HAS_ALPHA>(
+                    kernel,
+                    data,
+                    aos,
+                    shadow,
+                    stride,
+                    stride_px,
+                    sr_dy,
+                    sr_dst_y0,
+                    sr_dst_y1,
+                    true,
+                    cx0,
+                    cw,
+                    ov_x_bytes,
+                    ov_bytes,
+                    qx,
+                    band,
+                    dirty_slots,
+                    slot_scans,
+                    cache_non_empty,
+                );
+            }
         }
     } else {
         for band in scroll_bands.iter().rev() {
-            process_band(band);
+            // SAFETY: Caller guarantees exclusive column ownership and descending band order.
+            unsafe {
+                diff_and_update_scroll_band_with::<K, HAS_ALPHA>(
+                    kernel,
+                    data,
+                    aos,
+                    shadow,
+                    stride,
+                    stride_px,
+                    sr_dy,
+                    sr_dst_y0,
+                    sr_dst_y1,
+                    false,
+                    cx0,
+                    cw,
+                    ov_x_bytes,
+                    ov_bytes,
+                    qx,
+                    band,
+                    dirty_slots,
+                    slot_scans,
+                    cache_non_empty,
+                );
+            }
         }
     }
 }
@@ -3745,44 +4168,38 @@ unsafe fn diff_and_update_worker_with<K: RowKernel, const HAS_ALPHA: bool>(
         match sub_bands[idx] {
             ScanSubBand::Strip1D { rect, slot_idx } => {
                 // SAFETY: `sub_bands` cover disjoint regions in `shadow`.
-                let dirty = unsafe {
-                    diff_and_update_strip_with::<K, HAS_ALPHA>(kernel, aos, shadow, stride_px, rect)
-                };
-                if dirty {
-                    if let Some(scans) = slot_scans {
-                        // SAFETY: `rect` is in-bounds, finalized, and exclusively owned.
-                        let scan = unsafe {
-                            tile_hash::hash_rect_from_shadow::<HAS_ALPHA>(
-                                scans.key(),
-                                shadow.base.cast_const(),
-                                stride,
-                                rect,
-                            )
-                        };
-                        // SAFETY: `slot_idx` is exclusively owned by this worker.
-                        unsafe { scans.write(slot_idx, scan) };
-                    }
-                    dirty_slots[slot_idx].store(SlotDirty::FULL_RAW, Ordering::Relaxed);
-                }
-            },
-            ScanSubBand::RowBand2D { y0, y1, slot_base } => {
-                let slots = &dirty_slots[slot_base..slot_base + n_qx];
-                // SAFETY: `sub_bands` cover disjoint row ranges in `shadow`.
                 unsafe {
-                    diff_and_update_row_band_2d_with::<K, HAS_ALPHA>(
+                    diff_and_update_strip_slot_with::<K, HAS_ALPHA>(
                         kernel,
                         data,
                         aos,
                         shadow,
-                        width,
                         stride,
-                        y0 as usize,
-                        y1 as usize,
-                        slot_base,
-                        slots,
+                        stride_px,
+                        rect,
+                        slot_idx,
+                        &dirty_slots[slot_idx],
                         slot_scans,
-                        cache_non_empty,
                     );
+                }
+            },
+            ScanSubBand::RowBand2D { y0, y1, slot_base } => {
+                let ctx = ActiveRowBandCtx {
+                    data,
+                    aos,
+                    shadow,
+                    width,
+                    stride,
+                    y0: y0 as usize,
+                    y1: y1 as usize,
+                    slot_base,
+                    dirty_slots: &dirty_slots[slot_base..slot_base + n_qx],
+                    slot_scans,
+                    cache_non_empty,
+                };
+                // SAFETY: `sub_bands` cover disjoint row ranges in `shadow`.
+                unsafe {
+                    kernel.diff_and_update_row_band_2d::<HAS_ALPHA>(&ctx);
                 }
             },
         }
@@ -3831,6 +4248,7 @@ unsafe fn diff_and_update_scroll_worker_with<K: RowKernel, const HAS_ALPHA: bool
             unsafe {
                 diff_and_update_scroll_column_with::<K, HAS_ALPHA>(
                     kernel,
+                    data,
                     aos,
                     shadow,
                     width,
@@ -3854,46 +4272,38 @@ unsafe fn diff_and_update_scroll_worker_with<K: RowKernel, const HAS_ALPHA: bool
             match sub_bands[sb_idx] {
                 ScanSubBand::Strip1D { rect, slot_idx } => {
                     // SAFETY: Outside `sb_start..sb_end`, disjoint from `sr`.
-                    let dirty = unsafe {
-                        diff_and_update_strip_with::<K, HAS_ALPHA>(
-                            kernel, aos, shadow, stride_px, rect,
-                        )
-                    };
-                    if dirty {
-                        if let Some(scans) = slot_scans {
-                            // SAFETY: `rect` is in-bounds, finalized, and exclusively owned.
-                            let scan = unsafe {
-                                tile_hash::hash_rect_from_shadow::<HAS_ALPHA>(
-                                    scans.key(),
-                                    shadow.base.cast_const(),
-                                    stride,
-                                    rect,
-                                )
-                            };
-                            // SAFETY: `slot_idx` is exclusively owned by this worker.
-                            unsafe { scans.write(slot_idx, scan) };
-                        }
-                        dirty_slots[slot_idx].store(SlotDirty::FULL_RAW, Ordering::Relaxed);
-                    }
-                },
-                ScanSubBand::RowBand2D { y0, y1, slot_base } => {
-                    let slots = &dirty_slots[slot_base..slot_base + n_qx];
-                    // SAFETY: Outside `sb_start..sb_end`, disjoint from `sr`.
                     unsafe {
-                        diff_and_update_row_band_2d_with::<K, HAS_ALPHA>(
+                        diff_and_update_strip_slot_with::<K, HAS_ALPHA>(
                             kernel,
                             data,
                             aos,
                             shadow,
-                            width,
                             stride,
-                            y0 as usize,
-                            y1 as usize,
-                            slot_base,
-                            slots,
+                            stride_px,
+                            rect,
+                            slot_idx,
+                            &dirty_slots[slot_idx],
                             slot_scans,
-                            cache_non_empty,
                         );
+                    }
+                },
+                ScanSubBand::RowBand2D { y0, y1, slot_base } => {
+                    let ctx = ActiveRowBandCtx {
+                        data,
+                        aos,
+                        shadow,
+                        width,
+                        stride,
+                        y0: y0 as usize,
+                        y1: y1 as usize,
+                        slot_base,
+                        dirty_slots: &dirty_slots[slot_base..slot_base + n_qx],
+                        slot_scans,
+                        cache_non_empty,
+                    };
+                    // SAFETY: Outside `sb_start..sb_end`, disjoint from `sr`.
+                    unsafe {
+                        kernel.diff_and_update_row_band_2d::<HAS_ALPHA>(&ctx);
                     }
                 },
             }
@@ -5875,7 +6285,168 @@ mod tests {
                     assert_eq!(sh_a, sh_s);
                 }
             }
+        }
 
+        // Exhaustive `diff_and_update_row::<false/true>` sweep across every
+        // width `0..=256` and `300` (compact subset under Miri), covering clean
+        // rows, single-pixel RGB and alpha-only diffs across all 1/4/8/16/32/64
+        // vector boundaries, and multi-chunk dirty spans.
+        #[cfg(not(miri))]
+        let diff_widths: Vec<usize> = (0..=256).chain([300]).collect();
+        #[cfg(miri)]
+        let diff_widths: Vec<usize> = vec![
+            0, 1, 3, 4, 7, 8, 15, 16, 17, 31, 32, 33, 63, 64, 65, 128, 300,
+        ];
+        for tw in diff_widths {
+            let base: Vec<Vec4u8> = (0..tw)
+                .map(|i| {
+                    let k = (i * 37 + tw * 13 + 5) as u32;
+                    Vec4u8(
+                        ((k * 11 + 3) & 0xFF) as u8,
+                        ((k * 23 + 17) & 0xFF) as u8,
+                        ((k * 41 + 9) & 0xFF) as u8,
+                        ((k * 19 + 7) & 0xFF) as u8,
+                    )
+                })
+                .collect();
+            let p_base = base.as_ptr();
+            let bp_base = unsafe { BufferPointer::new(&p_base, tw) };
+
+            let mut sh_s = base.clone();
+            let mut sh_k = base.clone();
+            assert_eq!(
+                kernel.diff_and_update_row::<false>(bp_base, &mut sh_k),
+                None,
+                "[{tier_name}] clean xrgb tw={tw}"
+            );
+            assert_eq!(
+                kernel.diff_and_update_row::<true>(bp_base, &mut sh_k),
+                None,
+                "[{tier_name}] clean argb tw={tw}"
+            );
+            assert_eq!(sh_k, base, "[{tier_name}] clean mutated shadow tw={tw}");
+            if tw == 0 {
+                continue;
+            }
+
+            let probe_positions = [0, 1, 7, 8, 15, 16, 31, 32, 33, 63, 64, tw - 1];
+            for &pos in &probe_positions {
+                if pos >= tw {
+                    continue;
+                }
+                // Alpha-only diff at `pos`.
+                let mut alt_a = base.clone();
+                alt_a[pos].3 ^= 0xA5;
+                let pa = alt_a.as_ptr();
+                let bpa = unsafe { BufferPointer::new(&pa, tw) };
+                sh_s.clone_from(&base);
+                sh_k.clone_from(&base);
+                assert_eq!(
+                    kernel.diff_and_update_row::<false>(bpa, &mut sh_k),
+                    ScalarKernel.diff_and_update_row::<false>(bpa, &mut sh_s),
+                    "[{tier_name}] alpha-only xrgb span tw={tw} pos={pos}"
+                );
+                assert_eq!(
+                    sh_k, base,
+                    "[{tier_name}] alpha-only xrgb must not write shadow tw={tw} pos={pos}"
+                );
+                assert_eq!(
+                    kernel.diff_and_update_row::<true>(bpa, &mut sh_k),
+                    ScalarKernel.diff_and_update_row::<true>(bpa, &mut sh_s),
+                    "[{tier_name}] alpha-only argb span tw={tw} pos={pos}"
+                );
+                assert_eq!(
+                    sh_k, sh_s,
+                    "[{tier_name}] alpha-only argb shadow tw={tw} pos={pos}"
+                );
+
+                // Single-pixel RGB diff at `pos`.
+                let mut alt_rgb = base.clone();
+                alt_rgb[pos].0 ^= 0x5A;
+                let pr = alt_rgb.as_ptr();
+                let bpr = unsafe { BufferPointer::new(&pr, tw) };
+                sh_s.clone_from(&base);
+                sh_k.clone_from(&base);
+                assert_eq!(
+                    kernel.diff_and_update_row::<false>(bpr, &mut sh_k),
+                    ScalarKernel.diff_and_update_row::<false>(bpr, &mut sh_s),
+                    "[{tier_name}] single-px xrgb span tw={tw} pos={pos}"
+                );
+                assert_eq!(
+                    sh_k, sh_s,
+                    "[{tier_name}] single-px xrgb shadow tw={tw} pos={pos}"
+                );
+                sh_s.clone_from(&base);
+                sh_k.clone_from(&base);
+                assert_eq!(
+                    kernel.diff_and_update_row::<true>(bpr, &mut sh_k),
+                    ScalarKernel.diff_and_update_row::<true>(bpr, &mut sh_s),
+                    "[{tier_name}] single-px argb span tw={tw} pos={pos}"
+                );
+                assert_eq!(
+                    sh_k, sh_s,
+                    "[{tier_name}] single-px argb shadow tw={tw} pos={pos}"
+                );
+            }
+
+            // Multi-chunk dirty spans crossing 16/32/64/128/256-px boundaries,
+            // including an unrelated alpha-only diff in a clean outer chunk
+            // under `HAS_ALPHA = false`.
+            let span_pairs = [
+                (0, tw - 1),
+                (1, tw.saturating_sub(2)),
+                (7, 33.min(tw - 1)),
+                (15, 65.min(tw - 1)),
+                (31, 129.min(tw - 1)),
+                (63, 255.min(tw - 1)),
+            ];
+            for (p0, p1) in span_pairs {
+                if p0 > p1 || p1 >= tw {
+                    continue;
+                }
+                let mut alt = base.clone();
+                alt[p0].1 ^= 0x3C;
+                alt[p1].2 ^= 0xC3;
+                if p0 >= 16 {
+                    // Alpha-only perturbation in an earlier clean 16-px chunk
+                    // must remain ignored under `HAS_ALPHA = false`.
+                    alt[0].3 ^= 0x77;
+                }
+                let pa = alt.as_ptr();
+                let bpa = unsafe { BufferPointer::new(&pa, tw) };
+                sh_s.clone_from(&base);
+                sh_k.clone_from(&base);
+                let exp_xrgb = ScalarKernel.diff_and_update_row::<false>(bpa, &mut sh_s);
+                let got_xrgb = kernel.diff_and_update_row::<false>(bpa, &mut sh_k);
+                assert_eq!(
+                    got_xrgb, exp_xrgb,
+                    "[{tier_name}] multi-chunk xrgb span tw={tw} ({p0}..={p1})"
+                );
+                for j in 0..tw {
+                    assert_eq!(
+                        (sh_k[j].0, sh_k[j].1, sh_k[j].2),
+                        (sh_s[j].0, sh_s[j].1, sh_s[j].2),
+                        "[{tier_name}] multi-chunk xrgb rgb tw={tw} ({p0}..={p1}) px={j}"
+                    );
+                }
+
+                sh_s.clone_from(&base);
+                sh_k.clone_from(&base);
+                let exp_argb = ScalarKernel.diff_and_update_row::<true>(bpa, &mut sh_s);
+                let got_argb = kernel.diff_and_update_row::<true>(bpa, &mut sh_k);
+                assert_eq!(
+                    got_argb, exp_argb,
+                    "[{tier_name}] multi-chunk argb span tw={tw} ({p0}..={p1})"
+                );
+                assert_eq!(
+                    sh_k, sh_s,
+                    "[{tier_name}] multi-chunk argb shadow tw={tw} ({p0}..={p1})"
+                );
+            }
+        }
+
+        // Preserve `copy_and_scan_row` and palette checks for the original width set.
+        for tw in (1..=65).chain([127, 128, 129, 255, 256, 300]) {
             // `copy_and_scan_row` parity with `ScalarKernel` across solid,
             // garbage-X, translucent, and single-pixel diff inputs.
             let first_opq = u32::from_ne_bytes([0x12, 0x34, 0x56, 0xFF]);
@@ -6825,6 +7396,564 @@ mod tests {
         let tested = arch::verify_all_supported_kernels();
         assert_eq!(tested, arch::Tier::supported_tiers());
         assert!(!tested.is_empty());
+    }
+
+    /// Verifies exact `SlotDirty`, 128-bit keyed hash, [`RectScanMeta`], and
+    /// `shadow` byte parity across every supported tier for quadrants
+    /// transitioning from clean -> small crop -> large crop (`>= 1024 px`) ->
+    /// `bbox.full` at row 0, mid-quadrant, and last row (under both
+    /// `cache_non_empty = false` and `true`, `HAS_ALPHA = false` and `true`,
+    /// clipped edge quadrants, `n_qx > STACK_HASH_CAP`, and scroll columns).
+    #[test]
+    fn test_quadrant_bbox_transitions_hash_meta_and_shadow_parity() {
+        let key = tile_hash::TileHashKey::from_seed(0xC0DE_5168_CAFE_BEEF);
+        let tiers = arch::Tier::supported_tiers();
+        assert!(!tiers.is_empty());
+
+        let fill_frame =
+            |w: usize, h: usize, stride: usize, seed: u32, garbage_x: bool| -> Vec<u8> {
+                let mut buf = vec![0u8; h * stride];
+                for y in 0..h {
+                    for x in 0..w {
+                        let off = y * stride + x * 4;
+                        let v = (x as u32)
+                            .wrapping_mul(31)
+                            .wrapping_add((y as u32).wrapping_mul(17))
+                            .wrapping_add(seed);
+                        buf[off] = (v & 0xFF) as u8;
+                        buf[off + 1] = ((v >> 3) & 0xFF) as u8;
+                        buf[off + 2] = ((v >> 7) & 0xFF) as u8;
+                        buf[off + 3] = if garbage_x {
+                            ((v >> 11) ^ 0xA5) as u8
+                        } else {
+                            0xFF
+                        };
+                    }
+                }
+                buf
+            };
+
+        let verify_band = |width: usize,
+                           height: usize,
+                           stride: usize,
+                           base_shadow: &[u8],
+                           src: &[u8],
+                           has_alpha: bool,
+                           cache_non_empty: bool,
+                           with_scans: bool,
+                           label: &str| {
+            let n_qx = width.div_ceil(SUBTILE_W);
+            let sub_bands = [ScanSubBand::RowBand2D {
+                y0: 0,
+                y1: height as u32,
+                slot_base: 0,
+            }];
+
+            // Scalar reference via `ScalarKernel` + `hash_rect_from_shadow`.
+            let mut ref_shadow = base_shadow.to_vec();
+            let mut ref_slots = vec![SlotDirty::Clean; n_qx];
+            let mut ref_hashes = vec![tile_hash::TileHashResult::EMPTY; n_qx];
+            let max_crop_for = |cw: usize, ch: usize| (cw * ch * CROP_MAX_AREA_PCT) / 100;
+            for qx in 0..n_qx {
+                let x0 = qx * SUBTILE_W;
+                let cw = (width - x0).min(SUBTILE_W);
+                let mut bbox = QuadBbox::CLEAN;
+                for y in 0..height {
+                    let row_off = y * stride + x0 * 4;
+                    let src_px: &[Vec4u8] = bytemuck::cast_slice(&src[row_off..row_off + cw * 4]);
+                    let sp = src_px.as_ptr();
+                    let bp = unsafe { BufferPointer::new(&sp, cw) };
+                    let dst_px: &mut [Vec4u8] =
+                        bytemuck::cast_slice_mut(&mut ref_shadow[row_off..row_off + cw * 4]);
+                    if bbox.full {
+                        dst_px.copy_from_slice(src_px);
+                    } else {
+                        let span = if has_alpha {
+                            ScalarKernel.diff_and_update_row::<true>(bp, dst_px)
+                        } else {
+                            ScalarKernel.diff_and_update_row::<false>(bp, dst_px)
+                        };
+                        if let Some((fx, lx)) = span {
+                            bbox.record_row(y, fx, lx, max_crop_for(cw, height));
+                        }
+                    }
+                }
+                let qrect = TileRect {
+                    x: x0 as u32,
+                    y: 0,
+                    w: cw as u32,
+                    h: height as u32,
+                };
+                if bbox.full {
+                    ref_slots[qx] = SlotDirty::Full;
+                    if with_scans {
+                        ref_hashes[qx] = if has_alpha {
+                            unsafe {
+                                tile_hash::hash_rect_from_shadow::<true>(
+                                    &key,
+                                    ref_shadow.as_ptr(),
+                                    stride,
+                                    qrect,
+                                )
+                            }
+                        } else {
+                            unsafe {
+                                tile_hash::hash_rect_from_shadow::<false>(
+                                    &key,
+                                    ref_shadow.as_ptr(),
+                                    stride,
+                                    qrect,
+                                )
+                            }
+                        };
+                    }
+                } else if bbox.is_dirty() {
+                    let area =
+                        usize::from(bbox.max_x - bbox.min_x) * usize::from(bbox.max_y - bbox.min_y);
+                    let has_quad_hash =
+                        with_scans && cache_non_empty && area >= CROP_CACHE_LOOKUP_MIN_PIXELS;
+                    ref_slots[qx] = SlotDirty::Cropped {
+                        min_x: bbox.min_x,
+                        max_x: bbox.max_x,
+                        min_y: bbox.min_y,
+                        max_y: bbox.max_y,
+                        has_quad_hash,
+                    };
+                    if has_quad_hash {
+                        ref_hashes[qx] = if has_alpha {
+                            unsafe {
+                                tile_hash::hash_rect_from_shadow::<true>(
+                                    &key,
+                                    ref_shadow.as_ptr(),
+                                    stride,
+                                    qrect,
+                                )
+                            }
+                        } else {
+                            unsafe {
+                                tile_hash::hash_rect_from_shadow::<false>(
+                                    &key,
+                                    ref_shadow.as_ptr(),
+                                    stride,
+                                    qrect,
+                                )
+                            }
+                        };
+                    }
+                }
+            }
+
+            let src_ptr = src.as_ptr();
+            let bp = unsafe { BufferPointer::new(&src_ptr, src.len()) };
+            let aos = unsafe { bp.cast::<Vec4u8>() };
+            let stride_px = stride / 4;
+
+            for &tier in &tiers {
+                let mut shadow_buf = base_shadow.to_vec();
+                let shadow = ShadowRows {
+                    base: shadow_buf.as_mut_ptr(),
+                    stride,
+                };
+                let dirty_slots: Vec<AtomicU32> = (0..n_qx)
+                    .map(|_| AtomicU32::new(SlotDirty::CLEAN_RAW))
+                    .collect();
+                let mut scans = tile_cache::SlotScans::new(n_qx, key);
+                let next_sub = AtomicUsize::new(0);
+                unsafe {
+                    tier.diff_and_update_worker(
+                        has_alpha,
+                        bp,
+                        aos,
+                        &shadow,
+                        width,
+                        stride,
+                        stride_px,
+                        n_qx,
+                        &sub_bands,
+                        &dirty_slots,
+                        with_scans.then_some(&scans),
+                        cache_non_empty,
+                        &next_sub,
+                    );
+                }
+
+                let scans_slice = scans.as_slice();
+                for qx in 0..n_qx {
+                    let got_slot = SlotDirty::decode(dirty_slots[qx].load(Ordering::Relaxed));
+                    assert_eq!(
+                        got_slot, ref_slots[qx],
+                        "{label}: tier={tier:?} qx={qx} has_alpha={has_alpha} cache={cache_non_empty} scans={with_scans}"
+                    );
+                    let needs_hash = matches!(
+                        got_slot,
+                        SlotDirty::Full
+                            | SlotDirty::Cropped {
+                                has_quad_hash: true,
+                                ..
+                            }
+                    ) && with_scans;
+                    if needs_hash {
+                        let got_scan = scans_slice[qx];
+                        assert_eq!(
+                            got_scan, ref_hashes[qx],
+                            "{label}: hash/meta mismatch tier={tier:?} qx={qx} has_alpha={has_alpha} cache={cache_non_empty}"
+                        );
+                    }
+                    // Verify canonical shadow bytes match `ref_shadow` on every pixel.
+                    let x0 = qx * SUBTILE_W;
+                    let cw = (width - x0).min(SUBTILE_W);
+                    for y in 0..height {
+                        let off = y * stride + x0 * 4;
+                        let g = &shadow_buf[off..off + cw * 4];
+                        let e = &ref_shadow[off..off + cw * 4];
+                        if has_alpha {
+                            assert_eq!(
+                                g, e,
+                                "{label}: argb shadow mismatch tier={tier:?} qx={qx} y={y}"
+                            );
+                        } else {
+                            for px in 0..cw {
+                                assert_eq!(
+                                    &g[px * 4..px * 4 + 3],
+                                    &e[px * 4..px * 4 + 3],
+                                    "{label}: xrgb shadow mismatch tier={tier:?} qx={qx} y={y} px={px}"
+                                );
+                            }
+                        }
+                    }
+                }
+            }
+        };
+
+        // Case 1: Mixed transitions in one 7-quadrant band (clipped right edge
+        // `width = 6 * 128 + 37 = 805`, `height = 128` or `32` under Miri):
+        // - Q0: 100% clean (plus alpha-only noise under Xrgb)
+        // - Q1: small crop `< 1024 px` (stays `Cropped { has_quad_hash: false }`)
+        // - Q2: large crop `>= 1024 px`, never `bbox.full` (`Cropped { has_quad_hash }`)
+        // - Q3: clean prefix -> crosses `>= 1024 px` at `ry = 12` -> `bbox.full` mid-band
+        // - Q4: solid opaque tile transitioning to `bbox.full` mid-band
+        // - Q5: escalates to `bbox.full` on the VERY LAST row (`ry = height - 1`)
+        // - Q6: clipped right edge (`cw = 37`) solid translucent transitioning mid-band
+        #[cfg(not(miri))]
+        let band_h = 128usize;
+        #[cfg(miri)]
+        let band_h = 32usize;
+        let width = 6 * SUBTILE_W + 37;
+        let stride = (width + 5) * 4;
+        for has_alpha in [false, true] {
+            let base = fill_frame(width, band_h, stride, 11, !has_alpha);
+            let mut src = base.clone();
+
+            // Q0: alpha-only perturbation when `!has_alpha` (must remain Clean).
+            if !has_alpha {
+                for y in 0..band_h {
+                    src[y * stride + 7 * 4 + 3] ^= 0x55;
+                }
+            }
+
+            // Q1: small crop (`20 x 10 = 200 px < 1024 px`).
+            for y in 3..13 {
+                for x in 10..30 {
+                    src[y * stride + (SUBTILE_W + x) * 4] ^= 0x33;
+                }
+            }
+
+            // Q2: large crop (`64 x 20 = 1280 px >= 1024 px`, `< 45%` of quadrant).
+            let q2_h = (band_h / 4).max(20).min(band_h);
+            for y in 2..(2 + q2_h).min(band_h) {
+                for x in 4..68 {
+                    src[y * stride + (2 * SUBTILE_W + x) * 4 + 1] ^= 0x44;
+                }
+            }
+
+            // Q3: clean prefix (`0..4`), then `128`-px wide strip causing
+            // `>= 1024 px` at `ry = 11` and `bbox.full` mid-band.
+            for y in 4..band_h {
+                for x in 0..SUBTILE_W {
+                    src[y * stride + (3 * SUBTILE_W + x) * 4 + 2] ^= 0x77;
+                }
+            }
+
+            // Q4: solid opaque target color across entire quadrant (tests
+            // `still_solid == true` through `StartAbsorb -> AbsorbShadow -> CopyAndAbsorb`).
+            let solid_opq = [0x22u8, 0x44, 0x66, 0xFF];
+            for y in 0..band_h {
+                for x in 0..SUBTILE_W {
+                    let off = y * stride + (4 * SUBTILE_W + x) * 4;
+                    src[off..off + 4].copy_from_slice(&solid_opq);
+                }
+            }
+
+            // Q5: one dirty pixel on row 0 (`x = 0`) and one dirty pixel on the
+            // very last row (`y = band_h - 1, x = 127`) -> bbox jumps from
+            // `1x1 = 1 px` directly to `128 x band_h` (`bbox.full`) on the LAST row!
+            src[5 * SUBTILE_W * 4] ^= 0x19;
+            src[(band_h - 1) * stride + (5 * SUBTILE_W + SUBTILE_W - 1) * 4 + 1] ^= 0x2A;
+
+            // Q6: clipped right edge (`cw = 37`), solid translucent target color.
+            let solid_tr = [0x10u8, 0x80, 0xC0, if has_alpha { 0x7F } else { 0x33 }];
+            for y in 0..band_h {
+                for x in 0..37 {
+                    let off = y * stride + (6 * SUBTILE_W + x) * 4;
+                    src[off..off + 4].copy_from_slice(&solid_tr);
+                }
+            }
+
+            for cache_non_empty in [false, true] {
+                for with_scans in [false, true] {
+                    verify_band(
+                        width,
+                        band_h,
+                        stride,
+                        &base,
+                        &src,
+                        has_alpha,
+                        cache_non_empty,
+                        with_scans,
+                        "mixed_transitions",
+                    );
+                }
+            }
+        }
+
+        // Case 2: Row-0 immediate `bbox.full` escalation (`height = 1` band) +
+        // all-quadrants-full early exit (`copy_and_absorb_band_rows` on `height = 16`).
+        for (h_case, label) in [(1usize, "row0_full"), (16usize, "all_full_copy_absorb")] {
+            let w_case = 3 * SUBTILE_W + 19;
+            let st_case = w_case * 4;
+            for has_alpha in [false, true] {
+                let base = fill_frame(w_case, h_case, st_case, 5, !has_alpha);
+                let mut src = fill_frame(w_case, h_case, st_case, 99, !has_alpha);
+                // Make Q1 solid opaque to exercise mixed solid + non-solid in
+                // `copy_and_absorb_band_rows`.
+                for y in 0..h_case {
+                    for x in 0..SUBTILE_W {
+                        let off = y * st_case + (SUBTILE_W + x) * 4;
+                        src[off..off + 4].copy_from_slice(&[0xAB, 0xCD, 0xEF, 0xFF]);
+                    }
+                }
+                verify_band(
+                    w_case, h_case, st_case, &base, &src, has_alpha, true, true, label,
+                );
+                verify_band(
+                    w_case, h_case, st_case, &base, &src, has_alpha, false, true, label,
+                );
+            }
+        }
+
+        // Case 3: Wide frame exceeding `STACK_HASH_CAP` (`35` quadrants = 4463 px)
+        // to exercise heap fallback in both active-band paths.
+        #[cfg(not(miri))]
+        {
+            let wide_w = (STACK_HASH_CAP + 3) * SUBTILE_W - 17;
+            let wide_h = 20usize;
+            let wide_stride = wide_w * 4;
+            let base = fill_frame(wide_w, wide_h, wide_stride, 7, true);
+            let mut src = base.clone();
+            // Trigger `bbox.full` on first, middle, and clipped last quadrant.
+            for qx in [0, STACK_HASH_CAP, STACK_HASH_CAP + 2] {
+                let x0 = qx * SUBTILE_W;
+                let cw = (wide_w - x0).min(SUBTILE_W);
+                for y in 0..wide_h {
+                    for x in 0..cw {
+                        src[y * wide_stride + (x0 + x) * 4] ^= 0x55;
+                    }
+                }
+            }
+            verify_band(
+                wide_w,
+                wide_h,
+                wide_stride,
+                &base,
+                &src,
+                false,
+                true,
+                true,
+                "wide_heap_hashers",
+            );
+        }
+
+        // Case 4: Scroll column (`move_up = true` and `false`) where quadrants
+        // transition clean -> cropped -> `bbox.full` at row 0, mid-quadrant, and
+        // last row across all supported tiers.
+        let sw = 2 * SUBTILE_W + 31;
+        let sh = 2 * SUBTILE_H;
+        let s_stride = (sw + 3) * 4;
+        let s_n_qx = sw.div_ceil(SUBTILE_W);
+        let s_bands = [
+            ScanSubBand::RowBand2D {
+                y0: 0,
+                y1: SUBTILE_H as u32,
+                slot_base: 0,
+            },
+            ScanSubBand::RowBand2D {
+                y0: SUBTILE_H as u32,
+                y1: sh as u32,
+                slot_base: s_n_qx,
+            },
+        ];
+        let total_s_slots = 2 * s_n_qx;
+        for &dy in &[-16i32, 16i32] {
+            let sr = ScrollRect {
+                x: 0,
+                y: 0,
+                width: sw as u32,
+                height: sh as u32,
+                dy,
+            };
+            for has_alpha in [false, true] {
+                let base = fill_frame(sw, sh, s_stride, 21, !has_alpha);
+                let mut expected_shadow = base.clone();
+                // Apply reference scroll blit to `expected_shadow` first.
+                let shift = dy.unsigned_abs() as usize;
+                let copy_h = sh - shift;
+                if dy < 0 {
+                    for y in 0..copy_h {
+                        let dst_off = y * s_stride;
+                        let src_off = (y + shift) * s_stride;
+                        expected_shadow.copy_within(src_off..src_off + sw * 4, dst_off);
+                    }
+                } else {
+                    for y in (shift..sh).rev() {
+                        let dst_off = y * s_stride;
+                        let src_off = (y - shift) * s_stride;
+                        expected_shadow.copy_within(src_off..src_off + sw * 4, dst_off);
+                    }
+                }
+                // Build `src` as exact scrolled image + mid-quadrant full diff
+                // in Q0 (top band) + last-row full diff in Q1 (bottom band).
+                let mut src = expected_shadow.clone();
+                for y in 0..SUBTILE_H {
+                    for x in 0..SUBTILE_W {
+                        src[y * s_stride + x * 4] ^= 0x41;
+                    }
+                }
+                src[SUBTILE_H * s_stride + SUBTILE_W * 4] ^= 0x22;
+                src[(sh - 1) * s_stride + (2 * SUBTILE_W - 1) * 4 + 2] ^= 0x33;
+
+                let sp = src.as_ptr();
+                let bp = unsafe { BufferPointer::new(&sp, src.len()) };
+                let aos = unsafe { bp.cast::<Vec4u8>() };
+                let s_stride_px = s_stride / 4;
+
+                for cache_non_empty in [false, true] {
+                    // Run scalar tier as reference, compare every tier against it.
+                    let mut ref_slots_raw = Vec::new();
+                    let mut ref_scans_vec = Vec::new();
+                    let mut ref_shadow_final = Vec::new();
+                    for (t_idx, &tier) in tiers.iter().enumerate() {
+                        let mut sh_buf = base.clone();
+                        let shadow = ShadowRows {
+                            base: sh_buf.as_mut_ptr(),
+                            stride: s_stride,
+                        };
+                        let dirty_slots: Vec<AtomicU32> = (0..total_s_slots)
+                            .map(|_| AtomicU32::new(SlotDirty::CLEAN_RAW))
+                            .collect();
+                        let mut scans = tile_cache::SlotScans::new(total_s_slots, key);
+                        let next_sub = AtomicUsize::new(0);
+                        unsafe {
+                            tier.diff_and_update_scroll_worker(
+                                has_alpha,
+                                bp,
+                                aos,
+                                &shadow,
+                                sw,
+                                s_stride,
+                                s_stride_px,
+                                s_n_qx,
+                                &s_bands,
+                                sr,
+                                &dirty_slots,
+                                Some(&scans),
+                                cache_non_empty,
+                                &next_sub,
+                            );
+                        }
+                        let raw_slots: Vec<u32> = dirty_slots
+                            .iter()
+                            .map(|s| s.load(Ordering::Relaxed))
+                            .collect();
+                        let scans_slice = scans.as_slice();
+                        let mut got_scans = Vec::with_capacity(total_s_slots);
+                        for (slot_idx, &raw) in raw_slots.iter().enumerate() {
+                            let decoded = SlotDirty::decode(raw);
+                            let needs_hash = matches!(
+                                decoded,
+                                SlotDirty::Full
+                                    | SlotDirty::Cropped {
+                                        has_quad_hash: true,
+                                        ..
+                                    }
+                            );
+                            if needs_hash {
+                                let by = (slot_idx / s_n_qx) * SUBTILE_H;
+                                let qx = slot_idx % s_n_qx;
+                                let x0 = qx * SUBTILE_W;
+                                let cw = (sw - x0).min(SUBTILE_W);
+                                let qrect = TileRect {
+                                    x: x0 as u32,
+                                    y: by as u32,
+                                    w: cw as u32,
+                                    h: SUBTILE_H as u32,
+                                };
+                                let expected_hash = if has_alpha {
+                                    unsafe {
+                                        tile_hash::hash_rect_from_shadow::<true>(
+                                            &key,
+                                            sh_buf.as_ptr(),
+                                            s_stride,
+                                            qrect,
+                                        )
+                                    }
+                                } else {
+                                    unsafe {
+                                        tile_hash::hash_rect_from_shadow::<false>(
+                                            &key,
+                                            sh_buf.as_ptr(),
+                                            s_stride,
+                                            qrect,
+                                        )
+                                    }
+                                };
+                                let got = scans_slice[slot_idx];
+                                assert_eq!(
+                                    got, expected_hash,
+                                    "scroll dy={dy} tier={tier:?} slot={slot_idx} has_alpha={has_alpha} cache={cache_non_empty}"
+                                );
+                                got_scans.push(Some(got));
+                            } else {
+                                got_scans.push(None);
+                            }
+                        }
+                        if t_idx == 0 {
+                            ref_slots_raw = raw_slots;
+                            ref_scans_vec = got_scans;
+                            ref_shadow_final = sh_buf;
+                        } else {
+                            assert_eq!(raw_slots, ref_slots_raw, "scroll slots tier={tier:?}");
+                            assert_eq!(got_scans, ref_scans_vec, "scroll scans tier={tier:?}");
+                            for y in 0..sh {
+                                let off = y * s_stride;
+                                if has_alpha {
+                                    assert_eq!(
+                                        &sh_buf[off..off + sw * 4],
+                                        &ref_shadow_final[off..off + sw * 4]
+                                    );
+                                } else {
+                                    for x in 0..sw {
+                                        assert_eq!(
+                                            &sh_buf[off + x * 4..off + x * 4 + 3],
+                                            &ref_shadow_final[off + x * 4..off + x * 4 + 3]
+                                        );
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
     }
 
     #[cfg(all(target_arch = "x86_64", not(miri)))]

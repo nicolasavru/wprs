@@ -60,6 +60,7 @@ use std::arch::aarch64::vld4_u8;
 use std::arch::aarch64::vld4q_u8;
 use std::arch::aarch64::vmaxq_u8;
 use std::arch::aarch64::vmaxvq_u8;
+use std::arch::aarch64::vmaxvq_u32;
 use std::arch::aarch64::vorrq_u8;
 use std::arch::aarch64::vpadalq_u16;
 use std::arch::aarch64::vpaddlq_u8;
@@ -729,16 +730,83 @@ impl RowKernel for Kernel {
         debug_assert_eq!(shadow.len(), n);
         let src_p = src.ptr();
         let dst_p = shadow.as_mut_ptr();
-        let lim = (n / 4) * 4;
+        let lim16 = n & !15;
+        let lim4 = n & !3;
         let mut first = usize::MAX;
         let mut last_end = 0usize;
         // SAFETY: NEON is mandatory on AArch64, `src_p` and `dst_p` are valid
-        // for `n` `Vec4u8`s and non-overlapping, and `i + 4 <= n`.
+        // for `n` `Vec4u8`s and non-overlapping, and all offsets remain `< n`.
         unsafe {
             let rgb_mask = vreinterpretq_u8_u32(vdupq_n_u32(0x00FF_FFFF));
             let weights = vld1q_u32(LANE_WEIGHTS.as_ptr());
             let mut i = 0usize;
-            while i < lim {
+
+            // 4-vector OR-screened scan (64 B = 16 px/iter). Keeps `s0..s3` in
+            // NEON registers so a mismatch commits those exact loads without
+            // ever re-reading `src_p` (TOCTOU-safe).
+            while i < lim16 {
+                let s0 = vld1q_u8(src_p.add(i).cast::<u8>());
+                let x0 = veorq_u8(s0, vld1q_u8(dst_p.add(i).cast::<u8>()));
+                let s1 = vld1q_u8(src_p.add(i + 4).cast::<u8>());
+                let x1 = veorq_u8(s1, vld1q_u8(dst_p.add(i + 4).cast::<u8>()));
+                let s2 = vld1q_u8(src_p.add(i + 8).cast::<u8>());
+                let x2 = veorq_u8(s2, vld1q_u8(dst_p.add(i + 8).cast::<u8>()));
+                let s3 = vld1q_u8(src_p.add(i + 12).cast::<u8>());
+                let x3 = veorq_u8(s3, vld1q_u8(dst_p.add(i + 12).cast::<u8>()));
+                let any = vorrq_u8(vorrq_u8(x0, x1), vorrq_u8(x2, x3));
+                let any_m = if HAS_ALPHA {
+                    any
+                } else {
+                    vandq_u8(any, rgb_mask)
+                };
+                if vmaxvq_u32(vreinterpretq_u32_u8(any_m)) != 0 {
+                    let m0 = vreinterpretq_u32_u8(if HAS_ALPHA {
+                        x0
+                    } else {
+                        vandq_u8(x0, rgb_mask)
+                    });
+                    let m1 = vreinterpretq_u32_u8(if HAS_ALPHA {
+                        x1
+                    } else {
+                        vandq_u8(x1, rgb_mask)
+                    });
+                    let m2 = vreinterpretq_u32_u8(if HAS_ALPHA {
+                        x2
+                    } else {
+                        vandq_u8(x2, rgb_mask)
+                    });
+                    let m3 = vreinterpretq_u32_u8(if HAS_ALPHA {
+                        x3
+                    } else {
+                        vandq_u8(x3, rgb_mask)
+                    });
+                    let b0 = vaddvq_u32(vandq_u32(vtstq_u32(m0, m0), weights));
+                    let b1 = vaddvq_u32(vandq_u32(vtstq_u32(m1, m1), weights));
+                    let b2 = vaddvq_u32(vandq_u32(vtstq_u32(m2, m2), weights));
+                    let b3 = vaddvq_u32(vandq_u32(vtstq_u32(m3, m3), weights));
+                    if b0 != 0 {
+                        vst1q_u8(dst_p.add(i).cast::<u8>(), s0);
+                    }
+                    if b1 != 0 {
+                        vst1q_u8(dst_p.add(i + 4).cast::<u8>(), s1);
+                    }
+                    if b2 != 0 {
+                        vst1q_u8(dst_p.add(i + 8).cast::<u8>(), s2);
+                    }
+                    if b3 != 0 {
+                        vst1q_u8(dst_p.add(i + 12).cast::<u8>(), s3);
+                    }
+                    let mask16 = b0 | (b1 << 4) | (b2 << 8) | (b3 << 12);
+                    debug_assert_ne!(mask16, 0);
+                    if first == usize::MAX {
+                        first = i + mask16.trailing_zeros() as usize;
+                    }
+                    last_end = i + (32 - mask16.leading_zeros() as usize);
+                }
+                i += 16;
+            }
+
+            while i < lim4 {
                 let s = vld1q_u8(src_p.add(i).cast::<u8>());
                 let d = vld1q_u8(dst_p.add(i).cast::<u8>());
                 let diff = veorq_u8(s, d);
@@ -747,9 +815,9 @@ impl RowKernel for Kernel {
                 } else {
                     vandq_u8(diff, rgb_mask)
                 };
-                if vmaxvq_u8(masked) != 0 {
+                let m32 = vreinterpretq_u32_u8(masked);
+                if vmaxvq_u32(m32) != 0 {
                     vst1q_u8(dst_p.add(i).cast::<u8>(), s);
-                    let m32 = vreinterpretq_u32_u8(masked);
                     let lane_mask = vaddvq_u32(vandq_u32(vtstq_u32(m32, m32), weights));
                     debug_assert_ne!(lane_mask, 0);
                     if first == usize::MAX {
@@ -759,7 +827,7 @@ impl RowKernel for Kernel {
                 }
                 i += 4;
             }
-            for j in lim..n {
+            for j in lim4..n {
                 let s = src_p.add(j).read();
                 let d = dst_p.add(j).read();
                 let differs = if HAS_ALPHA {
@@ -1487,22 +1555,22 @@ impl Tier {
         y1: usize,
         dirty_slots: &[AtomicU32],
     ) {
+        let ctx = super::ActiveRowBandCtx {
+            data,
+            aos,
+            shadow,
+            width,
+            stride,
+            y0,
+            y1,
+            slot_base: 0,
+            dirty_slots,
+            slot_scans: None,
+            cache_non_empty: false,
+        };
         // SAFETY: Caller upholds disjoint-row shadow invariants.
         unsafe {
-            super::diff_and_update_row_band_2d_with::<Kernel, HAS_ALPHA>(
-                Kernel,
-                data,
-                aos,
-                shadow,
-                width,
-                stride,
-                y0,
-                y1,
-                0,
-                dirty_slots,
-                None,
-                false,
-            );
+            super::diff_and_update_row_band_2d_with::<Kernel, HAS_ALPHA>(Kernel, &ctx);
         }
     }
 
