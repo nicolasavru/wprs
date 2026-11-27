@@ -239,7 +239,6 @@ mod arch {
             slot_hashes: Option<&SlotHashes>,
             cache_non_empty: bool,
             next_sub: &AtomicUsize,
-            hash_buf: &mut Vec<u8>,
         ) {
             // SAFETY: Caller upholds disjoint-band shadow invariants.
             unsafe {
@@ -258,7 +257,6 @@ mod arch {
                         slot_hashes,
                         cache_non_empty,
                         next_sub,
-                        hash_buf,
                     );
                 } else {
                     super::diff_and_update_worker_with::<ScalarKernel, false>(
@@ -275,7 +273,6 @@ mod arch {
                         slot_hashes,
                         cache_non_empty,
                         next_sub,
-                        hash_buf,
                     );
                 }
             }
@@ -300,7 +297,6 @@ mod arch {
             slot_hashes: Option<&SlotHashes>,
             cache_non_empty: bool,
             next_sub: &AtomicUsize,
-            hash_buf: &mut Vec<u8>,
         ) {
             // SAFETY: Caller upholds disjoint-band and scroll-band invariants.
             unsafe {
@@ -320,7 +316,6 @@ mod arch {
                         slot_hashes,
                         cache_non_empty,
                         next_sub,
-                        hash_buf,
                     );
                 } else {
                     super::diff_and_update_scroll_worker_with::<ScalarKernel, false>(
@@ -338,7 +333,6 @@ mod arch {
                         slot_hashes,
                         cache_non_empty,
                         next_sub,
-                        hash_buf,
                     );
                 }
             }
@@ -378,7 +372,6 @@ mod arch {
         ) {
             // SAFETY: Caller upholds disjoint-row shadow invariants.
             unsafe {
-                let mut hash_buf = Vec::new();
                 super::diff_and_update_row_band_2d_with::<ScalarKernel, HAS_ALPHA>(
                     ScalarKernel,
                     data,
@@ -392,7 +385,6 @@ mod arch {
                     dirty_slots,
                     None,
                     false,
-                    &mut hash_buf,
                 );
             }
         }
@@ -413,6 +405,7 @@ mod arch {
 pub(crate) mod palette;
 pub(crate) mod scroll;
 pub(crate) mod tile_cache;
+pub(crate) mod tile_hash;
 
 use std::borrow::Cow;
 use std::cmp::Reverse;
@@ -505,7 +498,7 @@ const MIN_JPEG_DIM: usize = 16;
 const CROP_MAX_AREA_PCT: usize = 45;
 
 /// Minimum cropped pixel area inside a quadrant before computing a lookup-only
-/// full-quadrant BLAKE3 hash against a non-empty [`ServerTileCache`]. Tiny
+/// full-quadrant keyed 128-bit hash against a non-empty [`ServerTileCache`]. Tiny
 /// transient edits (`< 1,024` px: cursors, status digits, single-character
 /// typing) skip hashing completely, while larger cropped strips (such as a
 /// popup border returning on close) still hit cached full quadrants without
@@ -2352,8 +2345,8 @@ fn plan_incremental_scan(
 /// - `u32::MAX`: full quadrant or 1D strip dirty ([`SlotDirty::Full`])
 /// - Otherwise: cropped tight bounding box relative to the quadrant origin:
 ///   - bits `0..7`: `min_x` (`0..128`)
-///   - bit `7`: `has_quad_hash` (lookup-only full-quadrant BLAKE3 hash written
-///     to [`SlotHashes`])
+///   - bit `7`: `has_quad_hash` (lookup-only full-quadrant keyed 128-bit hash
+///     written to [`SlotHashes`])
 ///   - bits `8..16`: `max_x` (`1..=128`, exclusive)
 ///   - bits `16..24`: `min_y` (`0..128`)
 ///   - bits `24..32`: `max_y` (`1..=128`, exclusive)
@@ -2639,7 +2632,6 @@ unsafe fn diff_and_update_row_band_2d_with<K: RowKernel, const HAS_ALPHA: bool>(
     dirty_slots: &[AtomicU32],
     slot_hashes: Option<&SlotHashes>,
     cache_non_empty: bool,
-    hash_buf: &mut Vec<u8>,
 ) {
     let stride_px = stride / 4;
     let ch = y1 - y0;
@@ -2657,9 +2649,9 @@ unsafe fn diff_and_update_row_band_2d_with<K: RowKernel, const HAS_ALPHA: bool>(
     for y in y0..y1 {
         if full_count == n_qx {
             if let Some(hashes) = slot_hashes {
-                // Fuse remaining row copy (`y..y1`) and BLAKE3 hashing per
-                // `<= 128x128` quadrant so each 64 KiB quadrant stays L1/L2-hot
-                // instead of streaming the entire `RowBand2D` out of L2 first.
+                // Fuse remaining row copy (`y..y1`) and keyed 128-bit hashing
+                // per `<= 128x128` quadrant in registers without streaming the
+                // entire `RowBand2D` out of L2 first.
                 let copy_from_ry = y - y0;
                 let mut x = 0usize;
                 for (qx, slot) in dirty_slots.iter().enumerate() {
@@ -2672,13 +2664,13 @@ unsafe fn diff_and_update_row_band_2d_with<K: RowKernel, const HAS_ALPHA: bool>(
                     };
                     // SAFETY: `[y0, y1)` is strictly disjoint across workers.
                     let h = unsafe {
-                        tile_cache::copy_and_hash_rect_to_shadow::<HAS_ALPHA>(
+                        tile_hash::copy_and_hash_rect_to_shadow::<HAS_ALPHA>(
+                            hashes.key(),
                             data,
                             shadow.base,
                             stride,
                             qrect,
                             copy_from_ry,
-                            hash_buf,
                         )
                     };
                     // SAFETY: `slot_base + qx` is exclusively owned by this worker.
@@ -2751,11 +2743,11 @@ unsafe fn diff_and_update_row_band_2d_with<K: RowKernel, const HAS_ALPHA: bool>(
                 };
                 // SAFETY: `[y0, y1)` is in-bounds, finalized, and exclusively owned by this worker.
                 let h = unsafe {
-                    tile_cache::hash_rect_from_shadow::<HAS_ALPHA>(
+                    tile_hash::hash_rect_from_shadow::<HAS_ALPHA>(
+                        hashes.key(),
                         shadow.base.cast_const(),
                         stride,
                         qrect,
-                        hash_buf,
                     )
                 };
                 // SAFETY: `slot_base + qx` is exclusively owned by this worker.
@@ -2777,11 +2769,11 @@ unsafe fn diff_and_update_row_band_2d_with<K: RowKernel, const HAS_ALPHA: bool>(
                 };
                 // SAFETY: `[y0, y1)` is in-bounds, finalized, and exclusively owned by this worker.
                 let h = unsafe {
-                    tile_cache::hash_rect_from_shadow::<HAS_ALPHA>(
+                    tile_hash::hash_rect_from_shadow::<HAS_ALPHA>(
+                        hashes.key(),
                         shadow.base.cast_const(),
                         stride,
                         qrect,
-                        hash_buf,
                     )
                 };
                 // SAFETY: `slot_base + qx` is exclusively owned by this worker.
@@ -2825,7 +2817,6 @@ unsafe fn diff_and_update_scroll_column_with<K: RowKernel, const HAS_ALPHA: bool
     dirty_slots: &[AtomicU32],
     slot_hashes: Option<&SlotHashes>,
     cache_non_empty: bool,
-    hash_buf: &mut Vec<u8>,
 ) {
     let cx0 = qx * SUBTILE_W;
     let cx1 = (cx0 + SUBTILE_W).min(width);
@@ -2847,7 +2838,7 @@ unsafe fn diff_and_update_scroll_column_with<K: RowKernel, const HAS_ALPHA: bool
     };
     let move_up = sr.dy < 0;
 
-    let mut process_band = |band: &ScanSubBand| {
+    let process_band = |band: &ScanSubBand| {
         let ScanSubBand::RowBand2D { y0, y1, slot_base } = *band else {
             unreachable!("scroll bands must be RowBand2D");
         };
@@ -2917,11 +2908,11 @@ unsafe fn diff_and_update_scroll_column_with<K: RowKernel, const HAS_ALPHA: bool
                 // SAFETY: Column stripe `[cx0, cx1)` over `[y0, y1)` is in-bounds,
                 // finalized, and exclusively owned by this worker.
                 let h = unsafe {
-                    tile_cache::hash_rect_from_shadow::<HAS_ALPHA>(
+                    tile_hash::hash_rect_from_shadow::<HAS_ALPHA>(
+                        hashes.key(),
                         shadow.base.cast_const(),
                         stride,
                         qrect,
-                        hash_buf,
                     )
                 };
                 // SAFETY: `slot_base + qx` is exclusively owned by this worker.
@@ -2944,11 +2935,11 @@ unsafe fn diff_and_update_scroll_column_with<K: RowKernel, const HAS_ALPHA: bool
                 // SAFETY: Column stripe `[cx0, cx1)` over `[y0, y1)` is in-bounds,
                 // finalized, and exclusively owned by this worker.
                 let h = unsafe {
-                    tile_cache::hash_rect_from_shadow::<HAS_ALPHA>(
+                    tile_hash::hash_rect_from_shadow::<HAS_ALPHA>(
+                        hashes.key(),
                         shadow.base.cast_const(),
                         stride,
                         qrect,
-                        hash_buf,
                     )
                 };
                 // SAFETY: `slot_base + qx` is exclusively owned by this worker.
@@ -3019,7 +3010,6 @@ unsafe fn diff_and_update_worker_with<K: RowKernel, const HAS_ALPHA: bool>(
     slot_hashes: Option<&SlotHashes>,
     cache_non_empty: bool,
     next_sub: &AtomicUsize,
-    hash_buf: &mut Vec<u8>,
 ) {
     let n_sub = sub_bands.len();
     loop {
@@ -3037,11 +3027,11 @@ unsafe fn diff_and_update_worker_with<K: RowKernel, const HAS_ALPHA: bool>(
                     if let Some(hashes) = slot_hashes {
                         // SAFETY: `rect` is in-bounds, finalized, and exclusively owned.
                         let h = unsafe {
-                            tile_cache::hash_rect_from_shadow::<HAS_ALPHA>(
+                            tile_hash::hash_rect_from_shadow::<HAS_ALPHA>(
+                                hashes.key(),
                                 shadow.base.cast_const(),
                                 stride,
                                 rect,
-                                hash_buf,
                             )
                         };
                         // SAFETY: `slot_idx` is exclusively owned by this worker.
@@ -3067,7 +3057,6 @@ unsafe fn diff_and_update_worker_with<K: RowKernel, const HAS_ALPHA: bool>(
                         slots,
                         slot_hashes,
                         cache_non_empty,
-                        hash_buf,
                     );
                 }
             },
@@ -3098,7 +3087,6 @@ unsafe fn diff_and_update_scroll_worker_with<K: RowKernel, const HAS_ALPHA: bool
     slot_hashes: Option<&SlotHashes>,
     cache_non_empty: bool,
     next_sub: &AtomicUsize,
-    hash_buf: &mut Vec<u8>,
 ) {
     let (sb_start, sb_end) = scroll_sub_band_range(sub_bands, sr);
     let scroll_bands = &sub_bands[sb_start..sb_end];
@@ -3129,7 +3117,6 @@ unsafe fn diff_and_update_scroll_worker_with<K: RowKernel, const HAS_ALPHA: bool
                     dirty_slots,
                     slot_hashes,
                     cache_non_empty,
-                    hash_buf,
                 );
             }
         } else {
@@ -3151,11 +3138,11 @@ unsafe fn diff_and_update_scroll_worker_with<K: RowKernel, const HAS_ALPHA: bool
                         if let Some(hashes) = slot_hashes {
                             // SAFETY: `rect` is in-bounds, finalized, and exclusively owned.
                             let h = unsafe {
-                                tile_cache::hash_rect_from_shadow::<HAS_ALPHA>(
+                                tile_hash::hash_rect_from_shadow::<HAS_ALPHA>(
+                                    hashes.key(),
                                     shadow.base.cast_const(),
                                     stride,
                                     rect,
-                                    hash_buf,
                                 )
                             };
                             // SAFETY: `slot_idx` is exclusively owned by this worker.
@@ -3181,7 +3168,6 @@ unsafe fn diff_and_update_scroll_worker_with<K: RowKernel, const HAS_ALPHA: bool
                             slots,
                             slot_hashes,
                             cache_non_empty,
-                            hash_buf,
                         );
                     }
                 },
@@ -3294,8 +3280,9 @@ fn filter_and_compress_full_streaming_with_tier(
             // Fast single-pass cold-fill: when the cache starts empty, no
             // inter-frame hits or partial quadrant un-coalescing can occur, so
             // `tile_rects` is known upfront and each worker fuses
-            // copy-to-shadow + BLAKE3 hashing + intra-frame dedup + encoding
-            // while the tile's `<= 256 KiB` pixels stay hot in L2 cache.
+            // copy-to-shadow + keyed 128-bit hashing + intra-frame dedup +
+            // encoding while the tile's `<= 256 KiB` pixels stay hot in L2.
+            let hash_key = *cache.hash_key();
             let tile_rects: Vec<TileRect> = base_entries
                 .iter()
                 .copied()
@@ -3430,40 +3417,34 @@ fn filter_and_compress_full_streaming_with_tier(
                                     // SAFETY: `base_entries` are pairwise disjoint and in-bounds.
                                     unsafe {
                                         let h = if has_alpha {
-                                            tile_cache::copy_and_hash_rect_to_shadow::<true>(
+                                            tile_hash::copy_and_hash_rect_to_shadow::<true>(
+                                                &hash_key,
                                                 data,
                                                 shadow.base,
                                                 stride,
                                                 rect,
                                                 0,
-                                                &mut state.hash_buf,
                                             )
                                         } else {
-                                            tile_cache::copy_and_hash_rect_to_shadow::<false>(
+                                            tile_hash::copy_and_hash_rect_to_shadow::<false>(
+                                                &hash_key,
                                                 data,
                                                 shadow.base,
                                                 stride,
                                                 rect,
                                                 0,
-                                                &mut state.hash_buf,
                                             )
                                         };
                                         zero_shadow_row_padding(shadow, width_bytes, rect);
                                         h
                                     }
                                 } else if has_alpha {
-                                    tile_cache::hash_rect_from_ptr::<true>(
-                                        aos,
-                                        stride_px,
-                                        rect,
-                                        &mut state.hash_buf,
+                                    tile_hash::hash_rect_from_ptr::<true>(
+                                        &hash_key, aos, stride_px, rect,
                                     )
                                 } else {
-                                    tile_cache::hash_rect_from_ptr::<false>(
-                                        aos,
-                                        stride_px,
-                                        rect,
-                                        &mut state.hash_buf,
+                                    tile_hash::hash_rect_from_ptr::<false>(
+                                        &hash_key, aos, stride_px, rect,
                                     )
                                 };
                                 (digest, None)
@@ -3476,38 +3457,32 @@ fn filter_and_compress_full_streaming_with_tier(
                                         // SAFETY: `quads[q]` lies inside exclusively owned `rect`.
                                         unsafe {
                                             if has_alpha {
-                                                tile_cache::copy_and_hash_rect_to_shadow::<true>(
+                                                tile_hash::copy_and_hash_rect_to_shadow::<true>(
+                                                    &hash_key,
                                                     data,
                                                     shadow.base,
                                                     stride,
                                                     quads[q],
                                                     0,
-                                                    &mut state.hash_buf,
                                                 )
                                             } else {
-                                                tile_cache::copy_and_hash_rect_to_shadow::<false>(
+                                                tile_hash::copy_and_hash_rect_to_shadow::<false>(
+                                                    &hash_key,
                                                     data,
                                                     shadow.base,
                                                     stride,
                                                     quads[q],
                                                     0,
-                                                    &mut state.hash_buf,
                                                 )
                                             }
                                         }
                                     } else if has_alpha {
-                                        tile_cache::hash_rect_from_ptr::<true>(
-                                            aos,
-                                            stride_px,
-                                            quads[q],
-                                            &mut state.hash_buf,
+                                        tile_hash::hash_rect_from_ptr::<true>(
+                                            &hash_key, aos, stride_px, quads[q],
                                         )
                                     } else {
-                                        tile_cache::hash_rect_from_ptr::<false>(
-                                            aos,
-                                            stride_px,
-                                            quads[q],
-                                            &mut state.hash_buf,
+                                        tile_hash::hash_rect_from_ptr::<false>(
+                                            &hash_key, aos, stride_px, quads[q],
                                         )
                                     };
                                 }
@@ -3519,7 +3494,8 @@ fn filter_and_compress_full_streaming_with_tier(
                                 if n_quads == 1 {
                                     (quad_hashes[0], None)
                                 } else {
-                                    let parent_hash = tile_cache::combine_quad_hashes(
+                                    let parent_hash = tile_hash::combine_quad_hashes(
+                                        &hash_key,
                                         rect.w,
                                         rect.h,
                                         &quad_hashes[..n_quads],
@@ -3576,8 +3552,8 @@ fn filter_and_compress_full_streaming_with_tier(
         }
 
         // Phase A: copy all base tiles to `shadow` (when requested) and compute
-        // 128-bit BLAKE3 digests for every quadrant while hot in L1/L2 cache.
-        let slot_hashes = SlotHashes::new(total_slots);
+        // keyed 128-bit digests for every quadrant directly in registers.
+        let slot_hashes = SlotHashes::new(total_slots, *cache.hash_key());
         {
             let _hash_span = debug_span!("tile_cache_hash_full").entered();
             let shadow_rows = shadow_opt.as_deref_mut().map(|shadow| ShadowRows {
@@ -3586,7 +3562,7 @@ fn filter_and_compress_full_streaming_with_tier(
             });
             let n_entries = base_entries.len();
             let next_entry = AtomicUsize::new(0);
-            compressor.pool.execute(n_entries, |state| {
+            compressor.pool.execute(n_entries, |_state| {
                 loop {
                     let entry_idx = next_entry.fetch_add(1, Ordering::Relaxed);
                     if entry_idx >= n_entries {
@@ -3600,22 +3576,22 @@ fn filter_and_compress_full_streaming_with_tier(
                                 // and each `entry_idx` is claimed once.
                                 let h = unsafe {
                                     let h = if has_alpha {
-                                        tile_cache::copy_and_hash_rect_to_shadow::<true>(
+                                        tile_hash::copy_and_hash_rect_to_shadow::<true>(
+                                            slot_hashes.key(),
                                             data,
                                             shadow.base,
                                             stride,
                                             rect,
                                             0,
-                                            &mut state.hash_buf,
                                         )
                                     } else {
-                                        tile_cache::copy_and_hash_rect_to_shadow::<false>(
+                                        tile_hash::copy_and_hash_rect_to_shadow::<false>(
+                                            slot_hashes.key(),
                                             data,
                                             shadow.base,
                                             stride,
                                             rect,
                                             0,
-                                            &mut state.hash_buf,
                                         )
                                     };
                                     zero_shadow_row_padding(shadow, width_bytes, rect);
@@ -3634,22 +3610,22 @@ fn filter_and_compress_full_streaming_with_tier(
                                     // SAFETY: `quads[q]` lies inside exclusively owned `rect`.
                                     let h = unsafe {
                                         if has_alpha {
-                                            tile_cache::copy_and_hash_rect_to_shadow::<true>(
+                                            tile_hash::copy_and_hash_rect_to_shadow::<true>(
+                                                slot_hashes.key(),
                                                 data,
                                                 shadow.base,
                                                 stride,
                                                 quads[q],
                                                 0,
-                                                &mut state.hash_buf,
                                             )
                                         } else {
-                                            tile_cache::copy_and_hash_rect_to_shadow::<false>(
+                                            tile_hash::copy_and_hash_rect_to_shadow::<false>(
+                                                slot_hashes.key(),
                                                 data,
                                                 shadow.base,
                                                 stride,
                                                 quads[q],
                                                 0,
-                                                &mut state.hash_buf,
                                             )
                                         }
                                     };
@@ -3665,18 +3641,18 @@ fn filter_and_compress_full_streaming_with_tier(
                         match entry {
                             BaseScanEntry::Strip1D { rect, slot_idx } => {
                                 let h = if has_alpha {
-                                    tile_cache::hash_rect_from_ptr::<true>(
+                                    tile_hash::hash_rect_from_ptr::<true>(
+                                        slot_hashes.key(),
                                         aos,
                                         stride_px,
                                         rect,
-                                        &mut state.hash_buf,
                                     )
                                 } else {
-                                    tile_cache::hash_rect_from_ptr::<false>(
+                                    tile_hash::hash_rect_from_ptr::<false>(
+                                        slot_hashes.key(),
                                         aos,
                                         stride_px,
                                         rect,
-                                        &mut state.hash_buf,
                                     )
                                 };
                                 // SAFETY: `slot_idx` is exclusively owned by this entry.
@@ -3690,18 +3666,18 @@ fn filter_and_compress_full_streaming_with_tier(
                                 let (quads, _) = tile_quadrants(rect);
                                 for q in 0..n_quads {
                                     let h = if has_alpha {
-                                        tile_cache::hash_rect_from_ptr::<true>(
+                                        tile_hash::hash_rect_from_ptr::<true>(
+                                            slot_hashes.key(),
                                             aos,
                                             stride_px,
                                             quads[q],
-                                            &mut state.hash_buf,
                                         )
                                     } else {
-                                        tile_cache::hash_rect_from_ptr::<false>(
+                                        tile_hash::hash_rect_from_ptr::<false>(
+                                            slot_hashes.key(),
                                             aos,
                                             stride_px,
                                             quads[q],
-                                            &mut state.hash_buf,
                                         )
                                     };
                                     // SAFETY: `quad_slots[q]` is exclusively owned by this entry.
@@ -3991,7 +3967,9 @@ fn filter_and_compress_incremental_streaming_with_tier(
     let dirty_slots: Vec<AtomicU32> = (0..total_slots)
         .map(|_| AtomicU32::new(SlotDirty::CLEAN_RAW))
         .collect();
-    let slot_hashes = tile_cache.is_some().then(|| SlotHashes::new(total_slots));
+    let slot_hashes = tile_cache
+        .as_deref()
+        .map(|c| SlotHashes::new(total_slots, *c.hash_key()));
     let cache_non_empty = tile_cache
         .as_deref()
         .is_some_and(|c| c.occupied_slots() > 0);
@@ -4015,7 +3993,7 @@ fn filter_and_compress_incremental_streaming_with_tier(
         if let Some(sr) = scroll_rect {
             let (sb_start, sb_end) = scroll_sub_band_range(&sub_bands, sr);
             let phase_a_tasks = (sub_bands.len() - (sb_end - sb_start)) + n_qx;
-            compressor.pool.execute(phase_a_tasks, |state| {
+            compressor.pool.execute(phase_a_tasks, |_state| {
                 // SAFETY: `sub_bands` cover disjoint regions in `shadow`, and
                 // `sr` lies inside a contiguous `RowBand2D` slice.
                 unsafe {
@@ -4034,12 +4012,11 @@ fn filter_and_compress_incremental_streaming_with_tier(
                         slot_hashes.as_ref(),
                         cache_non_empty,
                         &next_sub,
-                        &mut state.hash_buf,
                     );
                 }
             });
         } else {
-            compressor.pool.execute(n_sub, |state| {
+            compressor.pool.execute(n_sub, |_state| {
                 // SAFETY: `sub_bands` cover disjoint regions in `shadow`.
                 unsafe {
                     tier.diff_and_update_worker(
@@ -4056,7 +4033,6 @@ fn filter_and_compress_incremental_streaming_with_tier(
                         slot_hashes.as_ref(),
                         cache_non_empty,
                         &next_sub,
-                        &mut state.hash_buf,
                     );
                 }
             });

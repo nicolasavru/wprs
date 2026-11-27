@@ -15,9 +15,9 @@
 //! Server-driven connection-wide inter-frame tile cache (`wprsd` metadata
 //! directory + `wprsc` bounded decoded pixel array).
 //!
-//! - `wprsd` stores **only** metadata (128-bit BLAKE3 hashes, slot dimensions,
-//!   alpha/quality keys, and an intrusive O(1) LRU list) and never duplicates
-//!   decoded tile pixels in RAM.
+//! - `wprsd` stores **only** metadata (keyed 128-bit SIMD hashes, slot
+//!   dimensions, alpha/quality keys, and an intrusive O(1) LRU list) and never
+//!   duplicates decoded tile pixels in RAM.
 //! - `wprsc` holds at most [`MAX_TILE_CACHE_SLOTS`] (`1024`) slots and strictly
 //!   enforces [`MAX_TILE_CACHE_BYTES`] (`64 MiB`), enough for two full 4K
 //!   screens (`270` `256x256` tiles = `63.3 MiB`) or `1024` `128x128` tiles.
@@ -36,7 +36,6 @@ use std::collections::hash_map::RandomState;
 use std::hash::BuildHasher;
 use std::hash::Hasher;
 use std::mem::MaybeUninit;
-use std::slice;
 use std::sync::Mutex;
 use std::sync::atomic::AtomicBool;
 use std::sync::atomic::AtomicU8;
@@ -44,12 +43,14 @@ use std::sync::atomic::AtomicU32;
 use std::sync::atomic::AtomicUsize;
 use std::sync::atomic::Ordering;
 
-use crate::buffer_pointer::BufferPointer;
 use crate::filtering::BaseScanEntry;
 use crate::filtering::FrameRows;
 use crate::filtering::SlotDirty;
 use crate::filtering::merge_cropped_quad_slots;
 use crate::filtering::quad_grid_slot;
+use crate::filtering::tile_hash::TileHash;
+use crate::filtering::tile_hash::TileHashKey;
+use crate::filtering::tile_hash::combine_quad_hashes;
 use crate::filtering::tile_quadrants;
 use crate::prelude::*;
 use crate::serialization::framing::CacheHitRef;
@@ -64,9 +65,6 @@ use crate::serialization::framing::SUBTILE_W;
 use crate::serialization::framing::TilePayload;
 use crate::serialization::framing::TileRect;
 use crate::vec4u8::Vec4u8;
-
-/// Truncated 128-bit BLAKE3 digest of canonical tile pixels.
-pub(crate) type TileHash = [u8; 16];
 
 /// Promotion bitmask flags applied after Phase B in [`CompressionMode::Hybrid`]
 /// when a tile or sub-quadrant encoded losslessly (`Solid`, `Palette`, or
@@ -127,11 +125,10 @@ pub(crate) fn quadrant_region(parent: TileRect, quad: TileRect) -> CacheHitRegio
     }
 }
 
-const XRGB_ALPHA_MASK: u32 = u32::from_ne_bytes([0, 0, 0, 0xFF]);
 const FX_MIX_K: u64 = 0x517C_C1B7_2722_0A95;
 
 /// Fast per-instance randomly-seeded hasher for cache directories keyed on
-/// already-cryptographic 128-bit BLAKE3 [`TileHash`] digests.
+/// keyed 128-bit [`TileHash`] digests.
 #[derive(Debug, Copy, Clone)]
 struct TileHashBuildHasher {
     seed: u64,
@@ -205,249 +202,29 @@ impl BuildHasher for TileHashBuildHasher {
     }
 }
 
-/// Copies `src` into `dst` while setting byte 3 (`X`) of every 4-byte pixel to
-/// `0xFF` via 32-bit bitwise OR (`vpor` on AVX2/AVX-512 instead of byte-level
-/// channel de-interleaving).
-#[inline(always)]
-fn copy_row_xrgb_normalized(src: &[u8], dst: &mut [u8]) {
-    debug_assert_eq!(src.len(), dst.len());
-    debug_assert!(src.len().is_multiple_of(4));
-    for (d, s) in dst
-        .as_chunks_mut::<4>()
-        .0
-        .iter_mut()
-        .zip(src.as_chunks::<4>().0.iter())
-    {
-        *d = (u32::from_ne_bytes(*s) | XRGB_ALPHA_MASK).to_ne_bytes();
-    }
-}
-
-/// Computes the 128-bit BLAKE3 digest of `rect` inside `shadow_base` (row
-/// stride `stride` bytes), normalizing byte 3 (`X`) to `0xFF` when `!HAS_ALPHA`
-/// so arbitrary `Xrgb8888` padding never causes false misses.
-///
-/// # Safety
-/// `shadow_base` must be readable for `(rect.y + rect.h) * stride` bytes and
-/// `(rect.x + rect.w) * 4 <= stride`, with no concurrent mutable writes to
-/// `rect`'s pixels.
-#[inline(never)]
-pub(crate) unsafe fn hash_rect_from_shadow<const HAS_ALPHA: bool>(
-    shadow_base: *const u8,
-    stride: usize,
-    rect: TileRect,
-    hash_buf: &mut Vec<u8>,
-) -> TileHash {
-    let x_bytes = rect.x as usize * 4;
-    let tw = rect.w as usize;
-    let th = rect.h as usize;
-    let row_bytes = tw * 4;
-    let total_bytes = row_bytes * th;
-    if hash_buf.len() < total_bytes {
-        hash_buf.resize(total_bytes, 0);
-    }
-    let buf = &mut hash_buf[..total_bytes];
-    let y0 = rect.y as usize;
-
-    if HAS_ALPHA {
-        for ry in 0..th {
-            // SAFETY: Caller guarantees `(y0 + ry, x_bytes..x_bytes + row_bytes)` is in bounds.
-            let src = unsafe {
-                slice::from_raw_parts(shadow_base.add((y0 + ry) * stride + x_bytes), row_bytes)
-            };
-            buf[ry * row_bytes..(ry + 1) * row_bytes].copy_from_slice(src);
-        }
-    } else {
-        for ry in 0..th {
-            // SAFETY: Caller guarantees `(y0 + ry, x_bytes..x_bytes + row_bytes)` is in bounds.
-            let src_bytes = unsafe {
-                slice::from_raw_parts(shadow_base.add((y0 + ry) * stride + x_bytes), row_bytes)
-            };
-            copy_row_xrgb_normalized(src_bytes, &mut buf[ry * row_bytes..(ry + 1) * row_bytes]);
-        }
-    }
-
-    let digest = blake3::hash(buf);
-    let mut out = [0u8; 16];
-    out.copy_from_slice(&digest.as_bytes()[..16]);
-    out
-}
-
-/// Copies `rect` from `src` (`wl_shm` via [`BufferPointer`]) into `shadow_base`
-/// for rows `[copy_from_ry..rect.h)` (using existing `shadow_base` pixels for
-/// `[0..copy_from_ry)`), populates L1/L2-hot `hash_buf` in the same row pass,
-/// and returns its 128-bit BLAKE3 digest without re-reading `shadow_base`.
-///
-/// # Safety
-/// `shadow_base` must be exclusively writable for `rect` across `(rect.y +
-/// rect.h) * stride` bytes with `(rect.x + rect.w) * 4 <= stride`,
-/// `copy_from_ry <= rect.h as usize`, and rows `[0..copy_from_ry)` must
-/// already be initialized (rows `[copy_from_ry..rect.h)` may be uninitialized
-/// spare capacity).
-#[inline(never)]
-pub(crate) unsafe fn copy_and_hash_rect_to_shadow<const HAS_ALPHA: bool>(
-    src: BufferPointer<u8>,
-    shadow_base: *mut u8,
-    stride: usize,
-    rect: TileRect,
-    copy_from_ry: usize,
-    hash_buf: &mut Vec<u8>,
-) -> TileHash {
-    let x_bytes = rect.x as usize * 4;
-    let tw = rect.w as usize;
-    let th = rect.h as usize;
-    debug_assert!(copy_from_ry <= th);
-    let row_bytes = tw * 4;
-    let total_bytes = row_bytes * th;
-    if hash_buf.len() < total_bytes {
-        hash_buf.resize(total_bytes, 0);
-    }
-    let buf = &mut hash_buf[..total_bytes];
-    let y0 = rect.y as usize;
-
-    for ry in 0..copy_from_ry {
-        let row_off = (y0 + ry) * stride + x_bytes;
-        // SAFETY: Caller guarantees `rect` is in-bounds, exclusively owned, and
-        // rows `[0..copy_from_ry)` are initialized.
-        let sh_row = unsafe { slice::from_raw_parts(shadow_base.add(row_off), row_bytes) };
-        let dst_hash = &mut buf[ry * row_bytes..(ry + 1) * row_bytes];
-        if HAS_ALPHA {
-            dst_hash.copy_from_slice(sh_row);
-        } else {
-            copy_row_xrgb_normalized(sh_row, dst_hash);
-        }
-    }
-    if copy_from_ry < th && row_bytes > 0 {
-        let last_end = (y0 + th - 1) * stride + x_bytes + row_bytes;
-        assert!(last_end <= src.len());
-    }
-    for ry in copy_from_ry..th {
-        let row_off = (y0 + ry) * stride + x_bytes;
-        // SAFETY: Validated `last_end <= src.len()` above, `MaybeUninit<[u8; 4]>`
-        // has alignment 1 and permits uninitialized destination storage, and
-        // caller guarantees `rect` is in-bounds and exclusively owned in
-        // `shadow_base`.
-        let src_row_ptr = unsafe { src.ptr().add(row_off) };
-        let dst_shadow = unsafe {
-            slice::from_raw_parts_mut(shadow_base.add(row_off).cast::<MaybeUninit<[u8; 4]>>(), tw)
-        };
-        let dst_hash = &mut buf[ry * row_bytes..(ry + 1) * row_bytes];
-        // Single-load dual-store: read each `wl_shm` pixel once via raw pointer
-        // (never creating `&[u8]` over shared memory), writing raw bytes to
-        // `shadow` and normalized bytes to L1-hot `hash_buf`.
-        if HAS_ALPHA {
-            for (i, (ds, dh)) in dst_shadow
-                .iter_mut()
-                .zip(dst_hash.as_chunks_mut::<4>().0.iter_mut())
-                .enumerate()
-            {
-                // SAFETY: `i * 4 + 4 <= row_bytes` and `last_end <= src.len()`.
-                let px = unsafe { src_row_ptr.add(i * 4).cast::<[u8; 4]>().read_unaligned() };
-                ds.write(px);
-                *dh = px;
-            }
-        } else {
-            for (i, (ds, dh)) in dst_shadow
-                .iter_mut()
-                .zip(dst_hash.as_chunks_mut::<4>().0.iter_mut())
-                .enumerate()
-            {
-                // SAFETY: `i * 4 + 4 <= row_bytes` and `last_end <= src.len()`.
-                let px = unsafe { src_row_ptr.add(i * 4).cast::<[u8; 4]>().read_unaligned() };
-                ds.write(px);
-                *dh = (u32::from_ne_bytes(px) | XRGB_ALPHA_MASK).to_ne_bytes();
-            }
-        }
-    }
-
-    let digest = blake3::hash(buf);
-    let mut out = [0u8; 16];
-    out.copy_from_slice(&digest.as_bytes()[..16]);
-    out
-}
-
-/// Computes the 128-bit BLAKE3 digest of `rect` read through [`BufferPointer`]
-/// (preserving shared-memory aliasing and `SIGBUS` boundaries).
-#[inline(never)]
-pub(crate) fn hash_rect_from_ptr<const HAS_ALPHA: bool>(
-    aos: BufferPointer<Vec4u8>,
-    stride_px: usize,
-    rect: TileRect,
-    hash_buf: &mut Vec<u8>,
-) -> TileHash {
-    let x0 = rect.x as usize;
-    let y0 = rect.y as usize;
-    let tw = rect.w as usize;
-    let th = rect.h as usize;
-    let row_bytes = tw * 4;
-    let total_bytes = row_bytes * th;
-    if hash_buf.len() < total_bytes {
-        hash_buf.resize(total_bytes, 0);
-    }
-    let buf = &mut hash_buf[..total_bytes];
-
-    if th > 0 && tw > 0 {
-        let last_end = (y0 + th - 1) * stride_px + x0 + tw;
-        assert!(last_end <= aos.len());
-    }
-    for ry in 0..th {
-        // SAFETY: Validated `last_end <= aos.len()` above.
-        let src_row_ptr = unsafe { aos.ptr().add((y0 + ry) * stride_px + x0) };
-        let dst_bytes = &mut buf[ry * row_bytes..(ry + 1) * row_bytes];
-        if HAS_ALPHA {
-            let dst_row: &mut [Vec4u8] = bytemuck::cast_slice_mut(dst_bytes);
-            // SAFETY: `tw <= aos.len() - row_start` and `dst_row` does not overlap `aos`.
-            unsafe { src_row_ptr.copy_to_nonoverlapping(dst_row.as_mut_ptr(), tw) };
-        } else {
-            for (i, dh) in dst_bytes.as_chunks_mut::<4>().0.iter_mut().enumerate() {
-                // SAFETY: `i < tw` and `last_end <= aos.len()`.
-                let px = unsafe { src_row_ptr.add(i).read() };
-                let raw = [px.0, px.1, px.2, px.3];
-                *dh = (u32::from_ne_bytes(raw) | XRGB_ALPHA_MASK).to_ne_bytes();
-            }
-        }
-    }
-
-    let digest = blake3::hash(buf);
-    let mut out = [0u8; 16];
-    out.copy_from_slice(&digest.as_bytes()[..16]);
-    out
-}
-
-/// Combines `2..=4` quadrant hashes into a single collision-resistant 128-bit
-/// parent tile digest without re-reading pixel memory.
-#[inline]
-pub(crate) fn combine_quad_hashes(w: u32, h: u32, quad_hashes: &[TileHash]) -> TileHash {
-    debug_assert!((2..=4).contains(&quad_hashes.len()));
-    let mut input = [0u8; 10 + 4 * 16];
-    input[0] = b'P';
-    input[1] = quad_hashes.len() as u8;
-    input[2..6].copy_from_slice(&w.to_le_bytes());
-    input[6..10].copy_from_slice(&h.to_le_bytes());
-    for (i, qh) in quad_hashes.iter().enumerate() {
-        let off = 10 + i * 16;
-        input[off..off + 16].copy_from_slice(qh);
-    }
-    let digest = blake3::hash(&input[..10 + quad_hashes.len() * 16]);
-    let mut out = [0u8; 16];
-    out.copy_from_slice(&digest.as_bytes()[..16]);
-    out
-}
-
-/// Disjoint per-slot hash output table populated in parallel during Phase A.
+/// Disjoint per-slot hash output table populated in parallel during Phase A,
+/// carrying the immutable per-connection [`TileHashKey`].
 pub(crate) struct SlotHashes {
     slots: Vec<UnsafeCell<TileHash>>,
+    key: TileHashKey,
 }
 
 // SAFETY: Each `slot_idx` in `0..slots.len()` is owned by a single Phase-A
 // task (`Strip1D`, `RowBand2D` column, or full-frame tile) and written at most
-// once before `pool.execute` joins.
+// once before `pool.execute` joins; `key` is immutable.
 unsafe impl Sync for SlotHashes {}
 
 impl SlotHashes {
-    pub(crate) fn new(len: usize) -> Self {
+    pub(crate) fn new(len: usize, key: TileHashKey) -> Self {
         Self {
             slots: (0..len).map(|_| UnsafeCell::new([0u8; 16])).collect(),
+            key,
         }
+    }
+
+    #[inline]
+    pub(crate) fn key(&self) -> &TileHashKey {
+        &self.key
     }
 
     /// # Safety
@@ -797,6 +574,7 @@ pub struct ServerTileCache {
     slots: Vec<ServerSlot>,
     free_slots: Vec<u16>,
     index: HashMap<CacheKey, CacheHitRef, TileHashBuildHasher>,
+    hash_key: TileHashKey,
     lru_head: u16,
     lru_tail: u16,
     used_bytes: usize,
@@ -824,6 +602,7 @@ impl ServerTileCache {
                 MAX_TILE_CACHE_SLOTS * 2,
                 TileHashBuildHasher::new(),
             ),
+            hash_key: TileHashKey::new_random(),
             lru_head: NONE_SLOT,
             lru_tail: NONE_SLOT,
             used_bytes: 0,
@@ -831,6 +610,11 @@ impl ServerTileCache {
             frame_gen: 0,
             reset_pending: false,
         }
+    }
+
+    #[inline]
+    pub(crate) fn hash_key(&self) -> &TileHashKey {
+        &self.hash_key
     }
 
     /// Clears all directory entries (call on disconnect or new client connect).
@@ -1276,8 +1060,12 @@ impl ServerTileCache {
                             for (q, &slot) in quad_slots[..n_quads].iter().enumerate() {
                                 quad_hashes[q] = slot_hashes[slot];
                             }
-                            let parent_hash =
-                                combine_quad_hashes(rect.w, rect.h, &quad_hashes[..n_quads]);
+                            let parent_hash = combine_quad_hashes(
+                                &self.hash_key,
+                                rect.w,
+                                rect.h,
+                                &quad_hashes[..n_quads],
+                            );
                             candidates.push(DirtyCandidate::Splittable {
                                 rect,
                                 parent_hash,
@@ -1304,8 +1092,14 @@ impl ServerTileCache {
                                 all_hashed = false;
                             }
                         }
-                        let parent_hash = all_hashed
-                            .then(|| combine_quad_hashes(rect.w, rect.h, &quad_hashes[..n_quads]));
+                        let parent_hash = all_hashed.then(|| {
+                            combine_quad_hashes(
+                                &self.hash_key,
+                                rect.w,
+                                rect.h,
+                                &quad_hashes[..n_quads],
+                            )
+                        });
                         candidates.push(DirtyCandidate::PartialTile2D {
                             rect,
                             parent_hash,

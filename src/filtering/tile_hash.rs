@@ -1,0 +1,2126 @@
+// Copyright 2026 Google LLC
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
+//! Keyed 128-bit fused SIMD tile hasher for [`crate::filtering::ServerTileCache`].
+//!
+//! Replaces intermediate-buffer hashing with an in-register, row-oriented 4-lane
+//! absorption primitive so `copy_and_hash_rect_to_shadow` reads each `wl_shm`
+//! pixel once, stores raw bytes directly into (potentially uninitialized) shadow
+//! memory, optionally masks `Xrgb8888` byte 3 to `0xFF` in-register, and folds
+//! pixels directly into four 128-bit state lanes without touching any scratch
+//! buffer.
+//!
+//! Backends (digests are strictly server-local to one [`TileHashKey`] and never
+//! cross the wire):
+//! - `x86_64` AES-NI (`is_x86_feature_detected!("aes")`, `#[target_feature(enable = "aes")]`):
+//!   4-lane `_mm_aesenc_si128(_mm_xor_si128(s_i, m_i), round_key)` with a
+//!   multi-round key-separated AES finalizer.
+//! - `aarch64` ARMv8 AES (`is_aarch64_feature_detected!("aes")`,
+//!   `#[target_feature(enable = "aes")]`): mathematically identical 4-lane
+//!   `veorq_u8(vaesmcq_u8(vaeseq_u8(s_i, m_i)), round_key)`.
+//! - Portable 128-bit keyed fallback (non-AES CPUs and Miri): 4-lane 64-bit
+//!   state (256-bit internal state) with widened `u128` multiply-xor-fold
+//!   absorption and 4-round cross-coupled 128-bit finalization.
+
+use std::collections::hash_map::RandomState;
+use std::hash::BuildHasher;
+
+use crate::buffer_pointer::BufferPointer;
+use crate::serialization::framing::TileRect;
+use crate::vec4u8::Vec4u8;
+
+/// 128-bit keyed digest of canonical tile pixels or combined quadrant digests.
+pub(crate) type TileHash = [u8; 16];
+
+const DOMAIN_LEAF: u64 = b'L' as u64;
+const DOMAIN_PARENT: u64 = b'P' as u64;
+
+#[cfg(any(
+    all(target_arch = "x86_64", not(miri)),
+    all(target_arch = "aarch64", not(miri)),
+))]
+const XRGB_ALPHA_MASK_U32: u32 = u32::from_ne_bytes([0, 0, 0, 0xFF]);
+
+const XRGB_ALPHA_MASK_U64: u64 = u64::from_ne_bytes([0, 0, 0, 0xFF, 0, 0, 0, 0xFF]);
+
+/// Per-connection random secret key for the 128-bit fused tile hasher.
+///
+/// Keyed randomly per [`crate::filtering::ServerTileCache`] via
+/// [`RandomState`] so untrusted pixels cannot construct offline collisions.
+#[derive(Debug, Copy, Clone)]
+pub(crate) struct TileHashKey {
+    /// Four independent 128-bit lane IVs.
+    iv: [[u64; 2]; 4],
+    /// 128-bit secret round key mixed into every absorption step.
+    round_key: [u64; 2],
+    /// Six independent 128-bit secret keys for lane folding and finalization.
+    final_keys: [[u64; 2]; 6],
+}
+
+#[inline]
+fn random_block() -> [u64; 2] {
+    let state = RandomState::new();
+    [
+        state.hash_one(0x243F_6A88_85A3_08D3u64),
+        state.hash_one(0x1319_8A2E_0370_7344u64),
+    ]
+}
+
+impl TileHashKey {
+    /// Generates a fresh per-connection random key from [`RandomState`].
+    pub(crate) fn new_random() -> Self {
+        Self {
+            iv: [
+                random_block(),
+                random_block(),
+                random_block(),
+                random_block(),
+            ],
+            round_key: random_block(),
+            final_keys: [
+                random_block(),
+                random_block(),
+                random_block(),
+                random_block(),
+                random_block(),
+                random_block(),
+            ],
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn from_seed(mut state: u64) -> Self {
+        let mut next_u64 = || {
+            state = state.wrapping_add(0x9E37_79B9_7F4A_7C15);
+            let mut z = state;
+            z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+            z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+            z ^ (z >> 31)
+        };
+        let mut next_block = || [next_u64(), next_u64()];
+        Self {
+            iv: [next_block(), next_block(), next_block(), next_block()],
+            round_key: next_block(),
+            final_keys: [
+                next_block(),
+                next_block(),
+                next_block(),
+                next_block(),
+                next_block(),
+                next_block(),
+            ],
+        }
+    }
+}
+
+#[inline(always)]
+fn leaf_meta(w: u32, h: u32) -> (u64, u64) {
+    ((u64::from(w) << 32) | u64::from(h), DOMAIN_LEAF)
+}
+
+#[inline(always)]
+fn parent_meta(w: u32, h: u32, n_quads: usize) -> (u64, u64) {
+    (
+        (u64::from(w) << 32) | u64::from(h),
+        DOMAIN_PARENT | ((n_quads as u64) << 8),
+    )
+}
+
+#[cfg(all(target_arch = "x86_64", not(miri)))]
+#[inline(always)]
+fn has_hw_aes() -> bool {
+    #[cfg(target_feature = "aes")]
+    {
+        true
+    }
+    #[cfg(not(target_feature = "aes"))]
+    {
+        std::arch::is_x86_feature_detected!("aes")
+    }
+}
+
+#[cfg(all(target_arch = "aarch64", not(miri)))]
+#[inline(always)]
+fn has_hw_aes() -> bool {
+    #[cfg(target_feature = "aes")]
+    {
+        true
+    }
+    #[cfg(not(target_feature = "aes"))]
+    {
+        std::arch::is_aarch64_feature_detected!("aes")
+    }
+}
+
+#[cfg(all(target_arch = "x86_64", not(miri)))]
+mod x86_aes {
+    use std::arch::x86_64::__m128i;
+    use std::arch::x86_64::_mm_aesenc_si128;
+    use std::arch::x86_64::_mm_loadu_si128;
+    use std::arch::x86_64::_mm_or_si128;
+    use std::arch::x86_64::_mm_set_epi32;
+    use std::arch::x86_64::_mm_set_epi64x;
+    use std::arch::x86_64::_mm_set1_epi32;
+    use std::arch::x86_64::_mm_storeu_si128;
+    use std::arch::x86_64::_mm_xor_si128;
+    use std::ptr;
+
+    use super::TileHash;
+    use super::TileHashKey;
+    use super::XRGB_ALPHA_MASK_U32;
+    use super::leaf_meta;
+    use super::parent_meta;
+    use crate::serialization::framing::TileRect;
+
+    #[inline]
+    #[target_feature(enable = "aes")]
+    fn load_key_block(block: &[u64; 2]) -> __m128i {
+        // SAFETY: `[u64; 2]` is 16 readable initialized bytes.
+        unsafe { _mm_loadu_si128(block.as_ptr().cast::<__m128i>()) }
+    }
+
+    #[inline]
+    #[target_feature(enable = "aes")]
+    fn init_lanes(key: &TileHashKey, meta_lo: u64, meta_hi: u64) -> ([__m128i; 4], __m128i) {
+        let meta = _mm_set_epi64x(meta_hi as i64, meta_lo as i64);
+        let lanes = [
+            _mm_xor_si128(load_key_block(&key.iv[0]), meta),
+            _mm_xor_si128(load_key_block(&key.iv[1]), meta),
+            _mm_xor_si128(load_key_block(&key.iv[2]), meta),
+            _mm_xor_si128(load_key_block(&key.iv[3]), meta),
+        ];
+        (lanes, meta)
+    }
+
+    #[inline]
+    #[target_feature(enable = "aes")]
+    fn finalize(key: &TileHashKey, lanes: [__m128i; 4], meta: __m128i) -> TileHash {
+        let fk0 = load_key_block(&key.final_keys[0]);
+        let fk1 = load_key_block(&key.final_keys[1]);
+        let fk2 = load_key_block(&key.final_keys[2]);
+        let fk3 = load_key_block(&key.final_keys[3]);
+        let fk4 = load_key_block(&key.final_keys[4]);
+        let fk5 = load_key_block(&key.final_keys[5]);
+
+        // Separate lanes with distinct keys before folding so equal lanes never
+        // cancel symmetrically.
+        let s0 = _mm_aesenc_si128(lanes[0], fk0);
+        let s1 = _mm_aesenc_si128(lanes[1], fk1);
+        let s2 = _mm_aesenc_si128(lanes[2], fk2);
+        let s3 = _mm_aesenc_si128(lanes[3], fk3);
+
+        let t0 = _mm_aesenc_si128(_mm_xor_si128(s0, s1), fk4);
+        let t1 = _mm_aesenc_si128(_mm_xor_si128(s2, s3), fk5);
+
+        let mut h = _mm_xor_si128(_mm_xor_si128(t0, t1), meta);
+        h = _mm_aesenc_si128(h, fk0);
+        h = _mm_aesenc_si128(h, fk1);
+        h = _mm_aesenc_si128(h, fk2);
+        h = _mm_aesenc_si128(h, fk3);
+        h = _mm_aesenc_si128(h, fk4);
+        h = _mm_aesenc_si128(h, fk5);
+
+        let mut out = [0u8; 16];
+        // SAFETY: `out` is 16 writable bytes.
+        unsafe { _mm_storeu_si128(out.as_mut_ptr().cast::<__m128i>(), h) };
+        out
+    }
+
+    /// Absorbs one row (`full64 + rem` bytes, `rem < 64` and a multiple of 4)
+    /// into `lanes`, optionally storing exact raw bytes into `dst_row` in the
+    /// same single load pass when `COPY` is `true`.
+    ///
+    /// # Safety
+    /// `src_row` must be readable for `full64 + rem` bytes. When `COPY` is
+    /// `true`, `dst_row` must be writable for `full64 + rem` bytes and disjoint
+    /// from `src_row`.
+    #[inline]
+    #[target_feature(enable = "aes")]
+    unsafe fn absorb_row<const HAS_ALPHA: bool, const COPY: bool>(
+        src_row: *const u8,
+        dst_row: *mut u8,
+        full64: usize,
+        rem: usize,
+        rk: __m128i,
+        alpha_mask: __m128i,
+        lanes: &mut [__m128i; 4],
+    ) {
+        let mut s0 = lanes[0];
+        let mut s1 = lanes[1];
+        let mut s2 = lanes[2];
+        let mut s3 = lanes[3];
+
+        let mut off = 0usize;
+        while off < full64 {
+            // SAFETY: `off + 64 <= full64`, within caller-validated row bounds.
+            let (r0, r1, r2, r3) = unsafe {
+                let r0 = _mm_loadu_si128(src_row.add(off).cast::<__m128i>());
+                let r1 = _mm_loadu_si128(src_row.add(off + 16).cast::<__m128i>());
+                let r2 = _mm_loadu_si128(src_row.add(off + 32).cast::<__m128i>());
+                let r3 = _mm_loadu_si128(src_row.add(off + 48).cast::<__m128i>());
+                if COPY {
+                    _mm_storeu_si128(dst_row.add(off).cast::<__m128i>(), r0);
+                    _mm_storeu_si128(dst_row.add(off + 16).cast::<__m128i>(), r1);
+                    _mm_storeu_si128(dst_row.add(off + 32).cast::<__m128i>(), r2);
+                    _mm_storeu_si128(dst_row.add(off + 48).cast::<__m128i>(), r3);
+                }
+                (r0, r1, r2, r3)
+            };
+            let m0 = if HAS_ALPHA {
+                r0
+            } else {
+                _mm_or_si128(r0, alpha_mask)
+            };
+            let m1 = if HAS_ALPHA {
+                r1
+            } else {
+                _mm_or_si128(r1, alpha_mask)
+            };
+            let m2 = if HAS_ALPHA {
+                r2
+            } else {
+                _mm_or_si128(r2, alpha_mask)
+            };
+            let m3 = if HAS_ALPHA {
+                r3
+            } else {
+                _mm_or_si128(r3, alpha_mask)
+            };
+            s0 = _mm_aesenc_si128(_mm_xor_si128(s0, m0), rk);
+            s1 = _mm_aesenc_si128(_mm_xor_si128(s1, m1), rk);
+            s2 = _mm_aesenc_si128(_mm_xor_si128(s2, m2), rk);
+            s3 = _mm_aesenc_si128(_mm_xor_si128(s3, m3), rk);
+            off += 64;
+        }
+
+        if rem != 0 {
+            let mut left = rem;
+            if left >= 16 {
+                // SAFETY: `off + 16 <= full64 + rem`.
+                let r0 = unsafe {
+                    let v = _mm_loadu_si128(src_row.add(off).cast::<__m128i>());
+                    if COPY {
+                        _mm_storeu_si128(dst_row.add(off).cast::<__m128i>(), v);
+                    }
+                    v
+                };
+                let m0 = if HAS_ALPHA {
+                    r0
+                } else {
+                    _mm_or_si128(r0, alpha_mask)
+                };
+                s0 = _mm_aesenc_si128(_mm_xor_si128(s0, m0), rk);
+                off += 16;
+                left -= 16;
+
+                if left >= 16 {
+                    // SAFETY: `off + 16 <= full64 + rem`.
+                    let r1 = unsafe {
+                        let v = _mm_loadu_si128(src_row.add(off).cast::<__m128i>());
+                        if COPY {
+                            _mm_storeu_si128(dst_row.add(off).cast::<__m128i>(), v);
+                        }
+                        v
+                    };
+                    let m1 = if HAS_ALPHA {
+                        r1
+                    } else {
+                        _mm_or_si128(r1, alpha_mask)
+                    };
+                    s1 = _mm_aesenc_si128(_mm_xor_si128(s1, m1), rk);
+                    off += 16;
+                    left -= 16;
+
+                    if left >= 16 {
+                        // SAFETY: `off + 16 <= full64 + rem`.
+                        let r2 = unsafe {
+                            let v = _mm_loadu_si128(src_row.add(off).cast::<__m128i>());
+                            if COPY {
+                                _mm_storeu_si128(dst_row.add(off).cast::<__m128i>(), v);
+                            }
+                            v
+                        };
+                        let m2 = if HAS_ALPHA {
+                            r2
+                        } else {
+                            _mm_or_si128(r2, alpha_mask)
+                        };
+                        s2 = _mm_aesenc_si128(_mm_xor_si128(s2, m2), rk);
+                        off += 16;
+                        left -= 16;
+                    }
+                }
+            }
+
+            if left > 0 {
+                debug_assert!(left < 16 && left.is_multiple_of(4));
+                // SAFETY: `off + left == full64 + rem`, `left` is 4, 8, or 12.
+                // Scalar 4-byte reads avoid `memcpy` calls, stack spills, and
+                // duplicate `wl_shm` loads.
+                let rt = unsafe {
+                    let p0 = src_row.add(off).cast::<u32>().read_unaligned();
+                    if COPY {
+                        dst_row.add(off).cast::<u32>().write_unaligned(p0);
+                    }
+                    let mut p1 = 0u32;
+                    let mut p2 = 0u32;
+                    if left >= 8 {
+                        p1 = src_row.add(off + 4).cast::<u32>().read_unaligned();
+                        if COPY {
+                            dst_row.add(off + 4).cast::<u32>().write_unaligned(p1);
+                        }
+                        if left == 12 {
+                            p2 = src_row.add(off + 8).cast::<u32>().read_unaligned();
+                            if COPY {
+                                dst_row.add(off + 8).cast::<u32>().write_unaligned(p2);
+                            }
+                        }
+                    }
+                    _mm_set_epi32(0, p2 as i32, p1 as i32, p0 as i32)
+                };
+                let mt = if HAS_ALPHA {
+                    rt
+                } else {
+                    _mm_or_si128(rt, alpha_mask)
+                };
+                s3 = _mm_aesenc_si128(_mm_xor_si128(s3, mt), rk);
+            }
+        }
+
+        lanes[0] = s0;
+        lanes[1] = s1;
+        lanes[2] = s2;
+        lanes[3] = s3;
+    }
+
+    /// # Safety
+    /// Caller must verify CPU AES-NI support and uphold [`super::hash_rect_from_shadow`]
+    /// bounds invariants.
+    #[target_feature(enable = "aes")]
+    pub(super) unsafe fn hash_rect_raw<const HAS_ALPHA: bool>(
+        key: &TileHashKey,
+        base: *const u8,
+        stride: usize,
+        rect: TileRect,
+    ) -> TileHash {
+        let (meta_lo, meta_hi) = leaf_meta(rect.w, rect.h);
+        let (mut lanes, meta) = init_lanes(key, meta_lo, meta_hi);
+        let row_bytes = rect.w as usize * 4;
+        let th = rect.h as usize;
+        if th > 0 && row_bytes > 0 {
+            let rk = load_key_block(&key.round_key);
+            let alpha_mask = _mm_set1_epi32(XRGB_ALPHA_MASK_U32 as i32);
+            let full64 = row_bytes & !63;
+            let rem = row_bytes & 63;
+            let x_bytes = rect.x as usize * 4;
+            let y0 = rect.y as usize;
+            // SAFETY: Caller guarantees `(y0 + ry, x_bytes..x_bytes + row_bytes)` is readable.
+            let mut row_ptr = unsafe { base.add(y0 * stride + x_bytes) };
+            for _ in 0..th {
+                // SAFETY: `row_ptr` is readable for `row_bytes == full64 + rem`.
+                unsafe {
+                    absorb_row::<HAS_ALPHA, false>(
+                        row_ptr,
+                        ptr::null_mut(),
+                        full64,
+                        rem,
+                        rk,
+                        alpha_mask,
+                        &mut lanes,
+                    );
+                    row_ptr = row_ptr.add(stride);
+                }
+            }
+        }
+        finalize(key, lanes, meta)
+    }
+
+    /// # Safety
+    /// Caller must verify CPU AES-NI support and uphold
+    /// [`super::copy_and_hash_rect_to_shadow`] bounds and exclusivity invariants.
+    #[target_feature(enable = "aes")]
+    pub(super) unsafe fn copy_and_hash_rect_to_shadow<const HAS_ALPHA: bool>(
+        key: &TileHashKey,
+        src_base: *const u8,
+        shadow_base: *mut u8,
+        stride: usize,
+        rect: TileRect,
+        copy_from_ry: usize,
+    ) -> TileHash {
+        let (meta_lo, meta_hi) = leaf_meta(rect.w, rect.h);
+        let (mut lanes, meta) = init_lanes(key, meta_lo, meta_hi);
+        let row_bytes = rect.w as usize * 4;
+        let th = rect.h as usize;
+        if th > 0 && row_bytes > 0 {
+            let rk = load_key_block(&key.round_key);
+            let alpha_mask = _mm_set1_epi32(XRGB_ALPHA_MASK_U32 as i32);
+            let full64 = row_bytes & !63;
+            let rem = row_bytes & 63;
+            let x_bytes = rect.x as usize * 4;
+            let y0 = rect.y as usize;
+            let base_off = y0 * stride + x_bytes;
+
+            // SAFETY: Caller guarantees `shadow_base` rows `0..copy_from_ry`
+            // are initialized and readable for `row_bytes`.
+            let mut sh_ptr = unsafe { shadow_base.add(base_off) };
+            for _ in 0..copy_from_ry {
+                // SAFETY: `sh_ptr` is readable for `row_bytes`.
+                unsafe {
+                    absorb_row::<HAS_ALPHA, false>(
+                        sh_ptr.cast_const(),
+                        ptr::null_mut(),
+                        full64,
+                        rem,
+                        rk,
+                        alpha_mask,
+                        &mut lanes,
+                    );
+                    sh_ptr = sh_ptr.add(stride);
+                }
+            }
+
+            if copy_from_ry < th {
+                // SAFETY: Caller validated `src_base` bounds and exclusive
+                // `shadow_base` write access for rows `copy_from_ry..th`.
+                let mut src_ptr = unsafe { src_base.add(base_off + copy_from_ry * stride) };
+                for _ in copy_from_ry..th {
+                    // SAFETY: `src_ptr` readable and `sh_ptr` writable for `row_bytes`, disjoint.
+                    unsafe {
+                        absorb_row::<HAS_ALPHA, true>(
+                            src_ptr, sh_ptr, full64, rem, rk, alpha_mask, &mut lanes,
+                        );
+                        src_ptr = src_ptr.add(stride);
+                        sh_ptr = sh_ptr.add(stride);
+                    }
+                }
+            }
+        }
+        finalize(key, lanes, meta)
+    }
+
+    /// # Safety
+    /// Caller must verify CPU AES-NI support.
+    #[target_feature(enable = "aes")]
+    pub(super) unsafe fn combine_quad_hashes(
+        key: &TileHashKey,
+        w: u32,
+        h: u32,
+        quad_hashes: &[TileHash],
+    ) -> TileHash {
+        let (meta_lo, meta_hi) = parent_meta(w, h, quad_hashes.len());
+        let (mut lanes, meta) = init_lanes(key, meta_lo, meta_hi);
+        let rk = load_key_block(&key.round_key);
+        for (lane, qh) in lanes.iter_mut().zip(quad_hashes.iter()) {
+            // SAFETY: `TileHash` is `[u8; 16]`.
+            let q = unsafe { _mm_loadu_si128(qh.as_ptr().cast::<__m128i>()) };
+            *lane = _mm_aesenc_si128(_mm_xor_si128(*lane, q), rk);
+        }
+        finalize(key, lanes, meta)
+    }
+}
+
+#[cfg(all(target_arch = "aarch64", not(miri)))]
+mod aarch64_aes {
+    use std::arch::aarch64::uint8x16_t;
+    use std::arch::aarch64::vaeseq_u8;
+    use std::arch::aarch64::vaesmcq_u8;
+    use std::arch::aarch64::vdupq_n_u8;
+    use std::arch::aarch64::vdupq_n_u32;
+    use std::arch::aarch64::veorq_u8;
+    use std::arch::aarch64::vld1q_u8;
+    use std::arch::aarch64::vorrq_u8;
+    use std::arch::aarch64::vreinterpretq_u8_u32;
+    use std::arch::aarch64::vst1q_u8;
+    use std::ptr;
+
+    use super::TileHash;
+    use super::TileHashKey;
+    use super::XRGB_ALPHA_MASK_U32;
+    use super::leaf_meta;
+    use super::parent_meta;
+    use crate::serialization::framing::TileRect;
+
+    #[inline]
+    #[target_feature(enable = "aes")]
+    fn load_key_block(block: &[u64; 2]) -> uint8x16_t {
+        let mut bytes = [0u8; 16];
+        bytes[..8].copy_from_slice(&block[0].to_le_bytes());
+        bytes[8..].copy_from_slice(&block[1].to_le_bytes());
+        // SAFETY: `bytes` is 16 readable initialized bytes.
+        unsafe { vld1q_u8(bytes.as_ptr()) }
+    }
+
+    #[inline]
+    #[target_feature(enable = "aes")]
+    fn init_lanes(key: &TileHashKey, meta_lo: u64, meta_hi: u64) -> ([uint8x16_t; 4], uint8x16_t) {
+        let meta = load_key_block(&[meta_lo, meta_hi]);
+        let lanes = [
+            veorq_u8(load_key_block(&key.iv[0]), meta),
+            veorq_u8(load_key_block(&key.iv[1]), meta),
+            veorq_u8(load_key_block(&key.iv[2]), meta),
+            veorq_u8(load_key_block(&key.iv[3]), meta),
+        ];
+        (lanes, meta)
+    }
+
+    #[inline]
+    #[target_feature(enable = "aes")]
+    fn aes_step(state: uint8x16_t, msg: uint8x16_t, rk: uint8x16_t) -> uint8x16_t {
+        // ARMv8 `vaeseq_u8(state, msg)` computes `ShiftRows(SubBytes(state ^ msg))`;
+        // `vaesmcq_u8` adds `MixColumns`, and `veorq_u8(..., rk)` mixes `round_key`.
+        veorq_u8(vaesmcq_u8(vaeseq_u8(state, msg)), rk)
+    }
+
+    #[inline]
+    #[target_feature(enable = "aes")]
+    fn finalize(key: &TileHashKey, lanes: [uint8x16_t; 4], meta: uint8x16_t) -> TileHash {
+        let zero = vdupq_n_u8(0);
+        let fk0 = load_key_block(&key.final_keys[0]);
+        let fk1 = load_key_block(&key.final_keys[1]);
+        let fk2 = load_key_block(&key.final_keys[2]);
+        let fk3 = load_key_block(&key.final_keys[3]);
+        let fk4 = load_key_block(&key.final_keys[4]);
+        let fk5 = load_key_block(&key.final_keys[5]);
+
+        let s0 = aes_step(lanes[0], zero, fk0);
+        let s1 = aes_step(lanes[1], zero, fk1);
+        let s2 = aes_step(lanes[2], zero, fk2);
+        let s3 = aes_step(lanes[3], zero, fk3);
+
+        let t0 = aes_step(veorq_u8(s0, s1), zero, fk4);
+        let t1 = aes_step(veorq_u8(s2, s3), zero, fk5);
+
+        let mut h = veorq_u8(veorq_u8(t0, t1), meta);
+        h = aes_step(h, zero, fk0);
+        h = aes_step(h, zero, fk1);
+        h = aes_step(h, zero, fk2);
+        h = aes_step(h, zero, fk3);
+        h = aes_step(h, zero, fk4);
+        h = aes_step(h, zero, fk5);
+
+        let mut out = [0u8; 16];
+        // SAFETY: `out` is 16 writable bytes.
+        unsafe { vst1q_u8(out.as_mut_ptr(), h) };
+        out
+    }
+
+    #[inline]
+    #[target_feature(enable = "aes")]
+    unsafe fn absorb_row<const HAS_ALPHA: bool, const COPY: bool>(
+        src_row: *const u8,
+        dst_row: *mut u8,
+        full64: usize,
+        rem: usize,
+        rk: uint8x16_t,
+        alpha_mask: uint8x16_t,
+        lanes: &mut [uint8x16_t; 4],
+    ) {
+        let mut s0 = lanes[0];
+        let mut s1 = lanes[1];
+        let mut s2 = lanes[2];
+        let mut s3 = lanes[3];
+
+        let mut off = 0usize;
+        while off < full64 {
+            // SAFETY: `off + 64 <= full64`, within caller-validated row bounds.
+            let (r0, r1, r2, r3) = unsafe {
+                let r0 = vld1q_u8(src_row.add(off));
+                let r1 = vld1q_u8(src_row.add(off + 16));
+                let r2 = vld1q_u8(src_row.add(off + 32));
+                let r3 = vld1q_u8(src_row.add(off + 48));
+                if COPY {
+                    vst1q_u8(dst_row.add(off), r0);
+                    vst1q_u8(dst_row.add(off + 16), r1);
+                    vst1q_u8(dst_row.add(off + 32), r2);
+                    vst1q_u8(dst_row.add(off + 48), r3);
+                }
+                (r0, r1, r2, r3)
+            };
+            let m0 = if HAS_ALPHA {
+                r0
+            } else {
+                vorrq_u8(r0, alpha_mask)
+            };
+            let m1 = if HAS_ALPHA {
+                r1
+            } else {
+                vorrq_u8(r1, alpha_mask)
+            };
+            let m2 = if HAS_ALPHA {
+                r2
+            } else {
+                vorrq_u8(r2, alpha_mask)
+            };
+            let m3 = if HAS_ALPHA {
+                r3
+            } else {
+                vorrq_u8(r3, alpha_mask)
+            };
+            s0 = aes_step(s0, m0, rk);
+            s1 = aes_step(s1, m1, rk);
+            s2 = aes_step(s2, m2, rk);
+            s3 = aes_step(s3, m3, rk);
+            off += 64;
+        }
+
+        if rem != 0 {
+            let mut left = rem;
+            if left >= 16 {
+                // SAFETY: `off + 16 <= full64 + rem`.
+                let r0 = unsafe {
+                    let v = vld1q_u8(src_row.add(off));
+                    if COPY {
+                        vst1q_u8(dst_row.add(off), v);
+                    }
+                    v
+                };
+                let m0 = if HAS_ALPHA {
+                    r0
+                } else {
+                    vorrq_u8(r0, alpha_mask)
+                };
+                s0 = aes_step(s0, m0, rk);
+                off += 16;
+                left -= 16;
+
+                if left >= 16 {
+                    // SAFETY: `off + 16 <= full64 + rem`.
+                    let r1 = unsafe {
+                        let v = vld1q_u8(src_row.add(off));
+                        if COPY {
+                            vst1q_u8(dst_row.add(off), v);
+                        }
+                        v
+                    };
+                    let m1 = if HAS_ALPHA {
+                        r1
+                    } else {
+                        vorrq_u8(r1, alpha_mask)
+                    };
+                    s1 = aes_step(s1, m1, rk);
+                    off += 16;
+                    left -= 16;
+
+                    if left >= 16 {
+                        // SAFETY: `off + 16 <= full64 + rem`.
+                        let r2 = unsafe {
+                            let v = vld1q_u8(src_row.add(off));
+                            if COPY {
+                                vst1q_u8(dst_row.add(off), v);
+                            }
+                            v
+                        };
+                        let m2 = if HAS_ALPHA {
+                            r2
+                        } else {
+                            vorrq_u8(r2, alpha_mask)
+                        };
+                        s2 = aes_step(s2, m2, rk);
+                        off += 16;
+                        left -= 16;
+                    }
+                }
+            }
+
+            if left > 0 {
+                debug_assert!(left < 16 && left.is_multiple_of(4));
+                let mut tail_words = [0u32; 4];
+                // SAFETY: `off + left == full64 + rem`, `left` is 4, 8, or 12.
+                let rt = unsafe {
+                    let p0 = src_row.add(off).cast::<u32>().read_unaligned();
+                    tail_words[0] = p0;
+                    if COPY {
+                        dst_row.add(off).cast::<u32>().write_unaligned(p0);
+                    }
+                    if left >= 8 {
+                        let p1 = src_row.add(off + 4).cast::<u32>().read_unaligned();
+                        tail_words[1] = p1;
+                        if COPY {
+                            dst_row.add(off + 4).cast::<u32>().write_unaligned(p1);
+                        }
+                        if left == 12 {
+                            let p2 = src_row.add(off + 8).cast::<u32>().read_unaligned();
+                            tail_words[2] = p2;
+                            if COPY {
+                                dst_row.add(off + 8).cast::<u32>().write_unaligned(p2);
+                            }
+                        }
+                    }
+                    vld1q_u8(tail_words.as_ptr().cast::<u8>())
+                };
+                let mt = if HAS_ALPHA {
+                    rt
+                } else {
+                    vorrq_u8(rt, alpha_mask)
+                };
+                s3 = aes_step(s3, mt, rk);
+            }
+        }
+
+        lanes[0] = s0;
+        lanes[1] = s1;
+        lanes[2] = s2;
+        lanes[3] = s3;
+    }
+
+    /// # Safety
+    /// Caller must verify CPU ARMv8 AES support and uphold
+    /// [`super::hash_rect_from_shadow`] bounds invariants.
+    #[target_feature(enable = "aes")]
+    pub(super) unsafe fn hash_rect_raw<const HAS_ALPHA: bool>(
+        key: &TileHashKey,
+        base: *const u8,
+        stride: usize,
+        rect: TileRect,
+    ) -> TileHash {
+        let (meta_lo, meta_hi) = leaf_meta(rect.w, rect.h);
+        let (mut lanes, meta) = init_lanes(key, meta_lo, meta_hi);
+        let row_bytes = rect.w as usize * 4;
+        let th = rect.h as usize;
+        if th > 0 && row_bytes > 0 {
+            let rk = load_key_block(&key.round_key);
+            let alpha_mask = vreinterpretq_u8_u32(vdupq_n_u32(XRGB_ALPHA_MASK_U32));
+            let full64 = row_bytes & !63;
+            let rem = row_bytes & 63;
+            let x_bytes = rect.x as usize * 4;
+            let y0 = rect.y as usize;
+            // SAFETY: Caller guarantees `(y0 + ry, x_bytes..x_bytes + row_bytes)` is readable.
+            let mut row_ptr = unsafe { base.add(y0 * stride + x_bytes) };
+            for _ in 0..th {
+                // SAFETY: `row_ptr` is readable for `row_bytes == full64 + rem`.
+                unsafe {
+                    absorb_row::<HAS_ALPHA, false>(
+                        row_ptr,
+                        ptr::null_mut(),
+                        full64,
+                        rem,
+                        rk,
+                        alpha_mask,
+                        &mut lanes,
+                    );
+                    row_ptr = row_ptr.add(stride);
+                }
+            }
+        }
+        finalize(key, lanes, meta)
+    }
+
+    /// # Safety
+    /// Caller must verify CPU ARMv8 AES support and uphold
+    /// [`super::copy_and_hash_rect_to_shadow`] bounds and exclusivity invariants.
+    #[target_feature(enable = "aes")]
+    pub(super) unsafe fn copy_and_hash_rect_to_shadow<const HAS_ALPHA: bool>(
+        key: &TileHashKey,
+        src_base: *const u8,
+        shadow_base: *mut u8,
+        stride: usize,
+        rect: TileRect,
+        copy_from_ry: usize,
+    ) -> TileHash {
+        let (meta_lo, meta_hi) = leaf_meta(rect.w, rect.h);
+        let (mut lanes, meta) = init_lanes(key, meta_lo, meta_hi);
+        let row_bytes = rect.w as usize * 4;
+        let th = rect.h as usize;
+        if th > 0 && row_bytes > 0 {
+            let rk = load_key_block(&key.round_key);
+            let alpha_mask = vreinterpretq_u8_u32(vdupq_n_u32(XRGB_ALPHA_MASK_U32));
+            let full64 = row_bytes & !63;
+            let rem = row_bytes & 63;
+            let x_bytes = rect.x as usize * 4;
+            let y0 = rect.y as usize;
+            let base_off = y0 * stride + x_bytes;
+
+            // SAFETY: Caller guarantees `shadow_base` rows `0..copy_from_ry`
+            // are initialized and readable for `row_bytes`.
+            let mut sh_ptr = unsafe { shadow_base.add(base_off) };
+            for _ in 0..copy_from_ry {
+                // SAFETY: `sh_ptr` is readable for `row_bytes`.
+                unsafe {
+                    absorb_row::<HAS_ALPHA, false>(
+                        sh_ptr.cast_const(),
+                        ptr::null_mut(),
+                        full64,
+                        rem,
+                        rk,
+                        alpha_mask,
+                        &mut lanes,
+                    );
+                    sh_ptr = sh_ptr.add(stride);
+                }
+            }
+
+            if copy_from_ry < th {
+                // SAFETY: Caller validated `src_base` bounds and exclusive
+                // `shadow_base` write access for rows `copy_from_ry..th`.
+                let mut src_ptr = unsafe { src_base.add(base_off + copy_from_ry * stride) };
+                for _ in copy_from_ry..th {
+                    // SAFETY: `src_ptr` readable and `sh_ptr` writable for `row_bytes`, disjoint.
+                    unsafe {
+                        absorb_row::<HAS_ALPHA, true>(
+                            src_ptr, sh_ptr, full64, rem, rk, alpha_mask, &mut lanes,
+                        );
+                        src_ptr = src_ptr.add(stride);
+                        sh_ptr = sh_ptr.add(stride);
+                    }
+                }
+            }
+        }
+        finalize(key, lanes, meta)
+    }
+
+    /// # Safety
+    /// Caller must verify CPU ARMv8 AES support.
+    #[target_feature(enable = "aes")]
+    pub(super) unsafe fn combine_quad_hashes(
+        key: &TileHashKey,
+        w: u32,
+        h: u32,
+        quad_hashes: &[TileHash],
+    ) -> TileHash {
+        let (meta_lo, meta_hi) = parent_meta(w, h, quad_hashes.len());
+        let (mut lanes, meta) = init_lanes(key, meta_lo, meta_hi);
+        let rk = load_key_block(&key.round_key);
+        for (lane, qh) in lanes.iter_mut().zip(quad_hashes.iter()) {
+            // SAFETY: `TileHash` is `[u8; 16]`.
+            let q = unsafe { vld1q_u8(qh.as_ptr()) };
+            *lane = aes_step(*lane, q, rk);
+        }
+        finalize(key, lanes, meta)
+    }
+}
+
+/// Always-compiled portable 128-bit keyed fallback (used on CPUs without
+/// hardware AES, under Miri, and exercised directly in unit tests).
+mod portable {
+    use std::ptr;
+
+    use super::TileHash;
+    use super::TileHashKey;
+    use super::XRGB_ALPHA_MASK_U64;
+    use super::leaf_meta;
+    use super::parent_meta;
+    use crate::serialization::framing::TileRect;
+
+    const P_K0: u64 = 0xA076_1D64_78BD_642F;
+    const P_K1: u64 = 0xE703_7ED1_A0B4_28DB;
+    const P_K2: u64 = 0x8EBC_6AF0_9C88_C6E3;
+    const P_K3: u64 = 0x5899_65CC_7537_4CC3;
+
+    #[inline(always)]
+    fn mum(a: u64, b: u64) -> u64 {
+        let p = u128::from(a).wrapping_mul(u128::from(b));
+        (p as u64) ^ ((p >> 64) as u64)
+    }
+
+    #[inline(always)]
+    fn step(s: u64, lo: u64, hi: u64, rk0: u64, rk1: u64) -> u64 {
+        let m0 = mum(s ^ lo ^ rk0, (hi ^ rk1 ^ P_K0) | 1);
+        let m1 = mum(m0 ^ hi, P_K1);
+        m1.wrapping_add(s.rotate_left(29) ^ lo)
+    }
+
+    #[inline(always)]
+    fn init_lanes(key: &TileHashKey, meta_lo: u64, meta_hi: u64) -> [u64; 4] {
+        [
+            key.iv[0][0] ^ key.iv[0][1].rotate_left(17) ^ meta_lo,
+            key.iv[1][0] ^ key.iv[1][1].rotate_left(23) ^ meta_hi,
+            key.iv[2][0] ^ key.iv[2][1].rotate_left(31) ^ meta_lo.wrapping_add(P_K2),
+            key.iv[3][0] ^ key.iv[3][1].rotate_left(41) ^ meta_hi.wrapping_add(P_K3),
+        ]
+    }
+
+    #[inline(always)]
+    fn finalize(key: &TileHashKey, lanes: [u64; 4], meta_lo: u64, meta_hi: u64) -> TileHash {
+        let s0 = mum(
+            lanes[0] ^ key.final_keys[0][0],
+            (key.final_keys[0][1] ^ P_K0) | 1,
+        );
+        let s1 = mum(
+            lanes[1] ^ key.final_keys[1][0],
+            (key.final_keys[1][1] ^ P_K1) | 1,
+        );
+        let s2 = mum(
+            lanes[2] ^ key.final_keys[2][0],
+            (key.final_keys[2][1] ^ P_K2) | 1,
+        );
+        let s3 = mum(
+            lanes[3] ^ key.final_keys[3][0],
+            (key.final_keys[3][1] ^ P_K3) | 1,
+        );
+
+        let mut h0 = (s0 ^ s2 ^ meta_lo).wrapping_add(key.final_keys[4][0]);
+        let mut h1 = (s1 ^ s3 ^ meta_hi).wrapping_add(key.final_keys[4][1]);
+
+        for &(fk0, fk1) in &[
+            (key.final_keys[0][0], key.final_keys[1][1]),
+            (key.final_keys[2][0], key.final_keys[3][1]),
+            (key.final_keys[4][0], key.final_keys[4][1]),
+            (key.final_keys[5][0], key.final_keys[5][1]),
+        ] {
+            let p0 = u128::from(h0 ^ fk0).wrapping_mul(u128::from(P_K0));
+            let p1 = u128::from(h1 ^ fk1).wrapping_mul(u128::from(P_K1));
+            let nh0 = ((p0 as u64) ^ ((p1 >> 64) as u64)).wrapping_add(h1.rotate_left(27));
+            let nh1 = ((p1 as u64) ^ ((p0 >> 64) as u64)).wrapping_add(h0.rotate_left(31));
+            h0 = nh0 ^ (nh0 >> 33);
+            h1 = nh1 ^ (nh1 >> 29);
+        }
+
+        let mut out = [0u8; 16];
+        out[..8].copy_from_slice(&h0.to_le_bytes());
+        out[8..].copy_from_slice(&h1.to_le_bytes());
+        out
+    }
+
+    #[inline(always)]
+    unsafe fn load_and_maybe_copy_16<const HAS_ALPHA: bool, const COPY: bool>(
+        src: *const u8,
+        dst: *mut u8,
+    ) -> (u64, u64) {
+        // SAFETY: Caller guarantees `src` is readable for 16 bytes, and when
+        // `COPY` is `true`, `dst` is writable for 16 bytes.
+        let (r0, r1) = unsafe {
+            let r0 = src.cast::<u64>().read_unaligned();
+            let r1 = src.add(8).cast::<u64>().read_unaligned();
+            if COPY {
+                dst.cast::<u64>().write_unaligned(r0);
+                dst.add(8).cast::<u64>().write_unaligned(r1);
+            }
+            (r0, r1)
+        };
+        if HAS_ALPHA {
+            (r0, r1)
+        } else {
+            (r0 | XRGB_ALPHA_MASK_U64, r1 | XRGB_ALPHA_MASK_U64)
+        }
+    }
+
+    #[inline(always)]
+    unsafe fn absorb_row<const HAS_ALPHA: bool, const COPY: bool>(
+        src_row: *const u8,
+        dst_row: *mut u8,
+        full64: usize,
+        rem: usize,
+        rk0: u64,
+        rk1: u64,
+        lanes: &mut [u64; 4],
+    ) {
+        let mut s0 = lanes[0];
+        let mut s1 = lanes[1];
+        let mut s2 = lanes[2];
+        let mut s3 = lanes[3];
+
+        let mut off = 0usize;
+        while off < full64 {
+            // SAFETY: `off + 64 <= full64`, within caller-validated row bounds.
+            unsafe {
+                let (m0l, m0h) =
+                    load_and_maybe_copy_16::<HAS_ALPHA, COPY>(src_row.add(off), dst_row.add(off));
+                let (m1l, m1h) = load_and_maybe_copy_16::<HAS_ALPHA, COPY>(
+                    src_row.add(off + 16),
+                    dst_row.add(off + 16),
+                );
+                let (m2l, m2h) = load_and_maybe_copy_16::<HAS_ALPHA, COPY>(
+                    src_row.add(off + 32),
+                    dst_row.add(off + 32),
+                );
+                let (m3l, m3h) = load_and_maybe_copy_16::<HAS_ALPHA, COPY>(
+                    src_row.add(off + 48),
+                    dst_row.add(off + 48),
+                );
+                s0 = step(s0, m0l, m0h, rk0, rk1);
+                s1 = step(s1, m1l, m1h, rk0, rk1);
+                s2 = step(s2, m2l, m2h, rk0, rk1);
+                s3 = step(s3, m3l, m3h, rk0, rk1);
+            }
+            off += 64;
+        }
+
+        if rem != 0 {
+            let mut left = rem;
+            if left >= 16 {
+                // SAFETY: `off + 16 <= full64 + rem`.
+                let (ml, mh) = unsafe {
+                    load_and_maybe_copy_16::<HAS_ALPHA, COPY>(src_row.add(off), dst_row.add(off))
+                };
+                s0 = step(s0, ml, mh, rk0, rk1);
+                off += 16;
+                left -= 16;
+
+                if left >= 16 {
+                    // SAFETY: `off + 16 <= full64 + rem`.
+                    let (ml, mh) = unsafe {
+                        load_and_maybe_copy_16::<HAS_ALPHA, COPY>(
+                            src_row.add(off),
+                            dst_row.add(off),
+                        )
+                    };
+                    s1 = step(s1, ml, mh, rk0, rk1);
+                    off += 16;
+                    left -= 16;
+
+                    if left >= 16 {
+                        // SAFETY: `off + 16 <= full64 + rem`.
+                        let (ml, mh) = unsafe {
+                            load_and_maybe_copy_16::<HAS_ALPHA, COPY>(
+                                src_row.add(off),
+                                dst_row.add(off),
+                            )
+                        };
+                        s2 = step(s2, ml, mh, rk0, rk1);
+                        off += 16;
+                        left -= 16;
+                    }
+                }
+            }
+
+            if left > 0 {
+                debug_assert!(left < 16 && left.is_multiple_of(4));
+                let mut tail = [0u8; 16];
+                // SAFETY: `off + left == full64 + rem`, `left` is 4, 8, or 12.
+                unsafe {
+                    let p0 = src_row.add(off).cast::<[u8; 4]>().read();
+                    tail[0..4].copy_from_slice(&p0);
+                    if COPY {
+                        dst_row.add(off).cast::<[u8; 4]>().write(p0);
+                    }
+                    if left >= 8 {
+                        let p1 = src_row.add(off + 4).cast::<[u8; 4]>().read();
+                        tail[4..8].copy_from_slice(&p1);
+                        if COPY {
+                            dst_row.add(off + 4).cast::<[u8; 4]>().write(p1);
+                        }
+                        if left == 12 {
+                            let p2 = src_row.add(off + 8).cast::<[u8; 4]>().read();
+                            tail[8..12].copy_from_slice(&p2);
+                            if COPY {
+                                dst_row.add(off + 8).cast::<[u8; 4]>().write(p2);
+                            }
+                        }
+                    }
+                }
+                let mut lo = u64::from_ne_bytes(tail[..8].try_into().unwrap());
+                let mut hi = u64::from_ne_bytes(tail[8..].try_into().unwrap());
+                if !HAS_ALPHA {
+                    lo |= XRGB_ALPHA_MASK_U64;
+                    hi |= XRGB_ALPHA_MASK_U64;
+                }
+                s3 = step(s3, lo, hi, rk0, rk1);
+            }
+        }
+
+        lanes[0] = s0;
+        lanes[1] = s1;
+        lanes[2] = s2;
+        lanes[3] = s3;
+    }
+
+    pub(super) unsafe fn hash_rect_raw<const HAS_ALPHA: bool>(
+        key: &TileHashKey,
+        base: *const u8,
+        stride: usize,
+        rect: TileRect,
+    ) -> TileHash {
+        let (meta_lo, meta_hi) = leaf_meta(rect.w, rect.h);
+        let mut lanes = init_lanes(key, meta_lo, meta_hi);
+        let row_bytes = rect.w as usize * 4;
+        let th = rect.h as usize;
+        if th > 0 && row_bytes > 0 {
+            let [rk0, rk1] = key.round_key;
+            let full64 = row_bytes & !63;
+            let rem = row_bytes & 63;
+            let x_bytes = rect.x as usize * 4;
+            let y0 = rect.y as usize;
+            // SAFETY: Caller guarantees `(y0 + ry, x_bytes..x_bytes + row_bytes)` is readable.
+            let mut row_ptr = unsafe { base.add(y0 * stride + x_bytes) };
+            for _ in 0..th {
+                // SAFETY: `row_ptr` is readable for `row_bytes`.
+                unsafe {
+                    absorb_row::<HAS_ALPHA, false>(
+                        row_ptr,
+                        ptr::null_mut(),
+                        full64,
+                        rem,
+                        rk0,
+                        rk1,
+                        &mut lanes,
+                    );
+                    row_ptr = row_ptr.add(stride);
+                }
+            }
+        }
+        finalize(key, lanes, meta_lo, meta_hi)
+    }
+
+    pub(super) unsafe fn copy_and_hash_rect_to_shadow<const HAS_ALPHA: bool>(
+        key: &TileHashKey,
+        src_base: *const u8,
+        shadow_base: *mut u8,
+        stride: usize,
+        rect: TileRect,
+        copy_from_ry: usize,
+    ) -> TileHash {
+        let (meta_lo, meta_hi) = leaf_meta(rect.w, rect.h);
+        let mut lanes = init_lanes(key, meta_lo, meta_hi);
+        let row_bytes = rect.w as usize * 4;
+        let th = rect.h as usize;
+        if th > 0 && row_bytes > 0 {
+            let [rk0, rk1] = key.round_key;
+            let full64 = row_bytes & !63;
+            let rem = row_bytes & 63;
+            let x_bytes = rect.x as usize * 4;
+            let y0 = rect.y as usize;
+            let base_off = y0 * stride + x_bytes;
+
+            // SAFETY: Caller guarantees `shadow_base` rows `0..copy_from_ry`
+            // are initialized and readable for `row_bytes`.
+            let mut sh_ptr = unsafe { shadow_base.add(base_off) };
+            for _ in 0..copy_from_ry {
+                // SAFETY: `sh_ptr` is readable for `row_bytes`.
+                unsafe {
+                    absorb_row::<HAS_ALPHA, false>(
+                        sh_ptr.cast_const(),
+                        ptr::null_mut(),
+                        full64,
+                        rem,
+                        rk0,
+                        rk1,
+                        &mut lanes,
+                    );
+                    sh_ptr = sh_ptr.add(stride);
+                }
+            }
+
+            if copy_from_ry < th {
+                // SAFETY: Caller validated `src_base` bounds and exclusive
+                // `shadow_base` write access for rows `copy_from_ry..th`.
+                let mut src_ptr = unsafe { src_base.add(base_off + copy_from_ry * stride) };
+                for _ in copy_from_ry..th {
+                    // SAFETY: `src_ptr` readable and `sh_ptr` writable for `row_bytes`, disjoint.
+                    unsafe {
+                        absorb_row::<HAS_ALPHA, true>(
+                            src_ptr, sh_ptr, full64, rem, rk0, rk1, &mut lanes,
+                        );
+                        src_ptr = src_ptr.add(stride);
+                        sh_ptr = sh_ptr.add(stride);
+                    }
+                }
+            }
+        }
+        finalize(key, lanes, meta_lo, meta_hi)
+    }
+
+    pub(super) fn combine_quad_hashes(
+        key: &TileHashKey,
+        w: u32,
+        h: u32,
+        quad_hashes: &[TileHash],
+    ) -> TileHash {
+        let (meta_lo, meta_hi) = parent_meta(w, h, quad_hashes.len());
+        let mut lanes = init_lanes(key, meta_lo, meta_hi);
+        let [rk0, rk1] = key.round_key;
+        for (lane, qh) in lanes.iter_mut().zip(quad_hashes.iter()) {
+            let lo = u64::from_ne_bytes(qh[..8].try_into().unwrap());
+            let hi = u64::from_ne_bytes(qh[8..].try_into().unwrap());
+            *lane = step(*lane, lo, hi, rk0, rk1);
+        }
+        finalize(key, lanes, meta_lo, meta_hi)
+    }
+}
+
+/// Computes the keyed 128-bit digest of `rect` inside `shadow_base` (row stride
+/// `stride` bytes), normalizing byte 3 (`X`) to `0xFF` in-register when
+/// `!HAS_ALPHA` so arbitrary `Xrgb8888` padding never causes false misses.
+///
+/// # Safety
+/// `shadow_base` must be readable for `(rect.y + rect.h) * stride` bytes and
+/// `(rect.x + rect.w) * 4 <= stride`, with no concurrent mutable writes to
+/// `rect`'s pixels.
+#[inline]
+pub(crate) unsafe fn hash_rect_from_shadow<const HAS_ALPHA: bool>(
+    key: &TileHashKey,
+    shadow_base: *const u8,
+    stride: usize,
+    rect: TileRect,
+) -> TileHash {
+    #[cfg(all(target_arch = "x86_64", not(miri)))]
+    if has_hw_aes() {
+        // SAFETY: `has_hw_aes()` verified AES-NI; caller upholds bounds invariants.
+        return unsafe { x86_aes::hash_rect_raw::<HAS_ALPHA>(key, shadow_base, stride, rect) };
+    }
+    #[cfg(all(target_arch = "aarch64", not(miri)))]
+    if has_hw_aes() {
+        // SAFETY: `has_hw_aes()` verified ARMv8 AES; caller upholds bounds invariants.
+        return unsafe { aarch64_aes::hash_rect_raw::<HAS_ALPHA>(key, shadow_base, stride, rect) };
+    }
+    // SAFETY: Caller upholds bounds invariants.
+    unsafe { portable::hash_rect_raw::<HAS_ALPHA>(key, shadow_base, stride, rect) }
+}
+
+/// Copies `rect` from `src` (`wl_shm` via [`BufferPointer`]) into `shadow_base`
+/// for rows `[copy_from_ry..rect.h)` in a single load pass (reading initialized
+/// `shadow_base` rows for `[0..copy_from_ry)`) and returns its keyed 128-bit
+/// digest directly from registers without any intermediate buffer.
+///
+/// Stores exact raw bytes from `src` into `shadow_base`, while masking byte 3
+/// (`X`) to `0xFF` in-register for the digest when `!HAS_ALPHA`.
+///
+/// # Safety
+/// `shadow_base` must be exclusively writable for `rect` across `(rect.y +
+/// rect.h) * stride` bytes with `(rect.x + rect.w) * 4 <= stride`, disjoint
+/// from `src`, `copy_from_ry <= rect.h as usize`, and rows `[0..copy_from_ry)`
+/// must already be initialized (rows `[copy_from_ry..rect.h)` may be
+/// uninitialized spare capacity).
+#[inline]
+pub(crate) unsafe fn copy_and_hash_rect_to_shadow<const HAS_ALPHA: bool>(
+    key: &TileHashKey,
+    src: BufferPointer<u8>,
+    shadow_base: *mut u8,
+    stride: usize,
+    rect: TileRect,
+    copy_from_ry: usize,
+) -> TileHash {
+    let th = rect.h as usize;
+    let row_bytes = rect.w as usize * 4;
+    debug_assert!(copy_from_ry <= th);
+    if copy_from_ry < th && row_bytes > 0 {
+        let last_end = (rect.y as usize + th - 1) * stride + rect.x as usize * 4 + row_bytes;
+        assert!(last_end <= src.len());
+    }
+    #[cfg(all(target_arch = "x86_64", not(miri)))]
+    if has_hw_aes() {
+        // SAFETY: `has_hw_aes()` verified AES-NI; `src` bounds checked above;
+        // caller upholds `shadow_base` bounds and exclusivity invariants.
+        return unsafe {
+            x86_aes::copy_and_hash_rect_to_shadow::<HAS_ALPHA>(
+                key,
+                src.ptr(),
+                shadow_base,
+                stride,
+                rect,
+                copy_from_ry,
+            )
+        };
+    }
+    #[cfg(all(target_arch = "aarch64", not(miri)))]
+    if has_hw_aes() {
+        // SAFETY: `has_hw_aes()` verified ARMv8 AES; `src` bounds checked above;
+        // caller upholds `shadow_base` bounds and exclusivity invariants.
+        return unsafe {
+            aarch64_aes::copy_and_hash_rect_to_shadow::<HAS_ALPHA>(
+                key,
+                src.ptr(),
+                shadow_base,
+                stride,
+                rect,
+                copy_from_ry,
+            )
+        };
+    }
+    // SAFETY: `src` bounds checked above; caller upholds `shadow_base` bounds and exclusivity.
+    unsafe {
+        portable::copy_and_hash_rect_to_shadow::<HAS_ALPHA>(
+            key,
+            src.ptr(),
+            shadow_base,
+            stride,
+            rect,
+            copy_from_ry,
+        )
+    }
+}
+
+/// Computes the keyed 128-bit digest of `rect` read through [`BufferPointer`]
+/// via raw loads (never creating `&[u8]` over shared memory).
+#[inline]
+pub(crate) fn hash_rect_from_ptr<const HAS_ALPHA: bool>(
+    key: &TileHashKey,
+    aos: BufferPointer<Vec4u8>,
+    stride_px: usize,
+    rect: TileRect,
+) -> TileHash {
+    let x0 = rect.x as usize;
+    let y0 = rect.y as usize;
+    let tw = rect.w as usize;
+    let th = rect.h as usize;
+    if th > 0 && tw > 0 {
+        let last_end = (y0 + th - 1) * stride_px + x0 + tw;
+        assert!(last_end <= aos.len());
+    }
+    let stride = stride_px * 4;
+    let base = aos.ptr().cast::<u8>();
+    #[cfg(all(target_arch = "x86_64", not(miri)))]
+    if has_hw_aes() {
+        // SAFETY: `has_hw_aes()` verified AES-NI; `aos` bounds validated above.
+        return unsafe { x86_aes::hash_rect_raw::<HAS_ALPHA>(key, base, stride, rect) };
+    }
+    #[cfg(all(target_arch = "aarch64", not(miri)))]
+    if has_hw_aes() {
+        // SAFETY: `has_hw_aes()` verified ARMv8 AES; `aos` bounds validated above.
+        return unsafe { aarch64_aes::hash_rect_raw::<HAS_ALPHA>(key, base, stride, rect) };
+    }
+    // SAFETY: `aos` bounds validated above.
+    unsafe { portable::hash_rect_raw::<HAS_ALPHA>(key, base, stride, rect) }
+}
+
+/// Combines `2..=4` quadrant hashes into a single domain-separated keyed
+/// 128-bit parent tile digest directly in registers without re-reading pixels.
+#[inline]
+pub(crate) fn combine_quad_hashes(
+    key: &TileHashKey,
+    w: u32,
+    h: u32,
+    quad_hashes: &[TileHash],
+) -> TileHash {
+    assert!((2..=4).contains(&quad_hashes.len()));
+    #[cfg(all(target_arch = "x86_64", not(miri)))]
+    if has_hw_aes() {
+        // SAFETY: `has_hw_aes()` verified AES-NI.
+        return unsafe { x86_aes::combine_quad_hashes(key, w, h, quad_hashes) };
+    }
+    #[cfg(all(target_arch = "aarch64", not(miri)))]
+    if has_hw_aes() {
+        // SAFETY: `has_hw_aes()` verified ARMv8 AES.
+        return unsafe { aarch64_aes::combine_quad_hashes(key, w, h, quad_hashes) };
+    }
+    portable::combine_quad_hashes(key, w, h, quad_hashes)
+}
+
+#[cfg(test)]
+mod tests {
+    use std::collections::HashSet;
+    use std::ptr;
+
+    use super::*;
+
+    #[derive(Copy, Clone)]
+    enum Backend {
+        Portable,
+        #[cfg(all(target_arch = "x86_64", not(miri)))]
+        X86Aes,
+        #[cfg(all(target_arch = "aarch64", not(miri)))]
+        Aarch64Aes,
+    }
+
+    impl Backend {
+        fn all_supported() -> Vec<Self> {
+            #[cfg(any(
+                all(target_arch = "x86_64", not(miri)),
+                all(target_arch = "aarch64", not(miri)),
+            ))]
+            {
+                let mut v = vec![Self::Portable];
+                #[cfg(target_arch = "x86_64")]
+                if has_hw_aes() {
+                    v.push(Self::X86Aes);
+                }
+                #[cfg(target_arch = "aarch64")]
+                if has_hw_aes() {
+                    v.push(Self::Aarch64Aes);
+                }
+                v
+            }
+            #[cfg(not(any(
+                all(target_arch = "x86_64", not(miri)),
+                all(target_arch = "aarch64", not(miri)),
+            )))]
+            {
+                vec![Self::Portable]
+            }
+        }
+
+        fn name(self) -> &'static str {
+            match self {
+                Self::Portable => "portable",
+                #[cfg(all(target_arch = "x86_64", not(miri)))]
+                Self::X86Aes => "x86_aes",
+                #[cfg(all(target_arch = "aarch64", not(miri)))]
+                Self::Aarch64Aes => "aarch64_aes",
+            }
+        }
+
+        unsafe fn hash_shadow<const HAS_ALPHA: bool>(
+            self,
+            key: &TileHashKey,
+            base: *const u8,
+            stride: usize,
+            rect: TileRect,
+        ) -> TileHash {
+            match self {
+                Self::Portable => unsafe {
+                    portable::hash_rect_raw::<HAS_ALPHA>(key, base, stride, rect)
+                },
+                #[cfg(all(target_arch = "x86_64", not(miri)))]
+                Self::X86Aes => unsafe {
+                    x86_aes::hash_rect_raw::<HAS_ALPHA>(key, base, stride, rect)
+                },
+                #[cfg(all(target_arch = "aarch64", not(miri)))]
+                Self::Aarch64Aes => unsafe {
+                    aarch64_aes::hash_rect_raw::<HAS_ALPHA>(key, base, stride, rect)
+                },
+            }
+        }
+
+        unsafe fn copy_and_hash<const HAS_ALPHA: bool>(
+            self,
+            key: &TileHashKey,
+            src: BufferPointer<u8>,
+            shadow_base: *mut u8,
+            stride: usize,
+            rect: TileRect,
+            copy_from_ry: usize,
+        ) -> TileHash {
+            match self {
+                Self::Portable => unsafe {
+                    portable::copy_and_hash_rect_to_shadow::<HAS_ALPHA>(
+                        key,
+                        src.ptr(),
+                        shadow_base,
+                        stride,
+                        rect,
+                        copy_from_ry,
+                    )
+                },
+                #[cfg(all(target_arch = "x86_64", not(miri)))]
+                Self::X86Aes => unsafe {
+                    x86_aes::copy_and_hash_rect_to_shadow::<HAS_ALPHA>(
+                        key,
+                        src.ptr(),
+                        shadow_base,
+                        stride,
+                        rect,
+                        copy_from_ry,
+                    )
+                },
+                #[cfg(all(target_arch = "aarch64", not(miri)))]
+                Self::Aarch64Aes => unsafe {
+                    aarch64_aes::copy_and_hash_rect_to_shadow::<HAS_ALPHA>(
+                        key,
+                        src.ptr(),
+                        shadow_base,
+                        stride,
+                        rect,
+                        copy_from_ry,
+                    )
+                },
+            }
+        }
+
+        fn combine(self, key: &TileHashKey, w: u32, h: u32, quads: &[TileHash]) -> TileHash {
+            match self {
+                Self::Portable => portable::combine_quad_hashes(key, w, h, quads),
+                #[cfg(all(target_arch = "x86_64", not(miri)))]
+                Self::X86Aes => unsafe { x86_aes::combine_quad_hashes(key, w, h, quads) },
+                #[cfg(all(target_arch = "aarch64", not(miri)))]
+                Self::Aarch64Aes => unsafe { aarch64_aes::combine_quad_hashes(key, w, h, quads) },
+            }
+        }
+    }
+
+    fn fill_pseudo_random(buf: &mut [u8], mut seed: u64) {
+        for chunk in buf.chunks_mut(8) {
+            seed = seed.wrapping_add(0x9E37_79B9_7F4A_7C15);
+            let mut z = seed;
+            z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+            z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+            z ^= z >> 31;
+            let b = z.to_le_bytes();
+            chunk.copy_from_slice(&b[..chunk.len()]);
+        }
+    }
+
+    fn hamming_distance(a: TileHash, b: TileHash) -> u32 {
+        a.iter()
+            .zip(b.iter())
+            .map(|(&x, &y)| (x ^ y).count_ones())
+            .sum()
+    }
+
+    fn check_rect_parity_case(
+        backend: Backend,
+        key: &TileHashKey,
+        tw: usize,
+        th: usize,
+        x0: usize,
+        y0: usize,
+        pad_px: usize,
+    ) {
+        let full_w = x0 + tw + pad_px;
+        let full_h = y0 + th + 2;
+        let stride_px = full_w;
+        let stride = stride_px * 4;
+        let byte_len = full_h * stride;
+
+        let mut src = vec![0u8; byte_len];
+        fill_pseudo_random(
+            &mut src,
+            (tw as u64) << 16 | (th as u64) << 4 | pad_px as u64,
+        );
+
+        let mut src_garbage_x = src.clone();
+        for px in src_garbage_x.as_chunks_mut::<4>().0 {
+            px[3] = px[3].wrapping_mul(37).wrapping_add(0xA5);
+        }
+
+        let rect = TileRect {
+            x: x0 as u32,
+            y: y0 as u32,
+            w: tw as u32,
+            h: th as u32,
+        };
+        let src_ptr = src.as_ptr();
+        let src_bp = unsafe { BufferPointer::new(&src_ptr, byte_len) };
+        let aos_bp = unsafe { src_bp.cast::<Vec4u8>() };
+
+        let x_ptr = src_garbage_x.as_ptr();
+        let x_bp = unsafe { BufferPointer::new(&x_ptr, byte_len) };
+        let x_aos_bp = unsafe { x_bp.cast::<Vec4u8>() };
+
+        // Xrgb8888 (`HAS_ALPHA = false`)
+        let h_shadow_xrgb =
+            unsafe { backend.hash_shadow::<false>(key, src.as_ptr(), stride, rect) };
+        let h_ptr_xrgb =
+            unsafe { backend.hash_shadow::<false>(key, aos_bp.ptr().cast::<u8>(), stride, rect) };
+        let h_garbage_xrgb =
+            unsafe { backend.hash_shadow::<false>(key, x_aos_bp.ptr().cast::<u8>(), stride, rect) };
+        assert_eq!(
+            h_shadow_xrgb,
+            h_ptr_xrgb,
+            "{}: Xrgb shadow vs ptr mismatch on {tw}x{th}",
+            backend.name()
+        );
+        assert_eq!(
+            h_shadow_xrgb,
+            h_garbage_xrgb,
+            "{}: Xrgb garbage byte 3 changed hash on {tw}x{th}",
+            backend.name()
+        );
+
+        // Argb8888 (`HAS_ALPHA = true`)
+        let h_shadow_argb = unsafe { backend.hash_shadow::<true>(key, src.as_ptr(), stride, rect) };
+        let h_ptr_argb =
+            unsafe { backend.hash_shadow::<true>(key, aos_bp.ptr().cast::<u8>(), stride, rect) };
+        assert_eq!(
+            h_shadow_argb,
+            h_ptr_argb,
+            "{}: Argb shadow vs ptr mismatch on {tw}x{th}",
+            backend.name()
+        );
+
+        // Flip 1 alpha bit inside `rect`: Argb must change, Xrgb must not.
+        let mut src_alpha_flip = src.clone();
+        let mid_off = (y0 + th / 2) * stride + (x0 + tw / 2) * 4 + 3;
+        src_alpha_flip[mid_off] ^= 0x01;
+        let h_flip_xrgb =
+            unsafe { backend.hash_shadow::<false>(key, src_alpha_flip.as_ptr(), stride, rect) };
+        let h_flip_argb =
+            unsafe { backend.hash_shadow::<true>(key, src_alpha_flip.as_ptr(), stride, rect) };
+        assert_eq!(h_flip_xrgb, h_shadow_xrgb);
+        assert_ne!(
+            h_flip_argb,
+            h_shadow_argb,
+            "{}: Argb missed 1-bit alpha flip on {tw}x{th}",
+            backend.name()
+        );
+
+        // `copy_and_hash_rect_to_shadow` across `copy_from_ry = 0, th / 2, th`,
+        // writing into genuinely uninitialized spare capacity for rows `copy_from_ry..th`
+        // and verifying raw pixels are preserved verbatim in `shadow`.
+        for copy_from_ry in [0usize, th / 2, th] {
+            for (has_alpha, expected) in [(false, h_shadow_xrgb), (true, h_shadow_argb)] {
+                let mut shadow: Vec<u8> = Vec::with_capacity(byte_len);
+                let sh_ptr = shadow.as_mut_ptr();
+                // Initialize rows `0..copy_from_ry` of `rect` inside `shadow`.
+                for ry in 0..copy_from_ry {
+                    let row_off = (y0 + ry) * stride + x0 * 4;
+                    unsafe {
+                        ptr::copy_nonoverlapping(
+                            src.as_ptr().add(row_off),
+                            sh_ptr.add(row_off),
+                            tw * 4,
+                        );
+                    }
+                }
+                let got = if has_alpha {
+                    unsafe {
+                        backend.copy_and_hash::<true>(
+                            key,
+                            src_bp,
+                            sh_ptr,
+                            stride,
+                            rect,
+                            copy_from_ry,
+                        )
+                    }
+                } else {
+                    unsafe {
+                        backend.copy_and_hash::<false>(
+                            key,
+                            x_bp,
+                            sh_ptr,
+                            stride,
+                            rect,
+                            copy_from_ry,
+                        )
+                    }
+                };
+                assert_eq!(
+                    got,
+                    expected,
+                    "{}: copy_and_hash mismatch (has_alpha={has_alpha}, copy_from_ry={copy_from_ry}) on {tw}x{th}",
+                    backend.name()
+                );
+
+                // Verify every copied row in `shadow` received exact raw bytes
+                // (including raw X bytes on `Xrgb8888`, never overwritten with `0xFF`).
+                let expected_raw_src = if has_alpha { &src } else { &src_garbage_x };
+                for ry in copy_from_ry..th {
+                    let row_off = (y0 + ry) * stride + x0 * 4;
+                    let mut actual_row = vec![0u8; tw * 4];
+                    unsafe {
+                        ptr::copy_nonoverlapping(
+                            sh_ptr.add(row_off),
+                            actual_row.as_mut_ptr(),
+                            tw * 4,
+                        );
+                    }
+                    assert_eq!(
+                        actual_row.as_slice(),
+                        &expected_raw_src[row_off..row_off + tw * 4],
+                        "{}: raw shadow bytes corrupted at ry={ry} on {tw}x{th}",
+                        backend.name()
+                    );
+                }
+            }
+        }
+    }
+
+    /// Miri-safe parity and uninitialized-shadow soundness test (runs under both
+    /// standard test execution and Miri).
+    #[test]
+    fn test_tile_hash_miri_uninit_and_edge_widths() {
+        let key = TileHashKey::from_seed(0xC0FF_EE42);
+        for backend in Backend::all_supported() {
+            for &tw in &[1usize, 2, 3, 4, 5, 15, 16, 17, 33] {
+                for &th in &[1usize, 3] {
+                    check_rect_parity_case(backend, &key, tw, th, 0, 0, 0);
+                    check_rect_parity_case(backend, &key, tw, th, 3, 1, 7);
+                }
+            }
+        }
+
+        // Verify public dispatch wrappers end-to-end against uninitialized shadow.
+        let tw = 19usize;
+        let th = 5usize;
+        let stride = (tw + 3) * 4;
+        let byte_len = th * stride;
+        let mut src = vec![0u8; byte_len];
+        fill_pseudo_random(&mut src, 0x1234_5678);
+        let rect = TileRect {
+            x: 0,
+            y: 0,
+            w: tw as u32,
+            h: th as u32,
+        };
+        let ptr = src.as_ptr();
+        let bp = unsafe { BufferPointer::new(&ptr, byte_len) };
+        let aos = unsafe { bp.cast::<Vec4u8>() };
+
+        let h_ptr = hash_rect_from_ptr::<false>(&key, aos, tw + 3, rect);
+        let h_sh = unsafe { hash_rect_from_shadow::<false>(&key, src.as_ptr(), stride, rect) };
+        let mut shadow: Vec<u8> = Vec::with_capacity(byte_len);
+        let h_copy = unsafe {
+            copy_and_hash_rect_to_shadow::<false>(&key, bp, shadow.as_mut_ptr(), stride, rect, 0)
+        };
+        assert_eq!(h_ptr, h_sh);
+        assert_eq!(h_ptr, h_copy);
+    }
+
+    /// Full parity sweep across all required widths/heights, packed & padded
+    /// strides, both `Xrgb8888` and `Argb8888`, on both hardware AES and portable.
+    #[test]
+    #[cfg_attr(miri, ignore)]
+    fn test_tile_hash_full_width_height_parity() {
+        let key = TileHashKey::new_random();
+        let widths = [
+            1usize, 2, 3, 4, 7, 15, 16, 17, 31, 32, 33, 63, 64, 65, 128, 256,
+        ];
+        let heights = [1usize, 3, 16, 128];
+
+        for backend in Backend::all_supported() {
+            for &tw in &widths {
+                for &th in &heights {
+                    check_rect_parity_case(backend, &key, tw, th, 0, 0, 0);
+                    check_rect_parity_case(backend, &key, tw, th, 5, 2, 11);
+                }
+            }
+        }
+
+        // Exact end-of-allocation boundary check (no over-read past the last byte).
+        for &tw in &widths {
+            let th = 3usize;
+            let stride = tw * 4;
+            let mut src = vec![0u8; th * stride];
+            fill_pseudo_random(&mut src, tw as u64);
+            let rect = TileRect {
+                x: 0,
+                y: 0,
+                w: tw as u32,
+                h: th as u32,
+            };
+            let ptr = src.as_ptr();
+            let bp = unsafe { BufferPointer::new(&ptr, src.len()) };
+            let aos = unsafe { bp.cast::<Vec4u8>() };
+            let mut shadow = Vec::with_capacity(src.len());
+            let h1 = hash_rect_from_ptr::<true>(&key, aos, tw, rect);
+            let h2 = unsafe { hash_rect_from_shadow::<true>(&key, src.as_ptr(), stride, rect) };
+            let h3 = unsafe {
+                copy_and_hash_rect_to_shadow::<true>(&key, bp, shadow.as_mut_ptr(), stride, rect, 0)
+            };
+            assert_eq!(h1, h2);
+            assert_eq!(h1, h3);
+        }
+    }
+
+    /// Strict Avalanche Criterion (SAC), zero stuck bits, and zero collisions
+    /// across pixels, dimensions, and `combine_quad_hashes` on every backend.
+    #[test]
+    #[cfg_attr(miri, ignore)]
+    fn test_tile_hash_avalanche_and_collision_resistance() {
+        let key = TileHashKey::from_seed(0xDEAD_BEEF_CAFE_BABE);
+
+        for backend in Backend::all_supported() {
+            // 1. Pixel single-bit flips across a 37x19 tile (exercises full
+            //    64B lanes, 16B remainder lanes, and 4B tail lane).
+            let tw = 37usize;
+            let th = 19usize;
+            let stride = tw * 4;
+            let mut base = vec![0u8; th * stride];
+            fill_pseudo_random(&mut base, 0x55AA_1122);
+            let rect = TileRect {
+                x: 0,
+                y: 0,
+                w: tw as u32,
+                h: th as u32,
+            };
+            let base_hash =
+                unsafe { backend.hash_shadow::<true>(&key, base.as_ptr(), stride, rect) };
+
+            let mut total_flips = 0u64;
+            let mut n_trials = 0u64;
+            let mut or_diff = [0u8; 16];
+            let byte_positions = [
+                0,
+                1,
+                2,
+                3,
+                15,
+                16,
+                31,
+                47,
+                63,
+                64,
+                127,
+                128,
+                144,
+                147,
+                stride * (th / 2) + 5,
+                stride * (th - 1),
+                stride * (th - 1) + 64,
+                stride * (th - 1) + 128,
+                stride * (th - 1) + 144,
+                stride * th - 1,
+            ];
+            for &pos in &byte_positions {
+                for bit in 0..8u8 {
+                    base[pos] ^= 1u8 << bit;
+                    let h =
+                        unsafe { backend.hash_shadow::<true>(&key, base.as_ptr(), stride, rect) };
+                    base[pos] ^= 1u8 << bit;
+                    let dist = hamming_distance(base_hash, h);
+                    assert!(
+                        dist >= 34,
+                        "{}: weak avalanche ({dist}/128 bits) flipping byte {pos} bit {bit}",
+                        backend.name()
+                    );
+                    for i in 0..16 {
+                        or_diff[i] |= base_hash[i] ^ h[i];
+                    }
+                    total_flips += u64::from(dist);
+                    n_trials += 1;
+                }
+            }
+            let mean_flips = total_flips as f64 / n_trials as f64;
+            assert!(
+                (58.0..=70.0).contains(&mean_flips),
+                "{}: pixel SAC mean {mean_flips:.2} outside [58, 70]",
+                backend.name()
+            );
+            assert_eq!(
+                or_diff,
+                [0xFF; 16],
+                "{}: stuck output bit(s) in pixel SAC",
+                backend.name()
+            );
+
+            // 2. `combine_quad_hashes` single-bit flips across all 4 quadrants.
+            let mut quads = [[0u8; 16]; 4];
+            for (q, slot) in quads.iter_mut().enumerate() {
+                fill_pseudo_random(slot, 0x9000 + q as u64);
+            }
+            let base_parent = backend.combine(&key, 256, 256, &quads);
+            let mut parent_flips = 0u64;
+            let mut parent_trials = 0u64;
+            let mut parent_or = [0u8; 16];
+            for q in 0..4 {
+                for byte in 0..16 {
+                    for bit in [0u8, 3, 7] {
+                        quads[q][byte] ^= 1u8 << bit;
+                        let h = backend.combine(&key, 256, 256, &quads);
+                        quads[q][byte] ^= 1u8 << bit;
+                        let dist = hamming_distance(base_parent, h);
+                        assert!(
+                            dist >= 32,
+                            "{}: weak parent avalanche ({dist}/128) at quad {q} byte {byte} bit {bit}",
+                            backend.name()
+                        );
+                        for i in 0..16 {
+                            parent_or[i] |= base_parent[i] ^ h[i];
+                        }
+                        parent_flips += u64::from(dist);
+                        parent_trials += 1;
+                    }
+                }
+            }
+            let parent_mean = parent_flips as f64 / parent_trials as f64;
+            assert!(
+                (58.0..=70.0).contains(&parent_mean),
+                "{}: parent SAC mean {parent_mean:.2} outside [58, 70]",
+                backend.name()
+            );
+            assert_eq!(
+                parent_or,
+                [0xFF; 16],
+                "{}: stuck output bit(s) in parent SAC",
+                backend.name()
+            );
+
+            // 2b. Dimension `(w, h)` single-bit flips (across both leaf hashing
+            //     and `combine_quad_hashes` metadata words).
+            let mut dim_flips = 0u64;
+            let mut dim_trials = 0u64;
+            let mut dim_or = [0u8; 16];
+            for bit in 0..32u32 {
+                let hw = backend.combine(&key, 256 ^ (1u32 << bit), 256, &quads);
+                let hh = backend.combine(&key, 256, 256 ^ (1u32 << bit), &quads);
+                for h in [hw, hh] {
+                    let dist = hamming_distance(base_parent, h);
+                    assert!(
+                        dist >= 32,
+                        "{}: weak dim avalanche ({dist}/128) at bit {bit}",
+                        backend.name()
+                    );
+                    for i in 0..16 {
+                        dim_or[i] |= base_parent[i] ^ h[i];
+                    }
+                    dim_flips += u64::from(dist);
+                    dim_trials += 1;
+                }
+            }
+            let dim_mean = dim_flips as f64 / dim_trials as f64;
+            assert!(
+                (56.0..=72.0).contains(&dim_mean),
+                "{}: dimension SAC mean {dim_mean:.2} outside [56, 72]",
+                backend.name()
+            );
+            assert_eq!(
+                dim_or,
+                [0xFF; 16],
+                "{}: stuck output bit(s) in dimension SAC",
+                backend.name()
+            );
+
+            // 3. Zero collisions across 4,096 distinct tiles (near-identical
+            //    1-bit-diff neighbors, solid tiles, and all-zero varying dims).
+            let mut seen: HashSet<TileHash> = HashSet::with_capacity(5000);
+            let mut tile = vec![0u8; 16 * 16 * 4];
+            let r16 = TileRect {
+                x: 0,
+                y: 0,
+                w: 16,
+                h: 16,
+            };
+            // 2,048 single-bit neighbors of an all-zero 16x16 tile.
+            assert!(
+                seen.insert(unsafe { backend.hash_shadow::<true>(&key, tile.as_ptr(), 64, r16) })
+            );
+            for bit_idx in 0..2048usize {
+                tile[bit_idx / 8] ^= 1u8 << (bit_idx % 8);
+                let h = unsafe { backend.hash_shadow::<true>(&key, tile.as_ptr(), 64, r16) };
+                assert!(
+                    seen.insert(h),
+                    "{}: collision on 1-bit neighbor {bit_idx}",
+                    backend.name()
+                );
+                tile[bit_idx / 8] ^= 1u8 << (bit_idx % 8);
+            }
+            // 1,024 distinct solid-color 16x16 tiles.
+            for c in 1..=1024u32 {
+                let px = [
+                    (c & 0xFF) as u8,
+                    ((c >> 8) & 0xFF) as u8,
+                    (c.wrapping_mul(37) & 0xFF) as u8,
+                    0xFF,
+                ];
+                for dst in tile.as_chunks_mut::<4>().0 {
+                    dst.copy_from_slice(&px);
+                }
+                let h = unsafe { backend.hash_shadow::<true>(&key, tile.as_ptr(), 64, r16) };
+                assert!(
+                    seen.insert(h),
+                    "{}: collision on solid tile {c}",
+                    backend.name()
+                );
+            }
+            // 1,024 distinct all-zero dimensions `w in 1..=32, h in 1..=32`.
+            let zeros = vec![0u8; 32 * 32 * 4];
+            for w in 1..=32u32 {
+                for h in 1..=32u32 {
+                    if w == 16 && h == 16 {
+                        continue;
+                    }
+                    let r = TileRect { x: 0, y: 0, w, h };
+                    let digest = unsafe {
+                        backend.hash_shadow::<true>(&key, zeros.as_ptr(), w as usize * 4, r)
+                    };
+                    assert!(
+                        seen.insert(digest),
+                        "{}: collision on zero tile {w}x{h}",
+                        backend.name()
+                    );
+                }
+            }
+        }
+    }
+
+    /// Domain separation (dimensions, leaf vs parent, quadrant order/count) and
+    /// independent random keying across both backends.
+    #[test]
+    fn test_tile_hash_domain_separation_and_keying() {
+        let key_a = TileHashKey::new_random();
+        let key_b = TileHashKey::new_random();
+
+        let mut buf = vec![0u8; 128 * 64 * 4];
+        fill_pseudo_random(&mut buf, 0xFACE_B00C);
+
+        for backend in Backend::all_supported() {
+            // Same exact byte stream at 128x64 vs 64x128 must hash differently.
+            let h_128x64 = unsafe {
+                backend.hash_shadow::<true>(
+                    &key_a,
+                    buf.as_ptr(),
+                    128 * 4,
+                    TileRect {
+                        x: 0,
+                        y: 0,
+                        w: 128,
+                        h: 64,
+                    },
+                )
+            };
+            let h_64x128 = unsafe {
+                backend.hash_shadow::<true>(
+                    &key_a,
+                    buf.as_ptr(),
+                    64 * 4,
+                    TileRect {
+                        x: 0,
+                        y: 0,
+                        w: 64,
+                        h: 128,
+                    },
+                )
+            };
+            assert_ne!(
+                h_128x64,
+                h_64x128,
+                "{}: 128x64 collided with 64x128",
+                backend.name()
+            );
+
+            // Different random keys must produce different digests for identical input.
+            let h_key_b = unsafe {
+                backend.hash_shadow::<true>(
+                    &key_b,
+                    buf.as_ptr(),
+                    128 * 4,
+                    TileRect {
+                        x: 0,
+                        y: 0,
+                        w: 128,
+                        h: 64,
+                    },
+                )
+            };
+            assert_ne!(
+                h_128x64,
+                h_key_b,
+                "{}: distinct random keys produced identical digest",
+                backend.name()
+            );
+
+            // Leaf vs `combine_quad_hashes` domain separation even when raw bytes match.
+            let q0 = [0x11u8; 16];
+            let q1 = [0x22u8; 16];
+            let q2 = [0x33u8; 16];
+            let q3 = [0x44u8; 16];
+            let mut quad_as_pixels = [0u8; 64];
+            quad_as_pixels[0..16].copy_from_slice(&q0);
+            quad_as_pixels[16..32].copy_from_slice(&q1);
+            quad_as_pixels[32..48].copy_from_slice(&q2);
+            quad_as_pixels[48..64].copy_from_slice(&q3);
+
+            let leaf_16x1 = unsafe {
+                backend.hash_shadow::<true>(
+                    &key_a,
+                    quad_as_pixels.as_ptr(),
+                    64,
+                    TileRect {
+                        x: 0,
+                        y: 0,
+                        w: 16,
+                        h: 1,
+                    },
+                )
+            };
+            let parent_16x1 = backend.combine(&key_a, 16, 1, &[q0, q1, q2, q3]);
+            assert_ne!(
+                leaf_16x1,
+                parent_16x1,
+                "{}: leaf collided with combine_quad_hashes",
+                backend.name()
+            );
+
+            // Quadrant order, count, dimensions, and key all separate parent hashes.
+            let p_ab = backend.combine(&key_a, 256, 128, &[q0, q1]);
+            let p_ba = backend.combine(&key_a, 256, 128, &[q1, q0]);
+            let p_abc = backend.combine(&key_a, 256, 128, &[q0, q1, q2]);
+            let p_dim = backend.combine(&key_a, 128, 256, &[q0, q1]);
+            let p_key_b = backend.combine(&key_b, 256, 128, &[q0, q1]);
+            assert_ne!(p_ab, p_ba);
+            assert_ne!(p_ab, p_abc);
+            assert_ne!(p_ab, p_dim);
+            assert_ne!(p_ab, p_key_b);
+        }
+    }
+}

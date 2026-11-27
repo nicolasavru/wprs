@@ -734,7 +734,6 @@ impl Tier {
         slot_hashes: Option<&SlotHashes>,
         cache_non_empty: bool,
         next_sub: &AtomicUsize,
-        hash_buf: &mut Vec<u8>,
     ) {
         // SAFETY: Caller upholds disjoint-band shadow invariants.
         unsafe {
@@ -753,7 +752,6 @@ impl Tier {
                     slot_hashes,
                     cache_non_empty,
                     next_sub,
-                    hash_buf,
                 );
             } else {
                 super::diff_and_update_worker_with::<Kernel, false>(
@@ -770,7 +768,6 @@ impl Tier {
                     slot_hashes,
                     cache_non_empty,
                     next_sub,
-                    hash_buf,
                 );
             }
         }
@@ -793,7 +790,6 @@ impl Tier {
         slot_hashes: Option<&SlotHashes>,
         cache_non_empty: bool,
         next_sub: &AtomicUsize,
-        hash_buf: &mut Vec<u8>,
     ) {
         // SAFETY: Caller upholds disjoint-band and scroll-band shadow invariants.
         unsafe {
@@ -813,7 +809,6 @@ impl Tier {
                     slot_hashes,
                     cache_non_empty,
                     next_sub,
-                    hash_buf,
                 );
             } else {
                 super::diff_and_update_scroll_worker_with::<Kernel, false>(
@@ -831,7 +826,6 @@ impl Tier {
                     slot_hashes,
                     cache_non_empty,
                     next_sub,
-                    hash_buf,
                 );
             }
         }
@@ -867,7 +861,6 @@ impl Tier {
     ) {
         // SAFETY: Caller upholds disjoint-row shadow invariants.
         unsafe {
-            let mut hash_buf = Vec::new();
             super::diff_and_update_row_band_2d_with::<Kernel, HAS_ALPHA>(
                 Kernel,
                 data,
@@ -881,7 +874,6 @@ impl Tier {
                 dirty_slots,
                 None,
                 false,
-                &mut hash_buf,
             );
         }
     }

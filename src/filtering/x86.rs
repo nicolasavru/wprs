@@ -2861,7 +2861,6 @@ macro_rules! define_tier_wrappers {
                 slot_hashes: Option<&SlotHashes>,
                 cache_non_empty: bool,
                 next_sub: &AtomicUsize,
-                hash_buf: &mut Vec<u8>,
             ) {
                 // SAFETY: Caller verified CPU feature support via `X86Tier::detect()`
                 // and upheld disjoint-band shadow invariants.
@@ -2884,7 +2883,6 @@ macro_rules! define_tier_wrappers {
                         slot_hashes,
                         cache_non_empty,
                         next_sub,
-                        hash_buf,
                     );
                 }
             }
@@ -2905,7 +2903,6 @@ macro_rules! define_tier_wrappers {
                 slot_hashes: Option<&SlotHashes>,
                 cache_non_empty: bool,
                 next_sub: &AtomicUsize,
-                hash_buf: &mut Vec<u8>,
             ) {
                 // SAFETY: Caller verified CPU feature support via `X86Tier::detect()`
                 // and upheld disjoint-band and scroll-band shadow invariants.
@@ -2929,7 +2926,6 @@ macro_rules! define_tier_wrappers {
                         slot_hashes,
                         cache_non_empty,
                         next_sub,
-                        hash_buf,
                     );
                 }
             }
@@ -2967,7 +2963,6 @@ macro_rules! define_tier_wrappers {
                 // SAFETY: Caller verified CPU feature support and disjoint-row invariants.
                 unsafe {
                     let kernel = super::$tier_mod::Kernel::new_unchecked();
-                    let mut hash_buf = Vec::new();
                     crate::filtering::diff_and_update_row_band_2d_with::<
                         super::$tier_mod::Kernel,
                         HAS_ALPHA,
@@ -2984,7 +2979,6 @@ macro_rules! define_tier_wrappers {
                         dirty_slots,
                         None,
                         false,
-                        &mut hash_buf,
                     );
                 }
             }
@@ -3429,7 +3423,6 @@ impl X86Tier {
         slot_hashes: Option<&SlotHashes>,
         cache_non_empty: bool,
         next_sub: &AtomicUsize,
-        hash_buf: &mut Vec<u8>,
     ) {
         // SAFETY: Each arm's tier witness verifies required CPU features, and
         // caller upholds disjoint-band shadow invariants.
@@ -3460,7 +3453,6 @@ impl X86Tier {
                             slot_hashes,
                             cache_non_empty,
                             next_sub,
-                            hash_buf,
                         );
                     } else {
                         super::diff_and_update_worker_with::<ScalarKernel, false>(
@@ -3477,7 +3469,6 @@ impl X86Tier {
                             slot_hashes,
                             cache_non_empty,
                             next_sub,
-                            hash_buf,
                         );
                     }
                 },
@@ -3504,7 +3495,6 @@ impl X86Tier {
                             slot_hashes,
                             cache_non_empty,
                             next_sub,
-                            hash_buf,
                         );
                     } else {
                         dispatch_ssse3::diff_and_update_worker::<false>(
@@ -3520,7 +3510,6 @@ impl X86Tier {
                             slot_hashes,
                             cache_non_empty,
                             next_sub,
-                            hash_buf,
                         );
                     }
                 },
@@ -3544,7 +3533,6 @@ impl X86Tier {
                             slot_hashes,
                             cache_non_empty,
                             next_sub,
-                            hash_buf,
                         );
                     } else {
                         dispatch_avx2::diff_and_update_worker::<false>(
@@ -3560,7 +3548,6 @@ impl X86Tier {
                             slot_hashes,
                             cache_non_empty,
                             next_sub,
-                            hash_buf,
                         );
                     }
                 },
@@ -3579,7 +3566,6 @@ impl X86Tier {
                             slot_hashes,
                             cache_non_empty,
                             next_sub,
-                            hash_buf,
                         );
                     } else {
                         dispatch_avx512::diff_and_update_worker::<false>(
@@ -3595,7 +3581,6 @@ impl X86Tier {
                             slot_hashes,
                             cache_non_empty,
                             next_sub,
-                            hash_buf,
                         );
                     }
                 },
@@ -3622,7 +3607,6 @@ impl X86Tier {
         slot_hashes: Option<&SlotHashes>,
         cache_non_empty: bool,
         next_sub: &AtomicUsize,
-        hash_buf: &mut Vec<u8>,
     ) {
         // SAFETY: Each arm's tier witness verifies required CPU features, and
         // caller upholds disjoint-band and scroll-band shadow invariants.
@@ -3654,7 +3638,6 @@ impl X86Tier {
                             slot_hashes,
                             cache_non_empty,
                             next_sub,
-                            hash_buf,
                         );
                     } else {
                         super::diff_and_update_scroll_worker_with::<ScalarKernel, false>(
@@ -3672,7 +3655,6 @@ impl X86Tier {
                             slot_hashes,
                             cache_non_empty,
                             next_sub,
-                            hash_buf,
                         );
                     }
                 },
@@ -3700,7 +3682,6 @@ impl X86Tier {
                             slot_hashes,
                             cache_non_empty,
                             next_sub,
-                            hash_buf,
                         );
                     } else {
                         dispatch_ssse3::diff_and_update_scroll_worker::<false>(
@@ -3717,7 +3698,6 @@ impl X86Tier {
                             slot_hashes,
                             cache_non_empty,
                             next_sub,
-                            hash_buf,
                         );
                     }
                 },
@@ -3742,7 +3722,6 @@ impl X86Tier {
                             slot_hashes,
                             cache_non_empty,
                             next_sub,
-                            hash_buf,
                         );
                     } else {
                         dispatch_avx2::diff_and_update_scroll_worker::<false>(
@@ -3759,7 +3738,6 @@ impl X86Tier {
                             slot_hashes,
                             cache_non_empty,
                             next_sub,
-                            hash_buf,
                         );
                     }
                 },
@@ -3779,7 +3757,6 @@ impl X86Tier {
                             slot_hashes,
                             cache_non_empty,
                             next_sub,
-                            hash_buf,
                         );
                     } else {
                         dispatch_avx512::diff_and_update_scroll_worker::<false>(
@@ -3796,7 +3773,6 @@ impl X86Tier {
                             slot_hashes,
                             cache_non_empty,
                             next_sub,
-                            hash_buf,
                         );
                     }
                 },
@@ -3882,7 +3858,6 @@ impl X86Tier {
                     )),
                 ))]
                 Self::Scalar => {
-                    let mut hash_buf = Vec::new();
                     super::diff_and_update_row_band_2d_with::<ScalarKernel, HAS_ALPHA>(
                         ScalarKernel,
                         data,
@@ -3896,7 +3871,6 @@ impl X86Tier {
                         dirty_slots,
                         None,
                         false,
-                        &mut hash_buf,
                     );
                 },
                 #[cfg(all(
