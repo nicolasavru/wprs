@@ -54,6 +54,16 @@ use crate::filtering::FrameRows;
         target_feature = "avx512vbmi",
     )),
 ))]
+use crate::filtering::RowKernel;
+#[cfg(all(
+    not(target_feature = "ssse3"),
+    not(target_feature = "avx2"),
+    not(all(
+        target_feature = "avx512bw",
+        target_feature = "avx512vl",
+        target_feature = "avx512vbmi",
+    )),
+))]
 use crate::filtering::ScalarKernel;
 use crate::filtering::ScanSubBand;
 use crate::filtering::ShadowRows;
@@ -174,43 +184,77 @@ mod detect {
 
 mod avx512 {
     use std::arch::x86_64::__m128i;
+    use std::arch::x86_64::__m256i;
     use std::arch::x86_64::__m512i;
+    use std::arch::x86_64::_mm_loadl_epi64;
     use std::arch::x86_64::_mm_loadu_si128;
     use std::arch::x86_64::_mm_sfence;
+    use std::arch::x86_64::_mm_srli_epi16;
     use std::arch::x86_64::_mm_storeu_si128;
+    use std::arch::x86_64::_mm_unpacklo_epi8;
+    use std::arch::x86_64::_mm256_setr_epi32;
+    use std::arch::x86_64::_mm256_storeu_si256;
     use std::arch::x86_64::_mm512_abs_epi8;
     use std::arch::x86_64::_mm512_add_epi8;
     use std::arch::x86_64::_mm512_add_epi64;
     use std::arch::x86_64::_mm512_and_si512;
+    use std::arch::x86_64::_mm512_andnot_si512;
+    use std::arch::x86_64::_mm512_broadcast_i32x4;
     use std::arch::x86_64::_mm512_bslli_epi128;
+    use std::arch::x86_64::_mm512_castsi256_si512;
     use std::arch::x86_64::_mm512_cmpeq_epi8_mask;
     use std::arch::x86_64::_mm512_cmpneq_epi8_mask;
+    use std::arch::x86_64::_mm512_cvtepi16_epi8;
+    use std::arch::x86_64::_mm512_cvtepi32_epi8;
+    use std::arch::x86_64::_mm512_cvtepu8_epi32;
     use std::arch::x86_64::_mm512_extracti32x4_epi32;
+    use std::arch::x86_64::_mm512_inserti64x4;
     use std::arch::x86_64::_mm512_loadu_si512;
+    use std::arch::x86_64::_mm512_madd_epi16;
+    use std::arch::x86_64::_mm512_maddubs_epi16;
+    use std::arch::x86_64::_mm512_mask_blend_epi32;
     use std::arch::x86_64::_mm512_mask_cmpneq_epi8_mask;
     use std::arch::x86_64::_mm512_mask_storeu_epi8;
     use std::arch::x86_64::_mm512_maskz_loadu_epi8;
     use std::arch::x86_64::_mm512_maskz_permutexvar_epi8;
+    use std::arch::x86_64::_mm512_max_epu8;
     use std::arch::x86_64::_mm512_or_si512;
     use std::arch::x86_64::_mm512_permutex2var_epi8;
     use std::arch::x86_64::_mm512_permutexvar_epi8;
+    use std::arch::x86_64::_mm512_permutexvar_epi32;
     use std::arch::x86_64::_mm512_reduce_add_epi64;
     use std::arch::x86_64::_mm512_sad_epu8;
     use std::arch::x86_64::_mm512_set1_epi8;
+    use std::arch::x86_64::_mm512_set1_epi16;
     use std::arch::x86_64::_mm512_set1_epi32;
     use std::arch::x86_64::_mm512_setzero_si512;
     use std::arch::x86_64::_mm512_shuffle_epi8;
+    use std::arch::x86_64::_mm512_srli_epi16;
+    use std::arch::x86_64::_mm512_srlv_epi32;
     use std::arch::x86_64::_mm512_storeu_si512;
     use std::arch::x86_64::_mm512_stream_si512;
     use std::arch::x86_64::_mm512_sub_epi8;
+    use std::arch::x86_64::_mm512_subs_epu8;
+    use std::arch::x86_64::_mm512_test_epi8_mask;
     use std::arch::x86_64::_mm512_xor_si512;
     use std::arch::x86_64::_mm512_zextsi128_si512;
     use std::mem::MaybeUninit;
 
     use crate::buffer_pointer::BufferPointer;
     use crate::filtering::RowKernel;
+    use crate::filtering::palette::MAX_PALETTE_COLORS;
+    use crate::filtering::palette::PaletteLut4;
+    use crate::filtering::palette::decode_palette_1bpp_scalar;
+    use crate::filtering::palette::decode_palette_2bpp_scalar;
+    use crate::filtering::palette::decode_palette_4bpp_scalar;
+    use crate::filtering::palette::decode_palette_8bpp_scalar;
+    use crate::filtering::palette::pack_palette_indices_scalar;
+    use crate::filtering::palette::validate_palette_indices_scalar;
     use crate::filtering::tile_hash::XRGB_ALPHA_MASK_U32;
+    use crate::serialization::framing::packed_palette_indices_len;
     use crate::vec4u8::Vec4u8;
+
+    const SHIFTS_2BPP_512: [u32; 16] = [0, 2, 4, 6, 8, 10, 12, 14, 16, 18, 20, 22, 24, 26, 28, 30];
 
     /// Opmask selecting the lower 48 bytes (`16` 3-byte BGR pixels) of a ZMM register.
     const MASK_48: u64 = 0x0000_FFFF_FFFF_FFFF;
@@ -990,6 +1034,384 @@ mod avx512 {
         }
     }
 
+    #[target_feature(enable = "avx512bw,avx512vl,avx512vbmi")]
+    #[inline]
+    unsafe fn validate_palette_indices_impl(n_colors: usize, packed: &[u8]) -> bool {
+        let len = packed.len();
+        // SAFETY: Caller guarantees AVX-512BW/VL/VBMI and all loads stay in `0..len`.
+        unsafe {
+            if n_colors == 3 {
+                let lim = (len / 64) * 64;
+                let mut acc = _mm512_setzero_si512();
+                let mut i = 0usize;
+                while i < lim {
+                    let v = _mm512_loadu_si512(packed.as_ptr().add(i).cast());
+                    acc = _mm512_or_si512(acc, _mm512_and_si512(v, _mm512_srli_epi16::<1>(v)));
+                    i += 64;
+                }
+                if _mm512_test_epi8_mask(acc, _mm512_set1_epi8(0x55)) != 0 {
+                    return false;
+                }
+                validate_palette_indices_scalar(3, &packed[lim..])
+            } else if (5..16).contains(&n_colors) {
+                let lim = (len / 64) * 64;
+                let mask_0f = _mm512_set1_epi8(0x0F);
+                let mut max_lo = _mm512_setzero_si512();
+                let mut max_hi = _mm512_setzero_si512();
+                let mut i = 0usize;
+                while i < lim {
+                    let v = _mm512_loadu_si512(packed.as_ptr().add(i).cast());
+                    max_lo = _mm512_max_epu8(max_lo, _mm512_and_si512(v, mask_0f));
+                    max_hi = _mm512_max_epu8(max_hi, _mm512_andnot_si512(mask_0f, v));
+                    i += 64;
+                }
+                let combined = _mm512_max_epu8(max_lo, _mm512_srli_epi16::<4>(max_hi));
+                let excess = _mm512_subs_epu8(combined, _mm512_set1_epi8((n_colors - 1) as i8));
+                if _mm512_cmpneq_epi8_mask(excess, _mm512_setzero_si512()) != 0 {
+                    return false;
+                }
+                validate_palette_indices_scalar(n_colors, &packed[lim..])
+            } else if (17..MAX_PALETTE_COLORS).contains(&n_colors) {
+                let lim128 = (len / 128) * 128;
+                let mut max0 = _mm512_setzero_si512();
+                let mut max1 = _mm512_setzero_si512();
+                let mut i = 0usize;
+                while i < lim128 {
+                    max0 = _mm512_max_epu8(max0, _mm512_loadu_si512(packed.as_ptr().add(i).cast()));
+                    max1 = _mm512_max_epu8(
+                        max1,
+                        _mm512_loadu_si512(packed.as_ptr().add(i + 64).cast()),
+                    );
+                    i += 128;
+                }
+                if i + 64 <= len {
+                    max0 = _mm512_max_epu8(max0, _mm512_loadu_si512(packed.as_ptr().add(i).cast()));
+                    i += 64;
+                }
+                let combined = _mm512_max_epu8(max0, max1);
+                let excess = _mm512_subs_epu8(combined, _mm512_set1_epi8((n_colors - 1) as i8));
+                if _mm512_cmpneq_epi8_mask(excess, _mm512_setzero_si512()) != 0 {
+                    return false;
+                }
+                validate_palette_indices_scalar(n_colors, &packed[i..])
+            } else {
+                true
+            }
+        }
+    }
+
+    #[target_feature(enable = "avx512bw,avx512vl,avx512vbmi")]
+    #[inline]
+    unsafe fn pack_palette_indices_impl(
+        indices: &[u8],
+        n_colors: usize,
+        packed: &mut [u8],
+    ) -> usize {
+        let n = indices.len();
+        let out_len = packed_palette_indices_len(n, n_colors);
+        debug_assert!(packed.len() >= out_len);
+        if n_colors <= 1 {
+            return 0;
+        }
+        // SAFETY: Caller guarantees AVX-512BW/VL/VBMI and `packed.len() >= out_len`.
+        unsafe {
+            let src = indices.as_ptr();
+            let dst = packed.as_mut_ptr();
+            if n_colors <= 2 {
+                let lim = (n / 64) * 64;
+                let ones = _mm512_set1_epi8(1);
+                let mut i = 0usize;
+                let mut oi = 0usize;
+                while i < lim {
+                    let v = _mm512_loadu_si512(src.add(i).cast());
+                    let mask = _mm512_test_epi8_mask(v, ones);
+                    dst.add(oi).cast::<u64>().write_unaligned(mask.to_le());
+                    i += 64;
+                    oi += 8;
+                }
+                if lim < n {
+                    pack_palette_indices_scalar(&indices[lim..], 2, &mut packed[oi..]);
+                }
+            } else if n_colors <= 4 {
+                let lim = (n / 64) * 64;
+                let mask3 = _mm512_set1_epi8(3);
+                let mul1 = _mm512_set1_epi16(0x0401);
+                let mul2 = _mm512_set1_epi32(0x0010_0001);
+                let mut i = 0usize;
+                let mut oi = 0usize;
+                while i < lim {
+                    let v = _mm512_and_si512(_mm512_loadu_si512(src.add(i).cast()), mask3);
+                    let t1 = _mm512_maddubs_epi16(v, mul1);
+                    let t2 = _mm512_madd_epi16(t1, mul2);
+                    _mm_storeu_si128(dst.add(oi).cast(), _mm512_cvtepi32_epi8(t2));
+                    i += 64;
+                    oi += 16;
+                }
+                if lim < n {
+                    pack_palette_indices_scalar(&indices[lim..], 4, &mut packed[oi..]);
+                }
+            } else if n_colors <= 16 {
+                let lim = (n / 64) * 64;
+                let mask_0f = _mm512_set1_epi8(0x0F);
+                let mul16 = _mm512_set1_epi16(0x1001);
+                let mut i = 0usize;
+                let mut oi = 0usize;
+                while i < lim {
+                    let v = _mm512_and_si512(_mm512_loadu_si512(src.add(i).cast()), mask_0f);
+                    let t = _mm512_maddubs_epi16(v, mul16);
+                    _mm256_storeu_si256(dst.add(oi).cast::<__m256i>(), _mm512_cvtepi16_epi8(t));
+                    i += 64;
+                    oi += 32;
+                }
+                if lim < n {
+                    pack_palette_indices_scalar(&indices[lim..], 16, &mut packed[oi..]);
+                }
+            } else {
+                packed[..n].copy_from_slice(indices);
+            }
+        }
+        out_len
+    }
+
+    #[target_feature(enable = "avx512bw,avx512vl,avx512vbmi")]
+    #[inline]
+    unsafe fn decode_palette_1bpp_row_impl<const STREAM: bool>(
+        c0: Vec4u8,
+        c1: Vec4u8,
+        packed: &[u8],
+        idx_pos: usize,
+        dst: &mut [MaybeUninit<Vec4u8>],
+    ) {
+        let tw = dst.len();
+        debug_assert!(
+            !STREAM
+                || ((dst.as_mut_ptr() as usize).is_multiple_of(64)
+                    && tw.is_multiple_of(16)
+                    && (idx_pos & 7) == 0)
+        );
+        let head = if STREAM {
+            0
+        } else {
+            let h = ((8 - (idx_pos & 7)) & 7).min(tw);
+            if h != 0 {
+                decode_palette_1bpp_scalar(c0, c1, packed, idx_pos, &mut dst[..h]);
+            }
+            h
+        };
+        let mut x = head;
+        let mut pos = idx_pos + head;
+        if x + 16 <= tw {
+            debug_assert_eq!(pos & 7, 0);
+            let mut bi = pos >> 3;
+            let end = if STREAM { tw } else { x + ((tw - x) / 16) * 16 };
+            // SAFETY: Caller guarantees AVX-512BW/VL/VBMI, `packed` bounds, and
+            // 64-byte alignment on `dst` when `STREAM` is `true`.
+            unsafe {
+                let vc0 = _mm512_set1_epi32(u32::from_le_bytes([c0.0, c0.1, c0.2, c0.3]) as i32);
+                let vc1 = _mm512_set1_epi32(u32::from_le_bytes([c1.0, c1.1, c1.2, c1.3]) as i32);
+                let src = packed.as_ptr();
+                let out = dst.as_mut_ptr();
+                while x < end {
+                    let mask = u16::from_le(src.add(bi).cast::<u16>().read_unaligned());
+                    let px = _mm512_mask_blend_epi32(mask, vc0, vc1);
+                    let p = out.add(x).cast::<__m512i>();
+                    if STREAM {
+                        _mm512_stream_si512(p, px);
+                    } else {
+                        _mm512_storeu_si512(p.cast(), px);
+                    }
+                    x += 16;
+                    bi += 2;
+                }
+            }
+            pos = bi << 3;
+        }
+        if !STREAM && x < tw {
+            decode_palette_1bpp_scalar(c0, c1, packed, pos, &mut dst[x..]);
+        }
+    }
+
+    #[target_feature(enable = "avx512bw,avx512vl,avx512vbmi")]
+    #[inline]
+    unsafe fn decode_palette_2bpp_row_impl<const STREAM: bool>(
+        lut: &[Vec4u8; 4],
+        packed: &[u8],
+        idx_pos: usize,
+        dst: &mut [MaybeUninit<Vec4u8>],
+    ) {
+        let tw = dst.len();
+        debug_assert!(
+            !STREAM
+                || ((dst.as_mut_ptr() as usize).is_multiple_of(64)
+                    && tw.is_multiple_of(16)
+                    && (idx_pos & 3) == 0)
+        );
+        let head = if STREAM {
+            0
+        } else {
+            let h = ((4 - (idx_pos & 3)) & 3).min(tw);
+            if h != 0 {
+                decode_palette_2bpp_scalar(lut, packed, idx_pos, &mut dst[..h]);
+            }
+            h
+        };
+        let mut x = head;
+        let mut pos = idx_pos + head;
+        if x + 16 <= tw {
+            debug_assert_eq!(pos & 3, 0);
+            let mut bi = pos >> 2;
+            let end = if STREAM { tw } else { x + ((tw - x) / 16) * 16 };
+            // SAFETY: Caller guarantees AVX-512BW/VL/VBMI, `packed` bounds, and
+            // 64-byte alignment on `dst` when `STREAM` is `true`.
+            unsafe {
+                // Replicating `[c0, c1, c2, c3]` 4x across all 16 lanes makes
+                // `vpermd` (`idx[3:0]`) wrap modulo 4 with zero `vpand` mask.
+                let lut_512 = _mm512_broadcast_i32x4(_mm_loadu_si128(lut.as_ptr().cast()));
+                let shifts = _mm512_loadu_si512(SHIFTS_2BPP_512.as_ptr().cast());
+                let src = packed.as_ptr();
+                let out = dst.as_mut_ptr();
+                while x < end {
+                    let w = u32::from_le(src.add(bi).cast::<u32>().read_unaligned());
+                    let idx = _mm512_srlv_epi32(_mm512_set1_epi32(w as i32), shifts);
+                    let px = _mm512_permutexvar_epi32(idx, lut_512);
+                    let p = out.add(x).cast::<__m512i>();
+                    if STREAM {
+                        _mm512_stream_si512(p, px);
+                    } else {
+                        _mm512_storeu_si512(p.cast(), px);
+                    }
+                    x += 16;
+                    bi += 4;
+                }
+            }
+            pos = bi << 2;
+        }
+        if !STREAM && x < tw {
+            decode_palette_2bpp_scalar(lut, packed, pos, &mut dst[x..]);
+        }
+    }
+
+    #[target_feature(enable = "avx512bw,avx512vl,avx512vbmi")]
+    #[inline]
+    unsafe fn decode_palette_4bpp_row_impl<const STREAM: bool>(
+        lut: &PaletteLut4,
+        packed: &[u8],
+        idx_pos: usize,
+        dst: &mut [MaybeUninit<Vec4u8>],
+    ) {
+        let tw = dst.len();
+        debug_assert!(
+            !STREAM
+                || ((dst.as_mut_ptr() as usize).is_multiple_of(64)
+                    && tw.is_multiple_of(16)
+                    && (idx_pos & 1) == 0)
+        );
+        let head = if STREAM {
+            0
+        } else {
+            let h = (idx_pos & 1).min(tw);
+            if h != 0 {
+                decode_palette_4bpp_scalar(&lut.colors, packed, idx_pos, &mut dst[..h]);
+            }
+            h
+        };
+        let mut x = head;
+        let mut pos = idx_pos + head;
+        if x + 16 <= tw {
+            debug_assert_eq!(pos & 1, 0);
+            let mut bi = pos >> 1;
+            let end = if STREAM { tw } else { x + ((tw - x) / 16) * 16 };
+            // SAFETY: Caller guarantees AVX-512BW/VL/VBMI, `packed` bounds, and
+            // 64-byte alignment on `dst` when `STREAM` is `true`.
+            unsafe {
+                let lut_512 = _mm512_loadu_si512(lut.colors.as_ptr().cast());
+                let src = packed.as_ptr();
+                let out = dst.as_mut_ptr();
+                while x < end {
+                    // `vpermd` uses only bits `[3:0]` of each 32-bit index lane,
+                    // so `raw64` and `raw64 >> 4` need no `0x0F` masking.
+                    let raw64 = _mm_loadl_epi64(src.add(bi).cast());
+                    let hi = _mm_srli_epi16::<4>(raw64);
+                    let idx16 = _mm_unpacklo_epi8(raw64, hi);
+                    let idx32 = _mm512_cvtepu8_epi32(idx16);
+                    let px = _mm512_permutexvar_epi32(idx32, lut_512);
+                    let p = out.add(x).cast::<__m512i>();
+                    if STREAM {
+                        _mm512_stream_si512(p, px);
+                    } else {
+                        _mm512_storeu_si512(p.cast(), px);
+                    }
+                    x += 16;
+                    bi += 8;
+                }
+            }
+            pos = bi << 1;
+        }
+        if !STREAM && x < tw {
+            decode_palette_4bpp_scalar(&lut.colors, packed, pos, &mut dst[x..]);
+        }
+    }
+
+    #[target_feature(enable = "avx512bw,avx512vl,avx512vbmi")]
+    #[inline]
+    unsafe fn decode_palette_8bpp_row_impl<const STREAM: bool>(
+        lut: &[u32; MAX_PALETTE_COLORS],
+        packed_row: &[u8],
+        dst: &mut [MaybeUninit<Vec4u8>],
+    ) {
+        let tw = dst.len();
+        debug_assert_eq!(packed_row.len(), tw);
+        debug_assert!(
+            !STREAM || ((dst.as_mut_ptr() as usize).is_multiple_of(64) && tw.is_multiple_of(16))
+        );
+        let lim = if STREAM { tw } else { (tw / 16) * 16 };
+        // SAFETY: Caller guarantees AVX-512F, `packed_row.len() == tw`, and
+        // 64-byte alignment on `dst` when `STREAM` is `true`.
+        unsafe {
+            let src = packed_row.as_ptr();
+            let out = dst.as_mut_ptr();
+            let mut x = 0usize;
+            while x < lim {
+                let w0 = u32::from_le(src.add(x).cast::<u32>().read_unaligned());
+                let w1 = u32::from_le(src.add(x + 4).cast::<u32>().read_unaligned());
+                let w2 = u32::from_le(src.add(x + 8).cast::<u32>().read_unaligned());
+                let w3 = u32::from_le(src.add(x + 12).cast::<u32>().read_unaligned());
+                let v0 = _mm256_setr_epi32(
+                    lut[(w0 & 0xFF) as usize] as i32,
+                    lut[((w0 >> 8) & 0xFF) as usize] as i32,
+                    lut[((w0 >> 16) & 0xFF) as usize] as i32,
+                    lut[(w0 >> 24) as usize] as i32,
+                    lut[(w1 & 0xFF) as usize] as i32,
+                    lut[((w1 >> 8) & 0xFF) as usize] as i32,
+                    lut[((w1 >> 16) & 0xFF) as usize] as i32,
+                    lut[(w1 >> 24) as usize] as i32,
+                );
+                let v1 = _mm256_setr_epi32(
+                    lut[(w2 & 0xFF) as usize] as i32,
+                    lut[((w2 >> 8) & 0xFF) as usize] as i32,
+                    lut[((w2 >> 16) & 0xFF) as usize] as i32,
+                    lut[(w2 >> 24) as usize] as i32,
+                    lut[(w3 & 0xFF) as usize] as i32,
+                    lut[((w3 >> 8) & 0xFF) as usize] as i32,
+                    lut[((w3 >> 16) & 0xFF) as usize] as i32,
+                    lut[(w3 >> 24) as usize] as i32,
+                );
+                if STREAM {
+                    let v = _mm512_inserti64x4::<1>(_mm512_castsi256_si512(v0), v1);
+                    _mm512_stream_si512(out.add(x).cast::<__m512i>(), v);
+                } else {
+                    let p = out.add(x).cast::<__m256i>();
+                    _mm256_storeu_si256(p, v0);
+                    _mm256_storeu_si256(p.add(1), v1);
+                }
+                x += 16;
+            }
+        }
+        if !STREAM && lim < tw {
+            decode_palette_8bpp_scalar(lut, &packed_row[lim..], &mut dst[lim..]);
+        }
+    }
+
     #[derive(Copy, Clone)]
     pub(super) struct Kernel(());
 
@@ -1144,6 +1566,70 @@ mod avx512 {
         }
 
         #[inline(always)]
+        fn validate_palette_indices(self, n_colors: usize, packed: &[u8]) -> bool {
+            // SAFETY: `self` witnesses `avx512bw + avx512vl + avx512vbmi` support.
+            unsafe { validate_palette_indices_impl(n_colors, packed) }
+        }
+
+        #[inline(always)]
+        fn pack_palette_indices(self, indices: &[u8], n_colors: usize, packed: &mut [u8]) -> usize {
+            // SAFETY: `self` witnesses `avx512bw + avx512vl + avx512vbmi` support.
+            unsafe { pack_palette_indices_impl(indices, n_colors, packed) }
+        }
+
+        #[inline(always)]
+        unsafe fn decode_palette_1bpp_row<const STREAM: bool>(
+            self,
+            c0: Vec4u8,
+            c1: Vec4u8,
+            packed: &[u8],
+            idx_pos: usize,
+            dst: &mut [MaybeUninit<Vec4u8>],
+        ) {
+            // SAFETY: `self` witnesses `avx512bw + avx512vl + avx512vbmi` support,
+            // and caller upholds `packed` and `STREAM` alignment invariants.
+            unsafe { decode_palette_1bpp_row_impl::<STREAM>(c0, c1, packed, idx_pos, dst) }
+        }
+
+        #[inline(always)]
+        unsafe fn decode_palette_2bpp_row<const STREAM: bool>(
+            self,
+            lut: &[Vec4u8; 4],
+            packed: &[u8],
+            idx_pos: usize,
+            dst: &mut [MaybeUninit<Vec4u8>],
+        ) {
+            // SAFETY: `self` witnesses `avx512bw + avx512vl + avx512vbmi` support,
+            // and caller upholds `packed` and `STREAM` alignment invariants.
+            unsafe { decode_palette_2bpp_row_impl::<STREAM>(lut, packed, idx_pos, dst) }
+        }
+
+        #[inline(always)]
+        unsafe fn decode_palette_4bpp_row<const STREAM: bool>(
+            self,
+            lut: &PaletteLut4,
+            packed: &[u8],
+            idx_pos: usize,
+            dst: &mut [MaybeUninit<Vec4u8>],
+        ) {
+            // SAFETY: `self` witnesses `avx512bw + avx512vl + avx512vbmi` support,
+            // and caller upholds `packed` and `STREAM` alignment invariants.
+            unsafe { decode_palette_4bpp_row_impl::<STREAM>(lut, packed, idx_pos, dst) }
+        }
+
+        #[inline(always)]
+        unsafe fn decode_palette_8bpp_row<const STREAM: bool>(
+            self,
+            lut: &[u32; MAX_PALETTE_COLORS],
+            packed_row: &[u8],
+            dst: &mut [MaybeUninit<Vec4u8>],
+        ) {
+            // SAFETY: `self` witnesses `avx512bw + avx512vl + avx512vbmi` support,
+            // and caller upholds `packed_row` and `STREAM` alignment invariants.
+            unsafe { decode_palette_8bpp_row_impl::<STREAM>(lut, packed_row, dst) }
+        }
+
+        #[inline(always)]
         fn fence_stream(self) {
             // SAFETY: `_mm_sfence` is baseline SSE (mandatory on all x86_64 CPUs).
             unsafe { _mm_sfence() };
@@ -1162,46 +1648,82 @@ mod avx2 {
     use std::arch::x86_64::_mm_add_epi8;
     use std::arch::x86_64::_mm_cvtsi64_si128;
     use std::arch::x86_64::_mm_cvtsi128_si32;
+    use std::arch::x86_64::_mm_loadl_epi64;
     use std::arch::x86_64::_mm_loadu_si128;
     use std::arch::x86_64::_mm_set_epi8;
     use std::arch::x86_64::_mm_set1_epi8;
+    use std::arch::x86_64::_mm_setr_epi8;
     use std::arch::x86_64::_mm_setzero_si128;
     use std::arch::x86_64::_mm_sfence;
     use std::arch::x86_64::_mm_shuffle_epi8;
     use std::arch::x86_64::_mm_slli_si128;
     use std::arch::x86_64::_mm_srli_si128;
+    use std::arch::x86_64::_mm_storel_epi64;
     use std::arch::x86_64::_mm_storeu_si128;
     use std::arch::x86_64::_mm256_abs_epi8;
     use std::arch::x86_64::_mm256_add_epi8;
     use std::arch::x86_64::_mm256_add_epi64;
     use std::arch::x86_64::_mm256_alignr_epi8;
     use std::arch::x86_64::_mm256_and_si256;
+    use std::arch::x86_64::_mm256_andnot_si256;
+    use std::arch::x86_64::_mm256_blendv_ps;
+    use std::arch::x86_64::_mm256_broadcastsi128_si256;
+    use std::arch::x86_64::_mm256_castps_si256;
+    use std::arch::x86_64::_mm256_castsi256_ps;
     use std::arch::x86_64::_mm256_castsi256_si128;
     use std::arch::x86_64::_mm256_cmpeq_epi8;
     use std::arch::x86_64::_mm256_cmpeq_epi32;
     use std::arch::x86_64::_mm256_extracti128_si256;
     use std::arch::x86_64::_mm256_loadu_si256;
+    use std::arch::x86_64::_mm256_madd_epi16;
+    use std::arch::x86_64::_mm256_maddubs_epi16;
+    use std::arch::x86_64::_mm256_max_epu8;
     use std::arch::x86_64::_mm256_movemask_epi8;
     use std::arch::x86_64::_mm256_or_si256;
+    use std::arch::x86_64::_mm256_packus_epi16;
     use std::arch::x86_64::_mm256_permute2x128_si256;
+    use std::arch::x86_64::_mm256_permute4x64_epi64;
+    use std::arch::x86_64::_mm256_permutevar8x32_epi32;
     use std::arch::x86_64::_mm256_sad_epu8;
     use std::arch::x86_64::_mm256_set_epi8;
     use std::arch::x86_64::_mm256_set_m128i;
     use std::arch::x86_64::_mm256_set1_epi8;
+    use std::arch::x86_64::_mm256_set1_epi16;
     use std::arch::x86_64::_mm256_set1_epi32;
+    use std::arch::x86_64::_mm256_setr_epi8;
+    use std::arch::x86_64::_mm256_setr_epi32;
     use std::arch::x86_64::_mm256_setzero_si256;
     use std::arch::x86_64::_mm256_shuffle_epi8;
+    use std::arch::x86_64::_mm256_slli_epi16;
     use std::arch::x86_64::_mm256_slli_si256;
+    use std::arch::x86_64::_mm256_sllv_epi32;
+    use std::arch::x86_64::_mm256_srli_epi16;
+    use std::arch::x86_64::_mm256_srlv_epi32;
     use std::arch::x86_64::_mm256_storeu_si256;
     use std::arch::x86_64::_mm256_stream_si256;
     use std::arch::x86_64::_mm256_sub_epi8;
+    use std::arch::x86_64::_mm256_subs_epu8;
     use std::arch::x86_64::_mm256_testz_si256;
+    use std::arch::x86_64::_mm256_unpackhi_epi8;
+    use std::arch::x86_64::_mm256_unpackhi_epi16;
+    use std::arch::x86_64::_mm256_unpacklo_epi8;
+    use std::arch::x86_64::_mm256_unpacklo_epi16;
     use std::arch::x86_64::_mm256_xor_si256;
+    use std::arch::x86_64::_mm256_zextsi128_si256;
     use std::mem::MaybeUninit;
 
     use crate::buffer_pointer::BufferPointer;
     use crate::filtering::RowKernel;
+    use crate::filtering::palette::MAX_PALETTE_COLORS;
+    use crate::filtering::palette::PaletteLut4;
+    use crate::filtering::palette::decode_palette_1bpp_scalar;
+    use crate::filtering::palette::decode_palette_2bpp_scalar;
+    use crate::filtering::palette::decode_palette_4bpp_scalar;
+    use crate::filtering::palette::decode_palette_8bpp_scalar;
+    use crate::filtering::palette::pack_palette_indices_scalar;
+    use crate::filtering::palette::validate_palette_indices_scalar;
     use crate::filtering::tile_hash::XRGB_ALPHA_MASK_U32;
+    use crate::serialization::framing::packed_palette_indices_len;
     use crate::vec4u8::Vec4u8;
 
     #[target_feature(enable = "avx2")]
@@ -1906,6 +2428,523 @@ mod avx2 {
         }
     }
 
+    #[target_feature(enable = "avx2")]
+    #[inline]
+    unsafe fn validate_palette_indices_impl(n_colors: usize, packed: &[u8]) -> bool {
+        let len = packed.len();
+        // SAFETY: Caller guarantees AVX2 and all loads stay in `0..len`.
+        unsafe {
+            if n_colors == 3 {
+                let lim64 = (len / 64) * 64;
+                let mut acc0 = _mm256_setzero_si256();
+                let mut acc1 = _mm256_setzero_si256();
+                let mut i = 0usize;
+                while i < lim64 {
+                    let v0 = _mm256_loadu_si256(packed.as_ptr().add(i).cast());
+                    let v1 = _mm256_loadu_si256(packed.as_ptr().add(i + 32).cast());
+                    acc0 = _mm256_or_si256(acc0, _mm256_and_si256(v0, _mm256_srli_epi16::<1>(v0)));
+                    acc1 = _mm256_or_si256(acc1, _mm256_and_si256(v1, _mm256_srli_epi16::<1>(v1)));
+                    i += 64;
+                }
+                if i + 32 <= len {
+                    let v = _mm256_loadu_si256(packed.as_ptr().add(i).cast());
+                    acc0 = _mm256_or_si256(acc0, _mm256_and_si256(v, _mm256_srli_epi16::<1>(v)));
+                    i += 32;
+                }
+                let acc = _mm256_or_si256(acc0, acc1);
+                if _mm256_testz_si256(acc, _mm256_set1_epi8(0x55)) == 0 {
+                    return false;
+                }
+                validate_palette_indices_scalar(3, &packed[i..])
+            } else if (5..16).contains(&n_colors) {
+                let lim = (len / 32) * 32;
+                let mask_0f = _mm256_set1_epi8(0x0F);
+                let mut max_lo = _mm256_setzero_si256();
+                let mut max_hi = _mm256_setzero_si256();
+                let mut i = 0usize;
+                while i < lim {
+                    let v = _mm256_loadu_si256(packed.as_ptr().add(i).cast());
+                    max_lo = _mm256_max_epu8(max_lo, _mm256_and_si256(v, mask_0f));
+                    max_hi = _mm256_max_epu8(max_hi, _mm256_andnot_si256(mask_0f, v));
+                    i += 32;
+                }
+                let combined = _mm256_max_epu8(max_lo, _mm256_srli_epi16::<4>(max_hi));
+                let excess = _mm256_subs_epu8(combined, _mm256_set1_epi8((n_colors - 1) as i8));
+                if _mm256_testz_si256(excess, excess) == 0 {
+                    return false;
+                }
+                validate_palette_indices_scalar(n_colors, &packed[lim..])
+            } else if (17..MAX_PALETTE_COLORS).contains(&n_colors) {
+                let lim64 = (len / 64) * 64;
+                let mut max0 = _mm256_setzero_si256();
+                let mut max1 = _mm256_setzero_si256();
+                let mut i = 0usize;
+                while i < lim64 {
+                    max0 = _mm256_max_epu8(max0, _mm256_loadu_si256(packed.as_ptr().add(i).cast()));
+                    max1 = _mm256_max_epu8(
+                        max1,
+                        _mm256_loadu_si256(packed.as_ptr().add(i + 32).cast()),
+                    );
+                    i += 64;
+                }
+                if i + 32 <= len {
+                    max0 = _mm256_max_epu8(max0, _mm256_loadu_si256(packed.as_ptr().add(i).cast()));
+                    i += 32;
+                }
+                let combined = _mm256_max_epu8(max0, max1);
+                let excess = _mm256_subs_epu8(combined, _mm256_set1_epi8((n_colors - 1) as i8));
+                if _mm256_testz_si256(excess, excess) == 0 {
+                    return false;
+                }
+                validate_palette_indices_scalar(n_colors, &packed[i..])
+            } else {
+                true
+            }
+        }
+    }
+
+    #[target_feature(enable = "avx2")]
+    #[inline]
+    unsafe fn pack_palette_indices_impl(
+        indices: &[u8],
+        n_colors: usize,
+        packed: &mut [u8],
+    ) -> usize {
+        let n = indices.len();
+        let out_len = packed_palette_indices_len(n, n_colors);
+        debug_assert!(packed.len() >= out_len);
+        if n_colors <= 1 {
+            return 0;
+        }
+        // SAFETY: Caller guarantees AVX2 and `packed.len() >= out_len`.
+        unsafe {
+            let src = indices.as_ptr();
+            let dst = packed.as_mut_ptr();
+            if n_colors <= 2 {
+                let lim = (n / 32) * 32;
+                let mut i = 0usize;
+                let mut oi = 0usize;
+                while i < lim {
+                    let v = _mm256_loadu_si256(src.add(i).cast());
+                    let mask = _mm256_movemask_epi8(_mm256_slli_epi16::<7>(v)) as u32;
+                    dst.add(oi).cast::<u32>().write_unaligned(mask.to_le());
+                    i += 32;
+                    oi += 4;
+                }
+                if lim < n {
+                    pack_palette_indices_scalar(&indices[lim..], 2, &mut packed[oi..]);
+                }
+            } else if n_colors <= 4 {
+                let lim = (n / 32) * 32;
+                let mask3 = _mm256_set1_epi8(3);
+                let mul1 = _mm256_set1_epi16(0x0401);
+                let mul2 = _mm256_set1_epi32(0x0010_0001);
+                let shuf = _mm256_setr_epi8(
+                    0, 4, 8, 12, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, 0, 4, 8, 12, -1,
+                    -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1,
+                );
+                let gather_d = _mm256_setr_epi32(0, 4, 0, 0, 0, 0, 0, 0);
+                let mut i = 0usize;
+                let mut oi = 0usize;
+                while i < lim {
+                    let v = _mm256_and_si256(_mm256_loadu_si256(src.add(i).cast()), mask3);
+                    let t1 = _mm256_maddubs_epi16(v, mul1);
+                    let t2 = _mm256_madd_epi16(t1, mul2);
+                    let pk = _mm256_shuffle_epi8(t2, shuf);
+                    let pk64 = _mm256_permutevar8x32_epi32(pk, gather_d);
+                    _mm_storel_epi64(dst.add(oi).cast(), _mm256_castsi256_si128(pk64));
+                    i += 32;
+                    oi += 8;
+                }
+                if lim < n {
+                    pack_palette_indices_scalar(&indices[lim..], 4, &mut packed[oi..]);
+                }
+            } else if n_colors <= 16 {
+                let lim64 = (n / 64) * 64;
+                let mask_0f = _mm256_set1_epi8(0x0F);
+                let mul16 = _mm256_set1_epi16(0x1001);
+                let mut i = 0usize;
+                let mut oi = 0usize;
+                while i < lim64 {
+                    let v0 = _mm256_and_si256(_mm256_loadu_si256(src.add(i).cast()), mask_0f);
+                    let v1 = _mm256_and_si256(_mm256_loadu_si256(src.add(i + 32).cast()), mask_0f);
+                    let t0 = _mm256_maddubs_epi16(v0, mul16);
+                    let t1 = _mm256_maddubs_epi16(v1, mul16);
+                    let pk = _mm256_permute4x64_epi64::<0xD8>(_mm256_packus_epi16(t0, t1));
+                    _mm256_storeu_si256(dst.add(oi).cast(), pk);
+                    i += 64;
+                    oi += 32;
+                }
+                if i + 32 <= n {
+                    let v = _mm256_and_si256(_mm256_loadu_si256(src.add(i).cast()), mask_0f);
+                    let t = _mm256_maddubs_epi16(v, mul16);
+                    let pk = _mm256_permute4x64_epi64::<0xD8>(_mm256_packus_epi16(t, t));
+                    _mm_storeu_si128(dst.add(oi).cast(), _mm256_castsi256_si128(pk));
+                    i += 32;
+                    oi += 16;
+                }
+                if i < n {
+                    pack_palette_indices_scalar(&indices[i..], 16, &mut packed[oi..]);
+                }
+            } else {
+                packed[..n].copy_from_slice(indices);
+            }
+        }
+        out_len
+    }
+
+    #[target_feature(enable = "avx2")]
+    #[inline]
+    unsafe fn decode_palette_1bpp_row_impl<const STREAM: bool>(
+        c0: Vec4u8,
+        c1: Vec4u8,
+        packed: &[u8],
+        idx_pos: usize,
+        dst: &mut [MaybeUninit<Vec4u8>],
+    ) {
+        let tw = dst.len();
+        debug_assert!(
+            !STREAM
+                || ((dst.as_mut_ptr() as usize).is_multiple_of(32)
+                    && tw.is_multiple_of(16)
+                    && (idx_pos & 7) == 0)
+        );
+        let head = if STREAM {
+            0
+        } else {
+            let h = ((8 - (idx_pos & 7)) & 7).min(tw);
+            if h != 0 {
+                decode_palette_1bpp_scalar(c0, c1, packed, idx_pos, &mut dst[..h]);
+            }
+            h
+        };
+        let mut x = head;
+        let mut pos = idx_pos + head;
+        if x + 8 <= tw {
+            debug_assert_eq!(pos & 7, 0);
+            let mut bi = pos >> 3;
+            let end32 = x + ((tw - x) / 32) * 32;
+            let end8 = if STREAM { tw } else { x + ((tw - x) / 8) * 8 };
+            // SAFETY: Caller guarantees AVX2, `packed` bounds, and 32-byte
+            // alignment on `dst` when `STREAM` is `true`.
+            unsafe {
+                let vc0 = _mm256_castsi256_ps(_mm256_set1_epi32(u32::from_le_bytes([
+                    c0.0, c0.1, c0.2, c0.3,
+                ]) as i32));
+                let vc1 = _mm256_castsi256_ps(_mm256_set1_epi32(u32::from_le_bytes([
+                    c1.0, c1.1, c1.2, c1.3,
+                ]) as i32));
+                let sh0 = _mm256_setr_epi32(31, 30, 29, 28, 27, 26, 25, 24);
+                let sh1 = _mm256_setr_epi32(23, 22, 21, 20, 19, 18, 17, 16);
+                let sh2 = _mm256_setr_epi32(15, 14, 13, 12, 11, 10, 9, 8);
+                let sh3 = _mm256_setr_epi32(7, 6, 5, 4, 3, 2, 1, 0);
+                let src = packed.as_ptr();
+                let out = dst.as_mut_ptr();
+                while x < end32 {
+                    let w = _mm256_set1_epi32(u32::from_le(
+                        src.add(bi).cast::<u32>().read_unaligned(),
+                    ) as i32);
+                    let p0 = _mm256_castps_si256(_mm256_blendv_ps(
+                        vc0,
+                        vc1,
+                        _mm256_castsi256_ps(_mm256_sllv_epi32(w, sh0)),
+                    ));
+                    let p1 = _mm256_castps_si256(_mm256_blendv_ps(
+                        vc0,
+                        vc1,
+                        _mm256_castsi256_ps(_mm256_sllv_epi32(w, sh1)),
+                    ));
+                    let p2 = _mm256_castps_si256(_mm256_blendv_ps(
+                        vc0,
+                        vc1,
+                        _mm256_castsi256_ps(_mm256_sllv_epi32(w, sh2)),
+                    ));
+                    let p3 = _mm256_castps_si256(_mm256_blendv_ps(
+                        vc0,
+                        vc1,
+                        _mm256_castsi256_ps(_mm256_sllv_epi32(w, sh3)),
+                    ));
+                    let p = out.add(x).cast::<__m256i>();
+                    if STREAM {
+                        _mm256_stream_si256(p, p0);
+                        _mm256_stream_si256(p.add(1), p1);
+                        _mm256_stream_si256(p.add(2), p2);
+                        _mm256_stream_si256(p.add(3), p3);
+                    } else {
+                        _mm256_storeu_si256(p, p0);
+                        _mm256_storeu_si256(p.add(1), p1);
+                        _mm256_storeu_si256(p.add(2), p2);
+                        _mm256_storeu_si256(p.add(3), p3);
+                    }
+                    x += 32;
+                    bi += 4;
+                }
+                while x < end8 {
+                    let b = _mm256_set1_epi8(*src.add(bi) as i8);
+                    let px = _mm256_castps_si256(_mm256_blendv_ps(
+                        vc0,
+                        vc1,
+                        _mm256_castsi256_ps(_mm256_sllv_epi32(b, sh0)),
+                    ));
+                    let p = out.add(x).cast::<__m256i>();
+                    if STREAM {
+                        _mm256_stream_si256(p, px);
+                    } else {
+                        _mm256_storeu_si256(p, px);
+                    }
+                    x += 8;
+                    bi += 1;
+                }
+            }
+            pos = bi << 3;
+        }
+        if !STREAM && x < tw {
+            decode_palette_1bpp_scalar(c0, c1, packed, pos, &mut dst[x..]);
+        }
+    }
+
+    #[target_feature(enable = "avx2")]
+    #[inline]
+    unsafe fn decode_palette_2bpp_row_impl<const STREAM: bool>(
+        lut: &[Vec4u8; 4],
+        packed: &[u8],
+        idx_pos: usize,
+        dst: &mut [MaybeUninit<Vec4u8>],
+    ) {
+        let tw = dst.len();
+        debug_assert!(
+            !STREAM
+                || ((dst.as_mut_ptr() as usize).is_multiple_of(32)
+                    && tw.is_multiple_of(16)
+                    && (idx_pos & 3) == 0)
+        );
+        let head = if STREAM {
+            0
+        } else {
+            let h = ((4 - (idx_pos & 3)) & 3).min(tw);
+            if h != 0 {
+                decode_palette_2bpp_scalar(lut, packed, idx_pos, &mut dst[..h]);
+            }
+            h
+        };
+        let mut x = head;
+        let mut pos = idx_pos + head;
+        if x + 8 <= tw {
+            debug_assert_eq!(pos & 3, 0);
+            let mut bi = pos >> 2;
+            let end16 = if STREAM { tw } else { x + ((tw - x) / 16) * 16 };
+            let end8 = x + ((tw - x) / 8) * 8;
+            // SAFETY: Caller guarantees AVX2, `packed` bounds, and 32-byte
+            // alignment on `dst` when `STREAM` is `true`.
+            unsafe {
+                // Replicating `[c0, c1, c2, c3]` into both 128-bit halves makes
+                // `vpermd` (`idx[2:0]`) wrap modulo 4 with zero `vpand` mask.
+                let lut_256 = _mm256_broadcastsi128_si256(_mm_loadu_si128(lut.as_ptr().cast()));
+                let sh0 = _mm256_setr_epi32(0, 2, 4, 6, 8, 10, 12, 14);
+                let sh1 = _mm256_setr_epi32(16, 18, 20, 22, 24, 26, 28, 30);
+                let src = packed.as_ptr();
+                let out = dst.as_mut_ptr();
+                while x < end16 {
+                    let w = _mm256_set1_epi32(u32::from_le(
+                        src.add(bi).cast::<u32>().read_unaligned(),
+                    ) as i32);
+                    let p0 = _mm256_permutevar8x32_epi32(lut_256, _mm256_srlv_epi32(w, sh0));
+                    let p1 = _mm256_permutevar8x32_epi32(lut_256, _mm256_srlv_epi32(w, sh1));
+                    let p = out.add(x).cast::<__m256i>();
+                    if STREAM {
+                        _mm256_stream_si256(p, p0);
+                        _mm256_stream_si256(p.add(1), p1);
+                    } else {
+                        _mm256_storeu_si256(p, p0);
+                        _mm256_storeu_si256(p.add(1), p1);
+                    }
+                    x += 16;
+                    bi += 4;
+                }
+                if !STREAM && x < end8 {
+                    let w = _mm256_set1_epi32(i32::from(u16::from_le(
+                        src.add(bi).cast::<u16>().read_unaligned(),
+                    )));
+                    let p0 = _mm256_permutevar8x32_epi32(lut_256, _mm256_srlv_epi32(w, sh0));
+                    let p = out.add(x).cast::<__m256i>();
+                    _mm256_storeu_si256(p, p0);
+                    x += 8;
+                    bi += 2;
+                }
+            }
+            pos = bi << 2;
+        }
+        if !STREAM && x < tw {
+            decode_palette_2bpp_scalar(lut, packed, pos, &mut dst[x..]);
+        }
+    }
+
+    #[target_feature(enable = "avx2")]
+    #[inline]
+    unsafe fn decode_palette_4bpp_row_impl<const STREAM: bool>(
+        lut: &PaletteLut4,
+        packed: &[u8],
+        idx_pos: usize,
+        dst: &mut [MaybeUninit<Vec4u8>],
+    ) {
+        let tw = dst.len();
+        debug_assert!(
+            !STREAM
+                || ((dst.as_mut_ptr() as usize).is_multiple_of(32)
+                    && tw.is_multiple_of(16)
+                    && (idx_pos & 1) == 0)
+        );
+        let head = if STREAM {
+            0
+        } else {
+            let h = (idx_pos & 1).min(tw);
+            if h != 0 {
+                decode_palette_4bpp_scalar(&lut.colors, packed, idx_pos, &mut dst[..h]);
+            }
+            h
+        };
+        let mut x = head;
+        let mut pos = idx_pos + head;
+        if x + 16 <= tw {
+            debug_assert_eq!(pos & 1, 0);
+            let mut bi = pos >> 1;
+            let end32 = x + ((tw - x) / 32) * 32;
+            let end16 = if STREAM { tw } else { x + ((tw - x) / 16) * 16 };
+            // SAFETY: Caller guarantees AVX2, `packed` bounds, and 32-byte
+            // alignment on `dst` when `STREAM` is `true`.
+            unsafe {
+                let b_lut = _mm256_broadcastsi128_si256(_mm_loadu_si128(lut.b.as_ptr().cast()));
+                let g_lut = _mm256_broadcastsi128_si256(_mm_loadu_si128(lut.g.as_ptr().cast()));
+                let r_lut = _mm256_broadcastsi128_si256(_mm_loadu_si128(lut.r.as_ptr().cast()));
+                let a_lut = _mm256_broadcastsi128_si256(_mm_loadu_si128(lut.a.as_ptr().cast()));
+                // De-interleave 16-bit pairs into even/odd halves so in-lane
+                // AVX2 `unpacklo/hi` yields `[P0..7, P8..15, P16..23, P24..31]`
+                // with zero cross-lane output shuffles.
+                let deint_w = _mm_setr_epi8(0, 1, 4, 5, 8, 9, 12, 13, 2, 3, 6, 7, 10, 11, 14, 15);
+                let mask_0f = _mm256_set1_epi8(0x0F);
+                let src = packed.as_ptr();
+                let out = dst.as_mut_ptr();
+                while x < end32 {
+                    let raw = _mm_loadu_si128(src.add(bi).cast());
+                    let grouped = _mm_shuffle_epi8(raw, deint_w);
+                    let g256 = _mm256_permute4x64_epi64::<0x10>(_mm256_zextsi128_si256(grouped));
+                    let lo = _mm256_and_si256(g256, mask_0f);
+                    let hi = _mm256_and_si256(_mm256_srli_epi16::<4>(g256), mask_0f);
+                    let idx = _mm256_unpacklo_epi8(lo, hi);
+
+                    let b = _mm256_shuffle_epi8(b_lut, idx);
+                    let g = _mm256_shuffle_epi8(g_lut, idx);
+                    let r = _mm256_shuffle_epi8(r_lut, idx);
+                    let a = _mm256_shuffle_epi8(a_lut, idx);
+
+                    let bg_lo = _mm256_unpacklo_epi8(b, g);
+                    let bg_hi = _mm256_unpackhi_epi8(b, g);
+                    let ra_lo = _mm256_unpacklo_epi8(r, a);
+                    let ra_hi = _mm256_unpackhi_epi8(r, a);
+
+                    let out0 = _mm256_unpacklo_epi16(bg_lo, ra_lo);
+                    let out1 = _mm256_unpackhi_epi16(bg_lo, ra_lo);
+                    let out2 = _mm256_unpacklo_epi16(bg_hi, ra_hi);
+                    let out3 = _mm256_unpackhi_epi16(bg_hi, ra_hi);
+
+                    let p = out.add(x).cast::<__m256i>();
+                    if STREAM {
+                        _mm256_stream_si256(p, out0);
+                        _mm256_stream_si256(p.add(1), out1);
+                        _mm256_stream_si256(p.add(2), out2);
+                        _mm256_stream_si256(p.add(3), out3);
+                    } else {
+                        _mm256_storeu_si256(p, out0);
+                        _mm256_storeu_si256(p.add(1), out1);
+                        _mm256_storeu_si256(p.add(2), out2);
+                        _mm256_storeu_si256(p.add(3), out3);
+                    }
+                    x += 32;
+                    bi += 16;
+                }
+                if x < end16 {
+                    let raw = _mm_loadl_epi64(src.add(bi).cast());
+                    let grouped = _mm_shuffle_epi8(raw, deint_w);
+                    let g256 = _mm256_permute4x64_epi64::<0x10>(_mm256_zextsi128_si256(grouped));
+                    let lo = _mm256_and_si256(g256, mask_0f);
+                    let hi = _mm256_and_si256(_mm256_srli_epi16::<4>(g256), mask_0f);
+                    let idx = _mm256_unpacklo_epi8(lo, hi);
+
+                    let b = _mm256_shuffle_epi8(b_lut, idx);
+                    let g = _mm256_shuffle_epi8(g_lut, idx);
+                    let r = _mm256_shuffle_epi8(r_lut, idx);
+                    let a = _mm256_shuffle_epi8(a_lut, idx);
+
+                    let bg_lo = _mm256_unpacklo_epi8(b, g);
+                    let ra_lo = _mm256_unpacklo_epi8(r, a);
+                    let out0 = _mm256_unpacklo_epi16(bg_lo, ra_lo);
+                    let out1 = _mm256_unpackhi_epi16(bg_lo, ra_lo);
+
+                    let p = out.add(x).cast::<__m256i>();
+                    if STREAM {
+                        _mm256_stream_si256(p, out0);
+                        _mm256_stream_si256(p.add(1), out1);
+                    } else {
+                        _mm256_storeu_si256(p, out0);
+                        _mm256_storeu_si256(p.add(1), out1);
+                    }
+                    x += 16;
+                    bi += 8;
+                }
+            }
+            pos = bi << 1;
+        }
+        if !STREAM && x < tw {
+            decode_palette_4bpp_scalar(&lut.colors, packed, pos, &mut dst[x..]);
+        }
+    }
+
+    #[target_feature(enable = "avx2")]
+    #[inline]
+    unsafe fn decode_palette_8bpp_row_impl<const STREAM: bool>(
+        lut: &[u32; MAX_PALETTE_COLORS],
+        packed_row: &[u8],
+        dst: &mut [MaybeUninit<Vec4u8>],
+    ) {
+        let tw = dst.len();
+        debug_assert_eq!(packed_row.len(), tw);
+        debug_assert!(
+            !STREAM || ((dst.as_mut_ptr() as usize).is_multiple_of(32) && tw.is_multiple_of(16))
+        );
+        let lim = if STREAM { tw } else { (tw / 8) * 8 };
+        // SAFETY: Caller guarantees AVX2, `packed_row.len() == tw`, and 32-byte
+        // alignment on `dst` when `STREAM` is `true`.
+        unsafe {
+            let src = packed_row.as_ptr();
+            let out = dst.as_mut_ptr();
+            let mut x = 0usize;
+            while x < lim {
+                let w0 = u32::from_le(src.add(x).cast::<u32>().read_unaligned());
+                let w1 = u32::from_le(src.add(x + 4).cast::<u32>().read_unaligned());
+                let v = _mm256_setr_epi32(
+                    lut[(w0 & 0xFF) as usize] as i32,
+                    lut[((w0 >> 8) & 0xFF) as usize] as i32,
+                    lut[((w0 >> 16) & 0xFF) as usize] as i32,
+                    lut[(w0 >> 24) as usize] as i32,
+                    lut[(w1 & 0xFF) as usize] as i32,
+                    lut[((w1 >> 8) & 0xFF) as usize] as i32,
+                    lut[((w1 >> 16) & 0xFF) as usize] as i32,
+                    lut[(w1 >> 24) as usize] as i32,
+                );
+                let p = out.add(x).cast::<__m256i>();
+                if STREAM {
+                    _mm256_stream_si256(p, v);
+                } else {
+                    _mm256_storeu_si256(p, v);
+                }
+                x += 8;
+            }
+        }
+        if !STREAM && lim < tw {
+            decode_palette_8bpp_scalar(lut, &packed_row[lim..], &mut dst[lim..]);
+        }
+    }
+
     #[derive(Copy, Clone)]
     pub(super) struct Kernel(());
 
@@ -2060,6 +3099,70 @@ mod avx2 {
         }
 
         #[inline(always)]
+        fn validate_palette_indices(self, n_colors: usize, packed: &[u8]) -> bool {
+            // SAFETY: `self` witnesses `avx2` support.
+            unsafe { validate_palette_indices_impl(n_colors, packed) }
+        }
+
+        #[inline(always)]
+        fn pack_palette_indices(self, indices: &[u8], n_colors: usize, packed: &mut [u8]) -> usize {
+            // SAFETY: `self` witnesses `avx2` support.
+            unsafe { pack_palette_indices_impl(indices, n_colors, packed) }
+        }
+
+        #[inline(always)]
+        unsafe fn decode_palette_1bpp_row<const STREAM: bool>(
+            self,
+            c0: Vec4u8,
+            c1: Vec4u8,
+            packed: &[u8],
+            idx_pos: usize,
+            dst: &mut [MaybeUninit<Vec4u8>],
+        ) {
+            // SAFETY: `self` witnesses `avx2` support, and caller upholds
+            // `packed` and `STREAM` alignment invariants.
+            unsafe { decode_palette_1bpp_row_impl::<STREAM>(c0, c1, packed, idx_pos, dst) }
+        }
+
+        #[inline(always)]
+        unsafe fn decode_palette_2bpp_row<const STREAM: bool>(
+            self,
+            lut: &[Vec4u8; 4],
+            packed: &[u8],
+            idx_pos: usize,
+            dst: &mut [MaybeUninit<Vec4u8>],
+        ) {
+            // SAFETY: `self` witnesses `avx2` support, and caller upholds
+            // `packed` and `STREAM` alignment invariants.
+            unsafe { decode_palette_2bpp_row_impl::<STREAM>(lut, packed, idx_pos, dst) }
+        }
+
+        #[inline(always)]
+        unsafe fn decode_palette_4bpp_row<const STREAM: bool>(
+            self,
+            lut: &PaletteLut4,
+            packed: &[u8],
+            idx_pos: usize,
+            dst: &mut [MaybeUninit<Vec4u8>],
+        ) {
+            // SAFETY: `self` witnesses `avx2` support, and caller upholds
+            // `packed` and `STREAM` alignment invariants.
+            unsafe { decode_palette_4bpp_row_impl::<STREAM>(lut, packed, idx_pos, dst) }
+        }
+
+        #[inline(always)]
+        unsafe fn decode_palette_8bpp_row<const STREAM: bool>(
+            self,
+            lut: &[u32; MAX_PALETTE_COLORS],
+            packed_row: &[u8],
+            dst: &mut [MaybeUninit<Vec4u8>],
+        ) {
+            // SAFETY: `self` witnesses `avx2` support, and caller upholds
+            // `packed_row` and `STREAM` alignment invariants.
+            unsafe { decode_palette_8bpp_row_impl::<STREAM>(lut, packed_row, dst) }
+        }
+
+        #[inline(always)]
         fn fence_stream(self) {
             // SAFETY: `_mm_sfence` is baseline SSE (mandatory on all x86_64 CPUs).
             unsafe { _mm_sfence() };
@@ -2082,30 +3185,57 @@ mod ssse3 {
     use std::arch::x86_64::_mm_add_epi64;
     use std::arch::x86_64::_mm_alignr_epi8;
     use std::arch::x86_64::_mm_and_si128;
+    use std::arch::x86_64::_mm_andnot_si128;
     use std::arch::x86_64::_mm_cmpeq_epi8;
+    use std::arch::x86_64::_mm_cmpeq_epi32;
     use std::arch::x86_64::_mm_cvtsi32_si128;
     use std::arch::x86_64::_mm_cvtsi128_si32;
+    use std::arch::x86_64::_mm_loadl_epi64;
     use std::arch::x86_64::_mm_loadu_si128;
+    use std::arch::x86_64::_mm_madd_epi16;
+    use std::arch::x86_64::_mm_maddubs_epi16;
+    use std::arch::x86_64::_mm_max_epu8;
     use std::arch::x86_64::_mm_movemask_epi8;
     use std::arch::x86_64::_mm_or_si128;
+    use std::arch::x86_64::_mm_packus_epi16;
     use std::arch::x86_64::_mm_sad_epu8;
     use std::arch::x86_64::_mm_set_epi8;
+    use std::arch::x86_64::_mm_set_epi64x;
     use std::arch::x86_64::_mm_set1_epi8;
+    use std::arch::x86_64::_mm_set1_epi16;
     use std::arch::x86_64::_mm_set1_epi32;
+    use std::arch::x86_64::_mm_setr_epi8;
+    use std::arch::x86_64::_mm_setr_epi32;
     use std::arch::x86_64::_mm_setzero_si128;
     use std::arch::x86_64::_mm_sfence;
     use std::arch::x86_64::_mm_shuffle_epi8;
+    use std::arch::x86_64::_mm_slli_epi16;
     use std::arch::x86_64::_mm_slli_si128;
+    use std::arch::x86_64::_mm_srli_epi16;
     use std::arch::x86_64::_mm_srli_si128;
     use std::arch::x86_64::_mm_storeu_si128;
     use std::arch::x86_64::_mm_stream_si128;
     use std::arch::x86_64::_mm_sub_epi8;
+    use std::arch::x86_64::_mm_subs_epu8;
+    use std::arch::x86_64::_mm_unpackhi_epi8;
+    use std::arch::x86_64::_mm_unpackhi_epi16;
+    use std::arch::x86_64::_mm_unpacklo_epi8;
+    use std::arch::x86_64::_mm_unpacklo_epi16;
     use std::arch::x86_64::_mm_xor_si128;
     use std::mem::MaybeUninit;
 
     use crate::buffer_pointer::BufferPointer;
     use crate::filtering::RowKernel;
+    use crate::filtering::palette::MAX_PALETTE_COLORS;
+    use crate::filtering::palette::PaletteLut4;
+    use crate::filtering::palette::decode_palette_1bpp_scalar;
+    use crate::filtering::palette::decode_palette_2bpp_scalar;
+    use crate::filtering::palette::decode_palette_4bpp_scalar;
+    use crate::filtering::palette::decode_palette_8bpp_scalar;
+    use crate::filtering::palette::pack_palette_indices_scalar;
+    use crate::filtering::palette::validate_palette_indices_scalar;
     use crate::filtering::tile_hash::XRGB_ALPHA_MASK_U32;
+    use crate::serialization::framing::packed_palette_indices_len;
     use crate::vec4u8::Vec4u8;
 
     #[target_feature(enable = "ssse3")]
@@ -2758,6 +3888,491 @@ mod ssse3 {
         }
     }
 
+    #[target_feature(enable = "ssse3")]
+    #[inline]
+    unsafe fn validate_palette_indices_impl(n_colors: usize, packed: &[u8]) -> bool {
+        let len = packed.len();
+        // SAFETY: Caller guarantees SSSE3 and all loads stay in `0..len`.
+        unsafe {
+            let zero = _mm_setzero_si128();
+            if n_colors == 3 {
+                let lim = (len / 16) * 16;
+                let mut acc = zero;
+                let mut i = 0usize;
+                while i < lim {
+                    let v = _mm_loadu_si128(packed.as_ptr().add(i).cast());
+                    acc = _mm_or_si128(acc, _mm_and_si128(v, _mm_srli_epi16::<1>(v)));
+                    i += 16;
+                }
+                let masked = _mm_and_si128(acc, _mm_set1_epi8(0x55));
+                if _mm_movemask_epi8(_mm_cmpeq_epi8(masked, zero)) != 0xFFFF {
+                    return false;
+                }
+                validate_palette_indices_scalar(3, &packed[lim..])
+            } else if (5..16).contains(&n_colors) {
+                let lim = (len / 16) * 16;
+                let mask_0f = _mm_set1_epi8(0x0F);
+                let mut max_lo = zero;
+                let mut max_hi = zero;
+                let mut i = 0usize;
+                while i < lim {
+                    let v = _mm_loadu_si128(packed.as_ptr().add(i).cast());
+                    max_lo = _mm_max_epu8(max_lo, _mm_and_si128(v, mask_0f));
+                    max_hi = _mm_max_epu8(max_hi, _mm_andnot_si128(mask_0f, v));
+                    i += 16;
+                }
+                let combined = _mm_max_epu8(max_lo, _mm_srli_epi16::<4>(max_hi));
+                let excess = _mm_subs_epu8(combined, _mm_set1_epi8((n_colors - 1) as i8));
+                if _mm_movemask_epi8(_mm_cmpeq_epi8(excess, zero)) != 0xFFFF {
+                    return false;
+                }
+                validate_palette_indices_scalar(n_colors, &packed[lim..])
+            } else if (17..MAX_PALETTE_COLORS).contains(&n_colors) {
+                let lim = (len / 16) * 16;
+                let mut max_v = zero;
+                let mut i = 0usize;
+                while i < lim {
+                    max_v = _mm_max_epu8(max_v, _mm_loadu_si128(packed.as_ptr().add(i).cast()));
+                    i += 16;
+                }
+                let excess = _mm_subs_epu8(max_v, _mm_set1_epi8((n_colors - 1) as i8));
+                if _mm_movemask_epi8(_mm_cmpeq_epi8(excess, zero)) != 0xFFFF {
+                    return false;
+                }
+                validate_palette_indices_scalar(n_colors, &packed[lim..])
+            } else {
+                true
+            }
+        }
+    }
+
+    #[target_feature(enable = "ssse3")]
+    #[inline]
+    unsafe fn pack_palette_indices_impl(
+        indices: &[u8],
+        n_colors: usize,
+        packed: &mut [u8],
+    ) -> usize {
+        let n = indices.len();
+        let out_len = packed_palette_indices_len(n, n_colors);
+        debug_assert!(packed.len() >= out_len);
+        if n_colors <= 1 {
+            return 0;
+        }
+        // SAFETY: Caller guarantees SSSE3 and `packed.len() >= out_len`.
+        unsafe {
+            let src = indices.as_ptr();
+            let dst = packed.as_mut_ptr();
+            if n_colors <= 2 {
+                let lim = (n / 16) * 16;
+                let mut i = 0usize;
+                let mut oi = 0usize;
+                while i < lim {
+                    let v = _mm_loadu_si128(src.add(i).cast());
+                    let mask = _mm_movemask_epi8(_mm_slli_epi16::<7>(v)) as u16;
+                    dst.add(oi).cast::<u16>().write_unaligned(mask.to_le());
+                    i += 16;
+                    oi += 2;
+                }
+                if lim < n {
+                    pack_palette_indices_scalar(&indices[lim..], 2, &mut packed[oi..]);
+                }
+            } else if n_colors <= 4 {
+                let lim = (n / 16) * 16;
+                let mask3 = _mm_set1_epi8(3);
+                let mul1 = _mm_set1_epi16(0x0401);
+                let mul2 = _mm_set1_epi32(0x0010_0001);
+                let shuf =
+                    _mm_setr_epi8(0, 4, 8, 12, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1);
+                let mut i = 0usize;
+                let mut oi = 0usize;
+                while i < lim {
+                    let v = _mm_and_si128(_mm_loadu_si128(src.add(i).cast()), mask3);
+                    let t1 = _mm_maddubs_epi16(v, mul1);
+                    let t2 = _mm_madd_epi16(t1, mul2);
+                    let pk = _mm_shuffle_epi8(t2, shuf);
+                    dst.add(oi)
+                        .cast::<u32>()
+                        .write_unaligned((_mm_cvtsi128_si32(pk) as u32).to_le());
+                    i += 16;
+                    oi += 4;
+                }
+                if lim < n {
+                    pack_palette_indices_scalar(&indices[lim..], 4, &mut packed[oi..]);
+                }
+            } else if n_colors <= 16 {
+                let lim = (n / 32) * 32;
+                let mask_0f = _mm_set1_epi8(0x0F);
+                let mul16 = _mm_set1_epi16(0x1001);
+                let mut i = 0usize;
+                let mut oi = 0usize;
+                while i < lim {
+                    let v0 = _mm_and_si128(_mm_loadu_si128(src.add(i).cast()), mask_0f);
+                    let v1 = _mm_and_si128(_mm_loadu_si128(src.add(i + 16).cast()), mask_0f);
+                    let t0 = _mm_maddubs_epi16(v0, mul16);
+                    let t1 = _mm_maddubs_epi16(v1, mul16);
+                    _mm_storeu_si128(dst.add(oi).cast(), _mm_packus_epi16(t0, t1));
+                    i += 32;
+                    oi += 16;
+                }
+                if lim < n {
+                    pack_palette_indices_scalar(&indices[lim..], 16, &mut packed[oi..]);
+                }
+            } else {
+                packed[..n].copy_from_slice(indices);
+            }
+        }
+        out_len
+    }
+
+    #[target_feature(enable = "ssse3")]
+    #[inline]
+    unsafe fn decode_palette_1bpp_row_impl<const STREAM: bool>(
+        c0: Vec4u8,
+        c1: Vec4u8,
+        packed: &[u8],
+        idx_pos: usize,
+        dst: &mut [MaybeUninit<Vec4u8>],
+    ) {
+        let tw = dst.len();
+        debug_assert!(
+            !STREAM
+                || ((dst.as_mut_ptr() as usize).is_multiple_of(16)
+                    && tw.is_multiple_of(16)
+                    && (idx_pos & 7) == 0)
+        );
+        let head = if STREAM {
+            0
+        } else {
+            let h = ((8 - (idx_pos & 7)) & 7).min(tw);
+            if h != 0 {
+                decode_palette_1bpp_scalar(c0, c1, packed, idx_pos, &mut dst[..h]);
+            }
+            h
+        };
+        let mut x = head;
+        let mut pos = idx_pos + head;
+        if x + 8 <= tw {
+            debug_assert_eq!(pos & 7, 0);
+            let mut bi = pos >> 3;
+            let end = if STREAM { tw } else { x + ((tw - x) / 8) * 8 };
+            // SAFETY: Caller guarantees SSSE3, `packed` bounds, and 16-byte
+            // alignment on `dst` when `STREAM` is `true`.
+            unsafe {
+                let vc0 = _mm_set1_epi32(u32::from_le_bytes([c0.0, c0.1, c0.2, c0.3]) as i32);
+                let vc1 = _mm_set1_epi32(u32::from_le_bytes([c1.0, c1.1, c1.2, c1.3]) as i32);
+                let xdiff = _mm_xor_si128(vc0, vc1);
+                let bits_lo = _mm_setr_epi32(1, 2, 4, 8);
+                let bits_hi = _mm_setr_epi32(16, 32, 64, 128);
+                let src = packed.as_ptr();
+                let out = dst.as_mut_ptr();
+                while x < end {
+                    let b = _mm_set1_epi32(i32::from(*src.add(bi)));
+                    let m0 = _mm_cmpeq_epi32(_mm_and_si128(b, bits_lo), bits_lo);
+                    let m1 = _mm_cmpeq_epi32(_mm_and_si128(b, bits_hi), bits_hi);
+                    let p0 = _mm_xor_si128(vc0, _mm_and_si128(m0, xdiff));
+                    let p1 = _mm_xor_si128(vc0, _mm_and_si128(m1, xdiff));
+                    let p = out.add(x).cast::<__m128i>();
+                    if STREAM {
+                        _mm_stream_si128(p, p0);
+                        _mm_stream_si128(p.add(1), p1);
+                    } else {
+                        _mm_storeu_si128(p, p0);
+                        _mm_storeu_si128(p.add(1), p1);
+                    }
+                    x += 8;
+                    bi += 1;
+                }
+            }
+            pos = bi << 3;
+        }
+        if !STREAM && x < tw {
+            decode_palette_1bpp_scalar(c0, c1, packed, pos, &mut dst[x..]);
+        }
+    }
+
+    #[target_feature(enable = "ssse3")]
+    #[inline]
+    unsafe fn store_16_indexed_bgra<const STREAM: bool>(
+        b_lut: __m128i,
+        g_lut: __m128i,
+        r_lut: __m128i,
+        a_lut: __m128i,
+        idx: __m128i,
+        out_p: *mut __m128i,
+    ) {
+        // SAFETY: Caller guarantees SSSE3, `out_p` writable for 64 bytes, and
+        // 16-byte alignment when `STREAM` is `true`.
+        unsafe {
+            let b = _mm_shuffle_epi8(b_lut, idx);
+            let g = _mm_shuffle_epi8(g_lut, idx);
+            let r = _mm_shuffle_epi8(r_lut, idx);
+            let a = _mm_shuffle_epi8(a_lut, idx);
+            let bg_lo = _mm_unpacklo_epi8(b, g);
+            let bg_hi = _mm_unpackhi_epi8(b, g);
+            let ra_lo = _mm_unpacklo_epi8(r, a);
+            let ra_hi = _mm_unpackhi_epi8(r, a);
+            let p0 = _mm_unpacklo_epi16(bg_lo, ra_lo);
+            let p1 = _mm_unpackhi_epi16(bg_lo, ra_lo);
+            let p2 = _mm_unpacklo_epi16(bg_hi, ra_hi);
+            let p3 = _mm_unpackhi_epi16(bg_hi, ra_hi);
+            if STREAM {
+                _mm_stream_si128(out_p, p0);
+                _mm_stream_si128(out_p.add(1), p1);
+                _mm_stream_si128(out_p.add(2), p2);
+                _mm_stream_si128(out_p.add(3), p3);
+            } else {
+                _mm_storeu_si128(out_p, p0);
+                _mm_storeu_si128(out_p.add(1), p1);
+                _mm_storeu_si128(out_p.add(2), p2);
+                _mm_storeu_si128(out_p.add(3), p3);
+            }
+        }
+    }
+
+    #[target_feature(enable = "ssse3")]
+    #[inline]
+    unsafe fn decode_palette_2bpp_row_impl<const STREAM: bool>(
+        lut: &[Vec4u8; 4],
+        packed: &[u8],
+        idx_pos: usize,
+        dst: &mut [MaybeUninit<Vec4u8>],
+    ) {
+        let tw = dst.len();
+        debug_assert!(
+            !STREAM
+                || ((dst.as_mut_ptr() as usize).is_multiple_of(16)
+                    && tw.is_multiple_of(16)
+                    && (idx_pos & 3) == 0)
+        );
+        let head = if STREAM {
+            0
+        } else {
+            let h = ((4 - (idx_pos & 3)) & 3).min(tw);
+            if h != 0 {
+                decode_palette_2bpp_scalar(lut, packed, idx_pos, &mut dst[..h]);
+            }
+            h
+        };
+        let mut x = head;
+        let mut pos = idx_pos + head;
+        if x + 16 <= tw {
+            debug_assert_eq!(pos & 3, 0);
+            let mut bi = pos >> 2;
+            let end = if STREAM { tw } else { x + ((tw - x) / 16) * 16 };
+            // SAFETY: Caller guarantees SSSE3, `packed` bounds, and 16-byte
+            // alignment on `dst` when `STREAM` is `true`.
+            unsafe {
+                let b_lut = _mm_setr_epi8(
+                    lut[0].0 as i8,
+                    lut[1].0 as i8,
+                    lut[2].0 as i8,
+                    lut[3].0 as i8,
+                    0,
+                    0,
+                    0,
+                    0,
+                    0,
+                    0,
+                    0,
+                    0,
+                    0,
+                    0,
+                    0,
+                    0,
+                );
+                let g_lut = _mm_setr_epi8(
+                    lut[0].1 as i8,
+                    lut[1].1 as i8,
+                    lut[2].1 as i8,
+                    lut[3].1 as i8,
+                    0,
+                    0,
+                    0,
+                    0,
+                    0,
+                    0,
+                    0,
+                    0,
+                    0,
+                    0,
+                    0,
+                    0,
+                );
+                let r_lut = _mm_setr_epi8(
+                    lut[0].2 as i8,
+                    lut[1].2 as i8,
+                    lut[2].2 as i8,
+                    lut[3].2 as i8,
+                    0,
+                    0,
+                    0,
+                    0,
+                    0,
+                    0,
+                    0,
+                    0,
+                    0,
+                    0,
+                    0,
+                    0,
+                );
+                let a_lut = _mm_setr_epi8(
+                    lut[0].3 as i8,
+                    lut[1].3 as i8,
+                    lut[2].3 as i8,
+                    lut[3].3 as i8,
+                    0,
+                    0,
+                    0,
+                    0,
+                    0,
+                    0,
+                    0,
+                    0,
+                    0,
+                    0,
+                    0,
+                    0,
+                );
+                let mask3 = _mm_set1_epi8(3);
+                let src = packed.as_ptr();
+                let out = dst.as_mut_ptr();
+                while x < end {
+                    let w = u32::from_le(src.add(bi).cast::<u32>().read_unaligned());
+                    let v = _mm_cvtsi32_si128(w as i32);
+                    let p0 = _mm_and_si128(v, mask3);
+                    let p1 = _mm_and_si128(_mm_srli_epi16::<2>(v), mask3);
+                    let p2 = _mm_and_si128(_mm_srli_epi16::<4>(v), mask3);
+                    let p3 = _mm_and_si128(_mm_srli_epi16::<6>(v), mask3);
+                    let idx =
+                        _mm_unpacklo_epi16(_mm_unpacklo_epi8(p0, p1), _mm_unpacklo_epi8(p2, p3));
+                    store_16_indexed_bgra::<STREAM>(
+                        b_lut,
+                        g_lut,
+                        r_lut,
+                        a_lut,
+                        idx,
+                        out.add(x).cast::<__m128i>(),
+                    );
+                    x += 16;
+                    bi += 4;
+                }
+            }
+            pos = bi << 2;
+        }
+        if !STREAM && x < tw {
+            decode_palette_2bpp_scalar(lut, packed, pos, &mut dst[x..]);
+        }
+    }
+
+    #[target_feature(enable = "ssse3")]
+    #[inline]
+    unsafe fn decode_palette_4bpp_row_impl<const STREAM: bool>(
+        lut: &PaletteLut4,
+        packed: &[u8],
+        idx_pos: usize,
+        dst: &mut [MaybeUninit<Vec4u8>],
+    ) {
+        let tw = dst.len();
+        debug_assert!(
+            !STREAM
+                || ((dst.as_mut_ptr() as usize).is_multiple_of(16)
+                    && tw.is_multiple_of(16)
+                    && (idx_pos & 1) == 0)
+        );
+        let head = if STREAM {
+            0
+        } else {
+            let h = (idx_pos & 1).min(tw);
+            if h != 0 {
+                decode_palette_4bpp_scalar(&lut.colors, packed, idx_pos, &mut dst[..h]);
+            }
+            h
+        };
+        let mut x = head;
+        let mut pos = idx_pos + head;
+        if x + 16 <= tw {
+            debug_assert_eq!(pos & 1, 0);
+            let mut bi = pos >> 1;
+            let end = if STREAM { tw } else { x + ((tw - x) / 16) * 16 };
+            // SAFETY: Caller guarantees SSSE3, `packed` bounds, and 16-byte
+            // alignment on `dst` when `STREAM` is `true`.
+            unsafe {
+                let b_lut = _mm_loadu_si128(lut.b.as_ptr().cast());
+                let g_lut = _mm_loadu_si128(lut.g.as_ptr().cast());
+                let r_lut = _mm_loadu_si128(lut.r.as_ptr().cast());
+                let a_lut = _mm_loadu_si128(lut.a.as_ptr().cast());
+                let mask_0f = _mm_set1_epi8(0x0F);
+                let src = packed.as_ptr();
+                let out = dst.as_mut_ptr();
+                while x < end {
+                    let raw64 = _mm_loadl_epi64(src.add(bi).cast());
+                    let lo = _mm_and_si128(raw64, mask_0f);
+                    let hi = _mm_and_si128(_mm_srli_epi16::<4>(raw64), mask_0f);
+                    let idx = _mm_unpacklo_epi8(lo, hi);
+                    store_16_indexed_bgra::<STREAM>(
+                        b_lut,
+                        g_lut,
+                        r_lut,
+                        a_lut,
+                        idx,
+                        out.add(x).cast::<__m128i>(),
+                    );
+                    x += 16;
+                    bi += 8;
+                }
+            }
+            pos = bi << 1;
+        }
+        if !STREAM && x < tw {
+            decode_palette_4bpp_scalar(&lut.colors, packed, pos, &mut dst[x..]);
+        }
+    }
+
+    #[target_feature(enable = "ssse3")]
+    #[inline]
+    unsafe fn decode_palette_8bpp_row_impl<const STREAM: bool>(
+        lut: &[u32; MAX_PALETTE_COLORS],
+        packed_row: &[u8],
+        dst: &mut [MaybeUninit<Vec4u8>],
+    ) {
+        let tw = dst.len();
+        debug_assert_eq!(packed_row.len(), tw);
+        debug_assert!(
+            !STREAM || ((dst.as_mut_ptr() as usize).is_multiple_of(16) && tw.is_multiple_of(16))
+        );
+        let lim = if STREAM { tw } else { (tw / 4) * 4 };
+        // SAFETY: Caller guarantees SSSE3, `packed_row.len() == tw`, and 16-byte
+        // alignment on `dst` when `STREAM` is `true`.
+        unsafe {
+            let src = packed_row.as_ptr();
+            let out = dst.as_mut_ptr();
+            let mut x = 0usize;
+            while x < lim {
+                let w = u32::from_le(src.add(x).cast::<u32>().read_unaligned());
+                let q0 = u64::from(lut[(w & 0xFF) as usize])
+                    | (u64::from(lut[((w >> 8) & 0xFF) as usize]) << 32);
+                let q1 = u64::from(lut[((w >> 16) & 0xFF) as usize])
+                    | (u64::from(lut[(w >> 24) as usize]) << 32);
+                if STREAM {
+                    _mm_stream_si128(
+                        out.add(x).cast::<__m128i>(),
+                        _mm_set_epi64x(q1 as i64, q0 as i64),
+                    );
+                } else {
+                    let p = out.add(x).cast::<u64>();
+                    p.write_unaligned(q0);
+                    p.add(1).write_unaligned(q1);
+                }
+                x += 4;
+            }
+        }
+        if !STREAM && lim < tw {
+            decode_palette_8bpp_scalar(lut, &packed_row[lim..], &mut dst[lim..]);
+        }
+    }
+
     #[derive(Copy, Clone)]
     pub(super) struct Kernel(());
 
@@ -2912,6 +4527,70 @@ mod ssse3 {
         }
 
         #[inline(always)]
+        fn validate_palette_indices(self, n_colors: usize, packed: &[u8]) -> bool {
+            // SAFETY: `self` witnesses `ssse3` support.
+            unsafe { validate_palette_indices_impl(n_colors, packed) }
+        }
+
+        #[inline(always)]
+        fn pack_palette_indices(self, indices: &[u8], n_colors: usize, packed: &mut [u8]) -> usize {
+            // SAFETY: `self` witnesses `ssse3` support.
+            unsafe { pack_palette_indices_impl(indices, n_colors, packed) }
+        }
+
+        #[inline(always)]
+        unsafe fn decode_palette_1bpp_row<const STREAM: bool>(
+            self,
+            c0: Vec4u8,
+            c1: Vec4u8,
+            packed: &[u8],
+            idx_pos: usize,
+            dst: &mut [MaybeUninit<Vec4u8>],
+        ) {
+            // SAFETY: `self` witnesses `ssse3` support, and caller upholds
+            // `packed` and `STREAM` alignment invariants.
+            unsafe { decode_palette_1bpp_row_impl::<STREAM>(c0, c1, packed, idx_pos, dst) }
+        }
+
+        #[inline(always)]
+        unsafe fn decode_palette_2bpp_row<const STREAM: bool>(
+            self,
+            lut: &[Vec4u8; 4],
+            packed: &[u8],
+            idx_pos: usize,
+            dst: &mut [MaybeUninit<Vec4u8>],
+        ) {
+            // SAFETY: `self` witnesses `ssse3` support, and caller upholds
+            // `packed` and `STREAM` alignment invariants.
+            unsafe { decode_palette_2bpp_row_impl::<STREAM>(lut, packed, idx_pos, dst) }
+        }
+
+        #[inline(always)]
+        unsafe fn decode_palette_4bpp_row<const STREAM: bool>(
+            self,
+            lut: &PaletteLut4,
+            packed: &[u8],
+            idx_pos: usize,
+            dst: &mut [MaybeUninit<Vec4u8>],
+        ) {
+            // SAFETY: `self` witnesses `ssse3` support, and caller upholds
+            // `packed` and `STREAM` alignment invariants.
+            unsafe { decode_palette_4bpp_row_impl::<STREAM>(lut, packed, idx_pos, dst) }
+        }
+
+        #[inline(always)]
+        unsafe fn decode_palette_8bpp_row<const STREAM: bool>(
+            self,
+            lut: &[u32; MAX_PALETTE_COLORS],
+            packed_row: &[u8],
+            dst: &mut [MaybeUninit<Vec4u8>],
+        ) {
+            // SAFETY: `self` witnesses `ssse3` support, and caller upholds
+            // `packed_row` and `STREAM` alignment invariants.
+            unsafe { decode_palette_8bpp_row_impl::<STREAM>(lut, packed_row, dst) }
+        }
+
+        #[inline(always)]
         fn fence_stream(self) {
             // SAFETY: `_mm_sfence` is baseline SSE (mandatory on all x86_64 CPUs).
             unsafe { _mm_sfence() };
@@ -2939,6 +4618,7 @@ macro_rules! define_tier_wrappers {
             use crate::filtering::ClientTileCache;
             use crate::filtering::DecodeCacheCtx;
             use crate::filtering::FrameRows;
+            use crate::filtering::RowKernel;
             use crate::filtering::ScanSubBand;
             use crate::filtering::ShadowRows;
             use crate::filtering::tile_cache::SlotScans;
@@ -2953,6 +4633,18 @@ macro_rules! define_tier_wrappers {
             use crate::sharding_compression::CompressorWorkerState;
             use crate::sharding_compression::DecompressorWorkerState;
             use crate::vec4u8::Vec4u8;
+
+            #[target_feature(enable = $feat)]
+            #[inline]
+            pub(super) unsafe fn pack_palette_indices(
+                indices: &[u8],
+                n_colors: usize,
+                packed: &mut [u8],
+            ) -> usize {
+                // SAFETY: Caller verified CPU feature support via `X86Tier::detect()`.
+                let kernel = unsafe { super::$tier_mod::Kernel::new_unchecked() };
+                kernel.pack_palette_indices(indices, n_colors, packed)
+            }
 
             #[target_feature(enable = $feat)]
             #[inline]
@@ -3339,6 +5031,51 @@ impl X86Tier {
             // `avx512bw + avx512vl + avx512vbmi`.
             Self::Avx512 => unsafe {
                 dispatch_avx512::filter_aos_zstd_leaf::<HAS_ALPHA>(aos, stride_px, rect, state)
+            },
+        }
+    }
+
+    #[inline(always)]
+    pub(super) fn pack_palette_indices(
+        self,
+        indices: &[u8],
+        n_colors: usize,
+        packed: &mut [u8],
+    ) -> usize {
+        match self {
+            #[cfg(all(
+                not(target_feature = "ssse3"),
+                not(target_feature = "avx2"),
+                not(all(
+                    target_feature = "avx512bw",
+                    target_feature = "avx512vl",
+                    target_feature = "avx512vbmi",
+                )),
+            ))]
+            Self::Scalar => ScalarKernel.pack_palette_indices(indices, n_colors, packed),
+            #[cfg(all(
+                not(target_feature = "avx2"),
+                not(all(
+                    target_feature = "avx512bw",
+                    target_feature = "avx512vl",
+                    target_feature = "avx512vbmi",
+                )),
+            ))]
+            // SAFETY: `X86Tier::Ssse3` is produced only after verifying `ssse3`.
+            Self::Ssse3 => unsafe {
+                dispatch_ssse3::pack_palette_indices(indices, n_colors, packed)
+            },
+            #[cfg(not(all(
+                target_feature = "avx512bw",
+                target_feature = "avx512vl",
+                target_feature = "avx512vbmi",
+            )))]
+            // SAFETY: `X86Tier::Avx2` is produced only after verifying `avx2`.
+            Self::Avx2 => unsafe { dispatch_avx2::pack_palette_indices(indices, n_colors, packed) },
+            // SAFETY: `X86Tier::Avx512` is produced only after verifying
+            // `avx512bw + avx512vl + avx512vbmi`.
+            Self::Avx512 => unsafe {
+                dispatch_avx512::pack_palette_indices(indices, n_colors, packed)
             },
         }
     }

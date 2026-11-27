@@ -19,8 +19,11 @@
 //! unique color so photo tiles exit within a few hundred pixels.
 
 use std::mem::MaybeUninit;
+use std::slice;
 
 use crate::buffer_pointer::BufferPointer;
+use crate::filtering::FrameRows;
+use crate::filtering::RowKernel;
 use crate::prelude::*;
 use crate::serialization::framing::SUBTILE_H;
 use crate::serialization::framing::SUBTILE_W;
@@ -29,9 +32,64 @@ use crate::serialization::framing::TileRect;
 use crate::serialization::framing::packed_palette_indices_len;
 use crate::vec4u8::Vec4u8;
 
-const MAX_PALETTE_COLORS: usize = 256;
+pub(crate) const MAX_PALETTE_COLORS: usize = 256;
 const HASH_SLOTS: usize = 512;
 const HASH_MASK: usize = HASH_SLOTS - 1;
+
+/// Precomputed 4-bpp (`5..=16`-color) lookup tables in both AoS (`[Vec4u8; 16]`,
+/// 64-byte aligned for AVX-512 `vpermd` and scalar tails) and SoA per-channel
+/// 16-byte tables (`b, g, r, a` for AVX2/SSSE3 `pshufb` and NEON `vqtbl1q_u8`).
+#[repr(align(64))]
+pub(crate) struct PaletteLut4 {
+    pub(crate) colors: [Vec4u8; 16],
+    pub(crate) b: [u8; 16],
+    pub(crate) g: [u8; 16],
+    pub(crate) r: [u8; 16],
+    pub(crate) a: [u8; 16],
+}
+
+impl PaletteLut4 {
+    #[inline]
+    pub(crate) fn from_bytes(pal_has_alpha: bool, palette_bytes: &[u8], n_colors: usize) -> Self {
+        debug_assert!((5..=16).contains(&n_colors));
+        let mut lut = Self {
+            colors: [Vec4u8(0, 0, 0, 0xFF); 16],
+            b: [0; 16],
+            g: [0; 16],
+            r: [0; 16],
+            a: [0xFF; 16],
+        };
+        if pal_has_alpha {
+            for (i, chunk) in palette_bytes
+                .as_chunks::<4>()
+                .0
+                .iter()
+                .take(n_colors)
+                .enumerate()
+            {
+                lut.colors[i] = Vec4u8(chunk[0], chunk[1], chunk[2], chunk[3]);
+                lut.b[i] = chunk[0];
+                lut.g[i] = chunk[1];
+                lut.r[i] = chunk[2];
+                lut.a[i] = chunk[3];
+            }
+        } else {
+            for (i, chunk) in palette_bytes
+                .as_chunks::<3>()
+                .0
+                .iter()
+                .take(n_colors)
+                .enumerate()
+            {
+                lut.colors[i] = Vec4u8(chunk[0], chunk[1], chunk[2], 0xFF);
+                lut.b[i] = chunk[0];
+                lut.g[i] = chunk[1];
+                lut.r[i] = chunk[2];
+            }
+        }
+        lut
+    }
+}
 
 /// Maximum pixel count of one `128x128` split quadrant (`TILE_PIXELS / 4`).
 pub(crate) const SUBTILE_PIXELS: usize = SUBTILE_W * SUBTILE_H;
@@ -175,9 +233,15 @@ fn mg_push(c: u32, c0: &mut u32, n0: &mut usize, c1: &mut u32, n1: &mut usize) {
     }
 }
 
-fn pack_indices(indices: &[u8], n_colors: usize, packed: &mut [u8]) -> usize {
+#[inline(always)]
+pub(crate) fn pack_palette_indices_scalar(
+    indices: &[u8],
+    n_colors: usize,
+    packed: &mut [u8],
+) -> usize {
     let n = indices.len();
     let out_len = packed_palette_indices_len(n, n_colors);
+    debug_assert!(packed.len() >= out_len);
     if n_colors <= 1 {
         return 0;
     } else if n_colors <= 2 {
@@ -208,6 +272,91 @@ fn pack_indices(indices: &[u8], n_colors: usize, packed: &mut [u8]) -> usize {
         packed[..n].copy_from_slice(indices);
     }
     out_len
+}
+
+#[inline(always)]
+pub(crate) fn validate_palette_indices_scalar(n_colors: usize, packed: &[u8]) -> bool {
+    if n_colors == 3 {
+        let (chunks, tail) = packed.as_chunks::<8>();
+        let mut acc = 0u64;
+        for chunk in chunks {
+            let w = u64::from_ne_bytes(*chunk);
+            acc |= w & (w >> 1);
+        }
+        if (acc & 0x5555_5555_5555_5555) != 0 {
+            return false;
+        }
+        let mut tail_acc = 0u8;
+        for &b in tail {
+            tail_acc |= b & (b >> 1);
+        }
+        (tail_acc & 0x55) == 0
+    } else if (5..16).contains(&n_colors) {
+        let max_n = n_colors as u8;
+        packed
+            .iter()
+            .all(|&b| (b & 0x0F) < max_n && (b >> 4) < max_n)
+    } else if (17..MAX_PALETTE_COLORS).contains(&n_colors) {
+        let max_n = n_colors as u8;
+        packed.iter().all(|&v| v < max_n)
+    } else {
+        true
+    }
+}
+
+#[inline(always)]
+pub(crate) fn decode_palette_1bpp_scalar(
+    c0: Vec4u8,
+    c1: Vec4u8,
+    packed: &[u8],
+    idx_pos: usize,
+    dst: &mut [MaybeUninit<Vec4u8>],
+) {
+    let lut = [c0, c1];
+    for (pos, out) in (idx_pos..).zip(dst.iter_mut()) {
+        let b = packed[pos >> 3];
+        out.write(lut[usize::from((b >> (pos & 7)) & 1)]);
+    }
+}
+
+#[inline(always)]
+pub(crate) fn decode_palette_2bpp_scalar(
+    lut: &[Vec4u8; 4],
+    packed: &[u8],
+    idx_pos: usize,
+    dst: &mut [MaybeUninit<Vec4u8>],
+) {
+    for (pos, out) in (idx_pos..).zip(dst.iter_mut()) {
+        let b = packed[pos >> 2];
+        out.write(lut[usize::from((b >> ((pos & 3) * 2)) & 3)]);
+    }
+}
+
+#[inline(always)]
+pub(crate) fn decode_palette_4bpp_scalar(
+    lut: &[Vec4u8; 16],
+    packed: &[u8],
+    idx_pos: usize,
+    dst: &mut [MaybeUninit<Vec4u8>],
+) {
+    for (pos, out) in (idx_pos..).zip(dst.iter_mut()) {
+        let b = packed[pos >> 1];
+        let v = usize::from(if (pos & 1) == 0 { b & 0x0F } else { b >> 4 });
+        out.write(lut[v]);
+    }
+}
+
+#[inline(always)]
+pub(crate) fn decode_palette_8bpp_scalar(
+    lut: &[u32; MAX_PALETTE_COLORS],
+    packed_row: &[u8],
+    dst: &mut [MaybeUninit<Vec4u8>],
+) {
+    debug_assert_eq!(packed_row.len(), dst.len());
+    for (out, &v) in dst.iter_mut().zip(packed_row) {
+        let [b, g, r, a] = lut[usize::from(v)].to_ne_bytes();
+        out.write(Vec4u8(b, g, r, a));
+    }
 }
 
 struct ColorTable {
@@ -686,7 +835,7 @@ pub(crate) struct PaletteScratch {
     pub(crate) palette: [u32; MAX_PALETTE_COLORS],
     quad_palettes: Option<Box<[[u32; MAX_PALETTE_COLORS]; 4]>>,
     indices: Vec<u8>,
-    pub(crate) packed: Vec<u8>,
+    packed: Vec<u8>,
 }
 
 /// Result of single-pass hybrid classification + palette construction for a
@@ -721,15 +870,19 @@ impl PaletteScratch {
             palette: [0; MAX_PALETTE_COLORS],
             quad_palettes: None,
             indices: vec![0; TILE_PIXELS],
-            packed: vec![0; TILE_PIXELS],
+            // 8-bpp palettes (`n_colors > 16`) are zero-copy directly from
+            // `self.indices`, so `self.packed` only ever holds `<= 4`-bpp data.
+            packed: vec![0; TILE_PIXELS / 2],
         }
     }
 
-    /// Scans `rect` in `aos` (stride `stride_px` pixels). Returns
-    /// `Ok((n_colors, packed_len))` if the tile contains at most 256 unique
-    /// colors, populating `self.palette[..n_colors]` and
-    /// `self.packed[..packed_len]`. Returns `Err(overflow_ry)` immediately upon
-    /// seeing a 257th unique color on row `overflow_ry`.
+    /// Scans `rect` in `aos` (stride `stride_px` pixels). Returns `Ok(n_colors)`
+    /// if the tile contains at most 256 unique colors, populating
+    /// `self.palette[..n_colors]` and `self.indices[..tw * th]`. Callers then
+    /// invoke [`Self::pack_indices_range`] (a no-op for 8-bpp `17..=256`) and
+    /// read wire-ready bytes via [`Self::packed_indices`]. Returns
+    /// `Err(overflow_ry)` immediately upon seeing a 257th unique color on row
+    /// `overflow_ry`.
     ///
     /// Reads directly from `BufferPointer` without creating a shared `&[u8]`
     /// slice over client shm memory.
@@ -739,7 +892,7 @@ impl PaletteScratch {
         aos: BufferPointer<Vec4u8>,
         stride_px: usize,
         rect: TileRect,
-    ) -> std::result::Result<(usize, usize), usize> {
+    ) -> std::result::Result<usize, usize> {
         let x0 = rect.x as usize;
         let y0 = rect.y as usize;
         let tw = rect.w as usize;
@@ -750,9 +903,10 @@ impl PaletteScratch {
         let cur_epoch = self.table.next_epoch();
         let alpha_or = if HAS_ALPHA { 0u32 } else { 0xFF00_0000u32 };
 
-        debug_assert!(y0 * stride_px + x0 + tw <= aos.len());
+        debug_assert!((y0 + th - 1) * stride_px + x0 + tw <= aos.len());
         // SAFETY: Caller guarantees `rect` is non-empty and inside `aos`.
-        let first_c = unsafe { load_pixel_le(aos.ptr().add(y0 * stride_px + x0), 0) } | alpha_or;
+        let mut row_ptr = unsafe { aos.ptr().add(y0 * stride_px + x0) };
+        let first_c = unsafe { load_pixel_le(row_ptr, 0) } | alpha_or;
         let h0 = (first_c.wrapping_mul(0x9E37_79B1) >> 23) as usize & HASH_MASK;
         self.table.gens[h0] = cur_epoch;
         self.table.keys[h0] = first_c;
@@ -762,13 +916,9 @@ impl PaletteScratch {
         let mut count = 1usize;
         let mut last_color = first_c;
         let mut last_idx = 0u8;
+        let indices = &mut self.indices[..n_px];
 
-        for ry in 0..th {
-            let row_start = (y0 + ry) * stride_px + x0;
-            debug_assert!(row_start + tw <= aos.len());
-            // SAFETY: Caller guarantees `rect` is inside `aos` (`(y0 + ry) * stride_px + x0 + tw <= aos.len()`).
-            let row_ptr = unsafe { aos.ptr().add(row_start) };
-            let row_out = &mut self.indices[ry * tw..(ry + 1) * tw];
+        for (ry, row_out) in indices.chunks_exact_mut(tw).enumerate() {
             let mut x = 0usize;
             while x < tw {
                 // SAFETY: `x < tw` and `row_ptr` is valid for `tw` `Vec4u8` reads.
@@ -819,13 +969,13 @@ impl PaletteScratch {
                 }
                 x += 1;
             }
+            if ry + 1 < th {
+                // SAFETY: Caller guarantees all `th` rows of `rect` lie inside `aos`.
+                row_ptr = unsafe { row_ptr.add(stride_px) };
+            }
         }
 
-        if count == 1 {
-            return Ok((1, 0));
-        }
-        let packed_len = pack_indices(&self.indices[..n_px], count, &mut self.packed);
-        Ok((count, packed_len))
+        Ok(count)
     }
 
     /// Single-pass hybrid classification + palette construction for a
@@ -887,31 +1037,51 @@ impl PaletteScratch {
             .expect("quad_palettes initialized by scan_hybrid_quadrant")[q]
     }
 
-    /// Packs `self.indices[start..start + n_px]` into `self.packed` for a
-    /// `n_colors`-entry palette (`2..=256`), returning the packed byte length.
+    /// Packs `self.indices[start..start + n_px]` into `self.packed` for
+    /// 1/2/4-bpp palettes (`2..=16` colors); 8-bpp palettes (`17..=256`) are
+    /// zero-copy and read directly from `self.indices` via
+    /// [`Self::packed_indices`].
     #[inline]
-    pub(crate) fn pack_indices_range(
+    pub(super) fn pack_indices_range(
         &mut self,
+        tier: super::arch::Tier,
         start: usize,
         n_px: usize,
         n_colors: usize,
-    ) -> usize {
-        pack_indices(
-            &self.indices[start..start + n_px],
-            n_colors,
-            &mut self.packed,
-        )
+    ) {
+        if (2..=16).contains(&n_colors) {
+            tier.pack_palette_indices(
+                &self.indices[start..start + n_px],
+                n_colors,
+                &mut self.packed,
+            );
+        }
+    }
+
+    /// Returns the bitpacked index bytes for `n_px` pixels starting at
+    /// `self.indices[start..]` with `n_colors` palette entries: zero-copy
+    /// directly into `self.indices` for 8-bpp (`n_colors > 16`), or into
+    /// `self.packed` for 1/2/4-bpp (`2..=16`).
+    #[inline]
+    pub(crate) fn packed_indices(&self, start: usize, n_px: usize, n_colors: usize) -> &[u8] {
+        if n_colors <= 1 {
+            &[]
+        } else if n_colors > 16 {
+            &self.indices[start..start + n_px]
+        } else {
+            &self.packed[..packed_palette_indices_len(n_px, n_colors)]
+        }
     }
 }
 
-/// Validates `palette_bytes` and `packed`, returning the `[Vec4u8; 256]` lookup
-/// table and active color count `n_colors` (`2..=256`).
-pub(crate) fn prepare_palette_lut(
+/// Validates the palette table header (`palette_bytes` length and color count
+/// `2..=256`), returning `(n_colors, expected_packed_len)` for `n_pixels`.
+#[inline]
+pub(crate) fn parse_palette_header(
     pal_has_alpha: bool,
     palette_bytes: &[u8],
-    packed: &[u8],
     n_pixels: usize,
-) -> Result<([Vec4u8; MAX_PALETTE_COLORS], usize)> {
+) -> Result<(usize, usize)> {
     let entry_bytes = if pal_has_alpha { 4 } else { 3 };
     if !palette_bytes.len().is_multiple_of(entry_bytes) {
         bail!(
@@ -923,6 +1093,19 @@ pub(crate) fn prepare_palette_lut(
     if !(2..=MAX_PALETTE_COLORS).contains(&n_colors) {
         bail!("invalid palette color count {n_colors}");
     }
+    Ok((n_colors, packed_palette_indices_len(n_pixels, n_colors)))
+}
+
+/// Validates `packed.len()`, canonical zero trailing padding bits, and that
+/// every active palette index is `< n_colors` (using `kernel` SIMD for
+/// non-power-of-two palette counts `3`, `5..=15`, and `17..=255`).
+#[inline(always)]
+pub(crate) fn validate_palette_packed<K: RowKernel>(
+    kernel: K,
+    n_colors: usize,
+    packed: &[u8],
+    n_pixels: usize,
+) -> Result<()> {
     let expected_len = packed_palette_indices_len(n_pixels, n_colors);
     if packed.len() != expected_len {
         bail!(
@@ -930,9 +1113,6 @@ pub(crate) fn prepare_palette_lut(
             packed.len()
         );
     }
-
-    // Validate canonical zero padding bits in the trailing byte and out-of-range
-    // 8-bpp indices up front so row decoding needs no bounds checks on 8 bpp.
     if n_colors <= 2 {
         let rem = n_pixels & 7;
         if rem != 0 && (packed[n_pixels >> 3] >> rem) != 0 {
@@ -943,36 +1123,223 @@ pub(crate) fn prepare_palette_lut(
         if rem != 0 && (packed[n_pixels >> 2] >> (rem * 2)) != 0 {
             bail!("non-zero trailing bits in 2-bpp palette stream");
         }
+        if n_colors == 3 && !kernel.validate_palette_indices(n_colors, packed) {
+            bail!("palette index out of range for {n_colors}-color palette");
+        }
     } else if n_colors <= 16 {
         if (n_pixels & 1) != 0 && (packed[n_pixels >> 1] >> 4) != 0 {
             bail!("non-zero trailing bits in 4-bpp palette stream");
         }
-    } else if n_colors < MAX_PALETTE_COLORS && packed.iter().any(|&v| usize::from(v) >= n_colors) {
+        if n_colors < 16 && !kernel.validate_palette_indices(n_colors, packed) {
+            bail!("palette index out of range for {n_colors}-color palette");
+        }
+    } else if n_colors < MAX_PALETTE_COLORS && !kernel.validate_palette_indices(n_colors, packed) {
         bail!("palette index out of range for {n_colors}-color palette");
     }
+    Ok(())
+}
 
-    let mut lut = [Vec4u8(0, 0, 0, 0xFF); MAX_PALETTE_COLORS];
+#[inline(always)]
+fn read_palette_entry(pal_has_alpha: bool, palette_bytes: &[u8], idx: usize) -> Vec4u8 {
+    if pal_has_alpha {
+        let o = idx * 4;
+        Vec4u8(
+            palette_bytes[o],
+            palette_bytes[o + 1],
+            palette_bytes[o + 2],
+            palette_bytes[o + 3],
+        )
+    } else {
+        let o = idx * 3;
+        Vec4u8(
+            palette_bytes[o],
+            palette_bytes[o + 1],
+            palette_bytes[o + 2],
+            0xFF,
+        )
+    }
+}
+
+#[inline(always)]
+fn build_palette_lut8(
+    pal_has_alpha: bool,
+    palette_bytes: &[u8],
+    n_colors: usize,
+) -> [u32; MAX_PALETTE_COLORS] {
+    let mut lut = [0u32; MAX_PALETTE_COLORS];
     if pal_has_alpha {
         for (dst, chunk) in lut[..n_colors]
             .iter_mut()
             .zip(palette_bytes.as_chunks::<4>().0)
         {
-            *dst = Vec4u8(chunk[0], chunk[1], chunk[2], chunk[3]);
+            *dst = u32::from_ne_bytes(*chunk);
         }
     } else {
         for (dst, chunk) in lut[..n_colors]
             .iter_mut()
             .zip(palette_bytes.as_chunks::<3>().0)
         {
-            *dst = Vec4u8(chunk[0], chunk[1], chunk[2], 0xFF);
+            *dst = u32::from_ne_bytes([chunk[0], chunk[1], chunk[2], 0xFF]);
         }
     }
+    lut
+}
 
+/// Validates all palette indices up front (leaving `frame` untouched on error)
+/// and decodes the `tw x th` palette tile into `frame` at `(x0, y0)` via
+/// `kernel`, using non-temporal streaming stores when `allow_stream` is `true`
+/// and every row is aligned to `K::STREAM_ALIGN` with `tw % 16 == 0`.
+///
+/// Returns `Ok(streamed)` where `streamed` is `true` iff non-temporal stores
+/// were issued (caller must call `kernel.fence_stream()`).
+///
+/// # Safety
+/// `(x0, y0, tw, th)` must be non-empty (`tw > 0 && th > 0`), validated
+/// in-bounds within `frame`, and disjoint from all other tiles being decoded
+/// concurrently. `palette_bytes` and `n_colors` must have been validated by
+/// [`parse_palette_header`].
+#[inline(always)]
+pub(crate) unsafe fn decode_palette_tile<K: RowKernel>(
+    kernel: K,
+    pal_has_alpha: bool,
+    palette_bytes: &[u8],
+    n_colors: usize,
+    packed: &[u8],
+    frame: &FrameRows,
+    x0: usize,
+    y0: usize,
+    tw: usize,
+    th: usize,
+    allow_stream: bool,
+) -> Result<bool> {
+    let n_px = tw * th;
+    validate_palette_packed(kernel, n_colors, packed, n_px).location(loc!())?;
+
+    // SAFETY: Caller guarantees `th > 0` and `(x0, y0, tw, th)` is in-bounds.
+    let stream_rows = allow_stream
+        && K::STREAM_ALIGN > 1
+        && tw.is_multiple_of(16)
+        && (unsafe { frame.row_ptr(y0, x0) } as usize).is_multiple_of(K::STREAM_ALIGN)
+        && (frame.stride_px * 4).is_multiple_of(K::STREAM_ALIGN);
+
+    let mut idx_pos = 0usize;
+    if n_colors <= 2 {
+        let c0 = read_palette_entry(pal_has_alpha, palette_bytes, 0);
+        let c1 = read_palette_entry(pal_has_alpha, palette_bytes, 1);
+        if stream_rows {
+            for ry in 0..th {
+                // SAFETY: Caller guarantees `(x0, y0, tw, th)` is in-bounds and disjoint;
+                // `stream_rows` verified `STREAM_ALIGN`, `tw % 16 == 0`, and `idx_pos % 8 == 0`.
+                let dst_row = unsafe { slice::from_raw_parts_mut(frame.row_ptr(y0 + ry, x0), tw) };
+                unsafe { kernel.decode_palette_1bpp_row::<true>(c0, c1, packed, idx_pos, dst_row) };
+                idx_pos += tw;
+            }
+        } else {
+            for ry in 0..th {
+                // SAFETY: Caller guarantees `(x0, y0, tw, th)` is in-bounds and disjoint.
+                let dst_row = unsafe { slice::from_raw_parts_mut(frame.row_ptr(y0 + ry, x0), tw) };
+                unsafe {
+                    kernel.decode_palette_1bpp_row::<false>(c0, c1, packed, idx_pos, dst_row);
+                }
+                idx_pos += tw;
+            }
+        }
+    } else if n_colors <= 4 {
+        let mut lut = [Vec4u8(0, 0, 0, 0xFF); 4];
+        for (i, slot) in lut[..n_colors].iter_mut().enumerate() {
+            *slot = read_palette_entry(pal_has_alpha, palette_bytes, i);
+        }
+        if stream_rows {
+            for ry in 0..th {
+                // SAFETY: Caller guarantees `(x0, y0, tw, th)` is in-bounds and disjoint;
+                // `stream_rows` verified `STREAM_ALIGN`, `tw % 16 == 0`, and `idx_pos % 4 == 0`.
+                let dst_row = unsafe { slice::from_raw_parts_mut(frame.row_ptr(y0 + ry, x0), tw) };
+                unsafe { kernel.decode_palette_2bpp_row::<true>(&lut, packed, idx_pos, dst_row) };
+                idx_pos += tw;
+            }
+        } else {
+            for ry in 0..th {
+                // SAFETY: Caller guarantees `(x0, y0, tw, th)` is in-bounds and disjoint.
+                let dst_row = unsafe { slice::from_raw_parts_mut(frame.row_ptr(y0 + ry, x0), tw) };
+                unsafe { kernel.decode_palette_2bpp_row::<false>(&lut, packed, idx_pos, dst_row) };
+                idx_pos += tw;
+            }
+        }
+    } else if n_colors <= 16 {
+        let lut = PaletteLut4::from_bytes(pal_has_alpha, palette_bytes, n_colors);
+        if stream_rows {
+            for ry in 0..th {
+                // SAFETY: Caller guarantees `(x0, y0, tw, th)` is in-bounds and disjoint;
+                // `stream_rows` verified `STREAM_ALIGN`, `tw % 16 == 0`, and `idx_pos % 2 == 0`.
+                let dst_row = unsafe { slice::from_raw_parts_mut(frame.row_ptr(y0 + ry, x0), tw) };
+                unsafe { kernel.decode_palette_4bpp_row::<true>(&lut, packed, idx_pos, dst_row) };
+                idx_pos += tw;
+            }
+        } else {
+            for ry in 0..th {
+                // SAFETY: Caller guarantees `(x0, y0, tw, th)` is in-bounds and disjoint.
+                let dst_row = unsafe { slice::from_raw_parts_mut(frame.row_ptr(y0 + ry, x0), tw) };
+                unsafe { kernel.decode_palette_4bpp_row::<false>(&lut, packed, idx_pos, dst_row) };
+                idx_pos += tw;
+            }
+        }
+    } else {
+        let lut = build_palette_lut8(pal_has_alpha, palette_bytes, n_colors);
+        if stream_rows {
+            for ry in 0..th {
+                // SAFETY: Caller guarantees `(x0, y0, tw, th)` is in-bounds and disjoint;
+                // `stream_rows` verified `STREAM_ALIGN` and `tw % 16 == 0`.
+                let dst_row = unsafe { slice::from_raw_parts_mut(frame.row_ptr(y0 + ry, x0), tw) };
+                unsafe {
+                    kernel.decode_palette_8bpp_row::<true>(
+                        &lut,
+                        &packed[idx_pos..idx_pos + tw],
+                        dst_row,
+                    );
+                }
+                idx_pos += tw;
+            }
+        } else {
+            for ry in 0..th {
+                // SAFETY: Caller guarantees `(x0, y0, tw, th)` is in-bounds and disjoint.
+                let dst_row = unsafe { slice::from_raw_parts_mut(frame.row_ptr(y0 + ry, x0), tw) };
+                unsafe {
+                    kernel.decode_palette_8bpp_row::<false>(
+                        &lut,
+                        &packed[idx_pos..idx_pos + tw],
+                        dst_row,
+                    );
+                }
+                idx_pos += tw;
+            }
+        }
+    }
+    Ok(stream_rows)
+}
+
+/// Validates `palette_bytes` and `packed` up front (including all active 2/4/8-bpp
+/// indices via `kernel`), returning the `[Vec4u8; 256]` lookup table and active
+/// color count `n_colors` (`2..=256`).
+#[cfg(test)]
+pub(crate) fn prepare_palette_lut<K: RowKernel>(
+    kernel: K,
+    pal_has_alpha: bool,
+    palette_bytes: &[u8],
+    packed: &[u8],
+    n_pixels: usize,
+) -> Result<([Vec4u8; MAX_PALETTE_COLORS], usize)> {
+    let (n_colors, _) = parse_palette_header(pal_has_alpha, palette_bytes, n_pixels)?;
+    validate_palette_packed(kernel, n_colors, packed, n_pixels)?;
+    let mut lut = [Vec4u8(0, 0, 0, 0xFF); MAX_PALETTE_COLORS];
+    for (i, slot) in lut[..n_colors].iter_mut().enumerate() {
+        *slot = read_palette_entry(pal_has_alpha, palette_bytes, i);
+    }
     Ok((lut, n_colors))
 }
 
-/// Decodes one row (`dst_row.len()` pixels) from `packed` starting at pixel
-/// offset `*idx_pos`, advancing `*idx_pos` by `dst_row.len()`.
+/// Infallibly decodes one validated row (`dst_row.len()` pixels) from `packed`
+/// starting at pixel offset `*idx_pos`, advancing `*idx_pos` by `dst_row.len()`.
+#[cfg(test)]
 #[inline]
 pub(crate) fn decode_palette_row(
     lut: &[Vec4u8; MAX_PALETTE_COLORS],
@@ -980,50 +1347,34 @@ pub(crate) fn decode_palette_row(
     packed: &[u8],
     idx_pos: &mut usize,
     dst_row: &mut [MaybeUninit<Vec4u8>],
-) -> Result<()> {
-    let mut pos = *idx_pos;
+) {
+    let pos = *idx_pos;
     if n_colors <= 2 {
-        for dst in dst_row.iter_mut() {
-            let b = packed[pos >> 3];
-            dst.write(lut[usize::from((b >> (pos & 7)) & 1)]);
-            pos += 1;
-        }
+        decode_palette_1bpp_scalar(lut[0], lut[1], packed, pos, dst_row);
     } else if n_colors <= 4 {
-        for dst in dst_row.iter_mut() {
-            let b = packed[pos >> 2];
-            let v = usize::from((b >> ((pos & 3) * 2)) & 3);
-            if v >= n_colors {
-                bail!("2-bpp palette index {v} >= {n_colors}");
-            }
-            dst.write(lut[v]);
-            pos += 1;
-        }
+        let lut2: [Vec4u8; 4] = lut[..4].try_into().unwrap();
+        decode_palette_2bpp_scalar(&lut2, packed, pos, dst_row);
     } else if n_colors <= 16 {
-        for dst in dst_row.iter_mut() {
-            let b = packed[pos >> 1];
-            let v = usize::from(if (pos & 1) == 0 { b & 0x0F } else { b >> 4 });
-            if v >= n_colors {
-                bail!("4-bpp palette index {v} >= {n_colors}");
-            }
-            dst.write(lut[v]);
-            pos += 1;
-        }
+        let lut4: [Vec4u8; 16] = lut[..16].try_into().unwrap();
+        decode_palette_4bpp_scalar(&lut4, packed, pos, dst_row);
     } else {
-        let prow = &packed[pos..pos + dst_row.len()];
-        for (dst, &v) in dst_row.iter_mut().zip(prow) {
-            dst.write(lut[usize::from(v)]);
+        let mut lut8 = [0u32; MAX_PALETTE_COLORS];
+        for (dst, &px) in lut8.iter_mut().zip(lut.iter()) {
+            *dst = u32::from_ne_bytes([px.0, px.1, px.2, px.3]);
         }
-        pos += dst_row.len();
+        decode_palette_8bpp_scalar(&lut8, &packed[pos..pos + dst_row.len()], dst_row);
     }
-    *idx_pos = pos;
-    Ok(())
+    *idx_pos = pos + dst_row.len();
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::filtering::ScalarKernel;
+    use crate::filtering::arch::Tier;
 
     fn encode_decode_palette_case(
+        tier: Tier,
         colors: &[Vec4u8],
         has_alpha: bool,
         tw: usize,
@@ -1053,13 +1404,16 @@ mod tests {
         } else {
             scratch.try_encode_2d::<false>(bp, stride_px, rect)
         };
-        let (n_colors, packed_len) = res.unwrap();
+        let n_colors = res.unwrap();
         assert_eq!(n_colors, colors.len());
+        scratch.pack_indices_range(tier, 0, tw * th, n_colors);
 
+        let packed = scratch.packed_indices(0, tw * th, n_colors);
         if n_colors == 1 {
-            assert_eq!(packed_len, 0);
+            assert!(packed.is_empty());
             return;
         }
+        assert_eq!(packed.len(), packed_palette_indices_len(tw * th, n_colors));
 
         let pal_has_alpha = has_alpha
             && scratch.palette[..n_colors]
@@ -1070,20 +1424,20 @@ mod tests {
             let b = c.to_le_bytes();
             pal_bytes.extend_from_slice(if pal_has_alpha { &b[..] } else { &b[..3] });
         }
-        let packed = &scratch.packed[..packed_len];
-        let (lut, dec_n) = prepare_palette_lut(pal_has_alpha, &pal_bytes, packed, tw * th).unwrap();
+        let (lut, dec_n) =
+            prepare_palette_lut(ScalarKernel, pal_has_alpha, &pal_bytes, packed, tw * th).unwrap();
         assert_eq!(dec_n, n_colors);
 
         let mut idx_pos = 0;
         let mut out_row = vec![MaybeUninit::uninit(); tw];
         for ry in 0..th {
-            decode_palette_row(&lut, dec_n, packed, &mut idx_pos, &mut out_row).unwrap();
+            decode_palette_row(&lut, dec_n, packed, &mut idx_pos, &mut out_row);
             for rx in 0..tw {
                 let mut exp = frame[(y0 + ry) * stride_px + x0 + rx];
                 if !has_alpha {
                     exp.3 = 0xFF;
                 }
-                // SAFETY: `decode_palette_row` initializes every element on `Ok`.
+                // SAFETY: `decode_palette_row` initializes every element.
                 assert_eq!(unsafe { out_row[rx].assume_init() }, exp);
             }
         }
@@ -1091,23 +1445,27 @@ mod tests {
 
     #[test]
     fn test_palette_1_2_4_8_bpp_and_overflow_bailout() {
-        // Test exact boundary color counts: 1, 2 (1bpp), 3, 4 (2bpp), 5, 16 (4bpp), 17, 256 (8bpp),
-        // with non-power-of-two odd pixel counts to exercise partial trailing bytes.
-        for n in [1usize, 2, 3, 4, 5, 16, 17, 256] {
-            let colors: Vec<Vec4u8> = (0..n)
-                .map(|i| Vec4u8(i as u8, (i * 3) as u8, (i * 7) as u8, 0xFF))
-                .collect();
-            encode_decode_palette_case(&colors, false, 19, 17, 24);
-            encode_decode_palette_case(&colors, true, 19, 17, 24);
-        }
+        // Test exact boundary color counts: 1, 2 (1bpp), 3, 4 (2bpp), 5, 15, 16 (4bpp),
+        // 17, 128, 255, 256 (8bpp), with odd and SIMD-crossing dimensions across all
+        // supported tiers.
+        for tier in Tier::supported_tiers() {
+            for n in [1usize, 2, 3, 4, 5, 15, 16, 17, 128, 255, 256] {
+                let colors: Vec<Vec4u8> = (0..n)
+                    .map(|i| Vec4u8(i as u8, (i * 3) as u8, (i * 7) as u8, 0xFF))
+                    .collect();
+                encode_decode_palette_case(tier, &colors, false, 19, 17, 24);
+                encode_decode_palette_case(tier, &colors, true, 19, 17, 24);
+                encode_decode_palette_case(tier, &colors, false, 65, 5, 72);
+            }
 
-        // Translucent palette entries (same RGB, different alpha).
-        let trans_colors = vec![
-            Vec4u8(10, 20, 30, 0x10),
-            Vec4u8(10, 20, 30, 0x80),
-            Vec4u8(10, 20, 30, 0xFF),
-        ];
-        encode_decode_palette_case(&trans_colors, true, 7, 5, 12);
+            // Translucent palette entries (same RGB, different alpha).
+            let trans_colors = vec![
+                Vec4u8(10, 20, 30, 0x10),
+                Vec4u8(10, 20, 30, 0x80),
+                Vec4u8(10, 20, 30, 0xFF),
+            ];
+            encode_decode_palette_case(tier, &trans_colors, true, 7, 5, 12);
+        }
 
         // 257 unique colors must return Err(overflow_ry) (early bailout).
         let pixels: Vec<Vec4u8> = (0..257u32)
@@ -1154,31 +1512,92 @@ mod tests {
 
     #[test]
     fn test_palette_decode_rejects_malformed_inputs() {
-        // Out-of-range 2-bpp index (3 for a 3-color palette).
+        // Out-of-range 2-bpp index (3 for a 3-color palette) caught up front in
+        // `prepare_palette_lut` across start, mid-SIMD-chunk, and tail offsets.
         let pal3 = vec![1, 2, 3, 4, 5, 6, 7, 8, 9];
-        let (lut3, n3) = prepare_palette_lut(false, &pal3, &[0b11], 1).unwrap();
-        let mut row = [MaybeUninit::uninit(); 1];
-        assert!(decode_palette_row(&lut3, n3, &[0b11], &mut 0, &mut row).is_err());
+        assert!(prepare_palette_lut(ScalarKernel, false, &pal3, &[0b11], 1).is_err());
+        for bad_byte in [0, 31, 63, 64, 129] {
+            for shift in [0u8, 2, 4, 6] {
+                let mut packed = vec![0b10_01_00_10u8; 130]; // valid 0/1/2 lanes only
+                packed[bad_byte] |= 0b11 << shift;
+                assert!(
+                    prepare_palette_lut(ScalarKernel, false, &pal3, &packed, 130 * 4).is_err(),
+                    "expected OOB 2-bpp rejection at byte={bad_byte} shift={shift}"
+                );
+            }
+        }
 
-        // Out-of-range 4-bpp index (10 for a 5-color palette).
+        // Out-of-range 4-bpp index (`>= n_colors` in lo or hi nibble) caught up front.
         let pal5 = vec![0u8; 5 * 3];
-        let (lut5, n5) = prepare_palette_lut(false, &pal5, &[0x0A], 1).unwrap();
-        assert!(decode_palette_row(&lut5, n5, &[0x0A], &mut 0, &mut row).is_err());
+        assert!(prepare_palette_lut(ScalarKernel, false, &pal5, &[0x0A], 1).is_err());
+        for bad_byte in [0, 31, 63, 64, 129] {
+            for bad_val in [0x05u8, 0x50u8, 0x0Fu8, 0xF0u8] {
+                let mut packed = vec![0x43u8; 130]; // valid 3/4 nibbles
+                packed[bad_byte] = bad_val;
+                assert!(
+                    prepare_palette_lut(ScalarKernel, false, &pal5, &packed, 130 * 2).is_err(),
+                    "expected OOB 4-bpp rejection at byte={bad_byte} val={bad_val:#x}"
+                );
+            }
+        }
 
-        // Out-of-range 8-bpp index (17 for a 17-color palette) caught in prepare_palette_lut.
+        // Out-of-range 8-bpp index (`>= n_colors`) caught up front across start/mid/tail.
         let pal17 = vec![0u8; 17 * 3];
-        assert!(prepare_palette_lut(false, &pal17, &[17], 1).is_err());
+        assert!(prepare_palette_lut(ScalarKernel, false, &pal17, &[17], 1).is_err());
+        for bad_byte in [0, 31, 63, 64, 127, 128, 131] {
+            let mut packed = vec![16u8; 132];
+            packed[bad_byte] = 17;
+            assert!(
+                prepare_palette_lut(ScalarKernel, false, &pal17, &packed, 132).is_err(),
+                "expected OOB 8-bpp rejection at byte={bad_byte}"
+            );
+        }
 
         // Non-zero trailing padding bits on 1/2/4-bpp.
         let pal2 = vec![0u8; 2 * 3];
-        assert!(prepare_palette_lut(false, &pal2, &[0b0000_0010], 1).is_err());
-        assert!(prepare_palette_lut(false, &pal3, &[0b0000_0100], 1).is_err());
-        assert!(prepare_palette_lut(false, &pal5, &[0x10], 1).is_err());
+        assert!(prepare_palette_lut(ScalarKernel, false, &pal2, &[0b0000_0010], 1).is_err());
+        assert!(prepare_palette_lut(ScalarKernel, false, &pal3, &[0b0000_0100], 1).is_err());
+        assert!(prepare_palette_lut(ScalarKernel, false, &pal5, &[0x10], 1).is_err());
 
-        // Invalid palette byte length / color count / packed length.
-        assert!(prepare_palette_lut(false, &[0, 1], &[0], 1).is_err());
-        assert!(prepare_palette_lut(false, &[0, 1, 2], &[], 1).is_err());
-        assert!(prepare_palette_lut(false, &pal2, &[0, 0], 1).is_err());
+        // Invalid palette byte length / color count (0, 1, 257) / packed length.
+        assert!(prepare_palette_lut(ScalarKernel, false, &[], &[], 1).is_err());
+        assert!(prepare_palette_lut(ScalarKernel, false, &[0, 1], &[0], 1).is_err());
+        assert!(prepare_palette_lut(ScalarKernel, false, &[0, 1, 2], &[], 1).is_err());
+        let pal257 = vec![0u8; 257 * 3];
+        assert!(prepare_palette_lut(ScalarKernel, false, &pal257, &[0], 1).is_err());
+        assert!(prepare_palette_lut(ScalarKernel, false, &pal2, &[0, 0], 1).is_err());
+
+        // Verify OOB index leaves destination frame untouched (zero partial corruption).
+        let sentinel = Vec4u8(0xDE, 0xAD, 0xBE, 0xEF);
+        let mut canvas = vec![MaybeUninit::new(sentinel); 16 * 4];
+        let frame = FrameRows {
+            base: canvas.as_mut_ptr(),
+            stride_px: 16,
+        };
+        let mut bad_2bpp = vec![0u8; 16]; // 64 pixels
+        bad_2bpp[15] = 0b1100_0000; // last pixel OOB for 3-color palette
+        assert!(
+            unsafe {
+                decode_palette_tile(
+                    ScalarKernel,
+                    false,
+                    &pal3,
+                    3,
+                    &bad_2bpp,
+                    &frame,
+                    0,
+                    0,
+                    16,
+                    4,
+                    false,
+                )
+            }
+            .is_err()
+        );
+        for slot in &canvas {
+            // SAFETY: Every element was initialized to `sentinel`.
+            assert_eq!(unsafe { slot.assume_init() }, sentinel);
+        }
     }
 
     fn oracle_is_text_safe(frame: &[Vec4u8], stride_px: usize, rect: TileRect) -> bool {
@@ -1208,12 +1627,16 @@ mod tests {
         let ptr = frame.as_ptr();
         let bp = unsafe { BufferPointer::new(&ptr, frame.len()) };
         let exp_text_safe = oracle_is_text_safe(frame, stride_px, rect);
+        let tier = Tier::detect();
         let mut ref_scratch = PaletteScratch::new();
         let ref_pal = if track_alpha {
             ref_scratch.try_encode_2d::<true>(bp, stride_px, rect)
         } else {
             ref_scratch.try_encode_2d::<false>(bp, stride_px, rect)
         };
+        if let Ok(ref_n) = ref_pal {
+            ref_scratch.pack_indices_range(tier, 0, rect.w as usize * rect.h as usize, ref_n);
+        }
 
         let n_px = rect.w as usize * rect.h as usize;
         let scan = if track_alpha {
@@ -1223,21 +1646,20 @@ mod tests {
         };
         assert_eq!(scan.is_text_safe(), exp_text_safe);
         match (scan, ref_pal) {
-            (HybridScan::Solid(px), Ok((1, 0))) => {
+            (HybridScan::Solid(px), Ok(1)) => {
                 assert_eq!(px, ref_scratch.palette[0].to_le_bytes());
             },
-            (HybridScan::Palette { n_colors }, Ok((ref_n, ref_plen))) => {
+            (HybridScan::Palette { n_colors }, Ok(ref_n)) => {
                 assert_eq!(n_colors, ref_n);
                 assert_eq!(
                     scratch.palette[..n_colors],
                     ref_scratch.palette[..ref_n],
                     "palette table mismatch"
                 );
-                let plen = scratch.pack_indices_range(0, n_px, n_colors);
-                assert_eq!(plen, ref_plen);
+                scratch.pack_indices_range(tier, 0, n_px, n_colors);
                 assert_eq!(
-                    scratch.packed[..plen],
-                    ref_scratch.packed[..ref_plen],
+                    scratch.packed_indices(0, n_px, n_colors),
+                    ref_scratch.packed_indices(0, n_px, ref_n),
                     "packed indices mismatch"
                 );
             },
@@ -1261,8 +1683,12 @@ mod tests {
                         scratch.quad_palette(q)[..n_colors],
                         ref_scratch.palette[..n_colors]
                     );
-                    let plen = scratch.pack_indices_range(q * SUBTILE_PIXELS, n_px, n_colors);
-                    assert_eq!(scratch.packed[..plen], ref_scratch.packed[..plen]);
+                    let start = q * SUBTILE_PIXELS;
+                    scratch.pack_indices_range(tier, start, n_px, n_colors);
+                    assert_eq!(
+                        scratch.packed_indices(start, n_px, n_colors),
+                        ref_scratch.packed_indices(0, n_px, n_colors)
+                    );
                 }
             }
         }

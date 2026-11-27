@@ -65,6 +65,7 @@ mod arch {
     use crate::filtering::ClientTileCache;
     use crate::filtering::DecodeCacheCtx;
     use crate::filtering::FrameRows;
+    use crate::filtering::RowKernel;
     use crate::filtering::ScalarKernel;
     use crate::filtering::ScanSubBand;
     use crate::filtering::ShadowRows;
@@ -115,6 +116,16 @@ mod arch {
             th: usize,
         ) -> AlphaChannel {
             super::encode_alpha_plane_with(ScalarKernel, state, tw, th)
+        }
+
+        #[inline(always)]
+        pub(super) fn pack_palette_indices(
+            self,
+            indices: &[u8],
+            n_colors: usize,
+            packed: &mut [u8],
+        ) -> usize {
+            ScalarKernel.pack_palette_indices(indices, n_colors, packed)
         }
 
         /// # Safety
@@ -454,9 +465,17 @@ use zstd::bulk::Decompressor;
 
 use crate::buffer_pointer::BufferPointer;
 use crate::filtering::palette::HybridScan;
+use crate::filtering::palette::MAX_PALETTE_COLORS;
+use crate::filtering::palette::PaletteLut4;
 use crate::filtering::palette::SUBTILE_PIXELS;
-use crate::filtering::palette::decode_palette_row;
-use crate::filtering::palette::prepare_palette_lut;
+use crate::filtering::palette::decode_palette_1bpp_scalar;
+use crate::filtering::palette::decode_palette_2bpp_scalar;
+use crate::filtering::palette::decode_palette_4bpp_scalar;
+use crate::filtering::palette::decode_palette_8bpp_scalar;
+use crate::filtering::palette::decode_palette_tile;
+use crate::filtering::palette::pack_palette_indices_scalar;
+use crate::filtering::palette::parse_palette_header;
+use crate::filtering::palette::validate_palette_indices_scalar;
 use crate::filtering::tile_cache::ColdSubQuads;
 use crate::filtering::tile_cache::SlotScans;
 use crate::filtering::tile_cache::SyncClientSlots;
@@ -630,6 +649,77 @@ pub(crate) trait RowKernel: Copy {
         n_px: usize,
         first_word: u32,
     ) -> (bool, bool);
+
+    /// Validates that every active palette index in `packed` is `< n_colors`
+    /// (`2..=256`). Trailing padding bits in any partial final byte must
+    /// already have been verified zero by the caller.
+    fn validate_palette_indices(self, n_colors: usize, packed: &[u8]) -> bool;
+
+    /// Bitpacks `indices` (each element in `0..n_colors`) into `packed` for
+    /// `n_colors` (`1..=256`), zero-filling any trailing padding bits and
+    /// returning the number of packed bytes written.
+    fn pack_palette_indices(self, indices: &[u8], n_colors: usize, packed: &mut [u8]) -> usize;
+
+    /// Decodes one 1-bpp (`2`-color) palette row (`dst.len()` pixels) starting
+    /// at pixel offset `idx_pos` in `packed`.
+    ///
+    /// # Safety
+    /// `packed` must contain at least `(idx_pos + dst.len()).div_ceil(8)` bytes.
+    /// When `STREAM` is `true`, `(dst.as_mut_ptr() as usize).is_multiple_of(Self::STREAM_ALIGN)`,
+    /// `dst.len().is_multiple_of(16)`, and `idx_pos.is_multiple_of(8)` must hold.
+    unsafe fn decode_palette_1bpp_row<const STREAM: bool>(
+        self,
+        c0: Vec4u8,
+        c1: Vec4u8,
+        packed: &[u8],
+        idx_pos: usize,
+        dst: &mut [MaybeUninit<Vec4u8>],
+    );
+
+    /// Decodes one 2-bpp (`3..=4`-color) palette row (`dst.len()` pixels)
+    /// starting at pixel offset `idx_pos` in `packed`.
+    ///
+    /// # Safety
+    /// `packed` must contain at least `(idx_pos + dst.len()).div_ceil(4)` bytes.
+    /// When `STREAM` is `true`, `(dst.as_mut_ptr() as usize).is_multiple_of(Self::STREAM_ALIGN)`,
+    /// `dst.len().is_multiple_of(16)`, and `idx_pos.is_multiple_of(4)` must hold.
+    unsafe fn decode_palette_2bpp_row<const STREAM: bool>(
+        self,
+        lut: &[Vec4u8; 4],
+        packed: &[u8],
+        idx_pos: usize,
+        dst: &mut [MaybeUninit<Vec4u8>],
+    );
+
+    /// Decodes one 4-bpp (`5..=16`-color) palette row (`dst.len()` pixels)
+    /// starting at pixel offset `idx_pos` in `packed`.
+    ///
+    /// # Safety
+    /// `packed` must contain at least `(idx_pos + dst.len()).div_ceil(2)` bytes.
+    /// When `STREAM` is `true`, `(dst.as_mut_ptr() as usize).is_multiple_of(Self::STREAM_ALIGN)`,
+    /// `dst.len().is_multiple_of(16)`, and `idx_pos.is_multiple_of(2)` must hold.
+    unsafe fn decode_palette_4bpp_row<const STREAM: bool>(
+        self,
+        lut: &PaletteLut4,
+        packed: &[u8],
+        idx_pos: usize,
+        dst: &mut [MaybeUninit<Vec4u8>],
+    );
+
+    /// Decodes one 8-bpp (`17..=256`-color) palette row (`dst.len()` pixels)
+    /// from `packed_row` (`packed_row.len() == dst.len()`), where each `lut[i]`
+    /// holds `[b, g, r, a]` in native-endian `u32` byte order.
+    ///
+    /// # Safety
+    /// `packed_row.len() == dst.len()` must hold. When `STREAM` is `true`,
+    /// `(dst.as_mut_ptr() as usize).is_multiple_of(Self::STREAM_ALIGN)` and
+    /// `dst.len().is_multiple_of(16)` must hold.
+    unsafe fn decode_palette_8bpp_row<const STREAM: bool>(
+        self,
+        lut: &[u32; MAX_PALETTE_COLORS],
+        packed_row: &[u8],
+        dst: &mut [MaybeUninit<Vec4u8>],
+    );
 
     fn fence_stream(self);
 }
@@ -919,6 +1009,60 @@ impl RowKernel for ScalarKernel {
     }
 
     #[inline(always)]
+    fn validate_palette_indices(self, n_colors: usize, packed: &[u8]) -> bool {
+        validate_palette_indices_scalar(n_colors, packed)
+    }
+
+    #[inline(always)]
+    fn pack_palette_indices(self, indices: &[u8], n_colors: usize, packed: &mut [u8]) -> usize {
+        pack_palette_indices_scalar(indices, n_colors, packed)
+    }
+
+    #[inline(always)]
+    unsafe fn decode_palette_1bpp_row<const STREAM: bool>(
+        self,
+        c0: Vec4u8,
+        c1: Vec4u8,
+        packed: &[u8],
+        idx_pos: usize,
+        dst: &mut [MaybeUninit<Vec4u8>],
+    ) {
+        decode_palette_1bpp_scalar(c0, c1, packed, idx_pos, dst);
+    }
+
+    #[inline(always)]
+    unsafe fn decode_palette_2bpp_row<const STREAM: bool>(
+        self,
+        lut: &[Vec4u8; 4],
+        packed: &[u8],
+        idx_pos: usize,
+        dst: &mut [MaybeUninit<Vec4u8>],
+    ) {
+        decode_palette_2bpp_scalar(lut, packed, idx_pos, dst);
+    }
+
+    #[inline(always)]
+    unsafe fn decode_palette_4bpp_row<const STREAM: bool>(
+        self,
+        lut: &PaletteLut4,
+        packed: &[u8],
+        idx_pos: usize,
+        dst: &mut [MaybeUninit<Vec4u8>],
+    ) {
+        decode_palette_4bpp_scalar(&lut.colors, packed, idx_pos, dst);
+    }
+
+    #[inline(always)]
+    unsafe fn decode_palette_8bpp_row<const STREAM: bool>(
+        self,
+        lut: &[u32; MAX_PALETTE_COLORS],
+        packed_row: &[u8],
+        dst: &mut [MaybeUninit<Vec4u8>],
+    ) {
+        decode_palette_8bpp_scalar(lut, packed_row, dst);
+    }
+
+    #[inline(always)]
     fn fence_stream(self) {}
 }
 
@@ -1027,9 +1171,14 @@ fn encode_palette_from_parts<const HAS_ALPHA: bool>(
     let pal_has_alpha = HAS_ALPHA && !all_opaque && palette.iter().any(|&c| (c >> 24) != 0xFF);
     let entry_bytes = if pal_has_alpha { 4 } else { 3 };
     let mut palette_bytes = Vec::with_capacity(n_colors * entry_bytes);
-    for &c in palette {
-        let b = c.to_le_bytes();
-        palette_bytes.extend_from_slice(if pal_has_alpha { &b[..] } else { &b[..3] });
+    if pal_has_alpha {
+        for &c in palette {
+            palette_bytes.extend_from_slice(&c.to_le_bytes());
+        }
+    } else {
+        for &c in palette {
+            palette_bytes.extend_from_slice(&c.to_le_bytes()[..3]);
+        }
     }
     let data = compress_bytes(compressor, zstd_scratch, packed);
     LeafPayload::Palette {
@@ -1040,13 +1189,14 @@ fn encode_palette_from_parts<const HAS_ALPHA: bool>(
 }
 
 fn try_encode_palette_leaf<const HAS_ALPHA: bool>(
+    tier: arch::Tier,
     aos: BufferPointer<Vec4u8>,
     stride_px: usize,
     rect: TileRect,
     all_opaque: bool,
     state: &mut CompressorWorkerState,
 ) -> Option<LeafPayload> {
-    let Ok((n_colors, packed_len)) = state
+    let Ok(n_colors) = state
         .palette
         .try_encode_2d::<HAS_ALPHA>(aos, stride_px, rect)
     else {
@@ -1055,9 +1205,11 @@ fn try_encode_palette_leaf<const HAS_ALPHA: bool>(
     if n_colors == 1 {
         return Some(LeafPayload::Solid(state.palette.palette[0].to_le_bytes()));
     }
+    let n_px = rect.w as usize * rect.h as usize;
+    state.palette.pack_indices_range(tier, 0, n_px, n_colors);
     Some(encode_palette_from_parts::<HAS_ALPHA>(
         &state.palette.palette[..n_colors],
-        &state.palette.packed[..packed_len],
+        state.palette.packed_indices(0, n_px, n_colors),
         all_opaque,
         &mut state.compressor,
         &mut state.zstd_scratch,
@@ -1195,7 +1347,7 @@ fn filter_lossless_leaf<const HAS_ALPHA: bool>(
         return LeafPayload::Solid(px);
     }
     if let Some(leaf) =
-        try_encode_palette_leaf::<HAS_ALPHA>(aos, stride_px, rect, meta.all_opaque, state)
+        try_encode_palette_leaf::<HAS_ALPHA>(tier, aos, stride_px, rect, meta.all_opaque, state)
     {
         return leaf;
     }
@@ -1292,10 +1444,11 @@ fn filter_hybrid_tile<const HAS_ALPHA: bool>(
         return TilePayload::Leaf(match scan {
             HybridScan::Solid(px) => LeafPayload::Solid(px),
             HybridScan::Palette { n_colors } => {
-                let packed_len = state.palette.pack_indices_range(0, tw * th, n_colors);
+                let n_px = tw * th;
+                state.palette.pack_indices_range(tier, 0, n_px, n_colors);
                 encode_palette_from_parts::<HAS_ALPHA>(
                     &state.palette.palette[..n_colors],
-                    &state.palette.packed[..packed_len],
+                    state.palette.packed_indices(0, n_px, n_colors),
                     meta.tile.all_opaque,
                     &mut state.compressor,
                     &mut state.zstd_scratch,
@@ -1325,15 +1478,17 @@ fn filter_hybrid_tile<const HAS_ALPHA: bool>(
         .palette
         .try_encode_2d::<HAS_ALPHA>(aos, stride_px, rect)
     {
-        Ok((n_colors, packed_len)) => {
+        Ok(n_colors) => {
             if n_colors == 1 {
                 return TilePayload::Leaf(LeafPayload::Solid(
                     state.palette.palette[0].to_le_bytes(),
                 ));
             }
+            let n_px = tw * th;
+            state.palette.pack_indices_range(tier, 0, n_px, n_colors);
             return TilePayload::Leaf(encode_palette_from_parts::<HAS_ALPHA>(
                 &state.palette.palette[..n_colors],
-                &state.palette.packed[..packed_len],
+                state.palette.packed_indices(0, n_px, n_colors),
                 meta.tile.all_opaque,
                 &mut state.compressor,
                 &mut state.zstd_scratch,
@@ -1409,14 +1564,14 @@ fn filter_hybrid_tile<const HAS_ALPHA: bool>(
                 match scans[q] {
                     HybridScan::Solid(px) => LeafPayload::Solid(px),
                     HybridScan::Palette { n_colors } => {
+                        let start = q * SUBTILE_PIXELS;
                         let q_px = qrect.w as usize * qrect.h as usize;
-                        let packed_len =
-                            state
-                                .palette
-                                .pack_indices_range(q * SUBTILE_PIXELS, q_px, n_colors);
+                        state
+                            .palette
+                            .pack_indices_range(tier, start, q_px, n_colors);
                         encode_palette_from_parts::<HAS_ALPHA>(
                             &state.palette.quad_palette(q)[..n_colors],
-                            &state.palette.packed[..packed_len],
+                            state.palette.packed_indices(start, q_px, n_colors),
                             qmeta.all_opaque,
                             &mut state.compressor,
                             &mut state.zstd_scratch,
@@ -1748,19 +1903,8 @@ unsafe fn unfilter_leaf<K: RowKernel, const HAS_ALPHA: bool>(
             if *pal_alpha && !HAS_ALPHA {
                 bail!("translucent Palette tile on Xrgb8888 buffer");
             }
-            let entry_bytes = if *pal_alpha { 4 } else { 3 };
-            if !palette.len().is_multiple_of(entry_bytes) {
-                bail!(
-                    "palette byte len {} is not a multiple of {entry_bytes}",
-                    palette.len()
-                );
-            }
-            let n_colors = palette.len() / entry_bytes;
-            if !(2..=256).contains(&n_colors) {
-                bail!("invalid palette color count {n_colors}");
-            }
-            let expected_len =
-                crate::serialization::framing::packed_palette_indices_len(n_px, n_colors);
+            let (n_colors, expected_len) =
+                parse_palette_header(*pal_alpha, palette, n_px).location(loc!())?;
             let packed = decode_encoded_bytes(
                 data,
                 expected_len,
@@ -1768,15 +1912,25 @@ unsafe fn unfilter_leaf<K: RowKernel, const HAS_ALPHA: bool>(
                 &mut state.decompressor,
             )
             .location(loc!())?;
-            let (lut, dec_n) =
-                prepare_palette_lut(*pal_alpha, palette, packed, n_px).location(loc!())?;
-            let mut idx_pos = 0usize;
-            for ry in 0..th {
-                // SAFETY: Caller guarantees `rect` is in-bounds and disjoint.
-                let dst_row = unsafe { slice::from_raw_parts_mut(frame.row_ptr(y0 + ry, x0), tw) };
-                decode_palette_row(&lut, dec_n, packed, &mut idx_pos, dst_row).location(loc!())?;
+            // SAFETY: Caller guarantees `rect` shifted by `dst_origin` is
+            // in-bounds and disjoint within `frame`, and `parse_palette_header`
+            // validated `palette` and `n_colors`.
+            unsafe {
+                decode_palette_tile(
+                    kernel,
+                    *pal_alpha,
+                    palette,
+                    n_colors,
+                    packed,
+                    frame,
+                    x0,
+                    y0,
+                    tw,
+                    th,
+                    allow_stream,
+                )
+                .location(loc!())
             }
-            Ok(false)
         },
         LeafPayload::AosZstd {
             predictors,
@@ -5566,6 +5720,499 @@ mod tests {
             "[{tier_name}] i8::MIN sad"
         );
         assert_eq!(kernel.is_constant_plane(&[]), None);
+
+        // Palette SIMD validation, packing, and 1/2/4/8-bpp row decoding
+        // (including streaming and unaligned `idx_pos` offsets) must match
+        // `ScalarKernel` bit-for-bit.
+        verify_palette_kernel_matches_scalar(kernel, tier_name);
+    }
+
+    #[inline(always)]
+    fn verify_palette_kernel_matches_scalar<K: RowKernel>(kernel: K, tier_name: &str) {
+        let widths: Vec<usize> = (1..=65).chain([127, 128, 129, 255, 256, 300]).collect();
+
+        // 1. `validate_palette_indices` across boundary counts and OOB positions.
+        for n_colors in [2usize, 3, 4, 5, 15, 16, 17, 128, 255, 256] {
+            for len in [
+                0usize, 1, 7, 15, 16, 17, 31, 32, 33, 63, 64, 65, 127, 128, 131,
+            ] {
+                let valid_byte: u8 = if n_colors <= 2 {
+                    0xAA
+                } else if n_colors == 3 {
+                    0b10_01_00_10
+                } else if n_colors <= 4 {
+                    0xFF
+                } else if n_colors <= 16 {
+                    let hi = (n_colors - 1) as u8;
+                    let lo = ((n_colors - 2) as u8) & 0x0F;
+                    (hi << 4) | lo
+                } else {
+                    (n_colors - 1) as u8
+                };
+                let mut buf = vec![valid_byte; len];
+                assert!(
+                    kernel.validate_palette_indices(n_colors, &buf),
+                    "[{tier_name}] validate valid n_colors={n_colors} len={len}"
+                );
+                if len > 0
+                    && (n_colors == 3
+                        || (5..16).contains(&n_colors)
+                        || (17..256).contains(&n_colors))
+                {
+                    for pos in [0, len / 2, len - 1] {
+                        let bad_vals: &[u8] = if n_colors == 3 {
+                            &[0b00_00_00_11, 0b00_00_11_00, 0b00_11_00_00, 0b11_00_00_00]
+                        } else if n_colors < 16 {
+                            &[n_colors as u8, (n_colors as u8) << 4, 0x0F, 0xF0]
+                        } else {
+                            &[n_colors as u8, 255]
+                        };
+                        for &bad in bad_vals {
+                            buf[pos] = bad;
+                            assert_eq!(
+                                kernel.validate_palette_indices(n_colors, &buf),
+                                ScalarKernel.validate_palette_indices(n_colors, &buf),
+                                "[{tier_name}] validate bad n_colors={n_colors} len={len} pos={pos} bad={bad:#x}"
+                            );
+                            assert!(
+                                !kernel.validate_palette_indices(n_colors, &buf),
+                                "[{tier_name}] missed OOB n_colors={n_colors} len={len} pos={pos} bad={bad:#x}"
+                            );
+                            buf[pos] = valid_byte;
+                        }
+                    }
+                }
+            }
+        }
+
+        // 2. `pack_palette_indices` and `decode_palette_{1,2,4,8}bpp_row` across
+        //    widths, color counts, `idx_pos` offsets, `STREAM = true/false`, and
+        //    aligned/unaligned destinations.
+        let mut pal256_bytes = Vec::with_capacity(256 * 4);
+        let mut lut8 = [0u32; MAX_PALETTE_COLORS];
+        for (i, slot) in lut8.iter_mut().enumerate() {
+            let px = [
+                (i.wrapping_mul(37).wrapping_add(11) & 0xFF) as u8,
+                (i.wrapping_mul(73).wrapping_add(29) & 0xFF) as u8,
+                (i.wrapping_mul(113).wrapping_add(53) & 0xFF) as u8,
+                if i % 3 == 0 {
+                    0xFF
+                } else {
+                    (0x40 + (i & 0x7F)) as u8
+                },
+            ];
+            pal256_bytes.extend_from_slice(&px);
+            *slot = u32::from_ne_bytes(px);
+        }
+        let c0 = Vec4u8(
+            pal256_bytes[0],
+            pal256_bytes[1],
+            pal256_bytes[2],
+            pal256_bytes[3],
+        );
+        let c1 = Vec4u8(
+            pal256_bytes[4],
+            pal256_bytes[5],
+            pal256_bytes[6],
+            pal256_bytes[7],
+        );
+        let lut2: [Vec4u8; 4] = std::array::from_fn(|i| {
+            Vec4u8(
+                pal256_bytes[i * 4],
+                pal256_bytes[i * 4 + 1],
+                pal256_bytes[i * 4 + 2],
+                pal256_bytes[i * 4 + 3],
+            )
+        });
+        let lut4 = PaletteLut4::from_bytes(true, &pal256_bytes[..16 * 4], 16);
+
+        for &tw in &widths {
+            let max_off = 15usize;
+            let total_px = tw + max_off;
+            for n_colors in [2usize, 3, 4, 5, 15, 16, 17, 128, 255, 256] {
+                let indices: Vec<u8> = (0..total_px)
+                    .map(|i| {
+                        ((i.wrapping_mul(19).wrapping_add(tw * 7 + n_colors)) % n_colors) as u8
+                    })
+                    .collect();
+                let exp_len =
+                    crate::serialization::framing::packed_palette_indices_len(total_px, n_colors);
+                let mut packed_s = vec![0xA5u8; exp_len];
+                let mut packed_k = vec![0x5Au8; exp_len];
+                let len_s = ScalarKernel.pack_palette_indices(&indices, n_colors, &mut packed_s);
+                let len_k = kernel.pack_palette_indices(&indices, n_colors, &mut packed_k);
+                assert_eq!(len_k, exp_len);
+                assert_eq!(len_k, len_s);
+                assert_eq!(
+                    packed_k, packed_s,
+                    "[{tier_name}] pack_palette_indices n_colors={n_colors} total_px={total_px}"
+                );
+                assert!(
+                    kernel.validate_palette_indices(n_colors, &packed_k),
+                    "[{tier_name}] validate packed n_colors={n_colors} total_px={total_px}"
+                );
+
+                // Decode with both aligned (`idx_pos = 0`) and unaligned (`idx_pos = 1..=7`)
+                // offsets, and both aligned+streaming (`STREAM = true` when `tw % 16 == 0`)
+                // and unaligned (`STREAM = false`) output buffers.
+                let mut dst_bytes = vec![0xAAu8; (tw + 17) * 4];
+                let aligned_off = (64 - (dst_bytes.as_ptr() as usize & 63)) & 63;
+                let mut exp_row = vec![MaybeUninit::uninit(); tw];
+
+                let idx_offsets: &[usize] = if tw.is_multiple_of(16) {
+                    &[0, 1, 2, 3, 5, 7, 8]
+                } else {
+                    &[0, 1, 3, 7]
+                };
+                for &idx_pos in idx_offsets {
+                    if n_colors <= 2 {
+                        unsafe {
+                            ScalarKernel.decode_palette_1bpp_row::<false>(
+                                c0,
+                                c1,
+                                &packed_k,
+                                idx_pos,
+                                &mut exp_row,
+                            );
+                        }
+                    } else if n_colors <= 4 {
+                        unsafe {
+                            ScalarKernel.decode_palette_2bpp_row::<false>(
+                                &lut2,
+                                &packed_k,
+                                idx_pos,
+                                &mut exp_row,
+                            );
+                        }
+                    } else if n_colors <= 16 {
+                        unsafe {
+                            ScalarKernel.decode_palette_4bpp_row::<false>(
+                                &lut4,
+                                &packed_k,
+                                idx_pos,
+                                &mut exp_row,
+                            );
+                        }
+                    } else {
+                        unsafe {
+                            ScalarKernel.decode_palette_8bpp_row::<false>(
+                                &lut8,
+                                &packed_k[idx_pos..idx_pos + tw],
+                                &mut exp_row,
+                            );
+                        }
+                    }
+                    let exp_init: Vec<Vec4u8> =
+                        exp_row.iter().map(|m| unsafe { m.assume_init() }).collect();
+
+                    let can_stream =
+                        K::STREAM_ALIGN > 1 && tw.is_multiple_of(16) && idx_pos.is_multiple_of(8);
+                    let modes: &[(bool, usize)] = if can_stream {
+                        &[(true, aligned_off), (false, aligned_off + 4)]
+                    } else {
+                        &[(false, aligned_off), (false, aligned_off + 4)]
+                    };
+                    for &(stream, byte_off) in modes {
+                        let dst: &mut [Vec4u8] =
+                            bytemuck::cast_slice_mut(&mut dst_bytes[byte_off..byte_off + tw * 4]);
+                        dst.fill(Vec4u8(0, 0, 0, 0));
+                        let dst_uninit: &mut [MaybeUninit<Vec4u8>] = unsafe {
+                            slice::from_raw_parts_mut(dst.as_mut_ptr().cast(), dst.len())
+                        };
+                        unsafe {
+                            if n_colors <= 2 {
+                                if stream {
+                                    kernel.decode_palette_1bpp_row::<true>(
+                                        c0, c1, &packed_k, idx_pos, dst_uninit,
+                                    );
+                                } else {
+                                    kernel.decode_palette_1bpp_row::<false>(
+                                        c0, c1, &packed_k, idx_pos, dst_uninit,
+                                    );
+                                }
+                            } else if n_colors <= 4 {
+                                if stream {
+                                    kernel.decode_palette_2bpp_row::<true>(
+                                        &lut2, &packed_k, idx_pos, dst_uninit,
+                                    );
+                                } else {
+                                    kernel.decode_palette_2bpp_row::<false>(
+                                        &lut2, &packed_k, idx_pos, dst_uninit,
+                                    );
+                                }
+                            } else if n_colors <= 16 {
+                                if stream {
+                                    kernel.decode_palette_4bpp_row::<true>(
+                                        &lut4, &packed_k, idx_pos, dst_uninit,
+                                    );
+                                } else {
+                                    kernel.decode_palette_4bpp_row::<false>(
+                                        &lut4, &packed_k, idx_pos, dst_uninit,
+                                    );
+                                }
+                            } else if stream {
+                                kernel.decode_palette_8bpp_row::<true>(
+                                    &lut8,
+                                    &packed_k[idx_pos..idx_pos + tw],
+                                    dst_uninit,
+                                );
+                            } else {
+                                kernel.decode_palette_8bpp_row::<false>(
+                                    &lut8,
+                                    &packed_k[idx_pos..idx_pos + tw],
+                                    dst_uninit,
+                                );
+                            }
+                        }
+                        if stream {
+                            kernel.fence_stream();
+                        }
+                        assert_eq!(
+                            dst,
+                            &exp_init[..],
+                            "[{tier_name}] decode_palette n_colors={n_colors} tw={tw} idx_pos={idx_pos} stream={stream}"
+                        );
+                    }
+                }
+            }
+        }
+
+        // 3. Whole-tile `decode_palette_tile` across odd/SIMD widths & heights,
+        //    packed/padded strides, `allow_stream = false/true` (aligned & unaligned),
+        //    `pal_has_alpha = false/true`, and upfront OOB rejection leaving zero
+        //    partial destination writes.
+        verify_palette_tile_decode(kernel, tier_name);
+    }
+
+    #[inline(always)]
+    fn verify_palette_tile_decode<K: RowKernel>(kernel: K, tier_name: &str) {
+        use palette::decode_palette_tile;
+        use palette::parse_palette_header;
+        use rkyv::util::AlignedVec;
+
+        let color_counts: &[usize] = if cfg!(miri) {
+            &[2, 3, 4, 5, 16, 17, 255, 256]
+        } else {
+            &[2, 3, 4, 5, 15, 16, 17, 128, 255, 256]
+        };
+        let widths: &[usize] = if cfg!(miri) {
+            &[1, 3, 16, 17, 33]
+        } else {
+            &[
+                1, 2, 3, 7, 15, 16, 17, 31, 32, 33, 63, 64, 65, 127, 128, 256,
+            ]
+        };
+        let heights: &[usize] = if cfg!(miri) {
+            &[1, 3]
+        } else {
+            &[1, 3, 5, 17, 128]
+        };
+
+        let tier = arch::Tier::detect();
+        let mut scratch = palette::PaletteScratch::new();
+        let max_stride = 256 + 32;
+        let max_h = if cfg!(miri) { 5 } else { 130 };
+        let mut src_buf = vec![Vec4u8(0, 0, 0, 0xFF); max_stride * max_h];
+        let mut aligned_bytes: AlignedVec<64> = AlignedVec::with_capacity(max_stride * max_h * 4);
+        aligned_bytes.resize(max_stride * max_h * 4, 0xCC);
+
+        for &tw in widths {
+            for &th in heights {
+                if !cfg!(miri) && th == 128 && !matches!(tw, 16 | 33 | 64 | 128 | 256) {
+                    continue;
+                }
+                let n_px = tw * th;
+                for &n_colors in color_counts {
+                    for pal_has_alpha in [false, true] {
+                        for (stride_px, x0, y0, allow_stream) in [
+                            (tw, 0usize, 0usize, true),
+                            (tw.div_ceil(16) * 16 + 16, 0, 1, true),
+                            (tw + 13, 1, 1, true),
+                            (tw + 7, 2, 0, false),
+                        ] {
+                            if !cfg!(miri) && th > 5 && x0 != 0 {
+                                continue;
+                            }
+                            let actual_colors = n_colors.min(n_px);
+                            if actual_colors < 2 {
+                                continue;
+                            }
+                            for ry in 0..th {
+                                for rx in 0..tw {
+                                    let i = ry * tw + rx;
+                                    let c = if i < actual_colors {
+                                        i
+                                    } else {
+                                        (i.wrapping_mul(37) ^ (ry * 13)) % actual_colors
+                                    };
+                                    let a = if pal_has_alpha {
+                                        0x40 + ((c * 19) & 0xBF) as u8
+                                    } else {
+                                        0xFF
+                                    };
+                                    src_buf[(y0 + ry) * stride_px + x0 + rx] = Vec4u8(
+                                        (c.wrapping_mul(17) & 0xFF) as u8,
+                                        (c.wrapping_mul(53).wrapping_add(7) & 0xFF) as u8,
+                                        (c.wrapping_mul(97).wrapping_add(29) & 0xFF) as u8,
+                                        a,
+                                    );
+                                }
+                            }
+                            let src_ptr = src_buf.as_ptr();
+                            let bp = unsafe { BufferPointer::new(&src_ptr, src_buf.len()) };
+                            let rect = TileRect {
+                                x: x0 as u32,
+                                y: y0 as u32,
+                                w: tw as u32,
+                                h: th as u32,
+                            };
+                            let got_n = if pal_has_alpha {
+                                scratch.try_encode_2d::<true>(bp, stride_px, rect)
+                            } else {
+                                scratch.try_encode_2d::<false>(bp, stride_px, rect)
+                            }
+                            .unwrap();
+                            assert_eq!(got_n, actual_colors);
+                            scratch.pack_indices_range(tier, 0, n_px, got_n);
+                            let packed = scratch.packed_indices(0, n_px, got_n);
+                            let mut pal_bytes = Vec::with_capacity(got_n * 4);
+                            for &c in &scratch.palette[..got_n] {
+                                let b = c.to_le_bytes();
+                                pal_bytes.extend_from_slice(if pal_has_alpha {
+                                    &b[..]
+                                } else {
+                                    &b[..3]
+                                });
+                            }
+                            let (parsed_n, exp_len) =
+                                parse_palette_header(pal_has_alpha, &pal_bytes, n_px).unwrap();
+                            assert_eq!(parsed_n, got_n);
+                            assert_eq!(exp_len, packed.len());
+
+                            let sentinel = Vec4u8(0xDE, 0xAD, 0xBE, 0xEF);
+                            let dst_total = stride_px * (y0 + th + 1);
+                            let dst_px = unsafe {
+                                std::slice::from_raw_parts_mut(
+                                    aligned_bytes.as_mut_ptr().cast::<MaybeUninit<Vec4u8>>(),
+                                    dst_total,
+                                )
+                            };
+                            dst_px.fill(MaybeUninit::new(sentinel));
+                            let frame = FrameRows {
+                                base: dst_px.as_mut_ptr(),
+                                stride_px,
+                            };
+                            let streamed = unsafe {
+                                decode_palette_tile(
+                                    kernel,
+                                    pal_has_alpha,
+                                    &pal_bytes,
+                                    parsed_n,
+                                    packed,
+                                    &frame,
+                                    x0,
+                                    y0,
+                                    tw,
+                                    th,
+                                    allow_stream,
+                                )
+                            }
+                            .unwrap();
+                            if streamed {
+                                kernel.fence_stream();
+                            }
+                            let expect_stream = allow_stream
+                                && K::STREAM_ALIGN > 1
+                                && tw.is_multiple_of(16)
+                                && ((dst_px.as_ptr() as usize + (y0 * stride_px + x0) * 4)
+                                    .is_multiple_of(K::STREAM_ALIGN))
+                                && (stride_px * 4).is_multiple_of(K::STREAM_ALIGN);
+                            assert_eq!(
+                                streamed, expect_stream,
+                                "[{tier_name}] streamed mismatch tw={tw} th={th} n={actual_colors} x0={x0} stride={stride_px}"
+                            );
+                            for ry in 0..(y0 + th + 1) {
+                                for rx in 0..stride_px {
+                                    let got = unsafe { dst_px[ry * stride_px + rx].assume_init() };
+                                    let in_tile =
+                                        ry >= y0 && ry < y0 + th && rx >= x0 && rx < x0 + tw;
+                                    let exp = if in_tile {
+                                        src_buf[ry * stride_px + rx]
+                                    } else {
+                                        sentinel
+                                    };
+                                    assert_eq!(
+                                        got, exp,
+                                        "[{tier_name}] pixel mismatch at ({rx},{ry}) tw={tw} th={th} n={actual_colors} alpha={pal_has_alpha} stream={allow_stream}"
+                                    );
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        // Upfront OOB rejection across 2/4/8-bpp must leave canvas completely untouched.
+        let sentinel = Vec4u8(0xAA, 0x55, 0xCC, 0x33);
+        let mut canvas = vec![MaybeUninit::new(sentinel); 64 * 4];
+        let frame = FrameRows {
+            base: canvas.as_mut_ptr(),
+            stride_px: 64,
+        };
+        let check_untouched = |canvas: &[MaybeUninit<Vec4u8>]| {
+            for slot in canvas {
+                assert_eq!(unsafe { slot.assume_init() }, sentinel);
+            }
+        };
+
+        let pal3 = vec![1u8; 3 * 3];
+        for bad_byte in [0usize, 31, 63] {
+            let mut bad = vec![0b10_01_00_10u8; 64];
+            bad[bad_byte] |= 0b1100_0000;
+            assert!(
+                unsafe {
+                    decode_palette_tile(kernel, false, &pal3, 3, &bad, &frame, 0, 0, 64, 4, true)
+                }
+                .is_err(),
+                "[{tier_name}] expected 2-bpp OOB error at byte {bad_byte}"
+            );
+            check_untouched(&canvas);
+        }
+
+        let pal15 = vec![2u8; 15 * 3];
+        for bad_byte in [0usize, 31, 63, 127] {
+            for bad_val in [0x0Fu8, 0xF0u8] {
+                let mut bad = vec![0xE3u8; 128];
+                bad[bad_byte] = bad_val;
+                assert!(
+                    unsafe {
+                        decode_palette_tile(
+                            kernel, false, &pal15, 15, &bad, &frame, 0, 0, 64, 4, true,
+                        )
+                    }
+                    .is_err(),
+                    "[{tier_name}] expected 4-bpp OOB error at byte {bad_byte} val={bad_val:#x}"
+                );
+                check_untouched(&canvas);
+            }
+        }
+
+        let pal255 = vec![3u8; 255 * 3];
+        for bad_byte in [0usize, 31, 63, 127, 255] {
+            let mut bad = vec![254u8; 256];
+            bad[bad_byte] = 255;
+            assert!(
+                unsafe {
+                    decode_palette_tile(
+                        kernel, false, &pal255, 255, &bad, &frame, 0, 0, 64, 4, true,
+                    )
+                }
+                .is_err(),
+                "[{tier_name}] expected 8-bpp OOB error at byte {bad_byte}"
+            );
+            check_untouched(&canvas);
+        }
     }
 
     /// Compares every compiled, host-supported backend tier bit-for-bit against
@@ -12930,6 +13577,7 @@ mod tests {
                 ));
             }
             if let Some(leaf) = try_encode_palette_leaf::<HAS_ALPHA>(
+                tier,
                 aos,
                 stride_px,
                 rect,
@@ -13308,5 +13956,230 @@ mod tests {
         fill_n_colors(&mut buf, stride, tr(0, 0, 256, 128), 20, 0, |_| 0xFF);
         fill_n_colors(&mut buf, stride, tr(0, 128, 256, 8), 2000, 0, |_| 0xFF);
         check_case("edge_256x136_thin_bottom_photo", &buf, re);
+    }
+
+    #[test]
+    #[cfg_attr(miri, ignore)]
+    fn test_palette_streaming_roundtrip_and_malformed_unfilter_all_tiers() {
+        use rkyv::util::AlignedVec;
+
+        use crate::serialization::framing::EncodedBytes;
+
+        let mut comp = ShardingCompressor::new(NonZeroUsize::new(2).unwrap(), 1).unwrap();
+        let mut decomp = ShardingDecompressor::new(NonZeroUsize::new(2).unwrap()).unwrap();
+
+        // Full encode + decode roundtrip for 1/2/4/8-bpp palette frames across
+        // cached (`tile_cache = Some`) and uncached (`tile_cache = None`, direct
+        // `allow_stream = true` NT stores) with both opaque Xrgb8888 and
+        // translucent Argb8888 formats.
+        for &(w, h) in &[(256usize, 256usize), (305, 193)] {
+            let stride = w * 4;
+            for n_colors in [2usize, 3, 4, 5, 15, 16, 17, 128, 255, 256] {
+                for format in [BufferFormat::Xrgb8888, BufferFormat::Argb8888] {
+                    let mut src = vec![0u8; h * stride];
+                    for y in 0..h {
+                        for x in 0..w {
+                            let i = y * w + x;
+                            let c = if i < n_colors {
+                                i
+                            } else {
+                                (i.wrapping_mul(31) ^ (y * 17)) % n_colors
+                            };
+                            let off = y * stride + x * 4;
+                            src[off] = (c.wrapping_mul(17) & 0xFF) as u8;
+                            src[off + 1] = (c.wrapping_mul(53).wrapping_add(9) & 0xFF) as u8;
+                            src[off + 2] = (c.wrapping_mul(97).wrapping_add(23) & 0xFF) as u8;
+                            src[off + 3] = if format == BufferFormat::Argb8888 {
+                                0x50 + ((c * 13) & 0xAF) as u8
+                            } else {
+                                0xFF
+                            };
+                        }
+                    }
+                    let meta = BufferMetadata {
+                        width: w as i32,
+                        height: h as i32,
+                        stride: stride as i32,
+                        format,
+                    };
+
+                    for use_cache in [false, true] {
+                        let mut srv = ServerTileCache::new();
+                        let mut cli = ClientTileCache::new();
+                        let ptr = src.as_ptr();
+                        let bp = unsafe { BufferPointer::new(&ptr, src.len()) };
+                        let mut stream_opt = None;
+                        filter_and_compress_full_streaming(
+                            bp,
+                            ClientId(1),
+                            WlSurfaceId(1),
+                            meta,
+                            CompressionMode::Lossless,
+                            None,
+                            use_cache.then_some(&mut srv),
+                            &mut comp,
+                            |s| stream_opt = Some(s),
+                        );
+                        let mut wire = Vec::new();
+                        stream_opt.unwrap().framed_write(&mut wire).unwrap();
+
+                        let mut dec_stream = None;
+                        let mut rdr = wire.as_slice();
+                        CompressedTileStream::read_from_stream(&mut rdr, |s| {
+                            dec_stream = Some(s);
+                            Ok(())
+                        })
+                        .unwrap();
+                        let validated = ValidatedTileStream::new(dec_stream.unwrap()).unwrap();
+                        let mut dst: AlignedVec<64> = AlignedVec::with_capacity(src.len());
+                        dst.resize(src.len(), 0xEE);
+                        decompress_and_unfilter_streaming(
+                            validated,
+                            &mut decomp,
+                            &mut dst,
+                            use_cache.then_some(&mut cli),
+                        )
+                        .unwrap();
+                        assert_eq!(
+                            dst.as_slice(),
+                            src.as_slice(),
+                            "roundtrip mismatch {w}x{h} n_colors={n_colors} fmt={format:?} cache={use_cache}"
+                        );
+                    }
+                }
+            }
+        }
+
+        // End-to-end malformed `LeafPayload::Palette` rejection through
+        // `unfilter_tiles_parallel_with_tier` across every compiled tier,
+        // verifying zero partial canvas corruption.
+        let malformed_cases: Vec<(&str, LeafPayload)> = vec![
+            (
+                "bad_pal_len_not_mult_3",
+                LeafPayload::Palette {
+                    has_alpha: false,
+                    palette: vec![1, 2, 3, 4],
+                    data: EncodedBytes::Uncompressed(vec![0; 32]),
+                },
+            ),
+            (
+                "n_colors_0",
+                LeafPayload::Palette {
+                    has_alpha: false,
+                    palette: vec![],
+                    data: EncodedBytes::Uncompressed(vec![]),
+                },
+            ),
+            (
+                "n_colors_1",
+                LeafPayload::Palette {
+                    has_alpha: false,
+                    palette: vec![1, 2, 3],
+                    data: EncodedBytes::Uncompressed(vec![]),
+                },
+            ),
+            (
+                "n_colors_257",
+                LeafPayload::Palette {
+                    has_alpha: false,
+                    palette: vec![0; 257 * 3],
+                    data: EncodedBytes::Uncompressed(vec![0; 64 * 4]),
+                },
+            ),
+            (
+                "wrong_packed_len",
+                LeafPayload::Palette {
+                    has_alpha: false,
+                    palette: vec![0; 2 * 3],
+                    data: EncodedBytes::Uncompressed(vec![0; 31]),
+                },
+            ),
+            (
+                "oob_2bpp_tail",
+                LeafPayload::Palette {
+                    has_alpha: false,
+                    palette: vec![1; 3 * 3],
+                    data: EncodedBytes::Uncompressed({
+                        let mut v = vec![0b10_01_00_10u8; 64];
+                        v[63] = 0b1100_0000;
+                        v
+                    }),
+                },
+            ),
+            (
+                "oob_4bpp_mid",
+                LeafPayload::Palette {
+                    has_alpha: true,
+                    palette: vec![1; 15 * 4],
+                    data: EncodedBytes::Uncompressed({
+                        let mut v = vec![0xE3u8; 128];
+                        v[63] = 0xF0;
+                        v
+                    }),
+                },
+            ),
+            (
+                "oob_8bpp_mid",
+                LeafPayload::Palette {
+                    has_alpha: false,
+                    palette: vec![1; 255 * 3],
+                    data: EncodedBytes::Uncompressed({
+                        let mut v = vec![254u8; 256];
+                        v[129] = 255;
+                        v
+                    }),
+                },
+            ),
+        ];
+
+        let meta = BufferMetadata {
+            width: 64,
+            height: 4,
+            stride: 64 * 4,
+            format: BufferFormat::Xrgb8888,
+        };
+        let tile_rects = [TileRect {
+            x: 0,
+            y: 0,
+            w: 64,
+            h: 4,
+        }];
+        for tier in arch::Tier::supported_tiers() {
+            for (name, payload) in &malformed_cases {
+                let mut canvas: AlignedVec<64> = AlignedVec::with_capacity(64 * 4 * 4);
+                canvas.resize(64 * 4 * 4, 0xA5);
+                let tile = CompressedTile {
+                    tile_idx: 0,
+                    cache_put: None,
+                    payload: TilePayload::Leaf(payload.clone()),
+                };
+                let emitted = AtomicBool::new(false);
+                let res = unsafe {
+                    unfilter_tiles_parallel_with_tier(
+                        tier,
+                        &mut decomp,
+                        meta,
+                        canvas.len(),
+                        false,
+                        &[],
+                        &tile_rects,
+                        Some(&mut canvas),
+                        None,
+                        || {
+                            (!emitted.swap(true, Ordering::Relaxed))
+                                .then(|| Ok(Cow::Borrowed(&tile)))
+                        },
+                    )
+                };
+                assert!(
+                    res.is_err(),
+                    "tier={tier:?} accepted malformed palette case {name}"
+                );
+                assert!(
+                    canvas.iter().all(|&b| b == 0xA5),
+                    "tier={tier:?} partially corrupted canvas on malformed case {name}"
+                );
+            }
+        }
     }
 }
