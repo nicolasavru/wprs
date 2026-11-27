@@ -14,6 +14,7 @@
 
 use std::fs::File;
 use std::io;
+use std::num::NonZeroU32;
 use std::os::fd::OwnedFd;
 use std::thread;
 
@@ -29,12 +30,32 @@ use smithay::xwayland::xwm::Reorder;
 use smithay::xwayland::xwm::ResizeEdge as X11ResizeEdge;
 use smithay::xwayland::xwm::WmWindowProperty;
 use smithay::xwayland::xwm::XwmId;
+use smithay_client_toolkit::globals::ProvidesBoundGlobal;
+use smithay_client_toolkit::reexports::csd_frame::DecorationsFrame;
+use smithay_client_toolkit::reexports::protocols::xdg::decoration::zv1::client::zxdg_decoration_manager_v1::ZxdgDecorationManagerV1;
+use smithay_client_toolkit::reexports::protocols::xdg::shell::client::xdg_toplevel::ResizeEdge as SctkResizeEdge;
+use smithay_client_toolkit::shell::WaylandSurface;
+use smithay_client_toolkit::shell::xdg::XdgShell;
+use smithay_client_toolkit::shell::xdg::window::DecorationMode;
 
 use crate::prelude::*;
 use crate::xwayland_xdg_shell::WprsState;
 use crate::xwayland_xdg_shell::client::Role;
 use crate::xwayland_xdg_shell::compositor::popup_parent_origin;
 use crate::xwayland_xdg_shell::xsurface_from_x11_surface;
+
+pub(crate) fn x11_resize_edge_to_xdg(edge: X11ResizeEdge) -> SctkResizeEdge {
+    match edge {
+        X11ResizeEdge::Top => SctkResizeEdge::Top,
+        X11ResizeEdge::Bottom => SctkResizeEdge::Bottom,
+        X11ResizeEdge::Left => SctkResizeEdge::Left,
+        X11ResizeEdge::TopLeft => SctkResizeEdge::TopLeft,
+        X11ResizeEdge::BottomLeft => SctkResizeEdge::BottomLeft,
+        X11ResizeEdge::Right => SctkResizeEdge::Right,
+        X11ResizeEdge::TopRight => SctkResizeEdge::TopRight,
+        X11ResizeEdge::BottomRight => SctkResizeEdge::BottomRight,
+    }
+}
 
 impl XwmHandler for WprsState {
     fn xwm_state(&mut self, _xwm: XwmId) -> &mut X11Wm {
@@ -46,35 +67,38 @@ impl XwmHandler for WprsState {
     fn new_override_redirect_window(&mut self, _xwm: XwmId, _window: X11Surface) {}
 
     fn map_window_request(&mut self, _xwm: XwmId, window: X11Surface) {
-        window.set_mapped(true).unwrap();
-        self.compositor_state.x11_surfaces.push(window);
+        window.set_mapped(true).log_and_ignore(loc!());
     }
 
-    fn mapped_override_redirect_window(&mut self, _xwm: XwmId, window: X11Surface) {
-        self.compositor_state.x11_surfaces.push(window);
-    }
+    fn mapped_override_redirect_window(&mut self, _xwm: XwmId, _window: X11Surface) {}
 
     #[instrument(skip(self, _xwm), level = "debug")]
     fn unmapped_window(&mut self, _xwm: XwmId, window: X11Surface) {
-        if let Some(wl_surface) = window.wl_surface() {
-            // TODO: verify that we don't end up with stale entries
-            let surface_id = wl_surface.id();
+        let surface_id = window.wl_surface().map(|s| s.id()).or_else(|| {
+            let win_id = window.window_id();
+            self.surfaces.iter().find_map(|(id, xws)| {
+                xws.x11_surface
+                    .as_ref()
+                    .is_some_and(|s| s.window_id() == win_id)
+                    .then(|| id.clone())
+            })
+        });
+        if let Some(surface_id) = surface_id {
             self.remove_surface(&surface_id);
-
-            // TODO: maybe do this on leave?
-            // Without this, xwayland still thinks the key that triggered the
-            // window close is still held down and sends key repeat events.
-            if let Some(keyboard) = self.compositor_state.seat.get_keyboard()
-                && let Some(focus) = keyboard.current_focus()
-                && focus == window
-            {
-                let serial = SERIAL_COUNTER.next_serial();
-                keyboard.set_focus(self, None, serial);
-            }
         }
 
-        if !window.is_override_redirect() {
-            window.set_mapped(false).unwrap();
+        // Without this, xwayland still thinks the key that triggered the
+        // window close is still held down and sends key repeat events.
+        if let Some(keyboard) = self.compositor_state.seat.get_keyboard()
+            && let Some(focus) = keyboard.current_focus()
+            && focus.window_id() == window.window_id()
+        {
+            let serial = SERIAL_COUNTER.next_serial();
+            keyboard.set_focus(self, None, serial);
+        }
+
+        if !window.is_override_redirect() && window.alive() {
+            window.set_mapped(false).log_and_ignore(loc!());
         }
     }
 
@@ -202,9 +226,19 @@ impl XwmHandler for WprsState {
             return;
         };
         match &mut xwayland_surface.role {
-            Some(Role::SubSurface(subsurface)) if !subsurface.move_active => {
+            Some(Role::SubSurface(subsurface))
+                if !subsurface.move_active && subsurface.resize_state.is_none() =>
+            {
                 if let Some((parent_x11_loc, _)) = parent_origin {
                     subsurface.offset = (-parent_x11_loc.x, -parent_x11_loc.y).into();
+                }
+                if let Some(frame) = subsurface.frame.as_mut()
+                    && !frame.is_hidden()
+                {
+                    let width = NonZeroU32::new(geometry.size.w.max(1) as u32).unwrap();
+                    let height = NonZeroU32::new(geometry.size.h.max(1) as u32).unwrap();
+                    frame.resize(width, height);
+                    frame.draw();
                 }
                 subsurface.move_(geometry.loc.x, geometry.loc.y, &self.client_state.qh);
             },
@@ -280,25 +314,64 @@ impl XwmHandler for WprsState {
         }
     }
 
+    fn minimize_request(&mut self, _xwm: XwmId, window: X11Surface) {
+        if let Some(xwayland_surface) = xsurface_from_x11_surface(&mut self.surfaces, &window) {
+            if let Some(Role::XdgToplevel(toplevel)) = &xwayland_surface.role {
+                toplevel.local_window.set_minimized();
+            } else {
+                warn!("Received minimize request for non-XdgToplevel surface.");
+            }
+        } else {
+            warn!("Received minimize request for unknown surface.");
+        }
+    }
+
     fn resize_request(
         &mut self,
         _xwm: XwmId,
-        _window: X11Surface,
+        window: X11Surface,
         _button: u32,
-        _edges: X11ResizeEdge,
+        edges: X11ResizeEdge,
     ) {
-        // TODO, base on frame_action, but need to get serial from somewhere.
+        let Some((seat, serial)) = self.client_state.interactive_grab_seat_and_serial() else {
+            warn!("Received resize request without an active seat/serial.");
+            return;
+        };
+        if let Some(xwayland_surface) = xsurface_from_x11_surface(&mut self.surfaces, &window) {
+            if let Some(Role::XdgToplevel(toplevel)) = &xwayland_surface.role {
+                toplevel
+                    .local_window
+                    .resize(&seat, serial, x11_resize_edge_to_xdg(edges));
+            } else {
+                warn!("Received resize request for non-XdgToplevel surface.");
+            }
+        } else {
+            warn!("Received resize request for unknown surface.");
+        }
     }
 
-    fn move_request(&mut self, _xwm: XwmId, _window: X11Surface, _button: u32) {
-        // TODO, base on frame_action, but need to get serial from somewhere.
+    fn move_request(&mut self, _xwm: XwmId, window: X11Surface, _button: u32) {
+        let Some((seat, serial)) = self.client_state.interactive_grab_seat_and_serial() else {
+            warn!("Received move request without an active seat/serial.");
+            return;
+        };
+        if let Some(xwayland_surface) = xsurface_from_x11_surface(&mut self.surfaces, &window) {
+            if let Some(Role::XdgToplevel(toplevel)) = &xwayland_surface.role {
+                toplevel.local_window.move_(&seat, serial);
+            } else {
+                warn!("Received move request for non-XdgToplevel surface.");
+            }
+        } else {
+            warn!("Received move request for unknown surface.");
+        }
     }
 
     #[instrument(skip(self, _xwm), level = "debug")]
     fn allow_selection_access(&mut self, _xwm: XwmId, selection: SelectionTarget) -> bool {
-        true
-        // TODO: the below should be correct but needs to be verified.
-        // !self.client_state.selection_offers.is_empty()
+        match selection {
+            SelectionTarget::Clipboard => self.client_state.selection_offer.is_some(),
+            SelectionTarget::Primary => self.client_state.primary_selection_offer.is_some(),
+        }
     }
 
     #[instrument(skip(self, _xwm), level = "debug")]
@@ -357,6 +430,7 @@ impl XwmHandler for WprsState {
 
             match selection {
                 SelectionTarget::Clipboard => {
+                    self.client_state.selection_offer = None;
                     let source = self
                         .client_state
                         .data_device_manager_state
@@ -373,6 +447,7 @@ impl XwmHandler for WprsState {
                     self.client_state.selection_source = Some(source);
                 },
                 SelectionTarget::Primary => {
+                    self.client_state.primary_selection_offer = None;
                     if let (Some(primary_selection_manager_state), Some(primary_selection_device)) = (
                         &self.client_state.primary_selection_manager_state,
                         &seat_obj.primary_selection_device,
@@ -394,27 +469,143 @@ impl XwmHandler for WprsState {
         }
     }
 
-    fn cleared_selection(&mut self, _xwm: XwmId, _selection: SelectionTarget) {
-        // TODO
+    #[instrument(skip(self, _xwm), level = "debug")]
+    fn cleared_selection(&mut self, _xwm: XwmId, selection: SelectionTarget) {
+        let serial = self.client_state.last_implicit_grab_serial;
+        match selection {
+            SelectionTarget::Clipboard => {
+                if let Some(source) = self.client_state.selection_source.take() {
+                    if let Some(seat_obj) = self.client_state.seat_objects.last() {
+                        seat_obj.data_device.unset_selection(serial);
+                    }
+                    drop(source);
+                }
+            },
+            SelectionTarget::Primary => {
+                if let Some(source) = self.client_state.primary_selection_source.take() {
+                    if let Some(seat_obj) = self.client_state.seat_objects.last()
+                        && let Some(primary_selection_device) = &seat_obj.primary_selection_device
+                    {
+                        primary_selection_device.unset_selection(serial);
+                    }
+                    drop(source);
+                }
+            },
+        }
     }
 
     fn property_notify(&mut self, _xwm: XwmId, window: X11Surface, property: WmWindowProperty) {
+        let has_xdg_decoration =
+            <XdgShell as ProvidesBoundGlobal<ZxdgDecorationManagerV1, 1>>::bound_global(
+                &self.client_state.xdg_shell_state,
+            )
+            .is_ok();
+        let Some(xwayland_surface) = xsurface_from_x11_surface(&mut self.surfaces, &window) else {
+            return;
+        };
+
         match property {
-            WmWindowProperty::Title
-                if let Some(xwayland_surface) =
-                    xsurface_from_x11_surface(&mut self.surfaces, &window)
-                    && let Some(Role::XdgToplevel(toplevel)) = &xwayland_surface.role =>
-            {
-                toplevel.local_window.set_title(window.title());
+            WmWindowProperty::Title => {
+                if let Some(Role::XdgToplevel(toplevel)) = &xwayland_surface.role {
+                    toplevel.local_window.set_title(window.title());
+                }
             },
-            WmWindowProperty::Class
-                if let Some(xwayland_surface) =
-                    xsurface_from_x11_surface(&mut self.surfaces, &window)
-                    && let Some(Role::XdgToplevel(toplevel)) = &xwayland_surface.role =>
-            {
-                toplevel.local_window.set_app_id(window.class());
+            WmWindowProperty::Class => {
+                if let Some(Role::XdgToplevel(toplevel)) = &xwayland_surface.role {
+                    toplevel.local_window.set_app_id(window.class());
+                }
+            },
+            WmWindowProperty::NormalHints => {
+                if let Some(Role::XdgToplevel(toplevel)) = &xwayland_surface.role {
+                    toplevel.sync_size_hints(&window);
+                }
+            },
+            WmWindowProperty::MotifHints => match &mut xwayland_surface.role {
+                Some(Role::XdgToplevel(toplevel)) => {
+                    if !toplevel.sync_decoration_mode(window.is_decorated()) {
+                        return;
+                    }
+                    if !toplevel.configured {
+                        return;
+                    }
+                    let host_in_client_mode = toplevel
+                        .last_configure
+                        .as_ref()
+                        .is_some_and(|c| c.decoration_mode == DecorationMode::Client);
+                    if host_in_client_mode
+                        && (!has_xdg_decoration
+                            || toplevel.requested_decoration_mode == DecorationMode::Client)
+                    {
+                        let last_configure = toplevel.last_configure.clone();
+                        let cur_loc = window.geometry().loc;
+                        toplevel
+                            .apply_decoration(
+                                &window,
+                                last_configure.as_ref(),
+                                xwayland_surface.buffer.as_ref().map(|b| &b.metadata),
+                                |_, _| cur_loc.into(),
+                            )
+                            .log_and_ignore(loc!());
+                        if !toplevel.window_frame.is_hidden() && toplevel.window_frame.is_dirty() {
+                            toplevel.window_frame.draw();
+                        }
+                    }
+                    toplevel.local_window.wl_surface().commit();
+                },
+                Some(Role::SubSurface(subsurface)) => {
+                    subsurface
+                        .update_decorations(
+                            &window,
+                            &self.client_state.shm_state,
+                            self.client_state.subcompositor_state.clone(),
+                            &self.client_state.qh,
+                        )
+                        .log_and_ignore(loc!());
+                },
+                _ => {},
             },
             _ => {},
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_x11_resize_edge_to_xdg_all_edges() {
+        assert_eq!(
+            x11_resize_edge_to_xdg(X11ResizeEdge::Top),
+            SctkResizeEdge::Top
+        );
+        assert_eq!(
+            x11_resize_edge_to_xdg(X11ResizeEdge::Bottom),
+            SctkResizeEdge::Bottom
+        );
+        assert_eq!(
+            x11_resize_edge_to_xdg(X11ResizeEdge::Left),
+            SctkResizeEdge::Left
+        );
+        assert_eq!(
+            x11_resize_edge_to_xdg(X11ResizeEdge::Right),
+            SctkResizeEdge::Right
+        );
+        assert_eq!(
+            x11_resize_edge_to_xdg(X11ResizeEdge::TopLeft),
+            SctkResizeEdge::TopLeft
+        );
+        assert_eq!(
+            x11_resize_edge_to_xdg(X11ResizeEdge::TopRight),
+            SctkResizeEdge::TopRight
+        );
+        assert_eq!(
+            x11_resize_edge_to_xdg(X11ResizeEdge::BottomLeft),
+            SctkResizeEdge::BottomLeft
+        );
+        assert_eq!(
+            x11_resize_edge_to_xdg(X11ResizeEdge::BottomRight),
+            SctkResizeEdge::BottomRight
+        );
     }
 }

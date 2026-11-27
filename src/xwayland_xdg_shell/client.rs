@@ -92,6 +92,7 @@ use smithay_client_toolkit::seat::keyboard::Keysym;
 use smithay_client_toolkit::seat::keyboard::Modifiers;
 use smithay_client_toolkit::seat::keyboard::RawModifiers;
 use smithay_client_toolkit::seat::keyboard::RepeatInfo;
+use smithay_client_toolkit::seat::pointer::PointerData;
 use smithay_client_toolkit::seat::pointer::PointerEvent;
 use smithay_client_toolkit::seat::pointer::PointerEventKind;
 use smithay_client_toolkit::seat::pointer::PointerHandler;
@@ -140,6 +141,7 @@ use crate::xwayland_xdg_shell::compositor::DecorationBehavior;
 use crate::xwayland_xdg_shell::compositor::X11ParentForPopup;
 use crate::xwayland_xdg_shell::compositor::X11ParentForSubsurface;
 use crate::xwayland_xdg_shell::compositor::popup_parent_origin;
+use crate::xwayland_xdg_shell::decoration::SubSurfaceResizeState;
 use crate::xwayland_xdg_shell::decoration::handle_window_frame_pointer_event;
 use crate::xwayland_xdg_shell::xsurface_from_client_surface;
 use crate::xwayland_xdg_shell::WprsState;
@@ -225,6 +227,83 @@ fn configure_popup_positioner(
     Ok(positioner)
 }
 
+/// Determines which `xdg-decoration` mode to request from the host Wayland
+/// compositor for a toplevel window.
+///
+/// Under `Auto`, client-side-decorated X11 windows (`x11_is_decorated == true`)
+/// request `DecorationMode::Client` so SSD compositors don't add a second
+/// titlebar, while undecorated X11 windows request `DecorationMode::Server` and
+/// fall back to `FallbackFrame` if the host configures `Client`.
+pub(crate) fn desired_decoration_mode(
+    behavior: DecorationBehavior,
+    x11_is_decorated: bool,
+) -> DecorationMode {
+    match behavior {
+        DecorationBehavior::Auto if !x11_is_decorated => DecorationMode::Server,
+        DecorationBehavior::Auto
+        | DecorationBehavior::AlwaysEnabled
+        | DecorationBehavior::AlwaysDisabled => DecorationMode::Client,
+    }
+}
+
+pub(crate) fn window_decorations_for_mode(mode: DecorationMode) -> WindowDecorations {
+    match mode {
+        DecorationMode::Client => WindowDecorations::RequestClient,
+        DecorationMode::Server => WindowDecorations::RequestServer,
+    }
+}
+
+/// Sanitizes X11 `WM_NORMAL_HINTS` min/max sizes for `xdg_toplevel.set_min_size`
+/// / `set_max_size`: clamps negatives to `0` and ensures a non-zero max bound is
+/// never smaller than the corresponding min bound (which is an xdg-shell
+/// protocol error).
+pub(crate) fn sanitize_xdg_size_hints(
+    min_size: Option<(i32, i32)>,
+    max_size: Option<(i32, i32)>,
+) -> (Option<(u32, u32)>, Option<(u32, u32)>) {
+    let min = min_size.map(|(w, h)| (w.max(0) as u32, h.max(0) as u32));
+    let (min_w, min_h) = min.unwrap_or((0, 0));
+    let max = max_size.map(|(w, h)| {
+        let mut mw = w.max(0) as u32;
+        let mut mh = h.max(0) as u32;
+        if mw > 0 && mw < min_w {
+            mw = min_w;
+        }
+        if mh > 0 && mh < min_h {
+            mh = min_h;
+        }
+        (mw, mh)
+    });
+    (min, max)
+}
+
+pub(crate) fn is_active_source<S, W>(
+    active: Option<&S>,
+    source: &W,
+    inner: impl FnOnce(&S) -> &W,
+) -> bool
+where
+    W: PartialEq,
+{
+    active.is_some_and(|active| inner(active) == source)
+}
+
+pub(crate) fn clear_if_active_source<S, W>(
+    active: &mut Option<S>,
+    source: &W,
+    inner: impl FnOnce(&S) -> &W,
+) -> bool
+where
+    W: PartialEq,
+{
+    if is_active_source(active.as_ref(), source, inner) {
+        *active = None;
+        true
+    } else {
+        false
+    }
+}
+
 #[derive(Debug)]
 pub struct WprsClientState {
     pub qh: QueueHandle<WprsState>,
@@ -246,6 +325,8 @@ pub struct WprsClientState {
 
     pub last_enter_serial: u32,
     pub(crate) last_implicit_grab_serial: u32,
+    pub(crate) last_implicit_grab_seat: Option<WlSeat>,
+    pub(crate) last_pointer_press: Option<(WlSeat, u32)>,
     pub(crate) last_pointer_surface: Option<ObjectId>,
     pub(crate) last_keyboard_surface: Option<ObjectId>,
 
@@ -292,6 +373,8 @@ impl WprsClientState {
 
             last_enter_serial: 0,
             last_implicit_grab_serial: 0,
+            last_implicit_grab_seat: None,
+            last_pointer_press: None,
             last_pointer_surface: None,
             last_keyboard_surface: None,
 
@@ -302,6 +385,17 @@ impl WprsClientState {
             primary_selection_offer: None,
             primary_selection_source: None,
         })
+    }
+
+    pub(crate) fn interactive_grab_seat_and_serial(&self) -> Option<(WlSeat, u32)> {
+        if let Some((seat, serial)) = &self.last_pointer_press {
+            return Some((seat.clone(), *serial));
+        }
+        let seat = self
+            .last_implicit_grab_seat
+            .clone()
+            .or_else(|| self.seat_objects.last().map(|s| s.seat.clone()))?;
+        Some((seat, self.last_implicit_grab_serial))
     }
 }
 
@@ -463,6 +557,9 @@ impl WindowHandler for WprsState {
             .set_fullscreen(configure.is_fullscreen())
             .log_and_ignore(loc!());
 
+        xdg_toplevel.last_configure = Some(configure.clone());
+        xdg_toplevel.sync_decoration_mode(x11_surface.is_decorated());
+
         xdg_toplevel
             .apply_decoration(
                 x11_surface,
@@ -482,10 +579,14 @@ impl WindowHandler for WprsState {
             )
             .log_and_ignore(loc!());
 
+        if !xdg_toplevel.window_frame.is_hidden() && xdg_toplevel.window_frame.is_dirty() {
+            xdg_toplevel.window_frame.draw();
+        }
+
         // The code below commits the buffer we received but couldn't attach
-        // because we hadn't received our initial commit. In the normal
+        // because we hadn't received our initial configure. In the normal
         // configure case, the above code will have sent some X11 configure
-        // events and the xwayland can commit in response if so desires.
+        // events and xwayland can commit in response if it desires.
         if xdg_toplevel.configured {
             return;
         }
@@ -687,7 +788,20 @@ impl SeatHandler for WprsState {
         }
     }
 
-    fn remove_seat(&mut self, _: &Connection, _: &QueueHandle<Self>, _: WlSeat) {}
+    fn remove_seat(&mut self, _: &Connection, _: &QueueHandle<Self>, seat: WlSeat) {
+        self.client_state.seat_objects.retain(|s| s.seat != seat);
+        if self
+            .client_state
+            .last_pointer_press
+            .as_ref()
+            .is_some_and(|(s, _)| *s == seat)
+        {
+            self.client_state.last_pointer_press = None;
+        }
+        if self.client_state.last_implicit_grab_seat.as_ref() == Some(&seat) {
+            self.client_state.last_implicit_grab_seat = None;
+        }
+    }
 }
 
 impl KeyboardHandler for WprsState {
@@ -805,7 +919,7 @@ impl KeyboardHandler for WprsState {
 
     // INTENTIONALLY NOT LOGGING KEY EVENTS
     #[instrument(
-        skip(self, _conn, _qh, _keyboard, event),
+        skip(self, _conn, _qh, keyboard, event),
         fields(event),
         level = "debug"
     )]
@@ -813,7 +927,7 @@ impl KeyboardHandler for WprsState {
         &mut self,
         _conn: &Connection,
         _qh: &QueueHandle<Self>,
-        _keyboard: &WlKeyboard,
+        keyboard: &WlKeyboard,
         serial: u32,
         event: KeyEvent,
     ) {
@@ -821,13 +935,21 @@ impl KeyboardHandler for WprsState {
             Span::current().record("event", field::debug(&event));
         }
         self.client_state.last_implicit_grab_serial = serial;
+        if let Some(seat_obj) = self
+            .client_state
+            .seat_objects
+            .iter()
+            .find(|s| s.keyboard.as_ref() == Some(keyboard))
+        {
+            self.client_state.last_implicit_grab_seat = Some(seat_obj.seat.clone());
+        }
         let serial = self.compositor_state.serial_map.insert(serial);
         log_and_return!(self.set_key_state(event.raw_code, KeyState::Pressed, serial));
     }
 
     // INTENTIONALLY NOT LOGGING KEY EVENTS
     #[instrument(
-        skip(self, _conn, _qh, _keyboard, event),
+        skip(self, _conn, _qh, keyboard, event),
         fields(event),
         level = "debug"
     )]
@@ -835,7 +957,7 @@ impl KeyboardHandler for WprsState {
         &mut self,
         _conn: &Connection,
         _qh: &QueueHandle<Self>,
-        _keyboard: &WlKeyboard,
+        keyboard: &WlKeyboard,
         serial: u32,
         event: KeyEvent,
     ) {
@@ -843,6 +965,14 @@ impl KeyboardHandler for WprsState {
             Span::current().record("event", field::debug(&event));
         }
         self.client_state.last_implicit_grab_serial = serial;
+        if let Some(seat_obj) = self
+            .client_state
+            .seat_objects
+            .iter()
+            .find(|s| s.keyboard.as_ref() == Some(keyboard))
+        {
+            self.client_state.last_implicit_grab_seat = Some(seat_obj.seat.clone());
+        }
         let serial = self.compositor_state.serial_map.insert(serial);
         log_and_return!(self.set_key_state(event.raw_code, KeyState::Repeated, serial));
     }
@@ -1063,6 +1193,11 @@ impl PointerHandler for WprsState {
                     serial,
                 } => {
                     self.client_state.last_implicit_grab_serial = serial;
+                    if let Some(pointer_data) = pointer.data::<PointerData<()>>() {
+                        let seat = pointer_data.seat().clone();
+                        self.client_state.last_implicit_grab_seat = Some(seat.clone());
+                        self.client_state.last_pointer_press = Some((seat, serial));
+                    }
                     self.compositor_state.pressed_buttons.insert(button);
                     let serial = self.compositor_state.serial_map.insert(serial);
                     compositor_pointer.button(
@@ -1330,6 +1465,8 @@ pub struct XWaylandXdgToplevel {
     pub frame_offset: Point<i32>,
     pub configured: bool,
     pub decoration_behavior: DecorationBehavior,
+    pub requested_decoration_mode: DecorationMode,
+    pub last_configure: Option<WindowConfigure>,
 }
 
 impl XWaylandXdgToplevel {
@@ -1479,9 +1616,7 @@ impl XWaylandXdgToplevel {
                         )
                     },
                     DecorationMode::Client => {
-                        // x11 app has drawn it's own decorations so it doesn't need ours
-                        // TODO: if the x11_surface is decorated, but there are server-side decorations then we
-                        // should request client-side decorations from the compositor
+                        // X11 app drew its own CSD; skip our fallback frame.
                         if x11_surface.is_decorated() {
                             self.disable_decoration(
                                 x11_surface,
@@ -1509,6 +1644,28 @@ impl XWaylandXdgToplevel {
         }
     }
 
+    /// Requests the appropriate host `xdg-decoration` mode when the desired
+    /// mode changed (avoiding redundant requests and configure loops).
+    pub fn sync_decoration_mode(&mut self, x11_is_decorated: bool) -> bool {
+        let desired = desired_decoration_mode(self.decoration_behavior, x11_is_decorated);
+        if self.requested_decoration_mode != desired {
+            self.requested_decoration_mode = desired;
+            self.local_window.request_decoration_mode(Some(desired));
+            true
+        } else {
+            false
+        }
+    }
+
+    pub fn sync_size_hints(&self, x11_surface: &X11Surface) {
+        let (min_size, max_size) = sanitize_xdg_size_hints(
+            x11_surface.min_size().map(|s| (s.w, s.h)),
+            x11_surface.max_size().map(|s| (s.w, s.h)),
+        );
+        self.local_window.set_min_size(min_size);
+        self.local_window.set_max_size(max_size);
+    }
+
     pub fn set_role(
         surface: &mut XWaylandSurface,
         xdg_shell_state: &XdgShell,
@@ -1518,21 +1675,31 @@ impl XWaylandXdgToplevel {
         decoration_behavior: DecorationBehavior,
     ) -> Result<()> {
         let local_surface = surface.local_surface.take().location(loc!())?;
-        let local_window =
-            xdg_shell_state.create_window(local_surface, WindowDecorations::ServerDefault, qh);
-
         let x11_surface = surface.get_x11_surface().location(loc!())?;
+        let requested_decoration_mode =
+            desired_decoration_mode(decoration_behavior, x11_surface.is_decorated());
+        let local_window = xdg_shell_state.create_window(
+            local_surface,
+            window_decorations_for_mode(requested_decoration_mode),
+            qh,
+        );
+
         local_window.set_title(x11_surface.title());
-
-        if let Some(max_size) = x11_surface.max_size() {
-            local_window.set_max_size(Some((max_size.w as u32, max_size.h as u32)));
+        let class = x11_surface.class();
+        if !class.is_empty() {
+            local_window.set_app_id(class);
         }
 
-        if let Some(min_size) = x11_surface.min_size() {
-            local_window.set_min_size(Some((min_size.w as u32, min_size.h as u32)));
+        let (min_size, max_size) = sanitize_xdg_size_hints(
+            x11_surface.min_size().map(|s| (s.w, s.h)),
+            x11_surface.max_size().map(|s| (s.w, s.h)),
+        );
+        if min_size.is_some() {
+            local_window.set_min_size(min_size);
         }
-
-        // TODO: decorations
+        if max_size.is_some() {
+            local_window.set_max_size(max_size);
+        }
 
         local_window.commit();
 
@@ -1547,6 +1714,8 @@ impl XWaylandXdgToplevel {
             frame_offset: (0, 0).into(),
             configured: false,
             decoration_behavior,
+            requested_decoration_mode,
+            last_configure: None,
         };
         surface.role = Some(Role::XdgToplevel(new_toplevel));
         Ok(())
@@ -1591,6 +1760,7 @@ pub struct XWaylandSubSurface {
     pub frame: Option<FallbackFrame<WprsState>>,
     pub move_active: bool,
     pub move_pointer_location: (f64, f64),
+    pub resize_state: Option<SubSurfaceResizeState>,
     pub pending_frame_callback: bool,
     pub buffer_attached: bool,
 }
@@ -1650,6 +1820,7 @@ impl XWaylandSubSurface {
             frame,
             move_active: false,
             move_pointer_location: (0 as f64, 0 as f64),
+            resize_state: None,
             pending_frame_callback: false,
             buffer_attached: false,
         };
@@ -1661,6 +1832,48 @@ impl XWaylandSubSurface {
             subsurface.move_without_commit(geometry.loc.x, geometry.loc.y, qh);
         }
 
+        Ok(())
+    }
+
+    pub(crate) fn update_decorations(
+        &mut self,
+        x11_surface: &X11Surface,
+        shm_state: &Shm,
+        subcompositor_state: Arc<SubcompositorState>,
+        qh: &QueueHandle<WprsState>,
+    ) -> Result<()> {
+        if x11_surface.is_decorated() || x11_surface.is_override_redirect() {
+            self.move_active = false;
+            self.resize_state = None;
+            if let Some(frame) = self.frame.as_mut() {
+                frame.set_hidden(true);
+            }
+            self.wl_surface().commit();
+            return Ok(());
+        }
+
+        let geometry = x11_surface.geometry();
+        let width = NonZeroU32::new(geometry.size.w.max(1) as u32).unwrap();
+        let height = NonZeroU32::new(geometry.size.h.max(1) as u32).unwrap();
+        if let Some(frame) = self.frame.as_mut() {
+            frame.set_hidden(false);
+            frame.resize(width, height);
+            frame.draw();
+        } else {
+            let mut frame = FallbackFrame::new(
+                &self.local_subsurface,
+                shm_state,
+                subcompositor_state,
+                qh.clone(),
+            )
+            .map_err(|e| anyhow!("failed to create client side decorations frame: {e:?}."))
+            .location(loc!())?;
+            frame.update_wm_capabilities(WindowManagerCapabilities::empty());
+            frame.resize(width, height);
+            frame.draw();
+            self.frame = Some(frame);
+        }
+        self.wl_surface().commit();
         Ok(())
     }
 
@@ -1728,6 +1941,7 @@ impl XWaylandXdgPopup {
             xdg_shell_state,
         )
         .location(loc!())?;
+        local_popup.wl_surface().commit();
 
         let new_popup = Self {
             local_popup,
@@ -1778,6 +1992,9 @@ impl XdgSurface for XWaylandXdgPopup {
 }
 
 impl DataDeviceHandler for WprsState {
+    // Smithay 0.7's `X11Wm` does not implement the Xdnd protocol (`XdndAware`,
+    // `XdndEnter`/`Position`/`Status`/`Drop`/`Finished`, `XdndSelection`), so
+    // Wayland <-> X11 drag-and-drop bridging is not yet wired here.
     fn enter(
         &mut self,
         _conn: &Connection,
@@ -1787,32 +2004,20 @@ impl DataDeviceHandler for WprsState {
         _y: f64,
         _wl_surface: &WlSurface,
     ) {
-        let data_device = &self
+        let Some(seat_obj) = self
             .client_state
             .seat_objects
             .iter()
             .find(|seat| seat.data_device.inner() == data_device)
-            .unwrap()
-            .data_device
-            .data();
-        let drag_offer = data_device.drag_offer().unwrap();
-        debug!(
-            "data offer entered x: {:.2} y: {:.2}",
-            drag_offer.x, drag_offer.y
-        );
-
-        // TODO: revisit xwayland drag-and-drop.
-        // // accept the first mime type we support
-        // if let Some(m) = data_device
-        //     .drag_mime_types()
-        //     .iter()
-        //     .find(|m| SUPPORTED_MIME_TYPES.contains(&m.as_str()))
-        // {
-        //     drag_offer.accept_mime_type(0, Some(m.clone()));
-        // }
-
-        // // accept the action now just in case
-        // drag_offer.set_actions(DndAction::Copy, DndAction::Copy);
+        else {
+            return;
+        };
+        if let Some(drag_offer) = seat_obj.data_device.data().drag_offer() {
+            debug!(
+                "data offer entered x: {:.2} y: {:.2}",
+                drag_offer.x, drag_offer.y
+            );
+        }
     }
 
     fn leave(&mut self, _conn: &Connection, _qh: &QueueHandle<Self>, _data_device: &WlDataDevice) {
@@ -1827,9 +2032,6 @@ impl DataDeviceHandler for WprsState {
         _x: f64,
         _y: f64,
     ) {
-        // TODO: revisit xwayland drag-and-drop.
-        // let DragOffer { x, y, time, .. } = data_device.drag_offer().unwrap();
-        // dbg!((time, x, y));
     }
 
     #[instrument(skip_all, level = "debug")]
@@ -1839,15 +2041,20 @@ impl DataDeviceHandler for WprsState {
         _qh: &QueueHandle<Self>,
         data_device: &WlDataDevice,
     ) {
-        let data_device = &self
+        let Some(seat_obj) = self
             .client_state
             .seat_objects
             .iter()
             .find(|seat| seat.data_device.inner() == data_device)
-            .unwrap()
-            .data_device
-            .data();
-        let Some(offer) = data_device.selection_offer() else {
+        else {
+            return;
+        };
+        let Some(offer) = seat_obj.data_device.data().selection_offer() else {
+            self.client_state.selection_offer = None;
+            if let Some(xwm) = &mut self.compositor_state.xwm {
+                xwm.new_selection(SelectionTarget::Clipboard, None)
+                    .log_and_ignore(loc!());
+            }
             return;
         };
         let mime_types = offer.with_mime_types(<[String]>::to_vec);
@@ -1859,11 +2066,6 @@ impl DataDeviceHandler for WprsState {
             xwm.new_selection(SelectionTarget::Clipboard, Some(mime_types))
                 .log_and_ignore(loc!());
         }
-        // TODO: do we need this?
-        // data_device::set_data_device_selection(&self.compositor_state.dh,
-        //                                        &self.compositor_state.seat,
-        //                                        mime_types,
-        //                                        ())
     }
 
     fn drop_performed(
@@ -1872,49 +2074,6 @@ impl DataDeviceHandler for WprsState {
         _qh: &QueueHandle<Self>,
         _data_device: &WlDataDevice,
     ) {
-        // TODO: revisit xwayland drag-and-drop.
-        // if let Some(offer) = data_device.drag_offer() {
-        //     println!("Dropped: {offer:?}");
-        //     self.dnd_offers.push((offer, String::new(), None));
-        //     let cur_offer = self.dnd_offers.last_mut().unwrap();
-        //     let mime_type = match data_device
-        //         .drag_mime_types()
-        //         .iter()
-        //         .find(|m| SUPPORTED_MIME_TYPES.contains(&m.as_str()))
-        //         .cloned()
-        //     {
-        //         Some(mime) => mime,
-        //         None => return,
-        //     };
-        //     dbg!(&mime_type);
-        //     self.accept_counter += 1;
-        //     cur_offer.0.accept_mime_type(self.accept_counter, Some(mime_type.clone()));
-        //     cur_offer.0.set_actions(DndAction::Copy, DndAction::Copy);
-        //     if let Ok(read_pipe) = cur_offer.0.receive(mime_type.clone()) {
-        //         let offer_clone = cur_offer.0.clone();
-        //         match self.loop_handle.insert_source(read_pipe, move |_, f, state| {
-        //             let (offer, mut contents, token) = state
-        //                 .dnd_offers
-        //                 .iter()
-        //                 .position(|o| &o.0.inner() == &offer_clone.inner())
-        //                 .map(|p| state.dnd_offers.remove(p))
-        //                 .unwrap();
-
-        //             f.read_to_string(&mut contents).unwrap();
-        //             println!("TEXT FROM drop: {contents}");
-        //             state.loop_handle.remove(token.unwrap());
-
-        //             offer.finish();
-        //         }) {
-        //             Ok(token) => {
-        //                 cur_offer.2.replace(token);
-        //             }
-        //             Err(err) => {
-        //                 eprintln!("{:?}", err);
-        //             }
-        //         }
-        //     }
-        // }
     }
 }
 
@@ -1927,8 +2086,6 @@ impl DataOfferHandler for WprsState {
         actions: DndAction,
     ) {
         debug!("Source actions: {actions:?}");
-        // TODO: revisit xwayland drag-and-drop.
-        // offer.set_actions(DndAction::Copy, DndAction::Copy);
     }
 
     fn selected_action(
@@ -1939,7 +2096,6 @@ impl DataOfferHandler for WprsState {
         actions: DndAction,
     ) {
         debug!("Selected action: {actions:?}");
-        // TODO ?
     }
 }
 
@@ -1963,7 +2119,14 @@ impl DataSourceHandler for WprsState {
         mime: String,
         write_pipe: WritePipe,
     ) {
-        // TODO: handle multiple sources
+        if !is_active_source(
+            self.client_state.selection_source.as_ref(),
+            source,
+            CopyPasteSource::inner,
+        ) {
+            debug!("ignoring send_request for inactive clipboard data source");
+            return;
+        }
         if let Some(xwm) = &mut self.compositor_state.xwm {
             xwm.send_selection(
                 SelectionTarget::Clipboard,
@@ -1977,12 +2140,15 @@ impl DataSourceHandler for WprsState {
 
     #[instrument(skip(self, _conn, _qh), level = "debug")]
     fn cancelled(&mut self, _conn: &Connection, _qh: &QueueHandle<Self>, source: &WlDataSource) {
-        // TODO: revisit xwayland drag-and-drop.
+        clear_if_active_source(
+            &mut self.client_state.selection_source,
+            source,
+            CopyPasteSource::inner,
+        );
     }
 
     #[instrument(skip_all, level = "debug")]
     fn dnd_dropped(&mut self, _conn: &Connection, _qh: &QueueHandle<Self>, _source: &WlDataSource) {
-        // TODO: revisit xwayland drag-and-drop.
     }
 
     #[instrument(skip_all, level = "debug")]
@@ -1992,7 +2158,6 @@ impl DataSourceHandler for WprsState {
         _qh: &QueueHandle<Self>,
         _source: &WlDataSource,
     ) {
-        // TODO: revisit xwayland drag-and-drop.
     }
 
     #[instrument(skip_all, level = "debug")]
@@ -2003,7 +2168,6 @@ impl DataSourceHandler for WprsState {
         _source: &WlDataSource,
         _action: DndAction,
     ) {
-        // TODO: revisit xwayland drag-and-drop.
     }
 }
 
@@ -2018,15 +2182,21 @@ impl PrimarySelectionDeviceHandler for WprsState {
         if self.client_state.primary_selection_manager_state.is_none() {
             return;
         }
-        let primary_selection_device = &self
+        let Some(primary_selection_device) = self
             .client_state
             .seat_objects
             .iter()
             .filter_map(|seat| seat.primary_selection_device.as_ref())
             .find(|device| device.inner() == primary_selection_device)
-            .unwrap()
-            .data();
-        let Some(offer) = primary_selection_device.selection_offer() else {
+        else {
+            return;
+        };
+        let Some(offer) = primary_selection_device.data().selection_offer() else {
+            self.client_state.primary_selection_offer = None;
+            if let Some(xwm) = &mut self.compositor_state.xwm {
+                xwm.new_selection(SelectionTarget::Primary, None)
+                    .log_and_ignore(loc!());
+            }
             return;
         };
         let mime_types = offer.with_mime_types(<[String]>::to_vec);
@@ -2051,6 +2221,14 @@ impl PrimarySelectionSourceHandler for WprsState {
         mime: String,
         write_pipe: WritePipe,
     ) {
+        if !is_active_source(
+            self.client_state.primary_selection_source.as_ref(),
+            source,
+            PrimarySelectionSource::inner,
+        ) {
+            debug!("ignoring send_request for inactive primary selection source");
+            return;
+        }
         if let Some(xwm) = &mut self.compositor_state.xwm {
             xwm.send_selection(
                 SelectionTarget::Primary,
@@ -2069,6 +2247,11 @@ impl PrimarySelectionSourceHandler for WprsState {
         _qh: &QueueHandle<Self>,
         source: &ZwpPrimarySelectionSourceV1,
     ) {
+        clear_if_active_source(
+            &mut self.client_state.primary_selection_source,
+            source,
+            PrimarySelectionSource::inner,
+        );
     }
 }
 
@@ -2433,5 +2616,754 @@ mod tests {
         assert!(!should_raise_window_on_enter(true, true));
         assert!(!should_raise_window_on_enter(false, true));
         assert!(should_raise_window_on_enter(false, false));
+    }
+
+    #[test]
+    fn test_desired_decoration_mode_and_size_hints() {
+        // Auto: CSD X11 window requests Client (avoid double titlebar on SSD
+        // compositors); undecorated X11 window requests Server (fallback to
+        // FallbackFrame if host configures Client).
+        assert_eq!(
+            desired_decoration_mode(DecorationBehavior::Auto, true),
+            DecorationMode::Client
+        );
+        assert_eq!(
+            desired_decoration_mode(DecorationBehavior::Auto, false),
+            DecorationMode::Server
+        );
+        // Explicit AlwaysEnabled / AlwaysDisabled both request Client so host
+        // SSD never stacks on top of FallbackFrame or overrides AlwaysDisabled.
+        assert_eq!(
+            desired_decoration_mode(DecorationBehavior::AlwaysEnabled, false),
+            DecorationMode::Client
+        );
+        assert_eq!(
+            desired_decoration_mode(DecorationBehavior::AlwaysEnabled, true),
+            DecorationMode::Client
+        );
+        assert_eq!(
+            desired_decoration_mode(DecorationBehavior::AlwaysDisabled, false),
+            DecorationMode::Client
+        );
+        assert_eq!(
+            desired_decoration_mode(DecorationBehavior::AlwaysDisabled, true),
+            DecorationMode::Client
+        );
+        assert_eq!(
+            window_decorations_for_mode(DecorationMode::Client),
+            WindowDecorations::RequestClient
+        );
+        assert_eq!(
+            window_decorations_for_mode(DecorationMode::Server),
+            WindowDecorations::RequestServer
+        );
+
+        // Size-hint sanitization: negative -> 0, non-zero max < min -> min,
+        // zero max stays unbounded (0).
+        assert_eq!(sanitize_xdg_size_hints(None, None), (None, None));
+        assert_eq!(
+            sanitize_xdg_size_hints(Some((320, 240)), Some((1920, 1080))),
+            (Some((320, 240)), Some((1920, 1080)))
+        );
+        assert_eq!(
+            sanitize_xdg_size_hints(Some((-10, 200)), Some((150, 100))),
+            (Some((0, 200)), Some((150, 200)))
+        );
+        assert_eq!(
+            sanitize_xdg_size_hints(Some((400, 300)), Some((0, 200))),
+            (Some((400, 300)), Some((0, 300)))
+        );
+    }
+
+    #[test]
+    fn test_active_selection_source_guard() {
+        let mut active: Option<u32> = None;
+        assert!(!is_active_source(active.as_ref(), &1, |v| v));
+        assert!(!clear_if_active_source(&mut active, &1, |v| v));
+
+        active = Some(1);
+        assert!(is_active_source(active.as_ref(), &1, |v| v));
+        assert!(!is_active_source(active.as_ref(), &2, |v| v));
+
+        // Superseded source 1 arriving late must not clobber active source 2.
+        active = Some(2);
+        assert!(!is_active_source(active.as_ref(), &1, |v| v));
+        assert!(!clear_if_active_source(&mut active, &1, |v| v));
+        assert_eq!(active, Some(2));
+
+        // Cancelling the active source clears it.
+        assert!(clear_if_active_source(&mut active, &2, |v| v));
+        assert_eq!(active, None);
+    }
+
+    #[test]
+    #[cfg_attr(miri, ignore)]
+    fn test_xdg_decoration_move_resize_and_selection_wire() {
+        use std::os::fd::OwnedFd;
+        use std::os::unix::net::UnixStream;
+        use std::sync::atomic::AtomicBool;
+        use std::sync::atomic::Ordering;
+
+        use smithay::input::Seat as ServerSeat;
+        use smithay::input::SeatHandler as ServerSeatHandler;
+        use smithay::input::SeatState as ServerSeatState;
+        use smithay::reexports::wayland_protocols::xdg::decoration::zv1::server::zxdg_toplevel_decoration_v1::Mode as ServerDecoMode;
+        use smithay::reexports::wayland_protocols::xdg::shell::server::xdg_toplevel::ResizeEdge as ServerResizeEdge;
+        use smithay::reexports::wayland_server::Client as ServerClient;
+        use smithay::reexports::wayland_server::Display;
+        use smithay::reexports::wayland_server::backend::ClientData;
+        use smithay::reexports::wayland_server::backend::ClientId;
+        use smithay::reexports::wayland_server::backend::DisconnectReason;
+        use smithay::reexports::wayland_server::protocol::wl_seat::WlSeat as ServerWlSeat;
+        use smithay::reexports::wayland_server::protocol::wl_surface::WlSurface as ServerWlSurface;
+        use smithay::utils::Serial as ServerSerial;
+        use smithay::wayland::compositor::CompositorClientState;
+        use smithay::wayland::compositor::CompositorHandler as ServerCompositorHandler;
+        use smithay::wayland::compositor::CompositorState as ServerCompositorState;
+        use smithay::wayland::selection::SelectionHandler as ServerSelectionHandler;
+        use smithay::wayland::selection::SelectionSource;
+        use smithay::wayland::selection::data_device::ClientDndGrabHandler;
+        use smithay::wayland::selection::data_device::DataDeviceHandler as ServerDataDeviceHandler;
+        use smithay::wayland::selection::data_device::DataDeviceState as ServerDataDeviceState;
+        use smithay::wayland::selection::data_device::ServerDndGrabHandler;
+        use smithay::wayland::selection::primary_selection::PrimarySelectionHandler as ServerPrimarySelectionHandler;
+        use smithay::wayland::selection::primary_selection::PrimarySelectionState as ServerPrimarySelectionState;
+        use smithay::wayland::shell::xdg::PopupSurface;
+        use smithay::wayland::shell::xdg::PositionerState;
+        use smithay::wayland::shell::xdg::ToplevelSurface;
+        use smithay::wayland::shell::xdg::XdgShellHandler;
+        use smithay::wayland::shell::xdg::XdgShellState;
+        use smithay::wayland::shell::xdg::decoration::XdgDecorationHandler;
+        use smithay::wayland::shell::xdg::decoration::XdgDecorationState;
+        use smithay::xwayland::xwm::ResizeEdge as X11ResizeEdge;
+        use smithay_client_toolkit::data_device_manager::data_device::DataDevice;
+        use smithay_client_toolkit::primary_selection::device::PrimarySelectionDevice;
+        use smithay_client_toolkit::reexports::client::EventQueue;
+        use smithay_client_toolkit::reexports::client::globals::registry_queue_init;
+        use smithay_client_toolkit::reexports::client::protocol::wl_callback;
+
+        use crate::xwayland_xdg_shell::xwayland::x11_resize_edge_to_xdg;
+
+        #[derive(Default)]
+        struct TestClientData {
+            compositor_state: CompositorClientState,
+        }
+
+        impl ClientData for TestClientData {
+            fn initialized(&self, _client_id: ClientId) {}
+            fn disconnected(&self, _client_id: ClientId, _reason: DisconnectReason) {}
+        }
+
+        struct TestHostServer {
+            compositor_state: ServerCompositorState,
+            xdg_shell_state: XdgShellState,
+            _xdg_decoration_state: XdgDecorationState,
+            seat_state: ServerSeatState<Self>,
+            data_device_state: ServerDataDeviceState,
+            primary_selection_state: ServerPrimarySelectionState,
+            deco_requests: Vec<Option<ServerDecoMode>>,
+            move_requests: Vec<u32>,
+            resize_requests: Vec<(u32, ServerResizeEdge)>,
+            minimize_count: usize,
+            selection_events: Vec<(SelectionTarget, bool)>,
+            first_toplevel_surface: Option<ServerWlSurface>,
+        }
+
+        impl ServerCompositorHandler for TestHostServer {
+            fn compositor_state(&mut self) -> &mut ServerCompositorState {
+                &mut self.compositor_state
+            }
+            fn client_compositor_state<'a>(
+                &self,
+                client: &'a ServerClient,
+            ) -> &'a CompositorClientState {
+                &client
+                    .get_data::<TestClientData>()
+                    .unwrap()
+                    .compositor_state
+            }
+            fn commit(&mut self, _surface: &ServerWlSurface) {}
+        }
+
+        impl XdgShellHandler for TestHostServer {
+            fn xdg_shell_state(&mut self) -> &mut XdgShellState {
+                &mut self.xdg_shell_state
+            }
+            fn new_toplevel(&mut self, surface: ToplevelSurface) {
+                if self.first_toplevel_surface.is_none() {
+                    self.first_toplevel_surface = Some(surface.wl_surface().clone());
+                }
+                surface.send_configure();
+            }
+            fn new_popup(&mut self, _surface: PopupSurface, _positioner: PositionerState) {}
+            fn grab(&mut self, _surface: PopupSurface, _seat: ServerWlSeat, _serial: ServerSerial) {
+            }
+            fn reposition_request(
+                &mut self,
+                _surface: PopupSurface,
+                _positioner: PositionerState,
+                _token: u32,
+            ) {
+            }
+            fn move_request(
+                &mut self,
+                _surface: ToplevelSurface,
+                _seat: ServerWlSeat,
+                serial: ServerSerial,
+            ) {
+                self.move_requests.push(u32::from(serial));
+            }
+            fn resize_request(
+                &mut self,
+                _surface: ToplevelSurface,
+                _seat: ServerWlSeat,
+                serial: ServerSerial,
+                edges: ServerResizeEdge,
+            ) {
+                self.resize_requests.push((u32::from(serial), edges));
+            }
+            fn minimize_request(&mut self, _surface: ToplevelSurface) {
+                self.minimize_count += 1;
+            }
+        }
+
+        impl XdgDecorationHandler for TestHostServer {
+            fn new_decoration(&mut self, _toplevel: ToplevelSurface) {}
+            fn request_mode(&mut self, toplevel: ToplevelSurface, mode: ServerDecoMode) {
+                self.deco_requests.push(Some(mode));
+                toplevel.with_pending_state(|state| {
+                    state.decoration_mode = Some(mode);
+                });
+                toplevel.send_configure();
+            }
+            fn unset_mode(&mut self, _toplevel: ToplevelSurface) {
+                self.deco_requests.push(None);
+            }
+        }
+
+        impl ServerSeatHandler for TestHostServer {
+            type KeyboardFocus = ServerWlSurface;
+            type PointerFocus = ServerWlSurface;
+            type TouchFocus = ServerWlSurface;
+            fn seat_state(&mut self) -> &mut ServerSeatState<Self> {
+                &mut self.seat_state
+            }
+        }
+
+        impl ServerSelectionHandler for TestHostServer {
+            type SelectionUserData = ();
+            fn new_selection(
+                &mut self,
+                ty: SelectionTarget,
+                source: Option<SelectionSource>,
+                _seat: ServerSeat<Self>,
+            ) {
+                self.selection_events.push((ty, source.is_some()));
+            }
+            fn send_selection(
+                &mut self,
+                _ty: SelectionTarget,
+                _mime_type: String,
+                _fd: OwnedFd,
+                _seat: ServerSeat<Self>,
+                _user_data: &Self::SelectionUserData,
+            ) {
+            }
+        }
+
+        impl ServerDataDeviceHandler for TestHostServer {
+            fn data_device_state(&self) -> &ServerDataDeviceState {
+                &self.data_device_state
+            }
+        }
+        impl ClientDndGrabHandler for TestHostServer {}
+        impl ServerDndGrabHandler for TestHostServer {}
+
+        impl ServerPrimarySelectionHandler for TestHostServer {
+            fn primary_selection_state(&self) -> &ServerPrimarySelectionState {
+                &self.primary_selection_state
+            }
+        }
+
+        smithay::delegate_compositor!(TestHostServer);
+        smithay::delegate_xdg_shell!(TestHostServer);
+        smithay::delegate_xdg_decoration!(TestHostServer);
+        smithay::delegate_seat!(TestHostServer);
+        smithay::delegate_data_device!(TestHostServer);
+        smithay::delegate_primary_selection!(TestHostServer);
+
+        struct TestClient {
+            registry_state: RegistryState,
+            output_state: OutputState,
+            seat_state: SeatState,
+            data_device_manager: DataDeviceManagerState,
+            primary_selection_manager: PrimarySelectionManagerState,
+            seat: Option<WlSeat>,
+            data_device: Option<DataDevice>,
+            primary_device: Option<PrimarySelectionDevice>,
+            active_clipboard: Option<CopyPasteSource>,
+            active_primary: Option<PrimarySelectionSource>,
+            cancelled_clipboard: usize,
+            cancelled_primary: usize,
+            configured_modes: Vec<DecorationMode>,
+        }
+
+        impl OutputHandler for TestClient {
+            fn output_state(&mut self) -> &mut OutputState {
+                &mut self.output_state
+            }
+            fn new_output(&mut self, _: &Connection, _: &QueueHandle<Self>, _: WlOutput) {}
+            fn update_output(&mut self, _: &Connection, _: &QueueHandle<Self>, _: WlOutput) {}
+            fn output_destroyed(&mut self, _: &Connection, _: &QueueHandle<Self>, _: WlOutput) {}
+        }
+
+        impl CompositorHandler for TestClient {
+            fn scale_factor_changed(
+                &mut self,
+                _: &Connection,
+                _: &QueueHandle<Self>,
+                _: &WlSurface,
+                _: i32,
+            ) {
+            }
+            fn transform_changed(
+                &mut self,
+                _: &Connection,
+                _: &QueueHandle<Self>,
+                _: &WlSurface,
+                _: Transform,
+            ) {
+            }
+            fn frame(&mut self, _: &Connection, _: &QueueHandle<Self>, _: &WlSurface, _: u32) {}
+            fn surface_enter(
+                &mut self,
+                _: &Connection,
+                _: &QueueHandle<Self>,
+                _: &WlSurface,
+                _: &WlOutput,
+            ) {
+            }
+            fn surface_leave(
+                &mut self,
+                _: &Connection,
+                _: &QueueHandle<Self>,
+                _: &WlSurface,
+                _: &WlOutput,
+            ) {
+            }
+        }
+
+        impl WindowHandler for TestClient {
+            fn request_close(&mut self, _: &Connection, _: &QueueHandle<Self>, _: &Window) {}
+            fn configure(
+                &mut self,
+                _: &Connection,
+                _: &QueueHandle<Self>,
+                _: &Window,
+                configure: WindowConfigure,
+                _: u32,
+            ) {
+                self.configured_modes.push(configure.decoration_mode);
+            }
+        }
+
+        impl SeatHandler for TestClient {
+            fn seat_state(&mut self) -> &mut SeatState {
+                &mut self.seat_state
+            }
+            fn new_seat(&mut self, _: &Connection, _: &QueueHandle<Self>, _: WlSeat) {}
+            fn new_capability(
+                &mut self,
+                _: &Connection,
+                qh: &QueueHandle<Self>,
+                seat: WlSeat,
+                _: Capability,
+            ) {
+                if self.seat.is_none() {
+                    self.data_device = Some(self.data_device_manager.get_data_device(qh, &seat));
+                    self.primary_device = Some(
+                        self.primary_selection_manager
+                            .get_selection_device(qh, &seat),
+                    );
+                    self.seat = Some(seat);
+                }
+            }
+            fn remove_capability(
+                &mut self,
+                _: &Connection,
+                _: &QueueHandle<Self>,
+                _: WlSeat,
+                _: Capability,
+            ) {
+            }
+            fn remove_seat(&mut self, _: &Connection, _: &QueueHandle<Self>, _: WlSeat) {}
+        }
+
+        impl DataDeviceHandler for TestClient {
+            fn enter(
+                &mut self,
+                _: &Connection,
+                _: &QueueHandle<Self>,
+                _: &WlDataDevice,
+                _: f64,
+                _: f64,
+                _: &WlSurface,
+            ) {
+            }
+            fn leave(&mut self, _: &Connection, _: &QueueHandle<Self>, _: &WlDataDevice) {}
+            fn motion(
+                &mut self,
+                _: &Connection,
+                _: &QueueHandle<Self>,
+                _: &WlDataDevice,
+                _: f64,
+                _: f64,
+            ) {
+            }
+            fn selection(&mut self, _: &Connection, _: &QueueHandle<Self>, _: &WlDataDevice) {}
+            fn drop_performed(&mut self, _: &Connection, _: &QueueHandle<Self>, _: &WlDataDevice) {}
+        }
+
+        impl DataOfferHandler for TestClient {
+            fn source_actions(
+                &mut self,
+                _: &Connection,
+                _: &QueueHandle<Self>,
+                _: &mut DragOffer,
+                _: DndAction,
+            ) {
+            }
+            fn selected_action(
+                &mut self,
+                _: &Connection,
+                _: &QueueHandle<Self>,
+                _: &mut DragOffer,
+                _: DndAction,
+            ) {
+            }
+        }
+
+        impl DataSourceHandler for TestClient {
+            fn accept_mime(
+                &mut self,
+                _: &Connection,
+                _: &QueueHandle<Self>,
+                _: &WlDataSource,
+                _: Option<String>,
+            ) {
+            }
+            fn send_request(
+                &mut self,
+                _: &Connection,
+                _: &QueueHandle<Self>,
+                _: &WlDataSource,
+                _: String,
+                _: WritePipe,
+            ) {
+            }
+            fn cancelled(&mut self, _: &Connection, _: &QueueHandle<Self>, source: &WlDataSource) {
+                self.cancelled_clipboard += 1;
+                clear_if_active_source(&mut self.active_clipboard, source, CopyPasteSource::inner);
+            }
+            fn dnd_dropped(&mut self, _: &Connection, _: &QueueHandle<Self>, _: &WlDataSource) {}
+            fn dnd_finished(&mut self, _: &Connection, _: &QueueHandle<Self>, _: &WlDataSource) {}
+            fn action(
+                &mut self,
+                _: &Connection,
+                _: &QueueHandle<Self>,
+                _: &WlDataSource,
+                _: DndAction,
+            ) {
+            }
+        }
+
+        impl PrimarySelectionDeviceHandler for TestClient {
+            fn selection(
+                &mut self,
+                _: &Connection,
+                _: &QueueHandle<Self>,
+                _: &ZwpPrimarySelectionDeviceV1,
+            ) {
+            }
+        }
+
+        impl PrimarySelectionSourceHandler for TestClient {
+            fn send_request(
+                &mut self,
+                _: &Connection,
+                _: &QueueHandle<Self>,
+                _: &ZwpPrimarySelectionSourceV1,
+                _: String,
+                _: WritePipe,
+            ) {
+            }
+            fn cancelled(
+                &mut self,
+                _: &Connection,
+                _: &QueueHandle<Self>,
+                source: &ZwpPrimarySelectionSourceV1,
+            ) {
+                self.cancelled_primary += 1;
+                clear_if_active_source(
+                    &mut self.active_primary,
+                    source,
+                    PrimarySelectionSource::inner,
+                );
+            }
+        }
+
+        impl ProvidesRegistryState for TestClient {
+            fn registry(&mut self) -> &mut RegistryState {
+                &mut self.registry_state
+            }
+            registry_handlers![OutputState, SeatState];
+        }
+
+        impl Dispatch<wl_callback::WlCallback, Arc<AtomicBool>> for TestClient {
+            fn event(
+                _state: &mut Self,
+                _proxy: &wl_callback::WlCallback,
+                event: wl_callback::Event,
+                done: &Arc<AtomicBool>,
+                _conn: &Connection,
+                _qh: &QueueHandle<Self>,
+            ) {
+                if matches!(event, wl_callback::Event::Done { .. }) {
+                    done.store(true, Ordering::Release);
+                }
+            }
+        }
+
+        smithay_client_toolkit::delegate_dispatch2!(TestClient);
+        smithay_client_toolkit::delegate_registry!(TestClient);
+
+        let mut display: Display<TestHostServer> = Display::new().unwrap();
+        let mut dh = display.handle();
+        let mut seat_state = ServerSeatState::new();
+        let mut server_seat = seat_state.new_wl_seat(&dh, "seat0");
+        let server_kb = server_seat
+            .add_keyboard(Default::default(), 200, 25)
+            .unwrap();
+        let _ptr = server_seat.add_pointer();
+
+        let mut server = TestHostServer {
+            compositor_state: ServerCompositorState::new::<TestHostServer>(&dh),
+            xdg_shell_state: XdgShellState::new::<TestHostServer>(&dh),
+            _xdg_decoration_state: XdgDecorationState::new::<TestHostServer>(&dh),
+            seat_state,
+            data_device_state: ServerDataDeviceState::new::<TestHostServer>(&dh),
+            primary_selection_state: ServerPrimarySelectionState::new::<TestHostServer>(&dh),
+            deco_requests: Vec::new(),
+            move_requests: Vec::new(),
+            resize_requests: Vec::new(),
+            minimize_count: 0,
+            selection_events: Vec::new(),
+            first_toplevel_surface: None,
+        };
+
+        let (server_sock, client_sock) = UnixStream::pair().unwrap();
+        let server_client = dh
+            .insert_client(server_sock, Arc::new(TestClientData::default()))
+            .unwrap();
+        // Give the client data-device & primary-selection focus so set_selection succeeds.
+        data_device::set_data_device_focus(&dh, &server_seat, Some(server_client.clone()));
+        primary_selection::set_primary_focus(&dh, &server_seat, Some(server_client));
+
+        let conn = Connection::from_socket(client_sock).unwrap();
+        // Dispatch server in a scoped thread just for `registry_queue_init`,
+        // then drive both sides synchronously on the test thread.
+        let (globals, mut queue): (_, EventQueue<TestClient>) = std::thread::scope(|s| {
+            let h = s.spawn(|| registry_queue_init::<TestClient>(&conn).unwrap());
+            loop {
+                display.dispatch_clients(&mut server).unwrap();
+                display.flush_clients().unwrap();
+                if h.is_finished() {
+                    break;
+                }
+                std::thread::sleep(std::time::Duration::from_millis(1));
+            }
+            h.join().unwrap()
+        });
+        let qh = queue.handle();
+
+        let compositor = CompositorState::bind(&globals, &qh).unwrap();
+        let xdg_shell = XdgShell::bind(&globals, &qh).unwrap();
+        let mut client = TestClient {
+            registry_state: RegistryState::new(&globals),
+            output_state: OutputState::new(&globals, &qh),
+            seat_state: SeatState::new(&globals, &qh),
+            data_device_manager: DataDeviceManagerState::bind(&globals, &qh).unwrap(),
+            primary_selection_manager: PrimarySelectionManagerState::bind(&globals, &qh).unwrap(),
+            seat: None,
+            data_device: None,
+            primary_device: None,
+            active_clipboard: None,
+            active_primary: None,
+            cancelled_clipboard: 0,
+            cancelled_primary: 0,
+            configured_modes: Vec::new(),
+        };
+
+        let roundtrip = |display: &mut Display<TestHostServer>,
+                         server: &mut TestHostServer,
+                         conn: &Connection,
+                         queue: &mut EventQueue<TestClient>,
+                         client: &mut TestClient| {
+            let done = Arc::new(AtomicBool::new(false));
+            let _cb = conn.display().sync(&queue.handle(), Arc::clone(&done));
+            conn.flush().unwrap();
+            display.dispatch_clients(server).unwrap();
+            display.flush_clients().unwrap();
+            while !done.load(Ordering::Acquire) {
+                queue.blocking_dispatch(client).unwrap();
+            }
+        };
+
+        roundtrip(&mut display, &mut server, &conn, &mut queue, &mut client);
+        roundtrip(&mut display, &mut server, &conn, &mut queue, &mut client);
+        let seat = client.seat.clone().expect("seat advertised");
+
+        // 1. Decoration mode requests: Auto+CSD -> ClientSide, Auto+SSD -> ServerSide,
+        //    dynamic toggle ServerSide -> ClientSide.
+        let csd_surf = compositor.create_surface(&qh);
+        let csd_win = xdg_shell.create_window(
+            csd_surf,
+            window_decorations_for_mode(desired_decoration_mode(DecorationBehavior::Auto, true)),
+            &qh,
+        );
+        csd_win.commit();
+
+        let ssd_surf = compositor.create_surface(&qh);
+        let ssd_win = xdg_shell.create_window(
+            ssd_surf,
+            window_decorations_for_mode(desired_decoration_mode(DecorationBehavior::Auto, false)),
+            &qh,
+        );
+        ssd_win.commit();
+        roundtrip(&mut display, &mut server, &conn, &mut queue, &mut client);
+
+        assert_eq!(
+            server.deco_requests,
+            vec![
+                Some(ServerDecoMode::ClientSide),
+                Some(ServerDecoMode::ServerSide),
+            ]
+        );
+
+        ssd_win.request_decoration_mode(Some(DecorationMode::Client));
+        ssd_win.commit();
+        roundtrip(&mut display, &mut server, &conn, &mut queue, &mut client);
+        assert_eq!(
+            server.deco_requests,
+            vec![
+                Some(ServerDecoMode::ClientSide),
+                Some(ServerDecoMode::ServerSide),
+                Some(ServerDecoMode::ClientSide),
+            ]
+        );
+
+        // 2. Interactive move, minimize, and resize for all 8 X11ResizeEdge variants.
+        csd_win.move_(&seat, 101);
+        csd_win.set_minimized();
+        let all_edges = [
+            (X11ResizeEdge::Top, ServerResizeEdge::Top),
+            (X11ResizeEdge::Bottom, ServerResizeEdge::Bottom),
+            (X11ResizeEdge::Left, ServerResizeEdge::Left),
+            (X11ResizeEdge::Right, ServerResizeEdge::Right),
+            (X11ResizeEdge::TopLeft, ServerResizeEdge::TopLeft),
+            (X11ResizeEdge::TopRight, ServerResizeEdge::TopRight),
+            (X11ResizeEdge::BottomLeft, ServerResizeEdge::BottomLeft),
+            (X11ResizeEdge::BottomRight, ServerResizeEdge::BottomRight),
+        ];
+        for (idx, &(x11_edge, _)) in all_edges.iter().enumerate() {
+            csd_win.resize(&seat, 200 + idx as u32, x11_resize_edge_to_xdg(x11_edge));
+        }
+        roundtrip(&mut display, &mut server, &conn, &mut queue, &mut client);
+
+        assert_eq!(server.move_requests, vec![101]);
+        assert_eq!(server.minimize_count, 1);
+        let expected_resizes: Vec<(u32, ServerResizeEdge)> = all_edges
+            .iter()
+            .enumerate()
+            .map(|(idx, &(_, srv_edge))| (200 + idx as u32, srv_edge))
+            .collect();
+        assert_eq!(server.resize_requests, expected_resizes);
+
+        // 3. Clipboard & Primary selection: superseding source does NOT clear
+        //    the newer active source on stale `cancelled`, and `unset_selection`
+        //    clears the compositor selection.
+        let focus_surf = server
+            .first_toplevel_surface
+            .clone()
+            .expect("toplevel surface created");
+        server_kb.set_focus(&mut server, Some(focus_surf), SERIAL_COUNTER.next_serial());
+        roundtrip(&mut display, &mut server, &conn, &mut queue, &mut client);
+
+        let clip_s1 = client
+            .data_device_manager
+            .create_copy_paste_source(&qh, ["text/plain"]);
+        clip_s1.set_selection(client.data_device.as_ref().unwrap(), 301);
+        client.active_clipboard = Some(clip_s1);
+        roundtrip(&mut display, &mut server, &conn, &mut queue, &mut client);
+
+        let clip_s2 = client
+            .data_device_manager
+            .create_copy_paste_source(&qh, ["text/plain;charset=utf-8"]);
+        clip_s2.set_selection(client.data_device.as_ref().unwrap(), 302);
+        // Keep `old_clip_s1` alive long enough to receive its `cancelled` event on wire.
+        let old_clip_s1 = client.active_clipboard.replace(clip_s2);
+        roundtrip(&mut display, &mut server, &conn, &mut queue, &mut client);
+        assert_eq!(client.cancelled_clipboard, 1);
+        assert!(
+            client.active_clipboard.is_some(),
+            "stale cancelled event must not clear active clipboard source"
+        );
+        drop(old_clip_s1);
+
+        // Now clear selection (matching `XwmHandler::cleared_selection`).
+        if let Some(source) = client.active_clipboard.take() {
+            client.data_device.as_ref().unwrap().unset_selection(303);
+            drop(source);
+        }
+        roundtrip(&mut display, &mut server, &conn, &mut queue, &mut client);
+
+        // Same wire check for Primary selection.
+        let prim_s1 = client
+            .primary_selection_manager
+            .create_selection_source(&qh, ["text/plain"]);
+        prim_s1.set_selection(client.primary_device.as_ref().unwrap(), 401);
+        client.active_primary = Some(prim_s1);
+        roundtrip(&mut display, &mut server, &conn, &mut queue, &mut client);
+
+        let prim_s2 = client
+            .primary_selection_manager
+            .create_selection_source(&qh, ["text/plain;charset=utf-8"]);
+        prim_s2.set_selection(client.primary_device.as_ref().unwrap(), 402);
+        let old_prim_s1 = client.active_primary.replace(prim_s2);
+        roundtrip(&mut display, &mut server, &conn, &mut queue, &mut client);
+        assert_eq!(client.cancelled_primary, 1);
+        assert!(
+            client.active_primary.is_some(),
+            "stale cancelled event must not clear active primary source"
+        );
+        drop(old_prim_s1);
+
+        if let Some(source) = client.active_primary.take() {
+            client.primary_device.as_ref().unwrap().unset_selection(403);
+            drop(source);
+        }
+        roundtrip(&mut display, &mut server, &conn, &mut queue, &mut client);
+
+        assert_eq!(
+            server.selection_events,
+            vec![
+                (SelectionTarget::Clipboard, true),
+                (SelectionTarget::Clipboard, true),
+                (SelectionTarget::Clipboard, false),
+                (SelectionTarget::Primary, true),
+                (SelectionTarget::Primary, true),
+                (SelectionTarget::Primary, false),
+            ]
+        );
     }
 }

@@ -264,9 +264,6 @@ pub struct WprsCompositorState {
     pub(crate) pressed_buttons: HashSet<u32>,
 
     pub xwm: Option<X11Wm>,
-
-    /// unpaired x11 surfaces
-    pub x11_surfaces: Vec<X11Surface>,
 }
 
 impl WprsCompositorState {
@@ -347,7 +344,6 @@ impl WprsCompositorState {
             pressed_keys: HashSet::new(),
             pressed_buttons: HashSet::new(),
             xwm: None,
-            x11_surfaces: Vec::new(),
         }
     }
 
@@ -444,32 +440,14 @@ impl XWaylandShellHandler for WprsState {
         &mut self.compositor_state.xwayland_shell_state
     }
 
+    #[instrument(skip(self, _xwm), level = "debug")]
     fn surface_associated(&mut self, _xwm: XwmId, wl_surface: WlSurface, surface: X11Surface) {
-        // TODO: we should implement this and get rid of the deferring commit logic below
         debug!(
             "X11 window {:?} associated with surface {:?}",
             surface, wl_surface
-        )
+        );
+        associate_x11_surface(self, &wl_surface, surface).log_and_ignore(loc!());
     }
-}
-
-fn execute_or_defer_commit(state: &mut WprsState, surface: WlSurface) -> Result<()> {
-    if !surface.alive() {
-        return Ok(());
-    }
-    commit(&surface, state).location(loc!())?;
-
-    let xwayland_surface = state.surfaces.get(&surface.id());
-
-    // we may not have matched an X11 surface to the wayland surface yet.
-    // defer if that is the case.
-    if !xwayland_surface.is_some_and(XWaylandSurface::ready) {
-        debug!("deferring commit");
-        state.event_loop_handle.insert_idle(|state| {
-            execute_or_defer_commit(state, surface).log_and_ignore(loc!());
-        });
-    }
-    Ok(())
 }
 
 impl CompositorHandler for WprsState {
@@ -484,9 +462,17 @@ impl CompositorHandler for WprsState {
             .compositor_state
     }
 
+    fn new_surface(&mut self, surface: &WlSurface) {
+        compositor::add_destruction_hook(surface, |state: &mut Self, surface| {
+            state.remove_surface(&surface.id());
+        });
+    }
+
     #[instrument(skip(self), level = "debug")]
     fn commit(&mut self, surface: &WlSurface) {
-        execute_or_defer_commit(self, surface.clone()).log_and_ignore(loc!());
+        if surface.alive() {
+            commit(surface, self).log_and_ignore(loc!());
+        }
     }
 }
 
@@ -852,86 +838,70 @@ fn resolve_x11_parent(
 }
 
 #[instrument(skip(state), level = "debug")]
-pub fn commit_inner(
-    surface: &WlSurface,
-    surface_data: &SurfaceData,
+pub fn associate_x11_surface(
     state: &mut WprsState,
+    surface: &WlSurface,
+    x11_surface: X11Surface,
 ) -> Result<()> {
-    let mut guard = surface_data.cached_state.get::<SurfaceAttributes>();
-    let surface_attributes = guard.current();
-    compositor_utils::cap_surface_damage(&mut surface_attributes.damage);
+    if !surface.alive() {
+        return Ok(());
+    }
 
-    let x11_surface = state
-        .compositor_state
-        .x11_surfaces
-        .iter()
-        .position(|x11s| x11s.wl_surface().map(|s| s == *surface).unwrap_or(false))
-        .map(|pos| state.compositor_state.x11_surfaces.swap_remove(pos));
-    debug!("matched x11 surface: {x11_surface:?}");
+    let explicit_parent_id = find_explicit_transient_parent_id(state, &surface.id(), &x11_surface);
+    let wayland_window_type = crate::xwayland_xdg_shell::classify_wayland_window_type(
+        x11_surface.window_type(),
+        x11_surface.is_override_redirect(),
+        explicit_parent_id.is_some(),
+    );
+    let parent = match wayland_window_type {
+        crate::xwayland_xdg_shell::WaylandWindowType::Toplevel => None,
+        crate::xwayland_xdg_shell::WaylandWindowType::Popup => {
+            resolve_x11_parent(state, &surface.id(), &x11_surface)
+        },
+        crate::xwayland_xdg_shell::WaylandWindowType::SubSurface => explicit_parent_id
+            .as_ref()
+            .and_then(|id| build_x11_parent(state, id)),
+    };
 
-    let role_plan = x11_surface.as_ref().map(|x11_surface| {
-        let explicit_parent_id =
-            find_explicit_transient_parent_id(state, &surface.id(), x11_surface);
-        let wayland_window_type = crate::xwayland_xdg_shell::classify_wayland_window_type(
-            x11_surface.window_type(),
-            x11_surface.is_override_redirect(),
-            explicit_parent_id.is_some(),
-        );
-        let parent = match wayland_window_type {
-            crate::xwayland_xdg_shell::WaylandWindowType::Toplevel => None,
-            crate::xwayland_xdg_shell::WaylandWindowType::Popup => {
-                resolve_x11_parent(state, &surface.id(), x11_surface)
-            },
-            crate::xwayland_xdg_shell::WaylandWindowType::SubSurface => explicit_parent_id
-                .as_ref()
-                .and_then(|id| build_x11_parent(state, id)),
-        };
-        (wayland_window_type, parent)
-    });
-
-    let mut assigned_parent_id: Option<ObjectId> = None;
-    {
+    let assigned_parent_id = {
         let xwayland_surface = state.surfaces.entry(surface.id()).or_default();
-
-        if let (Some(x11_surface), Some((wayland_window_type, parent))) = (x11_surface, role_plan) {
-            if xwayland_surface.local_surface.is_none() {
-                let needs_subsurface_parent =
-                    matches!(
-                        wayland_window_type,
-                        crate::xwayland_xdg_shell::WaylandWindowType::SubSurface
-                    ) || (matches!(
-                        wayland_window_type,
-                        crate::xwayland_xdg_shell::WaylandWindowType::Popup
-                    ) && parent.as_ref().is_some_and(|p| p.for_popup.is_none()));
-                let subsurface_parent = needs_subsurface_parent
-                    .then(|| parent.as_ref().map(|p| &p.for_subsurface.surface))
-                    .flatten();
-                xwayland_surface
-                    .update_local_surface(
-                        surface,
-                        subsurface_parent,
-                        &state.client_state.compositor_state,
-                        &state.client_state.qh,
-                        &mut state.surface_bimap,
-                    )
-                    .location(loc!())?;
-            }
-
-            xwayland_surface
-                .update_x11_surface(
-                    x11_surface,
+        if !xwayland_surface.has_client_surface() {
+            let needs_subsurface_parent =
+                matches!(
                     wayland_window_type,
-                    parent,
-                    &state.client_state.xdg_shell_state,
-                    &state.client_state.shm_state,
-                    state.client_state.subcompositor_state.clone(),
+                    crate::xwayland_xdg_shell::WaylandWindowType::SubSurface
+                ) || (matches!(
+                    wayland_window_type,
+                    crate::xwayland_xdg_shell::WaylandWindowType::Popup
+                ) && parent.as_ref().is_some_and(|p| p.for_popup.is_none()));
+            let subsurface_parent = needs_subsurface_parent
+                .then(|| parent.as_ref().map(|p| &p.for_subsurface.surface))
+                .flatten();
+            xwayland_surface
+                .update_local_surface(
+                    surface,
+                    subsurface_parent,
+                    &state.client_state.compositor_state,
                     &state.client_state.qh,
-                    state.compositor_state.decoration_behavior,
+                    &mut state.surface_bimap,
                 )
                 .location(loc!())?;
-            assigned_parent_id = xwayland_surface.parent_id.clone();
         }
-    }
+
+        xwayland_surface
+            .update_x11_surface(
+                x11_surface,
+                wayland_window_type,
+                parent,
+                &state.client_state.xdg_shell_state,
+                &state.client_state.shm_state,
+                state.client_state.subcompositor_state.clone(),
+                &state.client_state.qh,
+                state.compositor_state.decoration_behavior,
+            )
+            .location(loc!())?;
+        xwayland_surface.parent_id.clone()
+    };
 
     if let Some(parent_id) = assigned_parent_id
         && parent_id != surface.id()
@@ -944,6 +914,38 @@ pub fn commit_inner(
         );
         parent_xwayland_surface.children.insert(surface.id());
     }
+
+    // If `wl_surface.commit` arrived before `WL_SURFACE_SERIAL`, flush any
+    // queued buffer for roles that are immediately ready (subsurfaces).
+    // Toplevels and popups flush their queued buffer once the host sends their
+    // initial configure in response to the commit sent by `set_role`.
+    if let Some(xwayland_surface) = state.surfaces.get_mut(&surface.id())
+        && xwayland_surface.ready()
+        && !xwayland_surface.buffer_attached
+        && xwayland_surface.buffer.is_some()
+    {
+        if let Some(Role::SubSurface(subsurface)) = &mut xwayland_surface.role
+            && let Some(frame) = &mut subsurface.frame
+            && !frame.is_hidden()
+            && frame.is_dirty()
+        {
+            frame.draw();
+        }
+        xwayland_surface.commit_buffer(&state.client_state.qh);
+    }
+
+    Ok(())
+}
+
+#[instrument(skip(state), level = "debug")]
+pub fn commit_inner(
+    surface: &WlSurface,
+    surface_data: &SurfaceData,
+    state: &mut WprsState,
+) -> Result<()> {
+    let mut guard = surface_data.cached_state.get::<SurfaceAttributes>();
+    let surface_attributes = guard.current();
+    compositor_utils::cap_surface_damage(&mut surface_attributes.damage);
 
     let xwayland_surface = state.surfaces.entry(surface.id()).or_default();
 
@@ -1001,6 +1003,7 @@ pub fn commit_inner(
 
     if let Some(Role::XdgToplevel(toplevel)) = &mut xwayland_surface.role
         && toplevel.configured
+        && !toplevel.window_frame.is_hidden()
         && toplevel.window_frame.is_dirty()
     {
         toplevel.window_frame.draw();
@@ -1008,6 +1011,7 @@ pub fn commit_inner(
 
     if let Some(Role::SubSurface(subsurface)) = &mut xwayland_surface.role
         && let Some(decorated_subsurface) = &mut subsurface.frame
+        && !decorated_subsurface.is_hidden()
         && decorated_subsurface.is_dirty()
     {
         decorated_subsurface.draw();
@@ -1023,9 +1027,6 @@ pub fn commit_inner(
         }
 
         xwayland_surface.try_draw_buffer();
-    }
-
-    if xwayland_surface.ready() || xwayland_surface.needs_configure() {
         xwayland_surface.commit();
     }
 
@@ -1617,6 +1618,90 @@ mod tests {
         wl_surface.commit();
         roundtrip(&mut display, &mut server, &conn, &mut queue, &mut client);
         assert_eq!(server.last_commit, Some((2, SmithayWlTransform::_180)));
+    }
+
+    #[test]
+    #[cfg_attr(miri, ignore)]
+    fn test_surface_destruction_hook_removes_entry_wire() {
+        use std::sync::atomic::AtomicUsize;
+
+        use smithay::reexports::wayland_server::protocol::wl_surface::WlSurface as ServerWlSurface;
+
+        struct HookServer {
+            compositor_state: CompositorState,
+            tracked: HashSet<ObjectId>,
+            destroyed_count: Arc<AtomicUsize>,
+        }
+
+        impl CompositorHandler for HookServer {
+            fn compositor_state(&mut self) -> &mut CompositorState {
+                &mut self.compositor_state
+            }
+
+            fn client_compositor_state<'a>(&self, client: &'a Client) -> &'a CompositorClientState {
+                &client
+                    .get_data::<TestClientState>()
+                    .unwrap()
+                    .compositor_state
+            }
+
+            fn new_surface(&mut self, surface: &ServerWlSurface) {
+                self.tracked.insert(surface.id());
+                compositor::add_destruction_hook(surface, |state: &mut Self, surface| {
+                    state.tracked.remove(&surface.id());
+                    state.destroyed_count.fetch_add(1, Ordering::Relaxed);
+                });
+            }
+
+            fn commit(&mut self, _surface: &ServerWlSurface) {}
+        }
+
+        smithay::delegate_compositor!(HookServer);
+
+        let mut display: Display<HookServer> = Display::new().unwrap();
+        let mut dh = display.handle();
+        let destroyed_count = Arc::new(AtomicUsize::new(0));
+        let mut server = HookServer {
+            compositor_state: CompositorState::new::<HookServer>(&dh),
+            tracked: HashSet::new(),
+            destroyed_count: Arc::clone(&destroyed_count),
+        };
+
+        let (server_sock, client_sock) = UnixStream::pair().unwrap();
+        dh.insert_client(server_sock, Arc::new(TestClientState::default()))
+            .unwrap();
+        let conn = Connection::from_socket(client_sock).unwrap();
+        let mut queue: EventQueue<MiniClient> = conn.new_event_queue();
+        let qh = queue.handle();
+        let _registry = conn.display().get_registry(&qh, ());
+        let mut client = MiniClient::default();
+
+        let do_roundtrip = |display: &mut Display<HookServer>,
+                            server: &mut HookServer,
+                            conn: &Connection,
+                            queue: &mut EventQueue<MiniClient>,
+                            client: &mut MiniClient| {
+            let done = Arc::new(AtomicBool::new(false));
+            let _cb = conn.display().sync(&queue.handle(), Arc::clone(&done));
+            conn.flush().unwrap();
+            display.dispatch_clients(server).unwrap();
+            display.flush_clients().unwrap();
+            while !done.load(Ordering::Acquire) {
+                queue.blocking_dispatch(client).unwrap();
+            }
+        };
+
+        do_roundtrip(&mut display, &mut server, &conn, &mut queue, &mut client);
+        let wl_surface = client.compositor.as_ref().unwrap().create_surface(&qh, ());
+        wl_surface.commit();
+        do_roundtrip(&mut display, &mut server, &conn, &mut queue, &mut client);
+        assert_eq!(server.tracked.len(), 1);
+        assert_eq!(destroyed_count.load(Ordering::Relaxed), 0);
+
+        wl_surface.destroy();
+        do_roundtrip(&mut display, &mut server, &conn, &mut queue, &mut client);
+        assert!(server.tracked.is_empty());
+        assert_eq!(destroyed_count.load(Ordering::Relaxed), 1);
     }
 
     #[test]

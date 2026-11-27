@@ -244,14 +244,6 @@ impl XWaylandSurface {
         }
     }
 
-    fn needs_configure(&self) -> bool {
-        match &self.role {
-            Some(Role::XdgToplevel(toplevel)) if !toplevel.configured => true,
-            Some(Role::XdgPopup(popup)) if !popup.configured => true,
-            _ => false,
-        }
-    }
-
     fn try_draw_buffer(&mut self) {
         if !self.buffer_attached
             && let Some(buffer) = &self.buffer
@@ -270,7 +262,10 @@ impl XWaylandSurface {
         if !self.buffer_attached && self.buffer.is_some() {
             self.try_draw_buffer();
 
-            self.frame(qh);
+            if !matches!(&self.role, Some(Role::SubSurface(subsurface)) if subsurface.pending_frame_callback)
+            {
+                self.frame(qh);
+            }
             self.commit();
         }
     }

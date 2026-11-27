@@ -1,5 +1,8 @@
+use std::num::NonZeroU32;
 use std::time::Duration;
 
+use smithay::utils::Logical;
+use smithay::utils::Rectangle;
 use smithay::utils::Serial;
 use smithay::xwayland::X11Surface;
 use smithay_client_toolkit::compositor::SurfaceData;
@@ -29,6 +32,115 @@ use crate::xwayland_xdg_shell::client::WprsClientState;
 use crate::xwayland_xdg_shell::client::XWaylandSubSurface;
 use crate::xwayland_xdg_shell::client::XWaylandXdgToplevel;
 use crate::xwayland_xdg_shell::xsurface_from_client_surface;
+
+/// Active interactive resize state for a decorated [`XWaylandSubSurface`].
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct SubSurfaceResizeState {
+    pub edge: ResizeEdge,
+    pub start_geometry: Rectangle<i32, Logical>,
+    pub start_pointer: (f64, f64),
+}
+
+pub(crate) fn resize_edge_cursor(edge: ResizeEdge) -> CursorIcon {
+    match edge {
+        ResizeEdge::Top => CursorIcon::NResize,
+        ResizeEdge::TopRight => CursorIcon::NeResize,
+        ResizeEdge::Right => CursorIcon::EResize,
+        ResizeEdge::BottomRight => CursorIcon::SeResize,
+        ResizeEdge::Bottom => CursorIcon::SResize,
+        ResizeEdge::BottomLeft => CursorIcon::SwResize,
+        ResizeEdge::Left => CursorIcon::WResize,
+        ResizeEdge::TopLeft => CursorIcon::NwResize,
+        _ => CursorIcon::Default,
+    }
+}
+
+/// Computes the target X11 geometry for an interactive [`XWaylandSubSurface`]
+/// border drag, compensating for how each [`FallbackFrame`] border subsurface's
+/// root origin moves as `cur_geo` changes from `start_geo`.
+pub(crate) fn compute_subsurface_resize_geometry(
+    start_geo: Rectangle<i32, Logical>,
+    cur_geo: Rectangle<i32, Logical>,
+    edge: ResizeEdge,
+    start_pointer: (f64, f64),
+    cur_pointer: (f64, f64),
+    min_size: Option<(i32, i32)>,
+    max_size: Option<(i32, i32)>,
+) -> Rectangle<i32, Logical> {
+    // `FallbackFrame` places its border subsurfaces relative to the main surface:
+    // - `TOP_BORDER` (`Top`, `TopLeft`, `TopRight`): `(-B, -(H + B))`
+    // - `BOTTOM_BORDER` (`Bottom`, `BottomLeft`, `BottomRight`): `(-B, height)`
+    // - `LEFT_BORDER` (`Left`): `(-B, -H)`
+    // - `RIGHT_BORDER` (`Right`): `(width, -H)`
+    // Compute how far the grabbed border subsurface's root origin shifted from
+    // `start_geo` to `cur_geo` so `cur_pointer` maps back to total displacement.
+    let origin_shift_x = match edge {
+        ResizeEdge::Right => {
+            (cur_geo.loc.x + cur_geo.size.w) - (start_geo.loc.x + start_geo.size.w)
+        },
+        _ => cur_geo.loc.x - start_geo.loc.x,
+    };
+    let origin_shift_y = match edge {
+        ResizeEdge::Bottom | ResizeEdge::BottomLeft | ResizeEdge::BottomRight => {
+            (cur_geo.loc.y + cur_geo.size.h) - (start_geo.loc.y + start_geo.size.h)
+        },
+        _ => cur_geo.loc.y - start_geo.loc.y,
+    };
+
+    let total_dx = (cur_pointer.0 - start_pointer.0).round() as i32 + origin_shift_x;
+    let total_dy = (cur_pointer.1 - start_pointer.1).round() as i32 + origin_shift_y;
+
+    let min_w = min_size.map_or(1, |(w, _)| w).max(1);
+    let min_h = min_size.map_or(1, |(_, h)| h).max(1);
+    let max_w = max_size
+        .and_then(|(w, _)| (w >= min_w).then_some(w))
+        .unwrap_or(i32::MAX);
+    let max_h = max_size
+        .and_then(|(_, h)| (h >= min_h).then_some(h))
+        .unwrap_or(i32::MAX);
+
+    let (new_x, new_w) = match edge {
+        ResizeEdge::Left | ResizeEdge::TopLeft | ResizeEdge::BottomLeft => {
+            let w = start_geo
+                .size
+                .w
+                .saturating_sub(total_dx)
+                .clamp(min_w, max_w);
+            (start_geo.loc.x + (start_geo.size.w - w), w)
+        },
+        ResizeEdge::Right | ResizeEdge::TopRight | ResizeEdge::BottomRight => {
+            let w = start_geo
+                .size
+                .w
+                .saturating_add(total_dx)
+                .clamp(min_w, max_w);
+            (start_geo.loc.x, w)
+        },
+        _ => (start_geo.loc.x, start_geo.size.w),
+    };
+
+    let (new_y, new_h) = match edge {
+        ResizeEdge::Top | ResizeEdge::TopLeft | ResizeEdge::TopRight => {
+            let h = start_geo
+                .size
+                .h
+                .saturating_sub(total_dy)
+                .clamp(min_h, max_h);
+            (start_geo.loc.y + (start_geo.size.h - h), h)
+        },
+        ResizeEdge::Bottom | ResizeEdge::BottomLeft | ResizeEdge::BottomRight => {
+            let h = start_geo
+                .size
+                .h
+                .saturating_add(total_dy)
+                .clamp(min_h, max_h);
+            (start_geo.loc.y, h)
+        },
+        _ => (start_geo.loc.y, start_geo.size.h),
+    };
+
+    Rectangle::new((new_x, new_y).into(), (new_w, new_h).into())
+}
 
 fn parent(surface: &WlSurface) -> Option<&WlSurface> {
     surface.data::<SurfaceData<()>>()?.parent_surface()
@@ -104,7 +216,7 @@ pub trait FramedSurface {
         position: (f64, f64),
     ) -> Result<()>;
 
-    fn frame(&mut self) -> &mut FallbackFrame<WprsState>;
+    fn frame(&mut self) -> Option<&mut FallbackFrame<WprsState>>;
 
     fn handle_pointer_event_inner(
         &mut self,
@@ -134,20 +246,20 @@ pub trait FramedSurface {
             // when entering a surface, the current cursor is always undefined
             if new_cursor != cur_cursor || matches!(event.kind, PointerEventKind::Enter { .. }) {
                 client_state.cursor_icon = Some(new_cursor);
-                let _ = client_state
+                if let Some(themed_pointer) = client_state
                     .seat_objects
                     .last()
-                    .unwrap()
-                    .pointer
-                    .as_ref()
-                    .unwrap()
-                    .set_cursor(conn, new_cursor);
+                    .and_then(|seat| seat.pointer.as_ref())
+                {
+                    let _ = themed_pointer.set_cursor(conn, new_cursor);
+                }
             }
         }
 
-        let frame = self.frame();
-
-        if frame.is_dirty() {
+        if let Some(frame) = self.frame()
+            && !frame.is_hidden()
+            && frame.is_dirty()
+        {
             frame.draw();
         }
 
@@ -208,8 +320,8 @@ impl FramedSurface for XWaylandXdgToplevel {
         Ok(())
     }
 
-    fn frame(&mut self) -> &mut FallbackFrame<WprsState> {
-        &mut self.window_frame
+    fn frame(&mut self) -> Option<&mut FallbackFrame<WprsState>> {
+        Some(&mut self.window_frame)
     }
 
     fn handle_pointer_event_inner(
@@ -275,10 +387,18 @@ impl FramedSurface for XWaylandSubSurface {
             FrameAction::Close => {
                 x11_surface.close().location(loc!())?;
             },
-            FrameAction::Resize(_edge) => {
-                // TODO
+            FrameAction::Resize(edge) => {
+                if !matches!(edge, ResizeEdge::None) {
+                    self.move_active = false;
+                    self.resize_state = Some(SubSurfaceResizeState {
+                        edge,
+                        start_geometry: x11_surface.geometry(),
+                        start_pointer: position,
+                    });
+                }
             },
             FrameAction::Move => {
+                self.resize_state = None;
                 self.move_pointer_location = position;
                 self.move_active = true;
             },
@@ -288,8 +408,8 @@ impl FramedSurface for XWaylandSubSurface {
         Ok(())
     }
 
-    fn frame(&mut self) -> &mut FallbackFrame<WprsState> {
-        self.frame.as_mut().unwrap()
+    fn frame(&mut self) -> Option<&mut FallbackFrame<WprsState>> {
+        self.frame.as_mut()
     }
 
     fn handle_pointer_event_inner(
@@ -300,7 +420,9 @@ impl FramedSurface for XWaylandSubSurface {
         pointer: &WlPointer,
         event: &PointerEvent,
     ) -> Result<Option<CursorIcon>> {
-        let frame = self.frame.as_mut().unwrap();
+        let Some(frame) = self.frame.as_mut() else {
+            return Ok(None);
+        };
         let mut new_cursor: Option<CursorIcon> = None;
 
         let (x, y) = event.position;
@@ -314,33 +436,64 @@ impl FramedSurface for XWaylandSubSurface {
                 client_state.last_enter_serial = serial;
             },
             PointerEventKind::Leave { serial: _ } => {
+                self.move_active = false;
+                self.resize_state = None;
                 frame.click_point_left();
             },
             PointerEventKind::Motion { time: _ } => {
                 new_cursor = frame.click_point_moved(Duration::ZERO, &event.surface.id(), x, y);
 
-                if self.move_active {
+                if let Some(resize_state) = self.resize_state {
+                    new_cursor = Some(resize_edge_cursor(resize_state.edge));
+
+                    if !self.pending_frame_callback {
+                        let cur_geo = x11_surface.geometry();
+                        let new_geo = compute_subsurface_resize_geometry(
+                            resize_state.start_geometry,
+                            cur_geo,
+                            resize_state.edge,
+                            resize_state.start_pointer,
+                            (x, y),
+                            x11_surface.min_size().map(|s| (s.w, s.h)),
+                            x11_surface.max_size().map(|s| (s.w, s.h)),
+                        );
+
+                        if new_geo != cur_geo {
+                            if let Some(frame) = self.frame.as_mut()
+                                && !frame.is_hidden()
+                            {
+                                let width = NonZeroU32::new(new_geo.size.w.max(1) as u32).unwrap();
+                                let height = NonZeroU32::new(new_geo.size.h.max(1) as u32).unwrap();
+                                frame.resize(width, height);
+                                frame.draw();
+                            }
+
+                            self.move_(new_geo.loc.x, new_geo.loc.y, qh);
+                            x11_surface.configure(new_geo).location(loc!())?;
+                        }
+                    }
+                } else if self.move_active {
                     new_cursor = Some(CursorIcon::Move);
-                }
 
-                if self.move_active && !self.pending_frame_callback {
-                    let (init_x, init_y) = self.move_pointer_location;
-                    let offset_x = (x - init_x).round() as i32;
-                    let offset_y = (y - init_y).round() as i32;
+                    if !self.pending_frame_callback {
+                        let (init_x, init_y) = self.move_pointer_location;
+                        let offset_x = (x - init_x).round() as i32;
+                        let offset_y = (y - init_y).round() as i32;
 
-                    if (offset_x, offset_y) != (0, 0) {
-                        let mut geo = x11_surface.geometry();
-                        geo.loc.x += offset_x;
-                        geo.loc.y += offset_y;
+                        if (offset_x, offset_y) != (0, 0) {
+                            let mut geo = x11_surface.geometry();
+                            geo.loc.x += offset_x;
+                            geo.loc.y += offset_y;
 
-                        // frame() will cause the compositor to send us a frame callback on the next commit.
-                        // So if we commit() the parent and call frame(), then we know that the compositor
-                        // has processed our last set_position call, and therefore the next set of motion
-                        // coordinates will be relative to it.  Without this, we won't know if the coordinates
-                        // receive are relative to our current position or a previous position.
-                        self.move_(geo.loc.x, geo.loc.y, qh);
+                            // frame() will cause the compositor to send us a frame callback on the next commit.
+                            // So if we commit() the parent and call frame(), then we know that the compositor
+                            // has processed our last set_position call, and therefore the next set of motion
+                            // coordinates will be relative to it.  Without this, we won't know if the coordinates
+                            // receive are relative to our current position or a previous position.
+                            self.move_(geo.loc.x, geo.loc.y, qh);
 
-                        x11_surface.configure(geo).location(loc!())?;
+                            x11_surface.configure(geo).location(loc!())?;
+                        }
                     }
                 }
             },
@@ -354,6 +507,12 @@ impl FramedSurface for XWaylandSubSurface {
                     _ => return Ok(None),
                 };
 
+                if !pressed && (self.move_active || self.resize_state.is_some()) {
+                    self.move_active = false;
+                    self.resize_state = None;
+                    return Ok(None);
+                }
+
                 if let Some(action) = frame.on_click(Duration::ZERO, click, pressed) {
                     debug!("button: {click:?}, kind: {kind:?}, action {action:?}");
 
@@ -361,11 +520,196 @@ impl FramedSurface for XWaylandSubSurface {
                         .location(loc!())?;
                 } else {
                     self.move_active = false;
+                    self.resize_state = None;
                 }
             },
             PointerEventKind::Axis { .. } => {},
         }
 
         Ok(new_cursor)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn rect(x: i32, y: i32, w: i32, h: i32) -> Rectangle<i32, Logical> {
+        Rectangle::new((x, y).into(), (w, h).into())
+    }
+
+    /// Simulates what `FallbackFrame` border-local pointer coordinates the
+    /// Wayland compositor delivers for a cursor displaced by `(dx, dy)` in
+    /// screen space once the window is at `cur_geo`.
+    fn simulated_border_pointer(
+        start_geo: Rectangle<i32, Logical>,
+        cur_geo: Rectangle<i32, Logical>,
+        edge: ResizeEdge,
+        start_pointer: (f64, f64),
+        screen_delta: (f64, f64),
+    ) -> (f64, f64) {
+        let origin_shift_x = match edge {
+            ResizeEdge::Right => {
+                (cur_geo.loc.x + cur_geo.size.w) - (start_geo.loc.x + start_geo.size.w)
+            },
+            _ => cur_geo.loc.x - start_geo.loc.x,
+        };
+        let origin_shift_y = match edge {
+            ResizeEdge::Bottom | ResizeEdge::BottomLeft | ResizeEdge::BottomRight => {
+                (cur_geo.loc.y + cur_geo.size.h) - (start_geo.loc.y + start_geo.size.h)
+            },
+            _ => cur_geo.loc.y - start_geo.loc.y,
+        };
+        (
+            start_pointer.0 + screen_delta.0 - f64::from(origin_shift_x),
+            start_pointer.1 + screen_delta.1 - f64::from(origin_shift_y),
+        )
+    }
+
+    #[test]
+    fn test_resize_edge_cursor_all_edges() {
+        assert_eq!(resize_edge_cursor(ResizeEdge::Top), CursorIcon::NResize);
+        assert_eq!(
+            resize_edge_cursor(ResizeEdge::TopRight),
+            CursorIcon::NeResize
+        );
+        assert_eq!(resize_edge_cursor(ResizeEdge::Right), CursorIcon::EResize);
+        assert_eq!(
+            resize_edge_cursor(ResizeEdge::BottomRight),
+            CursorIcon::SeResize
+        );
+        assert_eq!(resize_edge_cursor(ResizeEdge::Bottom), CursorIcon::SResize);
+        assert_eq!(
+            resize_edge_cursor(ResizeEdge::BottomLeft),
+            CursorIcon::SwResize
+        );
+        assert_eq!(resize_edge_cursor(ResizeEdge::Left), CursorIcon::WResize);
+        assert_eq!(
+            resize_edge_cursor(ResizeEdge::TopLeft),
+            CursorIcon::NwResize
+        );
+        assert_eq!(resize_edge_cursor(ResizeEdge::None), CursorIcon::Default);
+    }
+
+    #[test]
+    fn test_subsurface_resize_geometry_all_edges_and_multi_step_drag() {
+        let start = rect(100, 200, 300, 240);
+        let min = Some((120, 100));
+        let max = Some((450, 360));
+
+        // Simulate a 4-step drag for every edge, including stationary hold and
+        // reversal past clamping limits. `TopRight` and `BottomRight` are
+        // critical because `TOP_BORDER`/`BOTTOM_BORDER` keep `pos.x = -BORDER`
+        // while `width` changes.
+        let cases: &[(
+            ResizeEdge,
+            (f64, f64),
+            &[(f64, f64)],
+            Rectangle<i32, Logical>,
+        )] = &[
+            (
+                ResizeEdge::Right,
+                (2.0, 50.0),
+                &[(20.0, 10.0), (20.0, 10.0), (200.0, 0.0), (50.0, 0.0)],
+                rect(100, 200, 350, 240),
+            ),
+            (
+                ResizeEdge::Left,
+                (2.0, 50.0),
+                &[(-25.0, 15.0), (-25.0, 15.0), (250.0, 0.0), (40.0, 0.0)],
+                rect(140, 200, 260, 240),
+            ),
+            (
+                ResizeEdge::Bottom,
+                (150.0, 2.0),
+                &[(10.0, 30.0), (10.0, 30.0), (0.0, 200.0), (0.0, -40.0)],
+                rect(100, 200, 300, 200),
+            ),
+            (
+                ResizeEdge::Top,
+                (150.0, 2.0),
+                &[(10.0, -30.0), (10.0, -30.0), (0.0, 200.0), (0.0, 50.0)],
+                rect(100, 250, 300, 190),
+            ),
+            (
+                ResizeEdge::TopLeft,
+                (2.0, 2.0),
+                &[(-20.0, -15.0), (-20.0, -15.0), (250.0, 250.0), (30.0, 20.0)],
+                rect(130, 220, 270, 220),
+            ),
+            (
+                ResizeEdge::TopRight,
+                (306.0, 2.0),
+                &[(10.0, -5.0), (10.0, -5.0), (30.0, -5.0), (30.0, -5.0)],
+                rect(100, 195, 330, 245),
+            ),
+            (
+                ResizeEdge::BottomLeft,
+                (2.0, 2.0),
+                &[(-15.0, 25.0), (-15.0, 25.0), (50.0, -30.0), (50.0, -30.0)],
+                rect(150, 200, 250, 210),
+            ),
+            (
+                ResizeEdge::BottomRight,
+                (306.0, 2.0),
+                &[(15.0, 20.0), (15.0, 20.0), (40.0, 35.0), (40.0, 35.0)],
+                rect(100, 200, 340, 275),
+            ),
+            (ResizeEdge::None, (10.0, 10.0), &[(50.0, 50.0)], start),
+        ];
+
+        for &(edge, start_ptr, steps, expected_final) in cases {
+            let mut cur = start;
+            for &screen_delta in steps {
+                let ptr = simulated_border_pointer(start, cur, edge, start_ptr, screen_delta);
+                let next =
+                    compute_subsurface_resize_geometry(start, cur, edge, start_ptr, ptr, min, max);
+                // Re-running with unchanged cursor after applying `next` must be idempotent.
+                let ptr_after =
+                    simulated_border_pointer(start, next, edge, start_ptr, screen_delta);
+                let steady = compute_subsurface_resize_geometry(
+                    start, next, edge, start_ptr, ptr_after, min, max,
+                );
+                assert_eq!(
+                    steady, next,
+                    "drift detected for edge {edge:?} at {screen_delta:?}"
+                );
+                cur = next;
+            }
+            assert_eq!(cur, expected_final, "final rect mismatch for edge {edge:?}");
+        }
+
+        // Clamping at `min_size` anchors the opposite edge (`start_x + start_w`
+        // for Left/TopLeft, `start_y + start_h` for Top/TopLeft).
+        let clamped_tl = compute_subsurface_resize_geometry(
+            start,
+            start,
+            ResizeEdge::TopLeft,
+            (2.0, 2.0),
+            (500.0, 500.0),
+            min,
+            max,
+        );
+        assert_eq!(clamped_tl, rect(280, 340, 120, 100));
+        assert_eq!(
+            clamped_tl.loc.x + clamped_tl.size.w,
+            start.loc.x + start.size.w
+        );
+        assert_eq!(
+            clamped_tl.loc.y + clamped_tl.size.h,
+            start.loc.y + start.size.h
+        );
+
+        // Invalid `max < min` and negative/zero bounds must not panic.
+        let bad_hints = compute_subsurface_resize_geometry(
+            start,
+            start,
+            ResizeEdge::BottomRight,
+            (306.0, 2.0),
+            (506.0, 102.0),
+            Some((200, -5)),
+            Some((100, 0)),
+        );
+        assert_eq!(bad_hints, rect(100, 200, 500, 340));
     }
 }
