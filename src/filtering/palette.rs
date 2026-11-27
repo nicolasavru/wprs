@@ -14,9 +14,10 @@
 
 //! Fast tile palette encoder/decoder (`<= 256` unique colors, 1/2/4/8 bpp).
 //!
-//! Uses a 512-slot open-addressed table (4 KiB, L1d-resident) with a generation
-//! counter to avoid per-tile clearing, bailing out immediately on the 257th
-//! unique color so photo tiles exit within a few hundred pixels.
+//! Uses a 512-slot open-addressed AoS table (4 KiB, 64 B aligned, 1 L1d cache
+//! line per probe) with a 16-bit generation counter to avoid per-tile clearing,
+//! bailing out immediately on the 257th unique color so photo tiles exit within
+//! a few hundred pixels.
 
 use std::mem::MaybeUninit;
 use std::slice;
@@ -359,44 +360,76 @@ pub(crate) fn decode_palette_8bpp_scalar(
     }
 }
 
+/// Single 8-byte open-addressed color-table slot (`[ColorEntry; 512]` = 4 KiB).
+///
+/// Packing `key`, `epoch`, and `val` into one 8-byte aligned entry keeps every
+/// probe (and linear-probe collisions within the same 8-slot block) inside a
+/// single 64-byte L1d cache line.
+#[repr(C, align(8))]
+#[derive(Copy, Clone, Default)]
+struct ColorEntry {
+    key: u32,
+    epoch: u16,
+    val: u8,
+    _pad: u8,
+}
+
+static_assertions::const_assert_eq!(std::mem::size_of::<ColorEntry>(), 8);
+static_assertions::const_assert_eq!(std::mem::align_of::<ColorEntry>(), 8);
+
+impl ColorEntry {
+    #[inline(always)]
+    const fn new(key: u32, epoch: u16, val: u8) -> Self {
+        Self {
+            key,
+            epoch,
+            val,
+            _pad: 0,
+        }
+    }
+}
+
+#[inline(always)]
+const fn color_hash(color: u32) -> usize {
+    (color.wrapping_mul(0x9E37_79B1) >> 23) as usize & HASH_MASK
+}
+
+#[repr(C, align(64))]
 struct ColorTable {
-    keys: [u32; HASH_SLOTS],
-    vals: [u8; HASH_SLOTS],
-    gens: [u32; HASH_SLOTS],
+    entries: [ColorEntry; HASH_SLOTS],
     counts: [u32; MAX_PALETTE_COLORS],
-    cur_gen: u32,
+    cur_epoch: u16,
 }
 
 impl ColorTable {
     fn new() -> Self {
         Self {
-            keys: [0; HASH_SLOTS],
-            vals: [0; HASH_SLOTS],
-            gens: [0; HASH_SLOTS],
+            entries: [ColorEntry::default(); HASH_SLOTS],
             counts: [0; MAX_PALETTE_COLORS],
-            cur_gen: 0,
+            cur_epoch: 0,
         }
     }
 
     #[inline(always)]
-    fn next_epoch(&mut self) -> u32 {
-        self.cur_gen = self.cur_gen.wrapping_add(1);
-        if self.cur_gen == 0 {
-            self.gens.fill(0);
-            self.cur_gen = 1;
+    fn next_epoch(&mut self) -> u16 {
+        self.cur_epoch = self.cur_epoch.wrapping_add(1);
+        if self.cur_epoch == 0 {
+            self.entries.fill(ColorEntry::default());
+            self.cur_epoch = 1;
         }
-        self.cur_gen
+        self.cur_epoch
     }
 
     #[inline]
-    fn prefix_count(&self, cur_epoch: u32, color: u32) -> usize {
-        let mut h = (color.wrapping_mul(0x9E37_79B1) >> 23) as usize & HASH_MASK;
+    fn prefix_count(&self, cur_epoch: u16, color: u32) -> usize {
+        let mut h = color_hash(color);
         loop {
-            if self.gens[h] != cur_epoch {
+            let entry = self.entries[h];
+            if entry.epoch != cur_epoch {
                 return 0;
             }
-            if self.keys[h] == color {
-                return self.counts[usize::from(self.vals[h])] as usize;
+            if entry.key == color {
+                return self.counts[usize::from(entry.val)] as usize;
             }
             h = (h + 1) & HASH_MASK;
         }
@@ -415,7 +448,7 @@ impl ColorTable {
     #[inline(never)]
     fn finish_misra_gries_from_counts(
         &self,
-        cur_epoch: u32,
+        cur_epoch: u16,
         aos: BufferPointer<Vec4u8>,
         stride_px: usize,
         rect: TileRect,
@@ -586,14 +619,13 @@ impl ColorTable {
         for i in 0..MAX_PALETTE_COLORS {
             let rgb = palette_out[i] | 0xFF00_0000;
             let cnt = self.counts[i];
-            let mut h = (rgb.wrapping_mul(0x9E37_79B1) >> 23) as usize & HASH_MASK;
+            let mut h = color_hash(rgb);
             loop {
-                if self.gens[h] != cur_epoch {
-                    self.gens[h] = cur_epoch;
-                    self.keys[h] = rgb;
+                let entry = self.entries[h];
+                if entry.epoch != cur_epoch {
                     let slot = rgb_count & (MAX_PALETTE_COLORS - 1);
                     debug_assert_eq!(slot, rgb_count);
-                    self.vals[h] = slot as u8;
+                    self.entries[h] = ColorEntry::new(rgb, cur_epoch, slot as u8);
                     palette_out[slot] = rgb;
                     self.counts[slot] = cnt;
                     if cnt as usize >= threshold {
@@ -602,8 +634,8 @@ impl ColorTable {
                     rgb_count += 1;
                     break;
                 }
-                if self.keys[h] == rgb {
-                    let idx = usize::from(self.vals[h]);
+                if entry.key == rgb {
+                    let idx = usize::from(entry.val);
                     let next = self.counts[idx] + cnt;
                     self.counts[idx] = next;
                     if next as usize >= threshold {
@@ -657,9 +689,10 @@ impl ColorTable {
                 }
                 last_run = 1;
 
-                let mut h = (c.wrapping_mul(0x9E37_79B1) >> 23) as usize & HASH_MASK;
+                let mut h = color_hash(c);
                 loop {
-                    if self.gens[h] != cur_epoch {
+                    let entry = self.entries[h];
+                    if entry.epoch != cur_epoch {
                         if rgb_count >= MAX_PALETTE_COLORS {
                             return self.finish_misra_gries_from_counts(
                                 cur_epoch,
@@ -672,10 +705,8 @@ impl ColorTable {
                                 threshold,
                             );
                         }
-                        self.gens[h] = cur_epoch;
-                        self.keys[h] = c;
                         let idx = rgb_count as u8;
-                        self.vals[h] = idx;
+                        self.entries[h] = ColorEntry::new(c, cur_epoch, idx);
                         palette_out[rgb_count] = c;
                         self.counts[rgb_count] = 0;
                         rgb_count += 1;
@@ -683,9 +714,9 @@ impl ColorTable {
                         last_idx = idx;
                         break;
                     }
-                    if self.keys[h] == c {
+                    if entry.key == c {
                         last_color = c;
-                        last_idx = self.vals[h];
+                        last_idx = entry.val;
                         break;
                     }
                     h = (h + 1) & HASH_MASK;
@@ -721,13 +752,12 @@ impl ColorTable {
         let alpha_or = if TRACK_ALPHA { 0u32 } else { 0xFF00_0000u32 };
 
         // Seed with pixel `(0, 0)` so the hot inner loop skips `count > 0`.
-        debug_assert!(y0 * stride_px + x0 + tw <= aos.len());
+        debug_assert!((y0 + th - 1) * stride_px + x0 + tw <= aos.len());
         // SAFETY: Caller guarantees `rect` is non-empty and inside `aos`.
-        let first_c = unsafe { load_pixel_le(aos.ptr().add(y0 * stride_px + x0), 0) } | alpha_or;
-        let h0 = (first_c.wrapping_mul(0x9E37_79B1) >> 23) as usize & HASH_MASK;
-        self.gens[h0] = cur_epoch;
-        self.keys[h0] = first_c;
-        self.vals[h0] = 0;
+        let mut row_ptr = unsafe { aos.ptr().add(y0 * stride_px + x0) };
+        let first_c = unsafe { load_pixel_le(row_ptr, 0) } | alpha_or;
+        let h0 = color_hash(first_c);
+        self.entries[h0] = ColorEntry::new(first_c, cur_epoch, 0);
         palette_out[0] = first_c;
         self.counts[0] = 0;
 
@@ -735,17 +765,16 @@ impl ColorTable {
         let mut last_color = first_c;
         let mut last_idx = 0u8;
         let mut last_run = 0u32;
+        let mut out_ptr = indices_out[..n_px].as_mut_ptr();
 
         for ry in 0..th {
-            let row_start = (y0 + ry) * stride_px + x0;
-            debug_assert!(row_start + tw <= aos.len());
-            // SAFETY: Caller guarantees `rect` is inside `aos`.
-            let row_ptr = unsafe { aos.ptr().add(row_start) };
-            let row_out = &mut indices_out[ry * tw..(ry + 1) * tw];
+            // SAFETY: `indices_out[..n_px]` bounds-checked `th * tw == n_px` above,
+            // so `out_ptr` is valid for `tw` mutable bytes on every row `0..th`.
+            let row_out = unsafe { slice::from_raw_parts_mut(out_ptr, tw) };
             let mut x = 0usize;
             while x < tw {
                 // SAFETY: `x < tw` and `row_ptr` is valid for `tw` reads.
-                let c = unsafe { load_pixel_le(row_ptr, x) } | alpha_or;
+                let mut c = unsafe { load_pixel_le(row_ptr, x) } | alpha_or;
                 if c == last_color {
                     row_out[x] = last_idx;
                     last_run += 1;
@@ -764,14 +793,30 @@ impl ColorTable {
                         last_run += 8;
                         x += 8;
                     }
-                    continue;
+                    // Drain the 0..7 remaining pixels of this run scalarly so
+                    // short runs and run tails never re-enter the 8-px SIMD check.
+                    while x < tw {
+                        // SAFETY: `x < tw` and `row_ptr` is valid for `tw` reads.
+                        let next_c = unsafe { load_pixel_le(row_ptr, x) } | alpha_or;
+                        if next_c != last_color {
+                            c = next_c;
+                            break;
+                        }
+                        row_out[x] = last_idx;
+                        last_run += 1;
+                        x += 1;
+                    }
+                    if x >= tw {
+                        break;
+                    }
                 }
                 self.counts[usize::from(last_idx)] += last_run;
                 last_run = 1;
 
-                let mut h = (c.wrapping_mul(0x9E37_79B1) >> 23) as usize & HASH_MASK;
+                let mut h = color_hash(c);
                 loop {
-                    if self.gens[h] != cur_epoch {
+                    let entry = self.entries[h];
+                    if entry.epoch != cur_epoch {
                         if count >= MAX_PALETTE_COLORS {
                             let threshold = (n_px * TEXT_SAFE_DOMINANT_BG_PCT).div_ceil(100);
                             return if TRACK_ALPHA {
@@ -797,10 +842,8 @@ impl ColorTable {
                                 )
                             };
                         }
-                        self.gens[h] = cur_epoch;
-                        self.keys[h] = c;
                         let idx = count as u8;
-                        self.vals[h] = idx;
+                        self.entries[h] = ColorEntry::new(c, cur_epoch, idx);
                         palette_out[count] = c;
                         self.counts[count] = 0;
                         count += 1;
@@ -809,8 +852,8 @@ impl ColorTable {
                         row_out[x] = idx;
                         break;
                     }
-                    if self.keys[h] == c {
-                        let idx = self.vals[h];
+                    if entry.key == c {
+                        let idx = entry.val;
                         last_color = c;
                         last_idx = idx;
                         row_out[x] = idx;
@@ -819,6 +862,12 @@ impl ColorTable {
                     h = (h + 1) & HASH_MASK;
                 }
                 x += 1;
+            }
+            // SAFETY: Advances by `tw` up to one-past-the-end of `indices_out[..n_px]`.
+            out_ptr = unsafe { out_ptr.add(tw) };
+            if ry + 1 < th {
+                // SAFETY: Caller guarantees all `th` rows of `rect` lie inside `aos`.
+                row_ptr = unsafe { row_ptr.add(stride_px) };
             }
         }
 
@@ -830,6 +879,7 @@ impl ColorTable {
     }
 }
 
+#[repr(C, align(64))]
 pub(crate) struct PaletteScratch {
     table: ColorTable,
     pub(crate) palette: [u32; MAX_PALETTE_COLORS],
@@ -907,22 +957,23 @@ impl PaletteScratch {
         // SAFETY: Caller guarantees `rect` is non-empty and inside `aos`.
         let mut row_ptr = unsafe { aos.ptr().add(y0 * stride_px + x0) };
         let first_c = unsafe { load_pixel_le(row_ptr, 0) } | alpha_or;
-        let h0 = (first_c.wrapping_mul(0x9E37_79B1) >> 23) as usize & HASH_MASK;
-        self.table.gens[h0] = cur_epoch;
-        self.table.keys[h0] = first_c;
-        self.table.vals[h0] = 0;
+        let h0 = color_hash(first_c);
+        self.table.entries[h0] = ColorEntry::new(first_c, cur_epoch, 0);
         self.palette[0] = first_c;
 
         let mut count = 1usize;
         let mut last_color = first_c;
         let mut last_idx = 0u8;
-        let indices = &mut self.indices[..n_px];
+        let mut out_ptr = self.indices[..n_px].as_mut_ptr();
 
-        for (ry, row_out) in indices.chunks_exact_mut(tw).enumerate() {
+        for ry in 0..th {
+            // SAFETY: `self.indices[..n_px]` bounds-checked `th * tw == n_px` above,
+            // so `out_ptr` is valid for `tw` mutable bytes on every row `0..th`.
+            let row_out = unsafe { slice::from_raw_parts_mut(out_ptr, tw) };
             let mut x = 0usize;
             while x < tw {
                 // SAFETY: `x < tw` and `row_ptr` is valid for `tw` `Vec4u8` reads.
-                let c = unsafe { load_pixel_le(row_ptr, x) } | alpha_or;
+                let mut c = unsafe { load_pixel_le(row_ptr, x) } | alpha_or;
                 if c == last_color {
                     row_out[x] = last_idx;
                     x += 1;
@@ -939,18 +990,31 @@ impl PaletteScratch {
                         dst8.fill(last_idx);
                         x += 8;
                     }
-                    continue;
+                    // Drain the 0..7 remaining pixels of this run scalarly so
+                    // short runs and run tails never re-enter the 8-px SIMD check.
+                    while x < tw {
+                        // SAFETY: `x < tw` and `row_ptr` is valid for `tw` reads.
+                        let next_c = unsafe { load_pixel_le(row_ptr, x) } | alpha_or;
+                        if next_c != last_color {
+                            c = next_c;
+                            break;
+                        }
+                        row_out[x] = last_idx;
+                        x += 1;
+                    }
+                    if x >= tw {
+                        break;
+                    }
                 }
-                let mut h = (c.wrapping_mul(0x9E37_79B1) >> 23) as usize & HASH_MASK;
+                let mut h = color_hash(c);
                 loop {
-                    if self.table.gens[h] != cur_epoch {
+                    let entry = self.table.entries[h];
+                    if entry.epoch != cur_epoch {
                         if count >= MAX_PALETTE_COLORS {
                             return Err(ry);
                         }
-                        self.table.gens[h] = cur_epoch;
-                        self.table.keys[h] = c;
                         let idx = count as u8;
-                        self.table.vals[h] = idx;
+                        self.table.entries[h] = ColorEntry::new(c, cur_epoch, idx);
                         self.palette[count] = c;
                         count += 1;
                         last_color = c;
@@ -958,8 +1022,8 @@ impl PaletteScratch {
                         row_out[x] = idx;
                         break;
                     }
-                    if self.table.keys[h] == c {
-                        let idx = self.table.vals[h];
+                    if entry.key == c {
+                        let idx = entry.val;
                         last_color = c;
                         last_idx = idx;
                         row_out[x] = idx;
@@ -969,6 +1033,8 @@ impl PaletteScratch {
                 }
                 x += 1;
             }
+            // SAFETY: Advances by `tw` up to one-past-the-end of `self.indices[..n_px]`.
+            out_ptr = unsafe { out_ptr.add(tw) };
             if ry + 1 < th {
                 // SAFETY: Caller guarantees all `th` rows of `rect` lie inside `aos`.
                 row_ptr = unsafe { row_ptr.add(stride_px) };
@@ -1896,5 +1962,385 @@ mod tests {
             assert_scan_matches_oracle(&mut scratch, &buf, w, r, false);
             assert_scan_matches_oracle(&mut scratch, &buf, w, r, true);
         }
+    }
+
+    fn colors_hashing_to(slot: usize, count: usize, alpha: u8) -> Vec<Vec4u8> {
+        let mut out = Vec::with_capacity(count);
+        let mut i = 0u32;
+        while out.len() < count {
+            let px = Vec4u8(
+                (i & 0xFF) as u8,
+                ((i >> 8) & 0xFF) as u8,
+                ((i >> 16) & 0xFF) as u8,
+                alpha,
+            );
+            let key = u32::from_le_bytes([px.0, px.1, px.2, alpha]);
+            if color_hash(key) == slot {
+                out.push(px);
+            }
+            i += 1;
+        }
+        out
+    }
+
+    #[test]
+    fn test_color_table_epoch_wraparound_clears_stale_entries() {
+        let c0 = Vec4u8(10, 20, 30, 0xFF);
+        let c1 = Vec4u8(40, 50, 60, 0xFF);
+        let c2 = Vec4u8(70, 80, 90, 0xFF);
+        let c3 = Vec4u8(100, 110, 120, 0xFF);
+        let c0_u32 = u32::from_le_bytes([c0.0, c0.1, c0.2, c0.3]);
+        let c1_u32 = u32::from_le_bytes([c1.0, c1.1, c1.2, c1.3]);
+        let rect = TileRect {
+            x: 0,
+            y: 0,
+            w: 16,
+            h: 2,
+        };
+
+        // 1. `try_encode_2d` across `u16::MAX -> 1` wraparound for both `HAS_ALPHA` modes:
+        //    stale epoch-1 entries `[c0 -> 0, c1 -> 1]` must be cleared so a post-wrap
+        //    tile starting with `[c1, c0]` assigns `c1 -> 0, c0 -> 1` cleanly.
+        for has_alpha in [false, true] {
+            let mut scratch = PaletteScratch::new();
+            let tile_epoch1: Vec<Vec4u8> =
+                (0..32).map(|i| if i % 2 == 0 { c0 } else { c1 }).collect();
+            let p1 = tile_epoch1.as_ptr();
+            let bp1 = unsafe { BufferPointer::new(&p1, tile_epoch1.len()) };
+            let n1 = if has_alpha {
+                scratch.try_encode_2d::<true>(bp1, 16, rect).unwrap()
+            } else {
+                scratch.try_encode_2d::<false>(bp1, 16, rect).unwrap()
+            };
+            assert_eq!(n1, 2);
+            assert_eq!(scratch.table.cur_epoch, 1);
+            assert_eq!(scratch.palette[..2], [c0_u32, c1_u32]);
+
+            // Jump right before wraparound (`u16::MAX - 1` -> `u16::MAX` -> `1`).
+            scratch.table.cur_epoch = u16::MAX - 1;
+            let tile_max: Vec<Vec4u8> = (0..32).map(|i| if i % 2 == 0 { c2 } else { c3 }).collect();
+            let p_max = tile_max.as_ptr();
+            let bp_max = unsafe { BufferPointer::new(&p_max, tile_max.len()) };
+            let n_max = if has_alpha {
+                scratch.try_encode_2d::<true>(bp_max, 16, rect).unwrap()
+            } else {
+                scratch.try_encode_2d::<false>(bp_max, 16, rect).unwrap()
+            };
+            assert_eq!(n_max, 2);
+            assert_eq!(scratch.table.cur_epoch, u16::MAX);
+
+            // Reversed order `[c1, c0]` on wrap to epoch `1` would corrupt indices if
+            // stale epoch-1 entries survived wraparound.
+            let tile_wrapped: Vec<Vec4u8> =
+                (0..32).map(|i| if i % 2 == 0 { c1 } else { c0 }).collect();
+            let p_wrap = tile_wrapped.as_ptr();
+            let bp_wrap = unsafe { BufferPointer::new(&p_wrap, tile_wrapped.len()) };
+            let n_wrap = if has_alpha {
+                scratch.try_encode_2d::<true>(bp_wrap, 16, rect).unwrap()
+            } else {
+                scratch.try_encode_2d::<false>(bp_wrap, 16, rect).unwrap()
+            };
+            assert_eq!(n_wrap, 2);
+            assert_eq!(scratch.table.cur_epoch, 1);
+            assert_eq!(scratch.palette[..2], [c1_u32, c0_u32]);
+            for (i, &idx) in scratch.indices[..32].iter().enumerate() {
+                assert_eq!(idx, (i % 2) as u8);
+            }
+        }
+
+        // 2. `scan_hybrid_leaf` across `u16::MAX -> 1` wraparound (both `TRACK_ALPHA` modes),
+        //    plus `finish_translucent_rgb` triggering the wraparound internally.
+        for track_alpha in [false, true] {
+            let mut scratch = PaletteScratch::new();
+            let tile_epoch1: Vec<Vec4u8> =
+                (0..32).map(|i| if i % 2 == 0 { c0 } else { c1 }).collect();
+            let p1 = tile_epoch1.as_ptr();
+            let bp1 = unsafe { BufferPointer::new(&p1, tile_epoch1.len()) };
+            let s1 = if track_alpha {
+                scratch.scan_hybrid_leaf::<true>(bp1, 16, rect)
+            } else {
+                scratch.scan_hybrid_leaf::<false>(bp1, 16, rect)
+            };
+            assert_eq!(s1, HybridScan::Palette { n_colors: 2 });
+            assert_eq!(scratch.table.cur_epoch, 1);
+            assert_eq!(scratch.palette[..2], [c0_u32, c1_u32]);
+
+            scratch.table.cur_epoch = u16::MAX;
+            let tile_wrapped: Vec<Vec4u8> =
+                (0..32).map(|i| if i % 2 == 0 { c1 } else { c0 }).collect();
+            let pw = tile_wrapped.as_ptr();
+            let bpw = unsafe { BufferPointer::new(&pw, tile_wrapped.len()) };
+            let sw = if track_alpha {
+                scratch.scan_hybrid_leaf::<true>(bpw, 16, rect)
+            } else {
+                scratch.scan_hybrid_leaf::<false>(bpw, 16, rect)
+            };
+            assert_eq!(sw, HybridScan::Palette { n_colors: 2 });
+            assert_eq!(scratch.table.cur_epoch, 1);
+            assert_eq!(scratch.palette[..2], [c1_u32, c0_u32]);
+            for (i, &idx) in scratch.indices[..32].iter().enumerate() {
+                assert_eq!(idx, (i % 2) as u8);
+            }
+        }
+
+        // `scan_hybrid_leaf::<true>` runs at `u16::MAX`, overflows 256 BGRA colors,
+        // and `finish_translucent_rgb` wraps `next_epoch()` to `1`.
+        let mut scratch = PaletteScratch::new();
+        let seed_tile: Vec<Vec4u8> = (0..32).map(|i| if i % 2 == 0 { c0 } else { c1 }).collect();
+        let ps = seed_tile.as_ptr();
+        let bps = unsafe { BufferPointer::new(&ps, seed_tile.len()) };
+        assert_eq!(
+            scratch.scan_hybrid_leaf::<true>(bps, 16, rect),
+            HybridScan::Palette { n_colors: 2 }
+        );
+        assert_eq!(scratch.table.cur_epoch, 1);
+
+        scratch.table.cur_epoch = u16::MAX - 1;
+        let trans_257: Vec<Vec4u8> = (0..300)
+            .map(|i| {
+                let mut px = if i < 256 { c0 } else { c1 };
+                px.3 = (i & 0xFF) as u8;
+                px
+            })
+            .collect();
+        let rect_t = TileRect {
+            x: 0,
+            y: 0,
+            w: 20,
+            h: 15,
+        };
+        let pt = trans_257.as_ptr();
+        let bpt = unsafe { BufferPointer::new(&pt, trans_257.len()) };
+        assert_eq!(
+            scratch.scan_hybrid_leaf::<true>(bpt, 20, rect_t),
+            HybridScan::TextSafeNoPalette
+        );
+        assert_eq!(scratch.table.cur_epoch, 1);
+    }
+
+    #[test]
+    fn test_color_table_hash_collisions_and_slot_511_wraparound() {
+        // Synthesize distinct opaque and translucent colors colliding at slot 511
+        // (`HASH_SLOTS - 1`), forcing linear probing to wrap `511 -> 0 -> 1 -> ...`,
+        // interleaved with colors hashing directly to slot `0`.
+        for has_alpha in [false, true] {
+            let alpha = if has_alpha { 0x80 } else { 0xFF };
+            let mut colliding = colors_hashing_to(HASH_SLOTS - 1, 8, alpha);
+            let slot0 = colors_hashing_to(0, 4, alpha);
+            colliding.extend_from_slice(&slot0);
+
+            for &c in &colliding[..8] {
+                assert_eq!(
+                    color_hash(u32::from_le_bytes([c.0, c.1, c.2, alpha])),
+                    HASH_SLOTS - 1
+                );
+            }
+            for &c in &colliding[8..] {
+                assert_eq!(color_hash(u32::from_le_bytes([c.0, c.1, c.2, alpha])), 0);
+            }
+
+            // Roundtrip through `try_encode_2d` across all supported tiers.
+            for tier in Tier::supported_tiers() {
+                encode_decode_palette_case(tier, &colliding, has_alpha, 19, 13, 24);
+            }
+
+            // Verify exact palette order and `scan_hybrid_leaf` / `scan_hybrid_quadrant`
+            // agreement on the same colliding sequence.
+            let mut pixels = Vec::with_capacity(24 * 16);
+            for i in 0..(24 * 16) {
+                pixels.push(colliding[i % colliding.len()]);
+            }
+            let rect = TileRect {
+                x: 0,
+                y: 0,
+                w: 24,
+                h: 16,
+            };
+            let mut scratch = PaletteScratch::new();
+            assert_scan_matches_oracle(&mut scratch, &pixels, 24, rect, has_alpha);
+
+            // Also verify `prefix_count` probes across `511 -> 0` wraparound when
+            // overflowing 256 colors in `scan_hybrid`: place `dom_wrapped` (hashes to
+            // 511, linearly probes to slot 0) once in the 256-color prefix, overflow at
+            // pixel 256, and place exactly 349 more copies interleaved in the suffix so
+            // total is `1 + 349 = 350` (exact 35% threshold). Missing the `+1` prefix
+            // count across `511 -> 0` would drop to `349` and misclassify as `Photo`.
+            let dom_wrapped = colliding[1];
+            let mut ovf = Vec::with_capacity(40 * 25);
+            for &c in &colliding {
+                ovf.push(c);
+            }
+            let mut next = 0u32;
+            while ovf.len() < 256 {
+                let px = Vec4u8((next & 0xFF) as u8, ((next >> 8) & 0xFF) as u8, 0x77, alpha);
+                if !ovf.contains(&px) {
+                    ovf.push(px);
+                }
+                next += 1;
+            }
+            // Interleave `[u_a, u_b, dom_wrapped]` after pixel 256 so Misra-Gries
+            // enters the uncertain band and must call `prefix_count` on `dom_wrapped`.
+            let mut dom_left = 349usize;
+            let mut tail_id = 0u32;
+            while ovf.len() < 1000 {
+                let rem = 1000 - ovf.len();
+                if (dom_left > 0 && ovf.len() % 3 == 2) || rem <= dom_left {
+                    ovf.push(dom_wrapped);
+                    dom_left -= 1;
+                } else {
+                    ovf.push(Vec4u8(
+                        (tail_id & 0xFF) as u8,
+                        ((tail_id >> 8) & 0xFF) as u8,
+                        0xEE,
+                        alpha,
+                    ));
+                    tail_id += 1;
+                }
+            }
+            let rect_ovf = TileRect {
+                x: 0,
+                y: 0,
+                w: 40,
+                h: 25,
+            };
+            assert_scan_matches_oracle(&mut scratch, &ovf, 40, rect_ovf, has_alpha);
+            let p = ovf.as_ptr();
+            let bp = unsafe { BufferPointer::new(&p, ovf.len()) };
+            let scan = if has_alpha {
+                scratch.scan_hybrid_leaf::<true>(bp, 40, rect_ovf)
+            } else {
+                scratch.scan_hybrid_leaf::<false>(bp, 40, rect_ovf)
+            };
+            assert_eq!(scan, HybridScan::TextSafeNoPalette);
+        }
+    }
+
+    #[test]
+    fn test_two_color_alternating_and_run_drain_edge_cases() {
+        // Exercises 1-px `bg <-> fg` alternation, short runs (1..=9 pixels covering the
+        // 8-px SIMD threshold and scalar run-drain tail), long runs (>= 16 px), odd
+        // widths, padded strides, and `0x0000_0000` with `HAS_ALPHA = true`.
+        let pairs = [
+            (
+                Vec4u8(0x1E, 0x1E, 0x1E, 0xFF),
+                Vec4u8(0xD4, 0xD4, 0xD4, 0xFF),
+                false,
+            ),
+            (
+                Vec4u8(0x00, 0x00, 0x00, 0x00),
+                Vec4u8(0xFF, 0xFF, 0xFF, 0x80),
+                true,
+            ),
+        ];
+        let mut scratch = PaletteScratch::new();
+        for (bg, fg, has_alpha) in pairs {
+            for &tw in &[1usize, 2, 7, 8, 9, 15, 16, 17, 33] {
+                let th = 6usize;
+                let stride_px = tw + 5;
+                let x0 = 3usize;
+                let y0 = 1usize;
+                let rect = TileRect {
+                    x: x0 as u32,
+                    y: y0 as u32,
+                    w: tw as u32,
+                    h: th as u32,
+                };
+                for run_len in [1usize, 2, 3, 7, 8, 9, 17] {
+                    let mut frame = vec![Vec4u8(0x55, 0x66, 0x77, 0xFF); stride_px * (th + 2)];
+                    for ry in 0..th {
+                        for rx in 0..tw {
+                            // Mix row-local run lengths and alternating rows so runs
+                            // end mid-row, at exact `tw`, and wrap across rows.
+                            let pos = ry * tw + rx;
+                            let px = if ((pos / run_len) + (ry & 1)) % 2 == 0 {
+                                bg
+                            } else {
+                                fg
+                            };
+                            frame[(y0 + ry) * stride_px + x0 + rx] = px;
+                        }
+                    }
+                    assert_scan_matches_oracle(&mut scratch, &frame, stride_px, rect, has_alpha);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn test_palette_256_saturation_and_257_bailout_both_alpha_modes() {
+        let mut scratch = PaletteScratch::new();
+        let rect = TileRect {
+            x: 0,
+            y: 0,
+            w: 16,
+            h: 20,
+        };
+
+        // 1. 256 unique opaque colors -> `Ok(256)` and `HybridScan::Palette { n_colors: 256 }`.
+        let mut buf_opaque: Vec<Vec4u8> = (0..320)
+            .map(|i| Vec4u8((i % 256) as u8, 42, 99, 0xFF))
+            .collect();
+        assert_scan_matches_oracle(&mut scratch, &buf_opaque, 16, rect, false);
+        assert_scan_matches_oracle(&mut scratch, &buf_opaque, 16, rect, true);
+        let p = buf_opaque.as_ptr();
+        let bp = unsafe { BufferPointer::new(&p, buf_opaque.len()) };
+        assert_eq!(scratch.try_encode_2d::<false>(bp, 16, rect), Ok(256));
+        assert_eq!(scratch.try_encode_2d::<true>(bp, 16, rect), Ok(256));
+        assert_eq!(
+            scratch.scan_hybrid_leaf::<false>(bp, 16, rect),
+            HybridScan::Palette { n_colors: 256 }
+        );
+        assert_eq!(
+            scratch.scan_hybrid_leaf::<true>(bp, 16, rect),
+            HybridScan::Palette { n_colors: 256 }
+        );
+
+        // 2. 257th unique RGB color on row 19 (uniform, <35% dominant) -> `Err(19)` and `Photo`.
+        buf_opaque[19 * 16 + 7] = Vec4u8(1, 2, 3, 0xFF);
+        assert_scan_matches_oracle(&mut scratch, &buf_opaque, 16, rect, false);
+        assert_scan_matches_oracle(&mut scratch, &buf_opaque, 16, rect, true);
+        let p = buf_opaque.as_ptr();
+        let bp = unsafe { BufferPointer::new(&p, buf_opaque.len()) };
+        assert_eq!(scratch.try_encode_2d::<false>(bp, 16, rect), Err(19));
+        assert_eq!(scratch.try_encode_2d::<true>(bp, 16, rect), Err(19));
+        assert_eq!(
+            scratch.scan_hybrid_leaf::<false>(bp, 16, rect),
+            HybridScan::Photo
+        );
+        assert_eq!(
+            scratch.scan_hybrid_leaf::<true>(bp, 16, rect),
+            HybridScan::Photo
+        );
+
+        // 3. 256 unique translucent BGRA colors sharing 1 RGB value -> `Ok(256)` for
+        //    `HAS_ALPHA = true`, `Ok(1)` for `HAS_ALPHA = false`.
+        let mut buf_trans: Vec<Vec4u8> = (0..320)
+            .map(|i| Vec4u8(10, 20, 30, if i < 256 { i as u8 } else { 0 }))
+            .collect();
+        assert_scan_matches_oracle(&mut scratch, &buf_trans, 16, rect, false);
+        assert_scan_matches_oracle(&mut scratch, &buf_trans, 16, rect, true);
+        let p = buf_trans.as_ptr();
+        let bp = unsafe { BufferPointer::new(&p, buf_trans.len()) };
+        assert_eq!(scratch.try_encode_2d::<false>(bp, 16, rect), Ok(1));
+        assert_eq!(scratch.try_encode_2d::<true>(bp, 16, rect), Ok(256));
+
+        // Adding a 257th unique BGRA (only 2nd unique RGB) on row 17: `try_encode_2d::<true>`
+        // bails at row 17, `try_encode_2d::<false>` sees 2 colors, `scan_hybrid_leaf::<true>`
+        // returns `TextSafeNoPalette` via `finish_translucent_rgb`.
+        buf_trans[17 * 16 + 3] = Vec4u8(40, 50, 60, 0x80);
+        assert_scan_matches_oracle(&mut scratch, &buf_trans, 16, rect, false);
+        assert_scan_matches_oracle(&mut scratch, &buf_trans, 16, rect, true);
+        let p = buf_trans.as_ptr();
+        let bp = unsafe { BufferPointer::new(&p, buf_trans.len()) };
+        assert_eq!(scratch.try_encode_2d::<false>(bp, 16, rect), Ok(2));
+        assert_eq!(scratch.try_encode_2d::<true>(bp, 16, rect), Err(17));
+        assert_eq!(
+            scratch.scan_hybrid_leaf::<false>(bp, 16, rect),
+            HybridScan::Palette { n_colors: 2 }
+        );
+        assert_eq!(
+            scratch.scan_hybrid_leaf::<true>(bp, 16, rect),
+            HybridScan::TextSafeNoPalette
+        );
     }
 }
