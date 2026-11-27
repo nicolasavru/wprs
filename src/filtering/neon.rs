@@ -45,6 +45,7 @@ use std::arch::aarch64::vld1q_u32;
 use std::arch::aarch64::vld3q_u8;
 use std::arch::aarch64::vld4q_u8;
 use std::arch::aarch64::vmaxvq_u8;
+use std::arch::aarch64::vorrq_u8;
 use std::arch::aarch64::vpadalq_u16;
 use std::arch::aarch64::vpaddlq_u8;
 use std::arch::aarch64::vqtbl1q_u8;
@@ -72,8 +73,10 @@ use crate::filtering::FrameRows;
 use crate::filtering::RowKernel;
 use crate::filtering::ScanSubBand;
 use crate::filtering::ShadowRows;
-use crate::filtering::tile_cache::SlotHashes;
+use crate::filtering::tile_cache::SlotScans;
 use crate::filtering::tile_cache::ValidatedCacheHit;
+use crate::filtering::tile_hash::RectScanMeta;
+use crate::filtering::tile_hash::XRGB_ALPHA_MASK_U32;
 use crate::prelude::*;
 use crate::serialization::framing::AlphaChannel;
 use crate::serialization::framing::CompressedTile;
@@ -601,6 +604,62 @@ impl RowKernel for Kernel {
     }
 
     #[inline(always)]
+    unsafe fn copy_and_scan_row<const HAS_ALPHA: bool>(
+        self,
+        src: *const u8,
+        dst: *mut u8,
+        n_px: usize,
+        first_word: u32,
+    ) -> (bool, bool) {
+        let lim = (n_px / 4) * 4;
+        // SAFETY: NEON is mandatory on AArch64; caller guarantees `src` readable
+        // and `dst` writable for `n_px * 4` bytes and non-overlapping.
+        unsafe {
+            let alpha_mask = vreinterpretq_u8_u32(vdupq_n_u32(XRGB_ALPHA_MASK_U32));
+            let first_vec = vreinterpretq_u8_u32(vdupq_n_u32(first_word));
+            let mut dacc = vdupq_n_u8(0);
+            let mut aand = vdupq_n_u8(0xFF);
+            let mut i = 0usize;
+            while i < lim {
+                let off = i * 4;
+                let r = vld1q_u8(src.add(off));
+                vst1q_u8(dst.add(off), r);
+                let m = if HAS_ALPHA {
+                    r
+                } else {
+                    vorrq_u8(r, alpha_mask)
+                };
+                dacc = vorrq_u8(dacc, veorq_u8(m, first_vec));
+                if HAS_ALPHA {
+                    aand = vandq_u8(aand, m);
+                }
+                i += 4;
+            }
+            let mut tail_diff = 0u32;
+            let mut tail_alpha = u32::MAX;
+            for j in lim..n_px {
+                let off = j * 4;
+                let raw = src.add(off).cast::<u32>().read_unaligned();
+                dst.add(off).cast::<u32>().write_unaligned(raw);
+                let canon = if HAS_ALPHA {
+                    raw
+                } else {
+                    raw | XRGB_ALPHA_MASK_U32
+                };
+                tail_diff |= canon ^ first_word;
+                if HAS_ALPHA {
+                    tail_alpha &= canon;
+                }
+            }
+            let solid = tail_diff == 0 && vmaxvq_u8(dacc) == 0;
+            let opaque = !HAS_ALPHA
+                || ((tail_alpha & XRGB_ALPHA_MASK_U32) == XRGB_ALPHA_MASK_U32
+                    && vmaxvq_u8(veorq_u8(vandq_u8(aand, alpha_mask), alpha_mask)) == 0);
+            (solid, opaque)
+        }
+    }
+
+    #[inline(always)]
     fn fence_stream(self) {}
 }
 
@@ -717,6 +776,24 @@ impl Tier {
     }
 
     /// # Safety
+    /// Caller must uphold [`super::copy_and_scan_rect_to_shadow_with`] invariants.
+    #[inline(always)]
+    pub(super) unsafe fn copy_and_scan_rect_to_shadow<const HAS_ALPHA: bool>(
+        self,
+        src: BufferPointer<u8>,
+        shadow: &ShadowRows,
+        stride: usize,
+        rect: TileRect,
+    ) -> RectScanMeta {
+        // SAFETY: Caller upholds disjoint-rect shadow invariants.
+        unsafe {
+            super::copy_and_scan_rect_to_shadow_with::<Kernel, HAS_ALPHA>(
+                Kernel, src, shadow, stride, rect,
+            )
+        }
+    }
+
+    /// # Safety
     /// Caller must uphold [`super::diff_and_update_worker_with`] invariants.
     #[inline(always)]
     pub(super) unsafe fn diff_and_update_worker(
@@ -731,7 +808,7 @@ impl Tier {
         n_qx: usize,
         sub_bands: &[ScanSubBand],
         dirty_slots: &[AtomicU32],
-        slot_hashes: Option<&SlotHashes>,
+        slot_scans: Option<&SlotScans>,
         cache_non_empty: bool,
         next_sub: &AtomicUsize,
     ) {
@@ -749,7 +826,7 @@ impl Tier {
                     n_qx,
                     sub_bands,
                     dirty_slots,
-                    slot_hashes,
+                    slot_scans,
                     cache_non_empty,
                     next_sub,
                 );
@@ -765,7 +842,7 @@ impl Tier {
                     n_qx,
                     sub_bands,
                     dirty_slots,
-                    slot_hashes,
+                    slot_scans,
                     cache_non_empty,
                     next_sub,
                 );
@@ -787,7 +864,7 @@ impl Tier {
         sub_bands: &[ScanSubBand],
         sr: ScrollRect,
         dirty_slots: &[AtomicU32],
-        slot_hashes: Option<&SlotHashes>,
+        slot_scans: Option<&SlotScans>,
         cache_non_empty: bool,
         next_sub: &AtomicUsize,
     ) {
@@ -806,7 +883,7 @@ impl Tier {
                     sub_bands,
                     sr,
                     dirty_slots,
-                    slot_hashes,
+                    slot_scans,
                     cache_non_empty,
                     next_sub,
                 );
@@ -823,7 +900,7 @@ impl Tier {
                     sub_bands,
                     sr,
                     dirty_slots,
-                    slot_hashes,
+                    slot_scans,
                     cache_non_empty,
                     next_sub,
                 );

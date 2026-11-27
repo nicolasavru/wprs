@@ -43,16 +43,114 @@ use crate::vec4u8::Vec4u8;
 /// 128-bit keyed digest of canonical tile pixels or combined quadrant digests.
 pub(crate) type TileHash = [u8; 16];
 
+/// Pixel uniformity and opacity metadata computed in-register during Phase-A
+/// scanning with zero extra memory passes.
+#[derive(Debug, Copy, Clone, Eq, PartialEq)]
+pub(crate) struct RectScanMeta {
+    /// `Some([b, g, r, a])` iff the rectangle is non-empty and every pixel
+    /// equals this exact canonical pixel (with byte 3 normalized to `0xFF` for
+    /// `Xrgb8888`).
+    pub(crate) solid_px: Option<[u8; 4]>,
+    /// `true` iff every pixel in the rectangle has alpha byte `0xFF` (always
+    /// `true` for `Xrgb8888` and for empty rectangles).
+    pub(crate) all_opaque: bool,
+}
+
+impl RectScanMeta {
+    /// Conservative metadata when exact pixel properties were not scanned for
+    /// a rectangle (e.g. unhashed tiny cropped patches or direct no-shadow
+    /// full frames).
+    pub(crate) const UNKNOWN: Self = Self {
+        solid_px: None,
+        all_opaque: false,
+    };
+
+    /// Exact metadata for an empty rectangle (`w == 0 || h == 0`).
+    pub(crate) const EMPTY: Self = Self {
+        solid_px: None,
+        all_opaque: true,
+    };
+
+    /// Combines `1..=4` child quadrant metadata entries into the exact
+    /// metadata for their parent rectangle in O(1).
+    #[inline]
+    pub(crate) fn combine(quads: &[Self]) -> Self {
+        debug_assert!(!quads.is_empty());
+        let first_solid = quads[0].solid_px;
+        let solid_px = first_solid.filter(|&px| quads[1..].iter().all(|q| q.solid_px == Some(px)));
+        let all_opaque = quads.iter().all(|q| q.all_opaque);
+        Self {
+            solid_px,
+            all_opaque,
+        }
+    }
+}
+
+/// Combined output of a single-pass Phase-A tile hash and pixel-property scan.
+#[derive(Debug, Copy, Clone, Eq, PartialEq)]
+pub(crate) struct TileHashResult {
+    pub(crate) hash: TileHash,
+    pub(crate) meta: RectScanMeta,
+}
+
+impl TileHashResult {
+    pub(crate) const EMPTY: Self = Self {
+        hash: [0u8; 16],
+        meta: RectScanMeta::UNKNOWN,
+    };
+}
+
 const DOMAIN_LEAF: u64 = b'L' as u64;
 const DOMAIN_PARENT: u64 = b'P' as u64;
 
-#[cfg(any(
-    all(target_arch = "x86_64", not(miri)),
-    all(target_arch = "aarch64", not(miri)),
-))]
-const XRGB_ALPHA_MASK_U32: u32 = u32::from_ne_bytes([0, 0, 0, 0xFF]);
+pub(crate) const XRGB_ALPHA_MASK_U32: u32 = u32::from_ne_bytes([0, 0, 0, 0xFF]);
 
 const XRGB_ALPHA_MASK_U64: u64 = u64::from_ne_bytes([0, 0, 0, 0xFF, 0, 0, 0, 0xFF]);
+
+/// Conservative O(1) 3-point pre-probe (`(0, 0)`, `(w / 2, h / 2)`,
+/// `(w - 1, h - 1)`) returning `(canonical_first_word, maybe_solid, maybe_opaque)`.
+///
+/// Short-circuits `read_last` whenever the first two pixels already rule out
+/// both uniformity and (when `HAS_ALPHA`) full opacity, avoiding the third
+/// far-stride cache line read on non-solid `Xrgb8888` and translucent `Argb8888`
+/// tiles.
+///
+/// Always TOCTOU-sound under concurrent `wl_shm` mutation: a false negative
+/// conservatively disables the fast skip (falling back to normal Phase-B
+/// encoding), while a positive probe still verifies every single pixel actually
+/// copied into `shadow` in-register.
+#[inline(always)]
+pub(crate) fn probe_three_pixels<const HAS_ALPHA: bool>(
+    first_raw: u32,
+    mid_raw: u32,
+    read_last: impl FnOnce() -> u32,
+) -> (u32, bool, bool) {
+    let first_word = if HAS_ALPHA {
+        first_raw
+    } else {
+        first_raw | XRGB_ALPHA_MASK_U32
+    };
+    let mid_word = if HAS_ALPHA {
+        mid_raw
+    } else {
+        mid_raw | XRGB_ALPHA_MASK_U32
+    };
+    let eq01 = first_word == mid_word;
+    let op01 = !HAS_ALPHA || ((first_word & mid_word & XRGB_ALPHA_MASK_U32) == XRGB_ALPHA_MASK_U32);
+    if !eq01 && (!HAS_ALPHA || !op01) {
+        return (first_word, false, !HAS_ALPHA);
+    }
+    let last_raw = read_last();
+    let last_word = if HAS_ALPHA {
+        last_raw
+    } else {
+        last_raw | XRGB_ALPHA_MASK_U32
+    };
+    let maybe_solid = eq01 && first_word == last_word;
+    let maybe_opaque =
+        op01 && (!HAS_ALPHA || (last_word & XRGB_ALPHA_MASK_U32) == XRGB_ALPHA_MASK_U32);
+    (first_word, maybe_solid, maybe_opaque)
+}
 
 /// Per-connection random secret key for the 128-bit fused tile hasher.
 ///
@@ -167,20 +265,29 @@ fn has_hw_aes() -> bool {
 mod x86_aes {
     use std::arch::x86_64::__m128i;
     use std::arch::x86_64::_mm_aesenc_si128;
+    use std::arch::x86_64::_mm_and_si128;
+    use std::arch::x86_64::_mm_cmpeq_epi8;
+    use std::arch::x86_64::_mm_cvtsi32_si128;
     use std::arch::x86_64::_mm_loadu_si128;
+    use std::arch::x86_64::_mm_movemask_epi8;
     use std::arch::x86_64::_mm_or_si128;
     use std::arch::x86_64::_mm_set_epi32;
     use std::arch::x86_64::_mm_set_epi64x;
+    use std::arch::x86_64::_mm_set1_epi8;
     use std::arch::x86_64::_mm_set1_epi32;
+    use std::arch::x86_64::_mm_setzero_si128;
     use std::arch::x86_64::_mm_storeu_si128;
     use std::arch::x86_64::_mm_xor_si128;
     use std::ptr;
 
+    use super::RectScanMeta;
     use super::TileHash;
     use super::TileHashKey;
+    use super::TileHashResult;
     use super::XRGB_ALPHA_MASK_U32;
     use super::leaf_meta;
     use super::parent_meta;
+    use super::probe_three_pixels;
     use crate::serialization::framing::TileRect;
 
     #[inline]
@@ -237,9 +344,19 @@ mod x86_aes {
         out
     }
 
+    #[inline]
+    #[target_feature(enable = "aes")]
+    fn alpha_lanes_all_opaque(aand0: __m128i, aand1: __m128i) -> bool {
+        let combined = _mm_and_si128(aand0, aand1);
+        (_mm_movemask_epi8(_mm_cmpeq_epi8(combined, _mm_set1_epi8(-1))) & 0x8888) == 0x8888
+    }
+
     /// Absorbs one row (`full64 + rem` bytes, `rem < 64` and a multiple of 4)
-    /// into `lanes`, optionally storing exact raw bytes into `dst_row` in the
-    /// same single load pass when `COPY` is `true`.
+    /// into `lanes`, optionally storing raw bytes into `dst_row` (`COPY`),
+    /// tracking solid-color differences (`TRACK_SOLID`), and/or tracking alpha
+    /// opacity (`TRACK_OPAQUE`). Keeps a single compact 64B inner loop so LLVM
+    /// chooses optimal unrolling per specialization and fits cleanly in L1i /
+    /// µop cache.
     ///
     /// # Safety
     /// `src_row` must be readable for `full64 + rem` bytes. When `COPY` is
@@ -247,19 +364,32 @@ mod x86_aes {
     /// from `src_row`.
     #[inline]
     #[target_feature(enable = "aes")]
-    unsafe fn absorb_row<const HAS_ALPHA: bool, const COPY: bool>(
+    unsafe fn absorb_row<
+        const HAS_ALPHA: bool,
+        const COPY: bool,
+        const TRACK_SOLID: bool,
+        const TRACK_OPAQUE: bool,
+    >(
         src_row: *const u8,
         dst_row: *mut u8,
         full64: usize,
         rem: usize,
         rk: __m128i,
         alpha_mask: __m128i,
+        first_word: u32,
+        first_px: __m128i,
         lanes: &mut [__m128i; 4],
+        dacc: &mut __m128i,
+        aand0: &mut __m128i,
+        aand1: &mut __m128i,
     ) {
         let mut s0 = lanes[0];
         let mut s1 = lanes[1];
         let mut s2 = lanes[2];
         let mut s3 = lanes[3];
+        let mut cur_dacc = *dacc;
+        let mut a0 = *aand0;
+        let mut a1 = *aand1;
 
         let mut off = 0usize;
         while off < full64 {
@@ -297,6 +427,17 @@ mod x86_aes {
             } else {
                 _mm_or_si128(r3, alpha_mask)
             };
+            if TRACK_SOLID {
+                let d01 = _mm_or_si128(_mm_xor_si128(m0, first_px), _mm_xor_si128(m1, first_px));
+                let d23 = _mm_or_si128(_mm_xor_si128(m2, first_px), _mm_xor_si128(m3, first_px));
+                cur_dacc = _mm_or_si128(cur_dacc, _mm_or_si128(d01, d23));
+            }
+            if TRACK_OPAQUE {
+                a0 = _mm_and_si128(a0, m0);
+                a1 = _mm_and_si128(a1, m1);
+                a0 = _mm_and_si128(a0, m2);
+                a1 = _mm_and_si128(a1, m3);
+            }
             s0 = _mm_aesenc_si128(_mm_xor_si128(s0, m0), rk);
             s1 = _mm_aesenc_si128(_mm_xor_si128(s1, m1), rk);
             s2 = _mm_aesenc_si128(_mm_xor_si128(s2, m2), rk);
@@ -320,6 +461,12 @@ mod x86_aes {
                 } else {
                     _mm_or_si128(r0, alpha_mask)
                 };
+                if TRACK_SOLID {
+                    cur_dacc = _mm_or_si128(cur_dacc, _mm_xor_si128(m0, first_px));
+                }
+                if TRACK_OPAQUE {
+                    a0 = _mm_and_si128(a0, m0);
+                }
                 s0 = _mm_aesenc_si128(_mm_xor_si128(s0, m0), rk);
                 off += 16;
                 left -= 16;
@@ -338,6 +485,12 @@ mod x86_aes {
                     } else {
                         _mm_or_si128(r1, alpha_mask)
                     };
+                    if TRACK_SOLID {
+                        cur_dacc = _mm_or_si128(cur_dacc, _mm_xor_si128(m1, first_px));
+                    }
+                    if TRACK_OPAQUE {
+                        a1 = _mm_and_si128(a1, m1);
+                    }
                     s1 = _mm_aesenc_si128(_mm_xor_si128(s1, m1), rk);
                     off += 16;
                     left -= 16;
@@ -356,6 +509,12 @@ mod x86_aes {
                         } else {
                             _mm_or_si128(r2, alpha_mask)
                         };
+                        if TRACK_SOLID {
+                            cur_dacc = _mm_or_si128(cur_dacc, _mm_xor_si128(m2, first_px));
+                        }
+                        if TRACK_OPAQUE {
+                            a0 = _mm_and_si128(a0, m2);
+                        }
                         s2 = _mm_aesenc_si128(_mm_xor_si128(s2, m2), rk);
                         off += 16;
                         left -= 16;
@@ -366,9 +525,7 @@ mod x86_aes {
             if left > 0 {
                 debug_assert!(left < 16 && left.is_multiple_of(4));
                 // SAFETY: `off + left == full64 + rem`, `left` is 4, 8, or 12.
-                // Scalar 4-byte reads avoid `memcpy` calls, stack spills, and
-                // duplicate `wl_shm` loads.
-                let rt = unsafe {
+                let (p0, p1, p2) = unsafe {
                     let p0 = src_row.add(off).cast::<u32>().read_unaligned();
                     if COPY {
                         dst_row.add(off).cast::<u32>().write_unaligned(p0);
@@ -387,8 +544,47 @@ mod x86_aes {
                             }
                         }
                     }
-                    _mm_set_epi32(0, p2 as i32, p1 as i32, p0 as i32)
+                    (p0, p1, p2)
                 };
+                if TRACK_SOLID || TRACK_OPAQUE {
+                    let c0 = if HAS_ALPHA {
+                        p0
+                    } else {
+                        p0 | XRGB_ALPHA_MASK_U32
+                    };
+                    let mut td = c0 ^ first_word;
+                    let mut ta = c0;
+                    if left >= 8 {
+                        let c1 = if HAS_ALPHA {
+                            p1
+                        } else {
+                            p1 | XRGB_ALPHA_MASK_U32
+                        };
+                        td |= c1 ^ first_word;
+                        if TRACK_OPAQUE {
+                            ta &= c1;
+                        }
+                        if left == 12 {
+                            let c2 = if HAS_ALPHA {
+                                p2
+                            } else {
+                                p2 | XRGB_ALPHA_MASK_U32
+                            };
+                            td |= c2 ^ first_word;
+                            if TRACK_OPAQUE {
+                                ta &= c2;
+                            }
+                        }
+                    }
+                    if TRACK_SOLID {
+                        cur_dacc = _mm_or_si128(cur_dacc, _mm_cvtsi32_si128(td as i32));
+                    }
+                    if TRACK_OPAQUE {
+                        a0 = _mm_and_si128(a0, _mm_set1_epi32(ta as i32));
+                    }
+                }
+
+                let rt = _mm_set_epi32(0, p2 as i32, p1 as i32, p0 as i32);
                 let mt = if HAS_ALPHA {
                     rt
                 } else {
@@ -402,6 +598,458 @@ mod x86_aes {
         lanes[1] = s1;
         lanes[2] = s2;
         lanes[3] = s3;
+        if TRACK_SOLID {
+            *dacc = cur_dacc;
+        }
+        if TRACK_OPAQUE {
+            *aand0 = a0;
+            *aand1 = a1;
+        }
+    }
+
+    #[cold]
+    #[inline(never)]
+    #[target_feature(enable = "aes")]
+    fn empty_rect_result(key: &TileHashKey, rect: TileRect) -> TileHashResult {
+        let (meta_lo, meta_hi) = leaf_meta(rect.w, rect.h);
+        let (lanes, meta) = init_lanes(key, meta_lo, meta_hi);
+        TileHashResult {
+            hash: finalize(key, lanes, meta),
+            meta: RectScanMeta::EMPTY,
+        }
+    }
+
+    /// Expands the non-solid row loop inline inside a
+    /// `#[target_feature(enable = "aes")]` function so LLVM never outlines it
+    /// across a call boundary or spills the 4 AES lane registers to stack.
+    macro_rules! x86_absorb_rows_fast {
+        (
+            $src_start:expr, $dst_start:expr, $n_rows:expr, $stride:expr,
+            $full64:expr, $rem:expr, $has_alpha:expr, $copy:expr,
+            $rk:expr, $alpha_mask:expr, $lanes:expr, $still_opaque:expr
+        ) => {{
+            let mut src_ptr: *const u8 = $src_start;
+            let mut dst_ptr: *mut u8 = $dst_start;
+            let n_rows: usize = $n_rows;
+            let mut dummy_dacc = _mm_setzero_si128();
+            let zero_px = _mm_setzero_si128();
+            if $has_alpha && $still_opaque {
+                let mut aand0 = _mm_set1_epi8(-1);
+                let mut aand1 = _mm_set1_epi8(-1);
+                for _ in 0..n_rows {
+                    absorb_row::<true, $copy, false, true>(
+                        src_ptr,
+                        dst_ptr,
+                        $full64,
+                        $rem,
+                        $rk,
+                        $alpha_mask,
+                        0,
+                        zero_px,
+                        $lanes,
+                        &mut dummy_dacc,
+                        &mut aand0,
+                        &mut aand1,
+                    );
+                    src_ptr = src_ptr.add($stride);
+                    if $copy {
+                        dst_ptr = dst_ptr.add($stride);
+                    }
+                }
+                alpha_lanes_all_opaque(aand0, aand1)
+            } else {
+                let mut dummy_a0 = _mm_setzero_si128();
+                let mut dummy_a1 = _mm_setzero_si128();
+                for _ in 0..n_rows {
+                    absorb_row::<$has_alpha, $copy, false, false>(
+                        src_ptr,
+                        dst_ptr,
+                        $full64,
+                        $rem,
+                        $rk,
+                        $alpha_mask,
+                        0,
+                        zero_px,
+                        $lanes,
+                        &mut dummy_dacc,
+                        &mut dummy_a0,
+                        &mut dummy_a1,
+                    );
+                    src_ptr = src_ptr.add($stride);
+                    if $copy {
+                        dst_ptr = dst_ptr.add($stride);
+                    }
+                }
+                !$has_alpha
+            }
+        }};
+    }
+
+    /// Expands the solid-candidate row scan inline inside a
+    /// `#[target_feature(enable = "aes")]` function so solid-candidate
+    /// quadrants never pay a second call boundary or spill the 4 AES lane
+    /// registers to stack. Tracks pixel uniformity row-by-row and drops
+    /// immediately into `x86_absorb_rows_fast!` if any row contains a differing
+    /// pixel.
+    macro_rules! x86_absorb_rows_solid_then_fast {
+        (
+            $src_start:expr, $dst_start:expr, $n_rows:expr, $stride:expr,
+            $full64:expr, $rem:expr, $has_alpha:expr, $copy:expr,
+            $rk:expr, $alpha_mask:expr, $first_word:expr, $lanes:expr,
+            $still_opaque_in:expr
+        ) => {{
+            let mut src_ptr: *const u8 = $src_start;
+            let mut dst_ptr: *mut u8 = $dst_start;
+            let n_rows: usize = $n_rows;
+            let first_word: u32 = $first_word;
+            let first_px = _mm_set1_epi32(first_word as i32);
+            let mut dacc = _mm_setzero_si128();
+            let mut aand0 = _mm_set1_epi8(-1);
+            let mut aand1 = _mm_set1_epi8(-1);
+            let mut ry = 0usize;
+            let mut still_solid = true;
+            let mut still_opaque: bool = $still_opaque_in;
+            while ry < n_rows {
+                absorb_row::<$has_alpha, $copy, true, $has_alpha>(
+                    src_ptr,
+                    dst_ptr,
+                    $full64,
+                    $rem,
+                    $rk,
+                    $alpha_mask,
+                    first_word,
+                    first_px,
+                    $lanes,
+                    &mut dacc,
+                    &mut aand0,
+                    &mut aand1,
+                );
+                src_ptr = src_ptr.add($stride);
+                if $copy {
+                    dst_ptr = dst_ptr.add($stride);
+                }
+                ry += 1;
+                if _mm_movemask_epi8(_mm_cmpeq_epi8(dacc, _mm_setzero_si128())) != 0xFFFF {
+                    still_solid = false;
+                    if $has_alpha && still_opaque {
+                        still_opaque = alpha_lanes_all_opaque(aand0, aand1);
+                    }
+                    break;
+                }
+            }
+            if ry < n_rows {
+                still_opaque = x86_absorb_rows_fast!(
+                    src_ptr,
+                    dst_ptr,
+                    n_rows - ry,
+                    $stride,
+                    $full64,
+                    $rem,
+                    $has_alpha,
+                    $copy,
+                    $rk,
+                    $alpha_mask,
+                    $lanes,
+                    still_opaque
+                );
+            }
+            (still_solid, !$has_alpha || still_opaque)
+        }};
+    }
+
+    #[inline(never)]
+    #[target_feature(enable = "aes")]
+    unsafe fn hash_rect_solid_candidate<const HAS_ALPHA: bool>(
+        key: &TileHashKey,
+        row_ptr: *const u8,
+        stride: usize,
+        w_h: u64,
+        first_word: u32,
+    ) -> TileHashResult {
+        let w = (w_h >> 32) as u32;
+        let h = w_h as u32;
+        let (meta_lo, meta_hi) = leaf_meta(w, h);
+        let (mut lanes, meta) = init_lanes(key, meta_lo, meta_hi);
+        let row_bytes = w as usize * 4;
+        let th = h as usize;
+        let rk = load_key_block(&key.round_key);
+        let alpha_mask = _mm_set1_epi32(XRGB_ALPHA_MASK_U32 as i32);
+        let full64 = row_bytes & !63;
+        let rem = row_bytes & 63;
+        let still_opaque = !HAS_ALPHA || (first_word & XRGB_ALPHA_MASK_U32) == XRGB_ALPHA_MASK_U32;
+        // SAFETY: Caller guarantees `row_ptr` is readable for `th` rows of `row_bytes`.
+        let (still_solid, all_opaque) = unsafe {
+            x86_absorb_rows_solid_then_fast!(
+                row_ptr,
+                ptr::null_mut(),
+                th,
+                stride,
+                full64,
+                rem,
+                HAS_ALPHA,
+                false,
+                rk,
+                alpha_mask,
+                first_word,
+                &mut lanes,
+                still_opaque
+            )
+        };
+        TileHashResult {
+            hash: finalize(key, lanes, meta),
+            meta: RectScanMeta {
+                solid_px: still_solid.then(|| first_word.to_ne_bytes()),
+                all_opaque,
+            },
+        }
+    }
+
+    #[inline(never)]
+    #[target_feature(enable = "aes")]
+    unsafe fn copy_and_hash_solid_candidate<const HAS_ALPHA: bool>(
+        key: &TileHashKey,
+        src_ptr: *const u8,
+        sh_ptr: *mut u8,
+        stride: usize,
+        w_h: u64,
+    ) -> TileHashResult {
+        let w = (w_h >> 32) as u32;
+        let h = w_h as u32;
+        let (meta_lo, meta_hi) = leaf_meta(w, h);
+        let (mut lanes, meta) = init_lanes(key, meta_lo, meta_hi);
+        let row_bytes = w as usize * 4;
+        let th = h as usize;
+        let rk = load_key_block(&key.round_key);
+        let alpha_mask = _mm_set1_epi32(XRGB_ALPHA_MASK_U32 as i32);
+        let full64 = row_bytes & !63;
+        let rem = row_bytes & 63;
+        // Re-reading `(0, 0)` (already hot in L1 from the caller's pre-probe)
+        // keeps this function at 5 explicit args (+ sret = 6 register args) so
+        // `copy_and_hash_rect_to_shadow` can emit a zero-overhead tail-call
+        // `jmp`. Still TOCTOU-sound: every copied pixel is verified against
+        // `first_word` in-register.
+        // SAFETY: Caller guarantees `src_ptr` is readable for `th > 0` rows of `w > 0` pixels.
+        let first_raw = unsafe { src_ptr.cast::<u32>().read_unaligned() };
+        let first_word = if HAS_ALPHA {
+            first_raw
+        } else {
+            first_raw | XRGB_ALPHA_MASK_U32
+        };
+        let still_opaque = !HAS_ALPHA || (first_word & XRGB_ALPHA_MASK_U32) == XRGB_ALPHA_MASK_U32;
+        // SAFETY: Caller guarantees `src_ptr` readable and `sh_ptr` writable for `th` rows.
+        let (still_solid, all_opaque) = unsafe {
+            x86_absorb_rows_solid_then_fast!(
+                src_ptr,
+                sh_ptr,
+                th,
+                stride,
+                full64,
+                rem,
+                HAS_ALPHA,
+                true,
+                rk,
+                alpha_mask,
+                first_word,
+                &mut lanes,
+                still_opaque
+            )
+        };
+        TileHashResult {
+            hash: finalize(key, lanes, meta),
+            meta: RectScanMeta {
+                solid_px: still_solid.then(|| first_word.to_ne_bytes()),
+                all_opaque,
+            },
+        }
+    }
+
+    #[inline(never)]
+    #[target_feature(enable = "aes")]
+    unsafe fn copy_and_hash_with_overlap_solid_candidate<const HAS_ALPHA: bool>(
+        key: &TileHashKey,
+        src_base: *const u8,
+        shadow_base: *mut u8,
+        stride: usize,
+        rect: TileRect,
+        copy_from_ry: usize,
+    ) -> TileHashResult {
+        let tw = rect.w as usize;
+        let th = rect.h as usize;
+        let row_bytes = tw * 4;
+        let x_bytes = rect.x as usize * 4;
+        let y0 = rect.y as usize;
+        let base_off = y0 * stride + x_bytes;
+        // SAFETY: Caller guarantees `copy_from_ry > 0`, `th > 0 && tw > 0`,
+        // `shadow_base` initialized for rows `0..copy_from_ry`, and `src_base`
+        // readable / `shadow_base` writable for rows `copy_from_ry..th`.
+        let src_ptr_base = unsafe { src_base.add(base_off) };
+        let sh_ptr = unsafe { shadow_base.add(base_off) };
+        let first_raw = unsafe { sh_ptr.cast_const().cast::<u32>().read_unaligned() };
+        let first_word = if HAS_ALPHA {
+            first_raw
+        } else {
+            first_raw | XRGB_ALPHA_MASK_U32
+        };
+        let (meta_lo, meta_hi) = leaf_meta(rect.w, rect.h);
+        let (mut lanes, meta) = init_lanes(key, meta_lo, meta_hi);
+        let rk = load_key_block(&key.round_key);
+        let alpha_mask = _mm_set1_epi32(XRGB_ALPHA_MASK_U32 as i32);
+        let full64 = row_bytes & !63;
+        let rem = row_bytes & 63;
+        let still_opaque = !HAS_ALPHA || (first_word & XRGB_ALPHA_MASK_U32) == XRGB_ALPHA_MASK_U32;
+
+        // SAFETY: Caller guarantees `sh_ptr` is initialized and readable for `0..copy_from_ry`.
+        let (mut still_solid, mut all_opaque) = unsafe {
+            x86_absorb_rows_solid_then_fast!(
+                sh_ptr.cast_const(),
+                ptr::null_mut(),
+                copy_from_ry,
+                stride,
+                full64,
+                rem,
+                HAS_ALPHA,
+                false,
+                rk,
+                alpha_mask,
+                first_word,
+                &mut lanes,
+                still_opaque
+            )
+        };
+
+        if copy_from_ry < th {
+            // SAFETY: Caller guarantees `src_ptr_base` readable and `sh_ptr` writable
+            // for rows `copy_from_ry..th`.
+            let src_ptr = unsafe { src_ptr_base.add(copy_from_ry * stride) };
+            let dst_ptr = unsafe { sh_ptr.add(copy_from_ry * stride) };
+            let rem_rows = th - copy_from_ry;
+            if still_solid {
+                (still_solid, all_opaque) = unsafe {
+                    x86_absorb_rows_solid_then_fast!(
+                        src_ptr, dst_ptr, rem_rows, stride, full64, rem, HAS_ALPHA, true, rk,
+                        alpha_mask, first_word, &mut lanes, all_opaque
+                    )
+                };
+            } else {
+                all_opaque = unsafe {
+                    x86_absorb_rows_fast!(
+                        src_ptr, dst_ptr, rem_rows, stride, full64, rem, HAS_ALPHA, true, rk,
+                        alpha_mask, &mut lanes, all_opaque
+                    )
+                };
+            }
+        }
+
+        TileHashResult {
+            hash: finalize(key, lanes, meta),
+            meta: RectScanMeta {
+                solid_px: still_solid.then(|| first_word.to_ne_bytes()),
+                all_opaque,
+            },
+        }
+    }
+
+    #[inline(never)]
+    #[target_feature(enable = "aes")]
+    unsafe fn copy_and_hash_with_overlap<const HAS_ALPHA: bool>(
+        key: &TileHashKey,
+        src_base: *const u8,
+        shadow_base: *mut u8,
+        stride: usize,
+        rect: TileRect,
+        copy_from_ry: usize,
+    ) -> TileHashResult {
+        let tw = rect.w as usize;
+        let th = rect.h as usize;
+        let row_bytes = tw * 4;
+        let x_bytes = rect.x as usize * 4;
+        let y0 = rect.y as usize;
+        let base_off = y0 * stride + x_bytes;
+        // SAFETY: Caller guarantees `copy_from_ry > 0`, `shadow_base` rows
+        // `0..copy_from_ry` are initialized and readable, and `src_base` rows
+        // `copy_from_ry..th` are readable, with `th > 0 && tw > 0`.
+        let src_ptr_base = unsafe { src_base.add(base_off) };
+        let sh_ptr = unsafe { shadow_base.add(base_off) };
+        let read_probe = |ry: usize, rx: usize| -> u32 {
+            let off = ry * stride + rx * 4;
+            unsafe {
+                let p = if ry < copy_from_ry {
+                    sh_ptr.cast_const().add(off)
+                } else {
+                    src_ptr_base.add(off)
+                };
+                p.cast::<u32>().read_unaligned()
+            }
+        };
+        let first_raw = unsafe { sh_ptr.cast_const().cast::<u32>().read_unaligned() };
+        let mid_raw = read_probe(th >> 1, tw >> 1);
+        let (_, still_solid, still_opaque) =
+            probe_three_pixels::<HAS_ALPHA>(first_raw, mid_raw, || read_probe(th - 1, tw - 1));
+        if still_solid {
+            // SAFETY: Bounds and exclusivity invariants forwarded from caller.
+            return unsafe {
+                copy_and_hash_with_overlap_solid_candidate::<HAS_ALPHA>(
+                    key,
+                    src_base,
+                    shadow_base,
+                    stride,
+                    rect,
+                    copy_from_ry,
+                )
+            };
+        }
+
+        let (meta_lo, meta_hi) = leaf_meta(rect.w, rect.h);
+        let (mut lanes, meta) = init_lanes(key, meta_lo, meta_hi);
+        let rk = load_key_block(&key.round_key);
+        let alpha_mask = _mm_set1_epi32(XRGB_ALPHA_MASK_U32 as i32);
+        let full64 = row_bytes & !63;
+        let rem = row_bytes & 63;
+
+        // SAFETY: `sh_ptr` is initialized and readable for `copy_from_ry` rows.
+        let mut all_opaque = unsafe {
+            x86_absorb_rows_fast!(
+                sh_ptr.cast_const(),
+                ptr::null_mut(),
+                copy_from_ry,
+                stride,
+                full64,
+                rem,
+                HAS_ALPHA,
+                false,
+                rk,
+                alpha_mask,
+                &mut lanes,
+                still_opaque
+            )
+        };
+        if copy_from_ry < th {
+            // SAFETY: Caller validated `src_base` bounds and exclusive
+            // `shadow_base` write access for rows `copy_from_ry..th`.
+            all_opaque = unsafe {
+                x86_absorb_rows_fast!(
+                    src_ptr_base.add(copy_from_ry * stride),
+                    sh_ptr.add(copy_from_ry * stride),
+                    th - copy_from_ry,
+                    stride,
+                    full64,
+                    rem,
+                    HAS_ALPHA,
+                    true,
+                    rk,
+                    alpha_mask,
+                    &mut lanes,
+                    all_opaque
+                )
+            };
+        }
+        TileHashResult {
+            hash: finalize(key, lanes, meta),
+            meta: RectScanMeta {
+                solid_px: None,
+                all_opaque,
+            },
+        }
     }
 
     /// # Safety
@@ -413,37 +1061,72 @@ mod x86_aes {
         base: *const u8,
         stride: usize,
         rect: TileRect,
-    ) -> TileHash {
+    ) -> TileHashResult {
+        let tw = rect.w as usize;
+        let th = rect.h as usize;
+        let row_bytes = tw * 4;
+        if th == 0 || row_bytes == 0 {
+            return empty_rect_result(key, rect);
+        }
+        let x_bytes = rect.x as usize * 4;
+        let y0 = rect.y as usize;
+        // SAFETY: Caller guarantees `(y0 + ry, x_bytes..x_bytes + row_bytes)` is readable
+        // and `th > 0 && tw > 0`, so `(0, 0)`, `(tw/2, th/2)`, and `(tw-1, th-1)` are in-bounds.
+        let row_ptr = unsafe { base.add(y0 * stride + x_bytes) };
+        let (first_raw, mid_raw) = unsafe {
+            (
+                row_ptr.cast::<u32>().read_unaligned(),
+                row_ptr
+                    .add((th >> 1) * stride + (tw >> 1) * 4)
+                    .cast::<u32>()
+                    .read_unaligned(),
+            )
+        };
+        let (first_word, still_solid, still_opaque) =
+            probe_three_pixels::<HAS_ALPHA>(first_raw, mid_raw, || unsafe {
+                row_ptr
+                    .add((th - 1) * stride + (tw - 1) * 4)
+                    .cast::<u32>()
+                    .read_unaligned()
+            });
+        let w_h = (u64::from(rect.w) << 32) | u64::from(rect.h);
+        if still_solid {
+            // SAFETY: `row_ptr` is readable for `th` rows of `row_bytes`.
+            return unsafe {
+                hash_rect_solid_candidate::<HAS_ALPHA>(key, row_ptr, stride, w_h, first_word)
+            };
+        }
+
         let (meta_lo, meta_hi) = leaf_meta(rect.w, rect.h);
         let (mut lanes, meta) = init_lanes(key, meta_lo, meta_hi);
-        let row_bytes = rect.w as usize * 4;
-        let th = rect.h as usize;
-        if th > 0 && row_bytes > 0 {
-            let rk = load_key_block(&key.round_key);
-            let alpha_mask = _mm_set1_epi32(XRGB_ALPHA_MASK_U32 as i32);
-            let full64 = row_bytes & !63;
-            let rem = row_bytes & 63;
-            let x_bytes = rect.x as usize * 4;
-            let y0 = rect.y as usize;
-            // SAFETY: Caller guarantees `(y0 + ry, x_bytes..x_bytes + row_bytes)` is readable.
-            let mut row_ptr = unsafe { base.add(y0 * stride + x_bytes) };
-            for _ in 0..th {
-                // SAFETY: `row_ptr` is readable for `row_bytes == full64 + rem`.
-                unsafe {
-                    absorb_row::<HAS_ALPHA, false>(
-                        row_ptr,
-                        ptr::null_mut(),
-                        full64,
-                        rem,
-                        rk,
-                        alpha_mask,
-                        &mut lanes,
-                    );
-                    row_ptr = row_ptr.add(stride);
-                }
-            }
+        let rk = load_key_block(&key.round_key);
+        let alpha_mask = _mm_set1_epi32(XRGB_ALPHA_MASK_U32 as i32);
+        let full64 = row_bytes & !63;
+        let rem = row_bytes & 63;
+        // SAFETY: `row_ptr` is readable for `th` rows of `full64 + rem` bytes.
+        let all_opaque = unsafe {
+            x86_absorb_rows_fast!(
+                row_ptr,
+                ptr::null_mut(),
+                th,
+                stride,
+                full64,
+                rem,
+                HAS_ALPHA,
+                false,
+                rk,
+                alpha_mask,
+                &mut lanes,
+                still_opaque
+            )
+        };
+        TileHashResult {
+            hash: finalize(key, lanes, meta),
+            meta: RectScanMeta {
+                solid_px: None,
+                all_opaque,
+            },
         }
-        finalize(key, lanes, meta)
     }
 
     /// # Safety
@@ -457,56 +1140,90 @@ mod x86_aes {
         stride: usize,
         rect: TileRect,
         copy_from_ry: usize,
-    ) -> TileHash {
+    ) -> TileHashResult {
+        let tw = rect.w as usize;
+        let th = rect.h as usize;
+        let row_bytes = tw * 4;
+        if th == 0 || row_bytes == 0 {
+            return empty_rect_result(key, rect);
+        }
+        if copy_from_ry > 0 {
+            // SAFETY: Bounds and exclusivity invariants forwarded from caller.
+            return unsafe {
+                copy_and_hash_with_overlap::<HAS_ALPHA>(
+                    key,
+                    src_base,
+                    shadow_base,
+                    stride,
+                    rect,
+                    copy_from_ry,
+                )
+            };
+        }
+        let x_bytes = rect.x as usize * 4;
+        let y0 = rect.y as usize;
+        let base_off = y0 * stride + x_bytes;
+
+        // SAFETY: `copy_from_ry == 0` and `th > 0 && tw > 0`, so `src_base` is
+        // readable and `shadow_base` is exclusively writable for all `th` rows.
+        let src_ptr = unsafe { src_base.add(base_off) };
+        let sh_ptr = unsafe { shadow_base.add(base_off) };
+        let (first_raw, mid_raw) = unsafe {
+            (
+                src_ptr.cast::<u32>().read_unaligned(),
+                src_ptr
+                    .add((th >> 1) * stride + (tw >> 1) * 4)
+                    .cast::<u32>()
+                    .read_unaligned(),
+            )
+        };
+        let (_, still_solid, still_opaque) =
+            probe_three_pixels::<HAS_ALPHA>(first_raw, mid_raw, || unsafe {
+                src_ptr
+                    .add((th - 1) * stride + (tw - 1) * 4)
+                    .cast::<u32>()
+                    .read_unaligned()
+            });
+        let w_h = (u64::from(rect.w) << 32) | u64::from(rect.h);
+        if still_solid {
+            // SAFETY: `src_ptr` readable and `sh_ptr` writable for `th` rows.
+            return unsafe {
+                copy_and_hash_solid_candidate::<HAS_ALPHA>(key, src_ptr, sh_ptr, stride, w_h)
+            };
+        }
+
         let (meta_lo, meta_hi) = leaf_meta(rect.w, rect.h);
         let (mut lanes, meta) = init_lanes(key, meta_lo, meta_hi);
-        let row_bytes = rect.w as usize * 4;
-        let th = rect.h as usize;
-        if th > 0 && row_bytes > 0 {
-            let rk = load_key_block(&key.round_key);
-            let alpha_mask = _mm_set1_epi32(XRGB_ALPHA_MASK_U32 as i32);
-            let full64 = row_bytes & !63;
-            let rem = row_bytes & 63;
-            let x_bytes = rect.x as usize * 4;
-            let y0 = rect.y as usize;
-            let base_off = y0 * stride + x_bytes;
+        let rk = load_key_block(&key.round_key);
+        let alpha_mask = _mm_set1_epi32(XRGB_ALPHA_MASK_U32 as i32);
+        let full64 = row_bytes & !63;
+        let rem = row_bytes & 63;
 
-            // SAFETY: Caller guarantees `shadow_base` rows `0..copy_from_ry`
-            // are initialized and readable for `row_bytes`.
-            let mut sh_ptr = unsafe { shadow_base.add(base_off) };
-            for _ in 0..copy_from_ry {
-                // SAFETY: `sh_ptr` is readable for `row_bytes`.
-                unsafe {
-                    absorb_row::<HAS_ALPHA, false>(
-                        sh_ptr.cast_const(),
-                        ptr::null_mut(),
-                        full64,
-                        rem,
-                        rk,
-                        alpha_mask,
-                        &mut lanes,
-                    );
-                    sh_ptr = sh_ptr.add(stride);
-                }
-            }
-
-            if copy_from_ry < th {
-                // SAFETY: Caller validated `src_base` bounds and exclusive
-                // `shadow_base` write access for rows `copy_from_ry..th`.
-                let mut src_ptr = unsafe { src_base.add(base_off + copy_from_ry * stride) };
-                for _ in copy_from_ry..th {
-                    // SAFETY: `src_ptr` readable and `sh_ptr` writable for `row_bytes`, disjoint.
-                    unsafe {
-                        absorb_row::<HAS_ALPHA, true>(
-                            src_ptr, sh_ptr, full64, rem, rk, alpha_mask, &mut lanes,
-                        );
-                        src_ptr = src_ptr.add(stride);
-                        sh_ptr = sh_ptr.add(stride);
-                    }
-                }
-            }
+        // SAFETY: Caller validated `src_base` bounds and exclusive `shadow_base`
+        // write access for all `th` rows.
+        let all_opaque = unsafe {
+            x86_absorb_rows_fast!(
+                src_ptr,
+                sh_ptr,
+                th,
+                stride,
+                full64,
+                rem,
+                HAS_ALPHA,
+                true,
+                rk,
+                alpha_mask,
+                &mut lanes,
+                still_opaque
+            )
+        };
+        TileHashResult {
+            hash: finalize(key, lanes, meta),
+            meta: RectScanMeta {
+                solid_px: None,
+                all_opaque,
+            },
         }
-        finalize(key, lanes, meta)
     }
 
     /// # Safety
@@ -535,20 +1252,25 @@ mod aarch64_aes {
     use std::arch::aarch64::uint8x16_t;
     use std::arch::aarch64::vaeseq_u8;
     use std::arch::aarch64::vaesmcq_u8;
+    use std::arch::aarch64::vandq_u8;
     use std::arch::aarch64::vdupq_n_u8;
     use std::arch::aarch64::vdupq_n_u32;
     use std::arch::aarch64::veorq_u8;
     use std::arch::aarch64::vld1q_u8;
+    use std::arch::aarch64::vmaxvq_u8;
     use std::arch::aarch64::vorrq_u8;
     use std::arch::aarch64::vreinterpretq_u8_u32;
     use std::arch::aarch64::vst1q_u8;
     use std::ptr;
 
+    use super::RectScanMeta;
     use super::TileHash;
     use super::TileHashKey;
+    use super::TileHashResult;
     use super::XRGB_ALPHA_MASK_U32;
     use super::leaf_meta;
     use super::parent_meta;
+    use super::probe_three_pixels;
     use crate::serialization::framing::TileRect;
 
     #[inline]
@@ -617,19 +1339,43 @@ mod aarch64_aes {
 
     #[inline]
     #[target_feature(enable = "aes")]
-    unsafe fn absorb_row<const HAS_ALPHA: bool, const COPY: bool>(
+    fn alpha_lanes_all_opaque(
+        aand0: uint8x16_t,
+        aand1: uint8x16_t,
+        alpha_mask: uint8x16_t,
+    ) -> bool {
+        let combined = vandq_u8(aand0, aand1);
+        vmaxvq_u8(veorq_u8(vandq_u8(combined, alpha_mask), alpha_mask)) == 0
+    }
+
+    #[inline]
+    #[target_feature(enable = "aes")]
+    unsafe fn absorb_row<
+        const HAS_ALPHA: bool,
+        const COPY: bool,
+        const TRACK_SOLID: bool,
+        const TRACK_OPAQUE: bool,
+    >(
         src_row: *const u8,
         dst_row: *mut u8,
         full64: usize,
         rem: usize,
         rk: uint8x16_t,
         alpha_mask: uint8x16_t,
+        first_word: u32,
+        first_px: uint8x16_t,
         lanes: &mut [uint8x16_t; 4],
+        dacc: &mut uint8x16_t,
+        aand0: &mut uint8x16_t,
+        aand1: &mut uint8x16_t,
     ) {
         let mut s0 = lanes[0];
         let mut s1 = lanes[1];
         let mut s2 = lanes[2];
         let mut s3 = lanes[3];
+        let mut cur_dacc = *dacc;
+        let mut a0 = *aand0;
+        let mut a1 = *aand1;
 
         let mut off = 0usize;
         while off < full64 {
@@ -667,6 +1413,17 @@ mod aarch64_aes {
             } else {
                 vorrq_u8(r3, alpha_mask)
             };
+            if TRACK_SOLID {
+                let d01 = vorrq_u8(veorq_u8(m0, first_px), veorq_u8(m1, first_px));
+                let d23 = vorrq_u8(veorq_u8(m2, first_px), veorq_u8(m3, first_px));
+                cur_dacc = vorrq_u8(cur_dacc, vorrq_u8(d01, d23));
+            }
+            if TRACK_OPAQUE {
+                a0 = vandq_u8(a0, m0);
+                a1 = vandq_u8(a1, m1);
+                a0 = vandq_u8(a0, m2);
+                a1 = vandq_u8(a1, m3);
+            }
             s0 = aes_step(s0, m0, rk);
             s1 = aes_step(s1, m1, rk);
             s2 = aes_step(s2, m2, rk);
@@ -690,6 +1447,12 @@ mod aarch64_aes {
                 } else {
                     vorrq_u8(r0, alpha_mask)
                 };
+                if TRACK_SOLID {
+                    cur_dacc = vorrq_u8(cur_dacc, veorq_u8(m0, first_px));
+                }
+                if TRACK_OPAQUE {
+                    a0 = vandq_u8(a0, m0);
+                }
                 s0 = aes_step(s0, m0, rk);
                 off += 16;
                 left -= 16;
@@ -708,6 +1471,12 @@ mod aarch64_aes {
                     } else {
                         vorrq_u8(r1, alpha_mask)
                     };
+                    if TRACK_SOLID {
+                        cur_dacc = vorrq_u8(cur_dacc, veorq_u8(m1, first_px));
+                    }
+                    if TRACK_OPAQUE {
+                        a1 = vandq_u8(a1, m1);
+                    }
                     s1 = aes_step(s1, m1, rk);
                     off += 16;
                     left -= 16;
@@ -726,6 +1495,12 @@ mod aarch64_aes {
                         } else {
                             vorrq_u8(r2, alpha_mask)
                         };
+                        if TRACK_SOLID {
+                            cur_dacc = vorrq_u8(cur_dacc, veorq_u8(m2, first_px));
+                        }
+                        if TRACK_OPAQUE {
+                            a0 = vandq_u8(a0, m2);
+                        }
                         s2 = aes_step(s2, m2, rk);
                         off += 16;
                         left -= 16;
@@ -737,28 +1512,70 @@ mod aarch64_aes {
                 debug_assert!(left < 16 && left.is_multiple_of(4));
                 let mut tail_words = [0u32; 4];
                 // SAFETY: `off + left == full64 + rem`, `left` is 4, 8, or 12.
-                let rt = unsafe {
+                let (p0, p1, p2) = unsafe {
                     let p0 = src_row.add(off).cast::<u32>().read_unaligned();
                     tail_words[0] = p0;
                     if COPY {
                         dst_row.add(off).cast::<u32>().write_unaligned(p0);
                     }
+                    let mut p1 = 0u32;
+                    let mut p2 = 0u32;
                     if left >= 8 {
-                        let p1 = src_row.add(off + 4).cast::<u32>().read_unaligned();
+                        p1 = src_row.add(off + 4).cast::<u32>().read_unaligned();
                         tail_words[1] = p1;
                         if COPY {
                             dst_row.add(off + 4).cast::<u32>().write_unaligned(p1);
                         }
                         if left == 12 {
-                            let p2 = src_row.add(off + 8).cast::<u32>().read_unaligned();
+                            p2 = src_row.add(off + 8).cast::<u32>().read_unaligned();
                             tail_words[2] = p2;
                             if COPY {
                                 dst_row.add(off + 8).cast::<u32>().write_unaligned(p2);
                             }
                         }
                     }
-                    vld1q_u8(tail_words.as_ptr().cast::<u8>())
+                    (p0, p1, p2)
                 };
+                if TRACK_SOLID || TRACK_OPAQUE {
+                    let c0 = if HAS_ALPHA {
+                        p0
+                    } else {
+                        p0 | XRGB_ALPHA_MASK_U32
+                    };
+                    let mut td = c0 ^ first_word;
+                    let mut ta = c0;
+                    if left >= 8 {
+                        let c1 = if HAS_ALPHA {
+                            p1
+                        } else {
+                            p1 | XRGB_ALPHA_MASK_U32
+                        };
+                        td |= c1 ^ first_word;
+                        if TRACK_OPAQUE {
+                            ta &= c1;
+                        }
+                        if left == 12 {
+                            let c2 = if HAS_ALPHA {
+                                p2
+                            } else {
+                                p2 | XRGB_ALPHA_MASK_U32
+                            };
+                            td |= c2 ^ first_word;
+                            if TRACK_OPAQUE {
+                                ta &= c2;
+                            }
+                        }
+                    }
+                    if TRACK_SOLID {
+                        cur_dacc = vorrq_u8(cur_dacc, vreinterpretq_u8_u32(vdupq_n_u32(td)));
+                    }
+                    if TRACK_OPAQUE {
+                        a0 = vandq_u8(a0, vreinterpretq_u8_u32(vdupq_n_u32(ta)));
+                    }
+                }
+
+                // SAFETY: `tail_words` is 16 initialized bytes.
+                let rt = unsafe { vld1q_u8(tail_words.as_ptr().cast::<u8>()) };
                 let mt = if HAS_ALPHA {
                     rt
                 } else {
@@ -772,6 +1589,444 @@ mod aarch64_aes {
         lanes[1] = s1;
         lanes[2] = s2;
         lanes[3] = s3;
+        if TRACK_SOLID {
+            *dacc = cur_dacc;
+        }
+        if TRACK_OPAQUE {
+            *aand0 = a0;
+            *aand1 = a1;
+        }
+    }
+
+    #[cold]
+    #[inline(never)]
+    #[target_feature(enable = "aes")]
+    fn empty_rect_result(key: &TileHashKey, rect: TileRect) -> TileHashResult {
+        let (meta_lo, meta_hi) = leaf_meta(rect.w, rect.h);
+        let (lanes, meta) = init_lanes(key, meta_lo, meta_hi);
+        TileHashResult {
+            hash: finalize(key, lanes, meta),
+            meta: RectScanMeta::EMPTY,
+        }
+    }
+
+    macro_rules! a64_absorb_rows_fast {
+        (
+            $src_start:expr, $dst_start:expr, $n_rows:expr, $stride:expr,
+            $full64:expr, $rem:expr, $has_alpha:expr, $copy:expr,
+            $rk:expr, $alpha_mask:expr, $lanes:expr, $still_opaque:expr
+        ) => {{
+            let mut src_ptr: *const u8 = $src_start;
+            let mut dst_ptr: *mut u8 = $dst_start;
+            let n_rows: usize = $n_rows;
+            let mut dummy_dacc = vdupq_n_u8(0);
+            let zero_px = vdupq_n_u8(0);
+            if $has_alpha && $still_opaque {
+                let mut aand0 = vdupq_n_u8(0xFF);
+                let mut aand1 = vdupq_n_u8(0xFF);
+                for _ in 0..n_rows {
+                    absorb_row::<true, $copy, false, true>(
+                        src_ptr,
+                        dst_ptr,
+                        $full64,
+                        $rem,
+                        $rk,
+                        $alpha_mask,
+                        0,
+                        zero_px,
+                        $lanes,
+                        &mut dummy_dacc,
+                        &mut aand0,
+                        &mut aand1,
+                    );
+                    src_ptr = src_ptr.add($stride);
+                    if $copy {
+                        dst_ptr = dst_ptr.add($stride);
+                    }
+                }
+                alpha_lanes_all_opaque(aand0, aand1, $alpha_mask)
+            } else {
+                let mut dummy_a0 = vdupq_n_u8(0);
+                let mut dummy_a1 = vdupq_n_u8(0);
+                for _ in 0..n_rows {
+                    absorb_row::<$has_alpha, $copy, false, false>(
+                        src_ptr,
+                        dst_ptr,
+                        $full64,
+                        $rem,
+                        $rk,
+                        $alpha_mask,
+                        0,
+                        zero_px,
+                        $lanes,
+                        &mut dummy_dacc,
+                        &mut dummy_a0,
+                        &mut dummy_a1,
+                    );
+                    src_ptr = src_ptr.add($stride);
+                    if $copy {
+                        dst_ptr = dst_ptr.add($stride);
+                    }
+                }
+                !$has_alpha
+            }
+        }};
+    }
+
+    macro_rules! a64_absorb_rows_solid_then_fast {
+        (
+            $src_start:expr, $dst_start:expr, $n_rows:expr, $stride:expr,
+            $full64:expr, $rem:expr, $has_alpha:expr, $copy:expr,
+            $rk:expr, $alpha_mask:expr, $first_word:expr, $lanes:expr,
+            $still_opaque_in:expr
+        ) => {{
+            let mut src_ptr: *const u8 = $src_start;
+            let mut dst_ptr: *mut u8 = $dst_start;
+            let n_rows: usize = $n_rows;
+            let first_word: u32 = $first_word;
+            let first_px = vreinterpretq_u8_u32(vdupq_n_u32(first_word));
+            let mut dacc = vdupq_n_u8(0);
+            let mut aand0 = vdupq_n_u8(0xFF);
+            let mut aand1 = vdupq_n_u8(0xFF);
+            let mut ry = 0usize;
+            let mut still_solid = true;
+            let mut still_opaque: bool = $still_opaque_in;
+            while ry < n_rows {
+                absorb_row::<$has_alpha, $copy, true, $has_alpha>(
+                    src_ptr,
+                    dst_ptr,
+                    $full64,
+                    $rem,
+                    $rk,
+                    $alpha_mask,
+                    first_word,
+                    first_px,
+                    $lanes,
+                    &mut dacc,
+                    &mut aand0,
+                    &mut aand1,
+                );
+                src_ptr = src_ptr.add($stride);
+                if $copy {
+                    dst_ptr = dst_ptr.add($stride);
+                }
+                ry += 1;
+                if vmaxvq_u8(dacc) != 0 {
+                    still_solid = false;
+                    if $has_alpha && still_opaque {
+                        still_opaque = alpha_lanes_all_opaque(aand0, aand1, $alpha_mask);
+                    }
+                    break;
+                }
+            }
+            if ry < n_rows {
+                still_opaque = a64_absorb_rows_fast!(
+                    src_ptr,
+                    dst_ptr,
+                    n_rows - ry,
+                    $stride,
+                    $full64,
+                    $rem,
+                    $has_alpha,
+                    $copy,
+                    $rk,
+                    $alpha_mask,
+                    $lanes,
+                    still_opaque
+                );
+            }
+            (still_solid, !$has_alpha || still_opaque)
+        }};
+    }
+
+    #[inline(never)]
+    #[target_feature(enable = "aes")]
+    unsafe fn hash_rect_solid_candidate<const HAS_ALPHA: bool>(
+        key: &TileHashKey,
+        row_ptr: *const u8,
+        stride: usize,
+        w_h: u64,
+        first_word: u32,
+    ) -> TileHashResult {
+        let w = (w_h >> 32) as u32;
+        let h = w_h as u32;
+        let (meta_lo, meta_hi) = leaf_meta(w, h);
+        let (mut lanes, meta) = init_lanes(key, meta_lo, meta_hi);
+        let row_bytes = w as usize * 4;
+        let th = h as usize;
+        let rk = load_key_block(&key.round_key);
+        let alpha_mask = vreinterpretq_u8_u32(vdupq_n_u32(XRGB_ALPHA_MASK_U32));
+        let full64 = row_bytes & !63;
+        let rem = row_bytes & 63;
+        let still_opaque = !HAS_ALPHA || (first_word & XRGB_ALPHA_MASK_U32) == XRGB_ALPHA_MASK_U32;
+        // SAFETY: Caller guarantees `row_ptr` is readable for `th` rows of `row_bytes`.
+        let (still_solid, all_opaque) = unsafe {
+            a64_absorb_rows_solid_then_fast!(
+                row_ptr,
+                ptr::null_mut(),
+                th,
+                stride,
+                full64,
+                rem,
+                HAS_ALPHA,
+                false,
+                rk,
+                alpha_mask,
+                first_word,
+                &mut lanes,
+                still_opaque
+            )
+        };
+        TileHashResult {
+            hash: finalize(key, lanes, meta),
+            meta: RectScanMeta {
+                solid_px: still_solid.then(|| first_word.to_ne_bytes()),
+                all_opaque,
+            },
+        }
+    }
+
+    #[inline(never)]
+    #[target_feature(enable = "aes")]
+    unsafe fn copy_and_hash_solid_candidate<const HAS_ALPHA: bool>(
+        key: &TileHashKey,
+        src_ptr: *const u8,
+        sh_ptr: *mut u8,
+        stride: usize,
+        w_h: u64,
+    ) -> TileHashResult {
+        let w = (w_h >> 32) as u32;
+        let h = w_h as u32;
+        let (meta_lo, meta_hi) = leaf_meta(w, h);
+        let (mut lanes, meta) = init_lanes(key, meta_lo, meta_hi);
+        let row_bytes = w as usize * 4;
+        let th = h as usize;
+        let rk = load_key_block(&key.round_key);
+        let alpha_mask = vreinterpretq_u8_u32(vdupq_n_u32(XRGB_ALPHA_MASK_U32));
+        let full64 = row_bytes & !63;
+        let rem = row_bytes & 63;
+        // SAFETY: Caller guarantees `src_ptr` is readable for `th > 0` rows of `w > 0` pixels.
+        let first_raw = unsafe { src_ptr.cast::<u32>().read_unaligned() };
+        let first_word = if HAS_ALPHA {
+            first_raw
+        } else {
+            first_raw | XRGB_ALPHA_MASK_U32
+        };
+        let still_opaque = !HAS_ALPHA || (first_word & XRGB_ALPHA_MASK_U32) == XRGB_ALPHA_MASK_U32;
+        // SAFETY: Caller guarantees `src_ptr` readable and `sh_ptr` writable for `th` rows.
+        let (still_solid, all_opaque) = unsafe {
+            a64_absorb_rows_solid_then_fast!(
+                src_ptr,
+                sh_ptr,
+                th,
+                stride,
+                full64,
+                rem,
+                HAS_ALPHA,
+                true,
+                rk,
+                alpha_mask,
+                first_word,
+                &mut lanes,
+                still_opaque
+            )
+        };
+        TileHashResult {
+            hash: finalize(key, lanes, meta),
+            meta: RectScanMeta {
+                solid_px: still_solid.then(|| first_word.to_ne_bytes()),
+                all_opaque,
+            },
+        }
+    }
+
+    #[inline(never)]
+    #[target_feature(enable = "aes")]
+    unsafe fn copy_and_hash_with_overlap_solid_candidate<const HAS_ALPHA: bool>(
+        key: &TileHashKey,
+        src_base: *const u8,
+        shadow_base: *mut u8,
+        stride: usize,
+        rect: TileRect,
+        copy_from_ry: usize,
+    ) -> TileHashResult {
+        let tw = rect.w as usize;
+        let th = rect.h as usize;
+        let row_bytes = tw * 4;
+        let x_bytes = rect.x as usize * 4;
+        let y0 = rect.y as usize;
+        let base_off = y0 * stride + x_bytes;
+        // SAFETY: Caller guarantees `copy_from_ry > 0`, `th > 0 && tw > 0`,
+        // `shadow_base` initialized for rows `0..copy_from_ry`, and `src_base`
+        // readable / `shadow_base` writable for rows `copy_from_ry..th`.
+        let src_ptr_base = unsafe { src_base.add(base_off) };
+        let sh_ptr = unsafe { shadow_base.add(base_off) };
+        let first_raw = unsafe { sh_ptr.cast_const().cast::<u32>().read_unaligned() };
+        let first_word = if HAS_ALPHA {
+            first_raw
+        } else {
+            first_raw | XRGB_ALPHA_MASK_U32
+        };
+        let (meta_lo, meta_hi) = leaf_meta(rect.w, rect.h);
+        let (mut lanes, meta) = init_lanes(key, meta_lo, meta_hi);
+        let rk = load_key_block(&key.round_key);
+        let alpha_mask = vreinterpretq_u8_u32(vdupq_n_u32(XRGB_ALPHA_MASK_U32));
+        let full64 = row_bytes & !63;
+        let rem = row_bytes & 63;
+        let still_opaque = !HAS_ALPHA || (first_word & XRGB_ALPHA_MASK_U32) == XRGB_ALPHA_MASK_U32;
+
+        // SAFETY: Caller guarantees `sh_ptr` is initialized and readable for `0..copy_from_ry`.
+        let (mut still_solid, mut all_opaque) = unsafe {
+            a64_absorb_rows_solid_then_fast!(
+                sh_ptr.cast_const(),
+                ptr::null_mut(),
+                copy_from_ry,
+                stride,
+                full64,
+                rem,
+                HAS_ALPHA,
+                false,
+                rk,
+                alpha_mask,
+                first_word,
+                &mut lanes,
+                still_opaque
+            )
+        };
+
+        if copy_from_ry < th {
+            // SAFETY: Caller guarantees `src_ptr_base` readable and `sh_ptr` writable
+            // for rows `copy_from_ry..th`.
+            let src_ptr = unsafe { src_ptr_base.add(copy_from_ry * stride) };
+            let dst_ptr = unsafe { sh_ptr.add(copy_from_ry * stride) };
+            let rem_rows = th - copy_from_ry;
+            if still_solid {
+                (still_solid, all_opaque) = unsafe {
+                    a64_absorb_rows_solid_then_fast!(
+                        src_ptr, dst_ptr, rem_rows, stride, full64, rem, HAS_ALPHA, true, rk,
+                        alpha_mask, first_word, &mut lanes, all_opaque
+                    )
+                };
+            } else {
+                all_opaque = unsafe {
+                    a64_absorb_rows_fast!(
+                        src_ptr, dst_ptr, rem_rows, stride, full64, rem, HAS_ALPHA, true, rk,
+                        alpha_mask, &mut lanes, all_opaque
+                    )
+                };
+            }
+        }
+
+        TileHashResult {
+            hash: finalize(key, lanes, meta),
+            meta: RectScanMeta {
+                solid_px: still_solid.then(|| first_word.to_ne_bytes()),
+                all_opaque,
+            },
+        }
+    }
+
+    #[inline(never)]
+    #[target_feature(enable = "aes")]
+    unsafe fn copy_and_hash_with_overlap<const HAS_ALPHA: bool>(
+        key: &TileHashKey,
+        src_base: *const u8,
+        shadow_base: *mut u8,
+        stride: usize,
+        rect: TileRect,
+        copy_from_ry: usize,
+    ) -> TileHashResult {
+        let tw = rect.w as usize;
+        let th = rect.h as usize;
+        let row_bytes = tw * 4;
+        let x_bytes = rect.x as usize * 4;
+        let y0 = rect.y as usize;
+        let base_off = y0 * stride + x_bytes;
+        // SAFETY: Caller guarantees `copy_from_ry > 0`, `shadow_base` rows
+        // `0..copy_from_ry` are initialized and readable, and `src_base` rows
+        // `copy_from_ry..th` are readable, with `th > 0 && tw > 0`.
+        let src_ptr_base = unsafe { src_base.add(base_off) };
+        let sh_ptr = unsafe { shadow_base.add(base_off) };
+        let read_probe = |ry: usize, rx: usize| -> u32 {
+            let off = ry * stride + rx * 4;
+            unsafe {
+                let p = if ry < copy_from_ry {
+                    sh_ptr.cast_const().add(off)
+                } else {
+                    src_ptr_base.add(off)
+                };
+                p.cast::<u32>().read_unaligned()
+            }
+        };
+        let first_raw = unsafe { sh_ptr.cast_const().cast::<u32>().read_unaligned() };
+        let mid_raw = read_probe(th >> 1, tw >> 1);
+        let (_, still_solid, still_opaque) =
+            probe_three_pixels::<HAS_ALPHA>(first_raw, mid_raw, || read_probe(th - 1, tw - 1));
+        if still_solid {
+            // SAFETY: Bounds and exclusivity invariants forwarded from caller.
+            return unsafe {
+                copy_and_hash_with_overlap_solid_candidate::<HAS_ALPHA>(
+                    key,
+                    src_base,
+                    shadow_base,
+                    stride,
+                    rect,
+                    copy_from_ry,
+                )
+            };
+        }
+
+        let (meta_lo, meta_hi) = leaf_meta(rect.w, rect.h);
+        let (mut lanes, meta) = init_lanes(key, meta_lo, meta_hi);
+        let rk = load_key_block(&key.round_key);
+        let alpha_mask = vreinterpretq_u8_u32(vdupq_n_u32(XRGB_ALPHA_MASK_U32));
+        let full64 = row_bytes & !63;
+        let rem = row_bytes & 63;
+
+        // SAFETY: `sh_ptr` is initialized and readable for `copy_from_ry` rows.
+        let mut all_opaque = unsafe {
+            a64_absorb_rows_fast!(
+                sh_ptr.cast_const(),
+                ptr::null_mut(),
+                copy_from_ry,
+                stride,
+                full64,
+                rem,
+                HAS_ALPHA,
+                false,
+                rk,
+                alpha_mask,
+                &mut lanes,
+                still_opaque
+            )
+        };
+        if copy_from_ry < th {
+            // SAFETY: Caller validated `src_base` bounds and exclusive
+            // `shadow_base` write access for rows `copy_from_ry..th`.
+            all_opaque = unsafe {
+                a64_absorb_rows_fast!(
+                    src_ptr_base.add(copy_from_ry * stride),
+                    sh_ptr.add(copy_from_ry * stride),
+                    th - copy_from_ry,
+                    stride,
+                    full64,
+                    rem,
+                    HAS_ALPHA,
+                    true,
+                    rk,
+                    alpha_mask,
+                    &mut lanes,
+                    all_opaque
+                )
+            };
+        }
+        TileHashResult {
+            hash: finalize(key, lanes, meta),
+            meta: RectScanMeta {
+                solid_px: None,
+                all_opaque,
+            },
+        }
     }
 
     /// # Safety
@@ -783,37 +2038,72 @@ mod aarch64_aes {
         base: *const u8,
         stride: usize,
         rect: TileRect,
-    ) -> TileHash {
+    ) -> TileHashResult {
+        let tw = rect.w as usize;
+        let th = rect.h as usize;
+        let row_bytes = tw * 4;
+        if th == 0 || row_bytes == 0 {
+            return empty_rect_result(key, rect);
+        }
+        let x_bytes = rect.x as usize * 4;
+        let y0 = rect.y as usize;
+        // SAFETY: Caller guarantees `(y0 + ry, x_bytes..x_bytes + row_bytes)` is readable
+        // and `th > 0 && tw > 0`.
+        let row_ptr = unsafe { base.add(y0 * stride + x_bytes) };
+        let (first_raw, mid_raw) = unsafe {
+            (
+                row_ptr.cast::<u32>().read_unaligned(),
+                row_ptr
+                    .add((th >> 1) * stride + (tw >> 1) * 4)
+                    .cast::<u32>()
+                    .read_unaligned(),
+            )
+        };
+        let (first_word, still_solid, still_opaque) =
+            probe_three_pixels::<HAS_ALPHA>(first_raw, mid_raw, || unsafe {
+                row_ptr
+                    .add((th - 1) * stride + (tw - 1) * 4)
+                    .cast::<u32>()
+                    .read_unaligned()
+            });
+        let w_h = (u64::from(rect.w) << 32) | u64::from(rect.h);
+        if still_solid {
+            // SAFETY: `row_ptr` is readable for `th` rows of `row_bytes`.
+            return unsafe {
+                hash_rect_solid_candidate::<HAS_ALPHA>(key, row_ptr, stride, w_h, first_word)
+            };
+        }
+
         let (meta_lo, meta_hi) = leaf_meta(rect.w, rect.h);
         let (mut lanes, meta) = init_lanes(key, meta_lo, meta_hi);
-        let row_bytes = rect.w as usize * 4;
-        let th = rect.h as usize;
-        if th > 0 && row_bytes > 0 {
-            let rk = load_key_block(&key.round_key);
-            let alpha_mask = vreinterpretq_u8_u32(vdupq_n_u32(XRGB_ALPHA_MASK_U32));
-            let full64 = row_bytes & !63;
-            let rem = row_bytes & 63;
-            let x_bytes = rect.x as usize * 4;
-            let y0 = rect.y as usize;
-            // SAFETY: Caller guarantees `(y0 + ry, x_bytes..x_bytes + row_bytes)` is readable.
-            let mut row_ptr = unsafe { base.add(y0 * stride + x_bytes) };
-            for _ in 0..th {
-                // SAFETY: `row_ptr` is readable for `row_bytes == full64 + rem`.
-                unsafe {
-                    absorb_row::<HAS_ALPHA, false>(
-                        row_ptr,
-                        ptr::null_mut(),
-                        full64,
-                        rem,
-                        rk,
-                        alpha_mask,
-                        &mut lanes,
-                    );
-                    row_ptr = row_ptr.add(stride);
-                }
-            }
+        let rk = load_key_block(&key.round_key);
+        let alpha_mask = vreinterpretq_u8_u32(vdupq_n_u32(XRGB_ALPHA_MASK_U32));
+        let full64 = row_bytes & !63;
+        let rem = row_bytes & 63;
+        // SAFETY: `row_ptr` is readable for `th` rows of `row_bytes == full64 + rem`.
+        let all_opaque = unsafe {
+            a64_absorb_rows_fast!(
+                row_ptr,
+                ptr::null_mut(),
+                th,
+                stride,
+                full64,
+                rem,
+                HAS_ALPHA,
+                false,
+                rk,
+                alpha_mask,
+                &mut lanes,
+                still_opaque
+            )
+        };
+        TileHashResult {
+            hash: finalize(key, lanes, meta),
+            meta: RectScanMeta {
+                solid_px: None,
+                all_opaque,
+            },
         }
-        finalize(key, lanes, meta)
     }
 
     /// # Safety
@@ -827,56 +2117,90 @@ mod aarch64_aes {
         stride: usize,
         rect: TileRect,
         copy_from_ry: usize,
-    ) -> TileHash {
+    ) -> TileHashResult {
+        let tw = rect.w as usize;
+        let th = rect.h as usize;
+        let row_bytes = tw * 4;
+        if th == 0 || row_bytes == 0 {
+            return empty_rect_result(key, rect);
+        }
+        if copy_from_ry > 0 {
+            // SAFETY: Bounds and exclusivity invariants forwarded from caller.
+            return unsafe {
+                copy_and_hash_with_overlap::<HAS_ALPHA>(
+                    key,
+                    src_base,
+                    shadow_base,
+                    stride,
+                    rect,
+                    copy_from_ry,
+                )
+            };
+        }
+        let x_bytes = rect.x as usize * 4;
+        let y0 = rect.y as usize;
+        let base_off = y0 * stride + x_bytes;
+
+        // SAFETY: `copy_from_ry == 0` and `th > 0 && tw > 0`, so `src_base` is
+        // readable and `shadow_base` is exclusively writable for all `th` rows.
+        let src_ptr = unsafe { src_base.add(base_off) };
+        let sh_ptr = unsafe { shadow_base.add(base_off) };
+        let (first_raw, mid_raw) = unsafe {
+            (
+                src_ptr.cast::<u32>().read_unaligned(),
+                src_ptr
+                    .add((th >> 1) * stride + (tw >> 1) * 4)
+                    .cast::<u32>()
+                    .read_unaligned(),
+            )
+        };
+        let (_, still_solid, still_opaque) =
+            probe_three_pixels::<HAS_ALPHA>(first_raw, mid_raw, || unsafe {
+                src_ptr
+                    .add((th - 1) * stride + (tw - 1) * 4)
+                    .cast::<u32>()
+                    .read_unaligned()
+            });
+        let w_h = (u64::from(rect.w) << 32) | u64::from(rect.h);
+        if still_solid {
+            // SAFETY: `src_ptr` readable and `sh_ptr` writable for `th` rows.
+            return unsafe {
+                copy_and_hash_solid_candidate::<HAS_ALPHA>(key, src_ptr, sh_ptr, stride, w_h)
+            };
+        }
+
         let (meta_lo, meta_hi) = leaf_meta(rect.w, rect.h);
         let (mut lanes, meta) = init_lanes(key, meta_lo, meta_hi);
-        let row_bytes = rect.w as usize * 4;
-        let th = rect.h as usize;
-        if th > 0 && row_bytes > 0 {
-            let rk = load_key_block(&key.round_key);
-            let alpha_mask = vreinterpretq_u8_u32(vdupq_n_u32(XRGB_ALPHA_MASK_U32));
-            let full64 = row_bytes & !63;
-            let rem = row_bytes & 63;
-            let x_bytes = rect.x as usize * 4;
-            let y0 = rect.y as usize;
-            let base_off = y0 * stride + x_bytes;
+        let rk = load_key_block(&key.round_key);
+        let alpha_mask = vreinterpretq_u8_u32(vdupq_n_u32(XRGB_ALPHA_MASK_U32));
+        let full64 = row_bytes & !63;
+        let rem = row_bytes & 63;
 
-            // SAFETY: Caller guarantees `shadow_base` rows `0..copy_from_ry`
-            // are initialized and readable for `row_bytes`.
-            let mut sh_ptr = unsafe { shadow_base.add(base_off) };
-            for _ in 0..copy_from_ry {
-                // SAFETY: `sh_ptr` is readable for `row_bytes`.
-                unsafe {
-                    absorb_row::<HAS_ALPHA, false>(
-                        sh_ptr.cast_const(),
-                        ptr::null_mut(),
-                        full64,
-                        rem,
-                        rk,
-                        alpha_mask,
-                        &mut lanes,
-                    );
-                    sh_ptr = sh_ptr.add(stride);
-                }
-            }
-
-            if copy_from_ry < th {
-                // SAFETY: Caller validated `src_base` bounds and exclusive
-                // `shadow_base` write access for rows `copy_from_ry..th`.
-                let mut src_ptr = unsafe { src_base.add(base_off + copy_from_ry * stride) };
-                for _ in copy_from_ry..th {
-                    // SAFETY: `src_ptr` readable and `sh_ptr` writable for `row_bytes`, disjoint.
-                    unsafe {
-                        absorb_row::<HAS_ALPHA, true>(
-                            src_ptr, sh_ptr, full64, rem, rk, alpha_mask, &mut lanes,
-                        );
-                        src_ptr = src_ptr.add(stride);
-                        sh_ptr = sh_ptr.add(stride);
-                    }
-                }
-            }
+        // SAFETY: Caller validated `src_base` bounds and exclusive `shadow_base`
+        // write access for all `th` rows.
+        let all_opaque = unsafe {
+            a64_absorb_rows_fast!(
+                src_ptr,
+                sh_ptr,
+                th,
+                stride,
+                full64,
+                rem,
+                HAS_ALPHA,
+                true,
+                rk,
+                alpha_mask,
+                &mut lanes,
+                still_opaque
+            )
+        };
+        TileHashResult {
+            hash: finalize(key, lanes, meta),
+            meta: RectScanMeta {
+                solid_px: None,
+                all_opaque,
+            },
         }
-        finalize(key, lanes, meta)
     }
 
     /// # Safety
@@ -905,11 +2229,15 @@ mod aarch64_aes {
 mod portable {
     use std::ptr;
 
+    use super::RectScanMeta;
     use super::TileHash;
     use super::TileHashKey;
+    use super::TileHashResult;
+    use super::XRGB_ALPHA_MASK_U32;
     use super::XRGB_ALPHA_MASK_U64;
     use super::leaf_meta;
     use super::parent_meta;
+    use super::probe_three_pixels;
     use crate::serialization::framing::TileRect;
 
     const P_K0: u64 = 0xA076_1D64_78BD_642F;
@@ -983,6 +2311,11 @@ mod portable {
     }
 
     #[inline(always)]
+    fn dup_u32_to_u64(word: u32) -> u64 {
+        (u64::from(word) << 32) | u64::from(word)
+    }
+
+    #[inline(always)]
     unsafe fn load_and_maybe_copy_16<const HAS_ALPHA: bool, const COPY: bool>(
         src: *const u8,
         dst: *mut u8,
@@ -1006,19 +2339,30 @@ mod portable {
     }
 
     #[inline(always)]
-    unsafe fn absorb_row<const HAS_ALPHA: bool, const COPY: bool>(
+    unsafe fn absorb_row<
+        const HAS_ALPHA: bool,
+        const COPY: bool,
+        const TRACK_SOLID: bool,
+        const TRACK_OPAQUE: bool,
+    >(
         src_row: *const u8,
         dst_row: *mut u8,
         full64: usize,
         rem: usize,
         rk0: u64,
         rk1: u64,
+        first_word: u32,
+        first_pair: u64,
         lanes: &mut [u64; 4],
+        diff_acc: &mut u64,
+        alpha_and: &mut u64,
     ) {
         let mut s0 = lanes[0];
         let mut s1 = lanes[1];
         let mut s2 = lanes[2];
         let mut s3 = lanes[3];
+        let mut dacc = *diff_acc;
+        let mut aand = *alpha_and;
 
         let mut off = 0usize;
         while off < full64 {
@@ -1038,6 +2382,19 @@ mod portable {
                     src_row.add(off + 48),
                     dst_row.add(off + 48),
                 );
+                if TRACK_SOLID {
+                    dacc |= (m0l ^ first_pair)
+                        | (m0h ^ first_pair)
+                        | (m1l ^ first_pair)
+                        | (m1h ^ first_pair)
+                        | (m2l ^ first_pair)
+                        | (m2h ^ first_pair)
+                        | (m3l ^ first_pair)
+                        | (m3h ^ first_pair);
+                }
+                if TRACK_OPAQUE {
+                    aand &= m0l & m0h & m1l & m1h & m2l & m2h & m3l & m3h;
+                }
                 s0 = step(s0, m0l, m0h, rk0, rk1);
                 s1 = step(s1, m1l, m1h, rk0, rk1);
                 s2 = step(s2, m2l, m2h, rk0, rk1);
@@ -1053,6 +2410,12 @@ mod portable {
                 let (ml, mh) = unsafe {
                     load_and_maybe_copy_16::<HAS_ALPHA, COPY>(src_row.add(off), dst_row.add(off))
                 };
+                if TRACK_SOLID {
+                    dacc |= (ml ^ first_pair) | (mh ^ first_pair);
+                }
+                if TRACK_OPAQUE {
+                    aand &= ml & mh;
+                }
                 s0 = step(s0, ml, mh, rk0, rk1);
                 off += 16;
                 left -= 16;
@@ -1065,6 +2428,12 @@ mod portable {
                             dst_row.add(off),
                         )
                     };
+                    if TRACK_SOLID {
+                        dacc |= (ml ^ first_pair) | (mh ^ first_pair);
+                    }
+                    if TRACK_OPAQUE {
+                        aand &= ml & mh;
+                    }
                     s1 = step(s1, ml, mh, rk0, rk1);
                     off += 16;
                     left -= 16;
@@ -1077,6 +2446,12 @@ mod portable {
                                 dst_row.add(off),
                             )
                         };
+                        if TRACK_SOLID {
+                            dacc |= (ml ^ first_pair) | (mh ^ first_pair);
+                        }
+                        if TRACK_OPAQUE {
+                            aand &= ml & mh;
+                        }
                         s2 = step(s2, ml, mh, rk0, rk1);
                         off += 16;
                         left -= 16;
@@ -1087,6 +2462,8 @@ mod portable {
             if left > 0 {
                 debug_assert!(left < 16 && left.is_multiple_of(4));
                 let mut tail = [0u8; 16];
+                let mut td = 0u32;
+                let mut ta = u32::MAX;
                 // SAFETY: `off + left == full64 + rem`, `left` is 4, 8, or 12.
                 unsafe {
                     let p0 = src_row.add(off).cast::<[u8; 4]>().read();
@@ -1094,11 +2471,27 @@ mod portable {
                     if COPY {
                         dst_row.add(off).cast::<[u8; 4]>().write(p0);
                     }
+                    if TRACK_SOLID || TRACK_OPAQUE {
+                        let c0 = u32::from_ne_bytes(p0)
+                            | if HAS_ALPHA { 0 } else { XRGB_ALPHA_MASK_U32 };
+                        td |= c0 ^ first_word;
+                        if TRACK_OPAQUE {
+                            ta &= c0;
+                        }
+                    }
                     if left >= 8 {
                         let p1 = src_row.add(off + 4).cast::<[u8; 4]>().read();
                         tail[4..8].copy_from_slice(&p1);
                         if COPY {
                             dst_row.add(off + 4).cast::<[u8; 4]>().write(p1);
+                        }
+                        if TRACK_SOLID || TRACK_OPAQUE {
+                            let c1 = u32::from_ne_bytes(p1)
+                                | if HAS_ALPHA { 0 } else { XRGB_ALPHA_MASK_U32 };
+                            td |= c1 ^ first_word;
+                            if TRACK_OPAQUE {
+                                ta &= c1;
+                            }
                         }
                         if left == 12 {
                             let p2 = src_row.add(off + 8).cast::<[u8; 4]>().read();
@@ -1106,9 +2499,24 @@ mod portable {
                             if COPY {
                                 dst_row.add(off + 8).cast::<[u8; 4]>().write(p2);
                             }
+                            if TRACK_SOLID || TRACK_OPAQUE {
+                                let c2 = u32::from_ne_bytes(p2)
+                                    | if HAS_ALPHA { 0 } else { XRGB_ALPHA_MASK_U32 };
+                                td |= c2 ^ first_word;
+                                if TRACK_OPAQUE {
+                                    ta &= c2;
+                                }
+                            }
                         }
                     }
                 }
+                if TRACK_SOLID {
+                    dacc |= u64::from(td);
+                }
+                if TRACK_OPAQUE {
+                    aand &= dup_u32_to_u64(ta);
+                }
+
                 let mut lo = u64::from_ne_bytes(tail[..8].try_into().unwrap());
                 let mut hi = u64::from_ne_bytes(tail[8..].try_into().unwrap());
                 if !HAS_ALPHA {
@@ -1123,45 +2531,199 @@ mod portable {
         lanes[1] = s1;
         lanes[2] = s2;
         lanes[3] = s3;
+        if TRACK_SOLID {
+            *diff_acc = dacc;
+        }
+        if TRACK_OPAQUE {
+            *alpha_and = aand;
+        }
     }
 
+    #[inline(always)]
+    unsafe fn absorb_rows_phased<const HAS_ALPHA: bool, const COPY: bool>(
+        mut src_ptr: *const u8,
+        mut dst_ptr: *mut u8,
+        n_rows: usize,
+        stride: usize,
+        full64: usize,
+        rem: usize,
+        rk0: u64,
+        rk1: u64,
+        first_word: u32,
+        first_pair: u64,
+        lanes: &mut [u64; 4],
+        mut still_solid: bool,
+        mut still_opaque: bool,
+    ) -> (bool, bool) {
+        let mut ry = 0usize;
+        if still_solid {
+            let mut diff_acc = 0u64;
+            let mut alpha_and = u64::MAX;
+            while ry < n_rows {
+                // SAFETY: Caller guarantees `src_ptr` readable and (when `COPY`)
+                // `dst_ptr` writable for `full64 + rem` bytes across `n_rows`.
+                unsafe {
+                    absorb_row::<HAS_ALPHA, COPY, true, HAS_ALPHA>(
+                        src_ptr,
+                        dst_ptr,
+                        full64,
+                        rem,
+                        rk0,
+                        rk1,
+                        first_word,
+                        first_pair,
+                        lanes,
+                        &mut diff_acc,
+                        &mut alpha_and,
+                    );
+                    src_ptr = src_ptr.add(stride);
+                    if COPY {
+                        dst_ptr = dst_ptr.add(stride);
+                    }
+                }
+                ry += 1;
+                if diff_acc != 0 {
+                    still_solid = false;
+                    if HAS_ALPHA && still_opaque {
+                        still_opaque = (alpha_and & XRGB_ALPHA_MASK_U64) == XRGB_ALPHA_MASK_U64;
+                    }
+                    break;
+                }
+            }
+        }
+        if ry < n_rows {
+            let mut dummy_diff = 0u64;
+            if HAS_ALPHA && still_opaque {
+                let mut alpha_and = u64::MAX;
+                while ry < n_rows {
+                    // SAFETY: Remaining rows lie within caller-validated bounds.
+                    unsafe {
+                        absorb_row::<true, COPY, false, true>(
+                            src_ptr,
+                            dst_ptr,
+                            full64,
+                            rem,
+                            rk0,
+                            rk1,
+                            0,
+                            0,
+                            lanes,
+                            &mut dummy_diff,
+                            &mut alpha_and,
+                        );
+                        src_ptr = src_ptr.add(stride);
+                        if COPY {
+                            dst_ptr = dst_ptr.add(stride);
+                        }
+                    }
+                    ry += 1;
+                }
+                still_opaque = (alpha_and & XRGB_ALPHA_MASK_U64) == XRGB_ALPHA_MASK_U64;
+            } else {
+                let mut dummy_alpha = u64::MAX;
+                while ry < n_rows {
+                    // SAFETY: Remaining rows lie within caller-validated bounds.
+                    unsafe {
+                        absorb_row::<HAS_ALPHA, COPY, false, false>(
+                            src_ptr,
+                            dst_ptr,
+                            full64,
+                            rem,
+                            rk0,
+                            rk1,
+                            0,
+                            0,
+                            lanes,
+                            &mut dummy_diff,
+                            &mut dummy_alpha,
+                        );
+                        src_ptr = src_ptr.add(stride);
+                        if COPY {
+                            dst_ptr = dst_ptr.add(stride);
+                        }
+                    }
+                    ry += 1;
+                }
+            }
+        }
+        (still_solid, !HAS_ALPHA || still_opaque)
+    }
+
+    #[inline(never)]
     pub(super) unsafe fn hash_rect_raw<const HAS_ALPHA: bool>(
         key: &TileHashKey,
         base: *const u8,
         stride: usize,
         rect: TileRect,
-    ) -> TileHash {
+    ) -> TileHashResult {
         let (meta_lo, meta_hi) = leaf_meta(rect.w, rect.h);
         let mut lanes = init_lanes(key, meta_lo, meta_hi);
-        let row_bytes = rect.w as usize * 4;
+        let tw = rect.w as usize;
         let th = rect.h as usize;
-        if th > 0 && row_bytes > 0 {
-            let [rk0, rk1] = key.round_key;
-            let full64 = row_bytes & !63;
-            let rem = row_bytes & 63;
-            let x_bytes = rect.x as usize * 4;
-            let y0 = rect.y as usize;
-            // SAFETY: Caller guarantees `(y0 + ry, x_bytes..x_bytes + row_bytes)` is readable.
-            let mut row_ptr = unsafe { base.add(y0 * stride + x_bytes) };
-            for _ in 0..th {
-                // SAFETY: `row_ptr` is readable for `row_bytes`.
-                unsafe {
-                    absorb_row::<HAS_ALPHA, false>(
-                        row_ptr,
-                        ptr::null_mut(),
-                        full64,
-                        rem,
-                        rk0,
-                        rk1,
-                        &mut lanes,
-                    );
-                    row_ptr = row_ptr.add(stride);
-                }
-            }
+        let row_bytes = tw * 4;
+        if th == 0 || row_bytes == 0 {
+            return TileHashResult {
+                hash: finalize(key, lanes, meta_lo, meta_hi),
+                meta: RectScanMeta::EMPTY,
+            };
         }
-        finalize(key, lanes, meta_lo, meta_hi)
+        let [rk0, rk1] = key.round_key;
+        let full64 = row_bytes & !63;
+        let rem = row_bytes & 63;
+        let x_bytes = rect.x as usize * 4;
+        let y0 = rect.y as usize;
+        // SAFETY: Caller guarantees `(y0 + ry, x_bytes..x_bytes + row_bytes)` is readable
+        // and `th > 0 && tw > 0`.
+        let row_ptr = unsafe { base.add(y0 * stride + x_bytes) };
+        let (first_raw, mid_raw) = unsafe {
+            (
+                u32::from_ne_bytes(row_ptr.cast::<[u8; 4]>().read()),
+                u32::from_ne_bytes(
+                    row_ptr
+                        .add((th >> 1) * stride + (tw >> 1) * 4)
+                        .cast::<[u8; 4]>()
+                        .read(),
+                ),
+            )
+        };
+        let (first_word, still_solid, still_opaque) =
+            probe_three_pixels::<HAS_ALPHA>(first_raw, mid_raw, || unsafe {
+                u32::from_ne_bytes(
+                    row_ptr
+                        .add((th - 1) * stride + (tw - 1) * 4)
+                        .cast::<[u8; 4]>()
+                        .read(),
+                )
+            });
+        let first_pair = dup_u32_to_u64(first_word);
+        // SAFETY: `row_ptr` is readable for `th` rows of `row_bytes`.
+        let (solid, all_opaque) = unsafe {
+            absorb_rows_phased::<HAS_ALPHA, false>(
+                row_ptr,
+                ptr::null_mut(),
+                th,
+                stride,
+                full64,
+                rem,
+                rk0,
+                rk1,
+                first_word,
+                first_pair,
+                &mut lanes,
+                still_solid,
+                still_opaque,
+            )
+        };
+        TileHashResult {
+            hash: finalize(key, lanes, meta_lo, meta_hi),
+            meta: RectScanMeta {
+                solid_px: solid.then(|| first_word.to_ne_bytes()),
+                all_opaque,
+            },
+        }
     }
 
+    #[inline(never)]
     pub(super) unsafe fn copy_and_hash_rect_to_shadow<const HAS_ALPHA: bool>(
         key: &TileHashKey,
         src_base: *const u8,
@@ -1169,55 +2731,95 @@ mod portable {
         stride: usize,
         rect: TileRect,
         copy_from_ry: usize,
-    ) -> TileHash {
+    ) -> TileHashResult {
         let (meta_lo, meta_hi) = leaf_meta(rect.w, rect.h);
         let mut lanes = init_lanes(key, meta_lo, meta_hi);
-        let row_bytes = rect.w as usize * 4;
+        let tw = rect.w as usize;
         let th = rect.h as usize;
-        if th > 0 && row_bytes > 0 {
-            let [rk0, rk1] = key.round_key;
-            let full64 = row_bytes & !63;
-            let rem = row_bytes & 63;
-            let x_bytes = rect.x as usize * 4;
-            let y0 = rect.y as usize;
-            let base_off = y0 * stride + x_bytes;
-
-            // SAFETY: Caller guarantees `shadow_base` rows `0..copy_from_ry`
-            // are initialized and readable for `row_bytes`.
-            let mut sh_ptr = unsafe { shadow_base.add(base_off) };
-            for _ in 0..copy_from_ry {
-                // SAFETY: `sh_ptr` is readable for `row_bytes`.
-                unsafe {
-                    absorb_row::<HAS_ALPHA, false>(
-                        sh_ptr.cast_const(),
-                        ptr::null_mut(),
-                        full64,
-                        rem,
-                        rk0,
-                        rk1,
-                        &mut lanes,
-                    );
-                    sh_ptr = sh_ptr.add(stride);
-                }
-            }
-
-            if copy_from_ry < th {
-                // SAFETY: Caller validated `src_base` bounds and exclusive
-                // `shadow_base` write access for rows `copy_from_ry..th`.
-                let mut src_ptr = unsafe { src_base.add(base_off + copy_from_ry * stride) };
-                for _ in copy_from_ry..th {
-                    // SAFETY: `src_ptr` readable and `sh_ptr` writable for `row_bytes`, disjoint.
-                    unsafe {
-                        absorb_row::<HAS_ALPHA, true>(
-                            src_ptr, sh_ptr, full64, rem, rk0, rk1, &mut lanes,
-                        );
-                        src_ptr = src_ptr.add(stride);
-                        sh_ptr = sh_ptr.add(stride);
-                    }
-                }
-            }
+        let row_bytes = tw * 4;
+        if th == 0 || row_bytes == 0 {
+            return TileHashResult {
+                hash: finalize(key, lanes, meta_lo, meta_hi),
+                meta: RectScanMeta::EMPTY,
+            };
         }
-        finalize(key, lanes, meta_lo, meta_hi)
+        let [rk0, rk1] = key.round_key;
+        let full64 = row_bytes & !63;
+        let rem = row_bytes & 63;
+        let x_bytes = rect.x as usize * 4;
+        let y0 = rect.y as usize;
+        let base_off = y0 * stride + x_bytes;
+
+        // SAFETY: Caller guarantees `shadow_base` rows `0..copy_from_ry`
+        // are initialized and readable for `row_bytes`, and `src_base` rows
+        // `copy_from_ry..th` are readable for `row_bytes`.
+        let sh_ptr = unsafe { shadow_base.add(base_off) };
+        let read_probe = |ry: usize, rx: usize| -> u32 {
+            let off = ry * stride + rx * 4;
+            unsafe {
+                let p = if ry < copy_from_ry {
+                    sh_ptr.cast_const().add(off)
+                } else {
+                    src_base.add(base_off + off)
+                };
+                u32::from_ne_bytes(p.cast::<[u8; 4]>().read())
+            }
+        };
+        let (first_word, mut still_solid, mut still_opaque) =
+            probe_three_pixels::<HAS_ALPHA>(read_probe(0, 0), read_probe(th >> 1, tw >> 1), || {
+                read_probe(th - 1, tw - 1)
+            });
+        let first_pair = dup_u32_to_u64(first_word);
+
+        if copy_from_ry > 0 {
+            // SAFETY: `sh_ptr` is initialized and readable for `copy_from_ry` rows.
+            (still_solid, still_opaque) = unsafe {
+                absorb_rows_phased::<HAS_ALPHA, false>(
+                    sh_ptr.cast_const(),
+                    ptr::null_mut(),
+                    copy_from_ry,
+                    stride,
+                    full64,
+                    rem,
+                    rk0,
+                    rk1,
+                    first_word,
+                    first_pair,
+                    &mut lanes,
+                    still_solid,
+                    still_opaque,
+                )
+            };
+        }
+
+        if copy_from_ry < th {
+            // SAFETY: Caller validated `src_base` bounds and exclusive
+            // `shadow_base` write access for rows `copy_from_ry..th`.
+            (still_solid, still_opaque) = unsafe {
+                absorb_rows_phased::<HAS_ALPHA, true>(
+                    src_base.add(base_off + copy_from_ry * stride),
+                    sh_ptr.add(copy_from_ry * stride),
+                    th - copy_from_ry,
+                    stride,
+                    full64,
+                    rem,
+                    rk0,
+                    rk1,
+                    first_word,
+                    first_pair,
+                    &mut lanes,
+                    still_solid,
+                    still_opaque,
+                )
+            };
+        }
+        TileHashResult {
+            hash: finalize(key, lanes, meta_lo, meta_hi),
+            meta: RectScanMeta {
+                solid_px: still_solid.then(|| first_word.to_ne_bytes()),
+                all_opaque: !HAS_ALPHA || still_opaque,
+            },
+        }
     }
 
     pub(super) fn combine_quad_hashes(
@@ -1238,9 +2840,10 @@ mod portable {
     }
 }
 
-/// Computes the keyed 128-bit digest of `rect` inside `shadow_base` (row stride
-/// `stride` bytes), normalizing byte 3 (`X`) to `0xFF` in-register when
-/// `!HAS_ALPHA` so arbitrary `Xrgb8888` padding never causes false misses.
+/// Computes the keyed 128-bit digest and in-register pixel scan metadata of
+/// `rect` inside `shadow_base` (row stride `stride` bytes), normalizing byte 3
+/// (`X`) to `0xFF` in-register when `!HAS_ALPHA` so arbitrary `Xrgb8888`
+/// padding never causes false misses.
 ///
 /// # Safety
 /// `shadow_base` must be readable for `(rect.y + rect.h) * stride` bytes and
@@ -1252,7 +2855,7 @@ pub(crate) unsafe fn hash_rect_from_shadow<const HAS_ALPHA: bool>(
     shadow_base: *const u8,
     stride: usize,
     rect: TileRect,
-) -> TileHash {
+) -> TileHashResult {
     #[cfg(all(target_arch = "x86_64", not(miri)))]
     if has_hw_aes() {
         // SAFETY: `has_hw_aes()` verified AES-NI; caller upholds bounds invariants.
@@ -1270,10 +2873,12 @@ pub(crate) unsafe fn hash_rect_from_shadow<const HAS_ALPHA: bool>(
 /// Copies `rect` from `src` (`wl_shm` via [`BufferPointer`]) into `shadow_base`
 /// for rows `[copy_from_ry..rect.h)` in a single load pass (reading initialized
 /// `shadow_base` rows for `[0..copy_from_ry)`) and returns its keyed 128-bit
-/// digest directly from registers without any intermediate buffer.
+/// digest plus in-register [`RectScanMeta`] directly from registers without any
+/// intermediate buffer.
 ///
 /// Stores exact raw bytes from `src` into `shadow_base`, while masking byte 3
-/// (`X`) to `0xFF` in-register for the digest when `!HAS_ALPHA`.
+/// (`X`) to `0xFF` in-register for the digest and uniformity check when
+/// `!HAS_ALPHA`.
 ///
 /// # Safety
 /// `shadow_base` must be exclusively writable for `rect` across `(rect.y +
@@ -1289,7 +2894,7 @@ pub(crate) unsafe fn copy_and_hash_rect_to_shadow<const HAS_ALPHA: bool>(
     stride: usize,
     rect: TileRect,
     copy_from_ry: usize,
-) -> TileHash {
+) -> TileHashResult {
     let th = rect.h as usize;
     let row_bytes = rect.w as usize * 4;
     debug_assert!(copy_from_ry <= th);
@@ -1340,15 +2945,16 @@ pub(crate) unsafe fn copy_and_hash_rect_to_shadow<const HAS_ALPHA: bool>(
     }
 }
 
-/// Computes the keyed 128-bit digest of `rect` read through [`BufferPointer`]
-/// via raw loads (never creating `&[u8]` over shared memory).
+/// Computes the keyed 128-bit digest and in-register pixel scan metadata of
+/// `rect` read through [`BufferPointer`] via raw loads (never creating `&[u8]`
+/// over shared memory).
 #[inline]
 pub(crate) fn hash_rect_from_ptr<const HAS_ALPHA: bool>(
     key: &TileHashKey,
     aos: BufferPointer<Vec4u8>,
     stride_px: usize,
     rect: TileRect,
-) -> TileHash {
+) -> TileHashResult {
     let x0 = rect.x as usize;
     let y0 = rect.y as usize;
     let tw = rect.w as usize;
@@ -1455,7 +3061,7 @@ mod tests {
             base: *const u8,
             stride: usize,
             rect: TileRect,
-        ) -> TileHash {
+        ) -> TileHashResult {
             match self {
                 Self::Portable => unsafe {
                     portable::hash_rect_raw::<HAS_ALPHA>(key, base, stride, rect)
@@ -1479,7 +3085,7 @@ mod tests {
             stride: usize,
             rect: TileRect,
             copy_from_ry: usize,
-        ) -> TileHash {
+        ) -> TileHashResult {
             match self {
                 Self::Portable => unsafe {
                     portable::copy_and_hash_rect_to_shadow::<HAS_ALPHA>(
@@ -1627,8 +3233,8 @@ mod tests {
             unsafe { backend.hash_shadow::<true>(key, src_alpha_flip.as_ptr(), stride, rect) };
         assert_eq!(h_flip_xrgb, h_shadow_xrgb);
         assert_ne!(
-            h_flip_argb,
-            h_shadow_argb,
+            h_flip_argb.hash,
+            h_shadow_argb.hash,
             "{}: Argb missed 1-bit alpha flip on {tw}x{th}",
             backend.name()
         );
@@ -1705,19 +3311,296 @@ mod tests {
         }
     }
 
+    fn check_solid_and_opaque_case(
+        backend: Backend,
+        key: &TileHashKey,
+        tw: usize,
+        th: usize,
+        x0: usize,
+        y0: usize,
+        pad_px: usize,
+    ) {
+        let full_w = x0 + tw + pad_px;
+        let full_h = y0 + th + 2;
+        let stride = full_w * 4;
+        let byte_len = full_h * stride;
+        let rect = TileRect {
+            x: x0 as u32,
+            y: y0 as u32,
+            w: tw as u32,
+            h: th as u32,
+        };
+        let verify_both = |buf: &[u8], has_alpha: bool, expected: RectScanMeta, label: &str| {
+            let bp_ptr = buf.as_ptr();
+            let bp = unsafe { BufferPointer::new(&bp_ptr, byte_len) };
+            let r_sh = if has_alpha {
+                unsafe { backend.hash_shadow::<true>(key, buf.as_ptr(), stride, rect) }
+            } else {
+                unsafe { backend.hash_shadow::<false>(key, buf.as_ptr(), stride, rect) }
+            };
+            assert_eq!(
+                r_sh.meta,
+                expected,
+                "{}: shadow meta mismatch ({label}) on {tw}x{th}",
+                backend.name()
+            );
+            for copy_from_ry in [0usize, th / 2, th] {
+                let mut shadow: Vec<u8> = Vec::with_capacity(byte_len);
+                let sh_ptr = shadow.as_mut_ptr();
+                for ry in 0..copy_from_ry {
+                    let row_off = (y0 + ry) * stride + x0 * 4;
+                    unsafe {
+                        ptr::copy_nonoverlapping(
+                            buf.as_ptr().add(row_off),
+                            sh_ptr.add(row_off),
+                            tw * 4,
+                        );
+                    }
+                }
+                let r_cp = if has_alpha {
+                    unsafe {
+                        backend.copy_and_hash::<true>(key, bp, sh_ptr, stride, rect, copy_from_ry)
+                    }
+                } else {
+                    unsafe {
+                        backend.copy_and_hash::<false>(key, bp, sh_ptr, stride, rect, copy_from_ry)
+                    }
+                };
+                assert_eq!(
+                    r_cp,
+                    r_sh,
+                    "{}: copy_and_hash mismatch ({label}, copy_from_ry={copy_from_ry}) on {tw}x{th}",
+                    backend.name()
+                );
+            }
+        };
+
+        // 1. Solid Xrgb8888 with varying garbage byte 3 on every pixel ->
+        //    canonical Solid([b, g, r, 0xFF]), all_opaque = true.
+        let base_rgb = [0x24u8, 0x7A, 0xD1, 0xFF];
+        let mut buf = vec![0x99u8; byte_len];
+        for ry in 0..th {
+            for rx in 0..tw {
+                let off = (y0 + ry) * stride + (x0 + rx) * 4;
+                buf[off] = base_rgb[0];
+                buf[off + 1] = base_rgb[1];
+                buf[off + 2] = base_rgb[2];
+                buf[off + 3] = ((ry * 31 + rx * 17 + 5) & 0xFF) as u8;
+            }
+        }
+        verify_both(
+            &buf,
+            false,
+            RectScanMeta {
+                solid_px: Some(base_rgb),
+                all_opaque: true,
+            },
+            "xrgb_solid_garbage_x",
+        );
+
+        // 2. Solid opaque Argb8888 (`alpha = 0xFF`).
+        for ry in 0..th {
+            for rx in 0..tw {
+                let off = (y0 + ry) * stride + (x0 + rx) * 4;
+                buf[off..off + 4].copy_from_slice(&base_rgb);
+            }
+        }
+        verify_both(
+            &buf,
+            true,
+            RectScanMeta {
+                solid_px: Some(base_rgb),
+                all_opaque: true,
+            },
+            "argb_solid_opaque",
+        );
+
+        // 3. Solid translucent Argb8888 (`alpha = 0x80`): solid_px = Some, all_opaque = false.
+        let translucent = [0x24u8, 0x7A, 0xD1, 0x80];
+        for ry in 0..th {
+            for rx in 0..tw {
+                let off = (y0 + ry) * stride + (x0 + rx) * 4;
+                buf[off..off + 4].copy_from_slice(&translucent);
+            }
+        }
+        verify_both(
+            &buf,
+            true,
+            RectScanMeta {
+                solid_px: Some(translucent),
+                all_opaque: false,
+            },
+            "argb_solid_translucent",
+        );
+
+        // 4. Single-pixel perturbations at the 3 pre-probe coordinates PLUS
+        //    non-probe 4th pixels (verifying that matching `(0,0)`, `(tw/2,th/2)`,
+        //    and `(tw-1,th-1)` still detects a differing 4th pixel as non-solid /
+        //    non-opaque across both `copy_from_ry == 0` and overlap paths).
+        let mut positions = vec![(0, 0), (tw / 2, th / 2), (tw - 1, th - 1)];
+        for cand in [
+            (tw - 1, 0),
+            (0, th - 1),
+            (1.min(tw - 1), 0),
+            (0, 1.min(th - 1)),
+        ] {
+            if !positions.contains(&cand) {
+                positions.push(cand);
+            }
+        }
+        let is_single_px = tw == 1 && th == 1;
+        for (px_x, px_y) in positions {
+            // Reset to solid opaque.
+            for ry in 0..th {
+                for rx in 0..tw {
+                    let off = (y0 + ry) * stride + (x0 + rx) * 4;
+                    buf[off..off + 4].copy_from_slice(&base_rgb);
+                }
+            }
+            let diff_off = (y0 + px_y) * stride + (x0 + px_x) * 4;
+
+            // (a) Single-pixel RGB diff: non-solid (when >1 px), still all_opaque.
+            buf[diff_off + 1] ^= 0x01;
+            let expected_rgb_diff = RectScanMeta {
+                solid_px: is_single_px
+                    .then(|| [base_rgb[0], base_rgb[1] ^ 0x01, base_rgb[2], 0xFF]),
+                all_opaque: true,
+            };
+            verify_both(&buf, false, expected_rgb_diff, "xrgb_single_rgb_diff");
+            verify_both(&buf, true, expected_rgb_diff, "argb_single_rgb_diff");
+            buf[diff_off + 1] ^= 0x01;
+
+            // (b) Single-pixel alpha = 0xFE with identical RGB:
+            //     Xrgb still solid + opaque; Argb non-opaque (and non-solid when >1 px).
+            buf[diff_off + 3] = 0xFE;
+            verify_both(
+                &buf,
+                false,
+                RectScanMeta {
+                    solid_px: Some(base_rgb),
+                    all_opaque: true,
+                },
+                "xrgb_single_alpha_fe",
+            );
+            verify_both(
+                &buf,
+                true,
+                RectScanMeta {
+                    solid_px: is_single_px.then(|| [base_rgb[0], base_rgb[1], base_rgb[2], 0xFE]),
+                    all_opaque: false,
+                },
+                "argb_single_alpha_fe",
+            );
+            buf[diff_off + 3] = 0xFF;
+
+            // (c) Non-solid opaque probe points (`still_solid = false, still_opaque = true`)
+            //     with a single non-probe translucent pixel (`alpha = 0xFE`):
+            //     verifies the `!still_solid && still_opaque` fast loop catches `0xFE`.
+            if !is_single_px && (px_x, px_y) != (0, 0) {
+                let first_off = y0 * stride + x0 * 4;
+                buf[first_off] ^= 0x10;
+                buf[diff_off + 3] = 0xFE;
+                verify_both(
+                    &buf,
+                    true,
+                    RectScanMeta {
+                        solid_px: None,
+                        all_opaque: false,
+                    },
+                    "argb_nonsolid_single_alpha_fe",
+                );
+                buf[first_off] ^= 0x10;
+                buf[diff_off + 3] = 0xFF;
+            }
+
+            // (d) Solid translucent probe points (`still_solid = true, still_opaque = false`)
+            //     with a single differing RGB pixel -> non-solid + non-opaque.
+            if !is_single_px {
+                for ry in 0..th {
+                    for rx in 0..tw {
+                        let off = (y0 + ry) * stride + (x0 + rx) * 4;
+                        buf[off..off + 4].copy_from_slice(&translucent);
+                    }
+                }
+                buf[diff_off + 2] ^= 0x01;
+                verify_both(
+                    &buf,
+                    true,
+                    RectScanMeta {
+                        solid_px: None,
+                        all_opaque: false,
+                    },
+                    "argb_translucent_single_rgb_diff",
+                );
+            }
+        }
+    }
+
     /// Miri-safe parity and uninitialized-shadow soundness test (runs under both
     /// standard test execution and Miri).
     #[test]
     fn test_tile_hash_miri_uninit_and_edge_widths() {
         let key = TileHashKey::from_seed(0xC0FF_EE42);
         for backend in Backend::all_supported() {
+            // Empty rect metadata check.
+            let empty_buf = [0u8; 16];
+            for r in [
+                TileRect {
+                    x: 0,
+                    y: 0,
+                    w: 0,
+                    h: 4,
+                },
+                TileRect {
+                    x: 0,
+                    y: 0,
+                    w: 4,
+                    h: 0,
+                },
+            ] {
+                let res_x =
+                    unsafe { backend.hash_shadow::<false>(&key, empty_buf.as_ptr(), 16, r) };
+                let res_a = unsafe { backend.hash_shadow::<true>(&key, empty_buf.as_ptr(), 16, r) };
+                assert_eq!(res_x.meta, RectScanMeta::EMPTY);
+                assert_eq!(res_a.meta, RectScanMeta::EMPTY);
+            }
+
             for &tw in &[1usize, 2, 3, 4, 5, 15, 16, 17, 33] {
                 for &th in &[1usize, 3] {
                     check_rect_parity_case(backend, &key, tw, th, 0, 0, 0);
                     check_rect_parity_case(backend, &key, tw, th, 3, 1, 7);
+                    check_solid_and_opaque_case(backend, &key, tw, th, 0, 0, 0);
+                    check_solid_and_opaque_case(backend, &key, tw, th, 2, 1, 5);
                 }
             }
         }
+
+        // `RectScanMeta::combine` algebraic invariants.
+        let s1 = RectScanMeta {
+            solid_px: Some([1, 2, 3, 0xFF]),
+            all_opaque: true,
+        };
+        let s2 = RectScanMeta {
+            solid_px: Some([4, 5, 6, 0xFF]),
+            all_opaque: true,
+        };
+        let st = RectScanMeta {
+            solid_px: Some([1, 2, 3, 0x80]),
+            all_opaque: false,
+        };
+        let opq = RectScanMeta {
+            solid_px: None,
+            all_opaque: true,
+        };
+        assert_eq!(RectScanMeta::combine(&[s1, s1, s1, s1]), s1);
+        assert_eq!(RectScanMeta::combine(&[s1, s2]), opq);
+        assert_eq!(RectScanMeta::combine(&[s1, opq]), opq);
+        assert_eq!(RectScanMeta::combine(&[st, st]), st);
+        assert_eq!(RectScanMeta::combine(&[s1, st]), RectScanMeta::UNKNOWN);
+        assert_eq!(
+            RectScanMeta::combine(&[opq, RectScanMeta::UNKNOWN]),
+            RectScanMeta::UNKNOWN
+        );
 
         // Verify public dispatch wrappers end-to-end against uninitialized shadow.
         let tw = 19usize;
@@ -1744,6 +3627,27 @@ mod tests {
         };
         assert_eq!(h_ptr, h_sh);
         assert_eq!(h_ptr, h_copy);
+    }
+
+    /// Full solid-color and `all_opaque` detection sweep across all widths,
+    /// heights, strides, formats, and backends.
+    #[test]
+    #[cfg_attr(miri, ignore)]
+    fn test_tile_hash_solid_and_all_opaque_detection() {
+        let key = TileHashKey::new_random();
+        let widths = [
+            1usize, 2, 3, 4, 7, 15, 16, 17, 31, 32, 33, 63, 64, 65, 128, 256,
+        ];
+        let heights = [1usize, 3, 16, 128];
+
+        for backend in Backend::all_supported() {
+            for &tw in &widths {
+                for &th in &heights {
+                    check_solid_and_opaque_case(backend, &key, tw, th, 0, 0, 0);
+                    check_solid_and_opaque_case(backend, &key, tw, th, 5, 2, 11);
+                }
+            }
+        }
     }
 
     /// Full parity sweep across all required widths/heights, packed & padded
@@ -1814,7 +3718,7 @@ mod tests {
                 h: th as u32,
             };
             let base_hash =
-                unsafe { backend.hash_shadow::<true>(&key, base.as_ptr(), stride, rect) };
+                unsafe { backend.hash_shadow::<true>(&key, base.as_ptr(), stride, rect) }.hash;
 
             let mut total_flips = 0u64;
             let mut n_trials = 0u64;
@@ -1845,7 +3749,8 @@ mod tests {
                 for bit in 0..8u8 {
                     base[pos] ^= 1u8 << bit;
                     let h =
-                        unsafe { backend.hash_shadow::<true>(&key, base.as_ptr(), stride, rect) };
+                        unsafe { backend.hash_shadow::<true>(&key, base.as_ptr(), stride, rect) }
+                            .hash;
                     base[pos] ^= 1u8 << bit;
                     let dist = hamming_distance(base_hash, h);
                     assert!(
@@ -1962,11 +3867,13 @@ mod tests {
             };
             // 2,048 single-bit neighbors of an all-zero 16x16 tile.
             assert!(
-                seen.insert(unsafe { backend.hash_shadow::<true>(&key, tile.as_ptr(), 64, r16) })
+                seen.insert(
+                    unsafe { backend.hash_shadow::<true>(&key, tile.as_ptr(), 64, r16) }.hash
+                )
             );
             for bit_idx in 0..2048usize {
                 tile[bit_idx / 8] ^= 1u8 << (bit_idx % 8);
-                let h = unsafe { backend.hash_shadow::<true>(&key, tile.as_ptr(), 64, r16) };
+                let h = unsafe { backend.hash_shadow::<true>(&key, tile.as_ptr(), 64, r16) }.hash;
                 assert!(
                     seen.insert(h),
                     "{}: collision on 1-bit neighbor {bit_idx}",
@@ -1985,7 +3892,7 @@ mod tests {
                 for dst in tile.as_chunks_mut::<4>().0 {
                     dst.copy_from_slice(&px);
                 }
-                let h = unsafe { backend.hash_shadow::<true>(&key, tile.as_ptr(), 64, r16) };
+                let h = unsafe { backend.hash_shadow::<true>(&key, tile.as_ptr(), 64, r16) }.hash;
                 assert!(
                     seen.insert(h),
                     "{}: collision on solid tile {c}",
@@ -2002,7 +3909,8 @@ mod tests {
                     let r = TileRect { x: 0, y: 0, w, h };
                     let digest = unsafe {
                         backend.hash_shadow::<true>(&key, zeros.as_ptr(), w as usize * 4, r)
-                    };
+                    }
+                    .hash;
                     assert!(
                         seen.insert(digest),
                         "{}: collision on zero tile {w}x{h}",
@@ -2037,7 +3945,8 @@ mod tests {
                         h: 64,
                     },
                 )
-            };
+            }
+            .hash;
             let h_64x128 = unsafe {
                 backend.hash_shadow::<true>(
                     &key_a,
@@ -2050,7 +3959,8 @@ mod tests {
                         h: 128,
                     },
                 )
-            };
+            }
+            .hash;
             assert_ne!(
                 h_128x64,
                 h_64x128,
@@ -2071,7 +3981,8 @@ mod tests {
                         h: 64,
                     },
                 )
-            };
+            }
+            .hash;
             assert_ne!(
                 h_128x64,
                 h_key_b,
@@ -2102,7 +4013,8 @@ mod tests {
                         h: 1,
                     },
                 )
-            };
+            }
+            .hash;
             let parent_16x1 = backend.combine(&key_a, 16, 1, &[q0, q1, q2, q3]);
             assert_ne!(
                 leaf_16x1,

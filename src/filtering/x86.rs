@@ -57,8 +57,9 @@ use crate::filtering::FrameRows;
 use crate::filtering::ScalarKernel;
 use crate::filtering::ScanSubBand;
 use crate::filtering::ShadowRows;
-use crate::filtering::tile_cache::SlotHashes;
+use crate::filtering::tile_cache::SlotScans;
 use crate::filtering::tile_cache::ValidatedCacheHit;
+use crate::filtering::tile_hash::RectScanMeta;
 use crate::prelude::*;
 use crate::serialization::framing::AlphaChannel;
 use crate::serialization::framing::CompressedTile;
@@ -180,6 +181,7 @@ mod avx512 {
     use std::arch::x86_64::_mm512_abs_epi8;
     use std::arch::x86_64::_mm512_add_epi8;
     use std::arch::x86_64::_mm512_add_epi64;
+    use std::arch::x86_64::_mm512_and_si512;
     use std::arch::x86_64::_mm512_bslli_epi128;
     use std::arch::x86_64::_mm512_cmpeq_epi8_mask;
     use std::arch::x86_64::_mm512_cmpneq_epi8_mask;
@@ -201,11 +203,13 @@ mod avx512 {
     use std::arch::x86_64::_mm512_storeu_si512;
     use std::arch::x86_64::_mm512_stream_si512;
     use std::arch::x86_64::_mm512_sub_epi8;
+    use std::arch::x86_64::_mm512_xor_si512;
     use std::arch::x86_64::_mm512_zextsi128_si512;
     use std::mem::MaybeUninit;
 
     use crate::buffer_pointer::BufferPointer;
     use crate::filtering::RowKernel;
+    use crate::filtering::tile_hash::XRGB_ALPHA_MASK_U32;
     use crate::vec4u8::Vec4u8;
 
     /// Opmask selecting the lower 48 bytes (`16` 3-byte BGR pixels) of a ZMM register.
@@ -927,6 +931,65 @@ mod avx512 {
         (first != usize::MAX).then_some((first, last_end))
     }
 
+    #[target_feature(enable = "avx512bw,avx512vl,avx512vbmi")]
+    #[inline]
+    unsafe fn copy_and_scan_row_impl<const HAS_ALPHA: bool>(
+        src: *const u8,
+        dst: *mut u8,
+        n_px: usize,
+        first_word: u32,
+    ) -> (bool, bool) {
+        let lim = (n_px / 16) * 16;
+        // SAFETY: Caller guarantees AVX-512BW, `src` readable and `dst` writable
+        // for `n_px * 4` bytes and non-overlapping.
+        unsafe {
+            let alpha_mask = _mm512_set1_epi32(XRGB_ALPHA_MASK_U32 as i32);
+            let first_vec = _mm512_set1_epi32(first_word as i32);
+            let mut dacc = _mm512_setzero_si512();
+            let mut aand = _mm512_set1_epi8(-1);
+            let mut i = 0usize;
+            while i < lim {
+                let off = i * 4;
+                let r = _mm512_loadu_si512(src.add(off).cast());
+                _mm512_storeu_si512(dst.add(off).cast(), r);
+                let m = if HAS_ALPHA {
+                    r
+                } else {
+                    _mm512_or_si512(r, alpha_mask)
+                };
+                dacc = _mm512_or_si512(dacc, _mm512_xor_si512(m, first_vec));
+                if HAS_ALPHA {
+                    aand = _mm512_and_si512(aand, m);
+                }
+                i += 16;
+            }
+            let mut tail_diff = 0u32;
+            let mut tail_alpha = u32::MAX;
+            for j in lim..n_px {
+                let off = j * 4;
+                let raw = src.add(off).cast::<u32>().read_unaligned();
+                dst.add(off).cast::<u32>().write_unaligned(raw);
+                let canon = if HAS_ALPHA {
+                    raw
+                } else {
+                    raw | XRGB_ALPHA_MASK_U32
+                };
+                tail_diff |= canon ^ first_word;
+                if HAS_ALPHA {
+                    tail_alpha &= canon;
+                }
+            }
+            let solid =
+                tail_diff == 0 && _mm512_cmpneq_epi8_mask(dacc, _mm512_setzero_si512()) == 0;
+            let opaque = !HAS_ALPHA
+                || ((tail_alpha & XRGB_ALPHA_MASK_U32) == XRGB_ALPHA_MASK_U32
+                    && (_mm512_cmpeq_epi8_mask(aand, _mm512_set1_epi8(-1))
+                        & 0x8888_8888_8888_8888)
+                        == 0x8888_8888_8888_8888);
+            (solid, opaque)
+        }
+    }
+
     #[derive(Copy, Clone)]
     pub(super) struct Kernel(());
 
@@ -1068,6 +1131,19 @@ mod avx512 {
         }
 
         #[inline(always)]
+        unsafe fn copy_and_scan_row<const HAS_ALPHA: bool>(
+            self,
+            src: *const u8,
+            dst: *mut u8,
+            n_px: usize,
+            first_word: u32,
+        ) -> (bool, bool) {
+            // SAFETY: `self` witnesses `avx512bw + avx512vl + avx512vbmi` support,
+            // and caller upholds pointer bounds and non-overlapping invariants.
+            unsafe { copy_and_scan_row_impl::<HAS_ALPHA>(src, dst, n_px, first_word) }
+        }
+
+        #[inline(always)]
         fn fence_stream(self) {
             // SAFETY: `_mm_sfence` is baseline SSE (mandatory on all x86_64 CPUs).
             unsafe { _mm_sfence() };
@@ -1101,6 +1177,7 @@ mod avx2 {
     use std::arch::x86_64::_mm256_alignr_epi8;
     use std::arch::x86_64::_mm256_and_si256;
     use std::arch::x86_64::_mm256_castsi256_si128;
+    use std::arch::x86_64::_mm256_cmpeq_epi8;
     use std::arch::x86_64::_mm256_cmpeq_epi32;
     use std::arch::x86_64::_mm256_extracti128_si256;
     use std::arch::x86_64::_mm256_loadu_si256;
@@ -1124,6 +1201,7 @@ mod avx2 {
 
     use crate::buffer_pointer::BufferPointer;
     use crate::filtering::RowKernel;
+    use crate::filtering::tile_hash::XRGB_ALPHA_MASK_U32;
     use crate::vec4u8::Vec4u8;
 
     #[target_feature(enable = "avx2")]
@@ -1769,6 +1847,65 @@ mod avx2 {
         (first != usize::MAX).then_some((first, last_end))
     }
 
+    #[target_feature(enable = "avx2")]
+    #[inline]
+    unsafe fn copy_and_scan_row_impl<const HAS_ALPHA: bool>(
+        src: *const u8,
+        dst: *mut u8,
+        n_px: usize,
+        first_word: u32,
+    ) -> (bool, bool) {
+        let lim = (n_px / 8) * 8;
+        // SAFETY: Caller guarantees AVX2, `src` readable and `dst` writable
+        // for `n_px * 4` bytes and non-overlapping.
+        unsafe {
+            let alpha_mask = _mm256_set1_epi32(XRGB_ALPHA_MASK_U32 as i32);
+            let first_vec = _mm256_set1_epi32(first_word as i32);
+            let mut dacc = _mm256_setzero_si256();
+            let mut aand = _mm256_set1_epi8(-1);
+            let mut i = 0usize;
+            while i < lim {
+                let off = i * 4;
+                let r = _mm256_loadu_si256(src.add(off).cast());
+                _mm256_storeu_si256(dst.add(off).cast(), r);
+                let m = if HAS_ALPHA {
+                    r
+                } else {
+                    _mm256_or_si256(r, alpha_mask)
+                };
+                dacc = _mm256_or_si256(dacc, _mm256_xor_si256(m, first_vec));
+                if HAS_ALPHA {
+                    aand = _mm256_and_si256(aand, m);
+                }
+                i += 8;
+            }
+            let mut tail_diff = 0u32;
+            let mut tail_alpha = u32::MAX;
+            for j in lim..n_px {
+                let off = j * 4;
+                let raw = src.add(off).cast::<u32>().read_unaligned();
+                dst.add(off).cast::<u32>().write_unaligned(raw);
+                let canon = if HAS_ALPHA {
+                    raw
+                } else {
+                    raw | XRGB_ALPHA_MASK_U32
+                };
+                tail_diff |= canon ^ first_word;
+                if HAS_ALPHA {
+                    tail_alpha &= canon;
+                }
+            }
+            let solid = tail_diff == 0 && _mm256_testz_si256(dacc, dacc) != 0;
+            let opaque = !HAS_ALPHA
+                || ((tail_alpha & XRGB_ALPHA_MASK_U32) == XRGB_ALPHA_MASK_U32
+                    && (_mm256_movemask_epi8(_mm256_cmpeq_epi8(aand, _mm256_set1_epi8(-1)))
+                        as u32
+                        & 0x8888_8888)
+                        == 0x8888_8888);
+            (solid, opaque)
+        }
+    }
+
     #[derive(Copy, Clone)]
     pub(super) struct Kernel(());
 
@@ -1910,6 +2047,19 @@ mod avx2 {
         }
 
         #[inline(always)]
+        unsafe fn copy_and_scan_row<const HAS_ALPHA: bool>(
+            self,
+            src: *const u8,
+            dst: *mut u8,
+            n_px: usize,
+            first_word: u32,
+        ) -> (bool, bool) {
+            // SAFETY: `self` witnesses `avx2` support, and caller upholds
+            // pointer bounds and non-overlapping invariants.
+            unsafe { copy_and_scan_row_impl::<HAS_ALPHA>(src, dst, n_px, first_word) }
+        }
+
+        #[inline(always)]
         fn fence_stream(self) {
             // SAFETY: `_mm_sfence` is baseline SSE (mandatory on all x86_64 CPUs).
             unsafe { _mm_sfence() };
@@ -1955,6 +2105,7 @@ mod ssse3 {
 
     use crate::buffer_pointer::BufferPointer;
     use crate::filtering::RowKernel;
+    use crate::filtering::tile_hash::XRGB_ALPHA_MASK_U32;
     use crate::vec4u8::Vec4u8;
 
     #[target_feature(enable = "ssse3")]
@@ -2549,6 +2700,64 @@ mod ssse3 {
         (first != usize::MAX).then_some((first, last_end))
     }
 
+    #[target_feature(enable = "ssse3")]
+    #[inline]
+    unsafe fn copy_and_scan_row_impl<const HAS_ALPHA: bool>(
+        src: *const u8,
+        dst: *mut u8,
+        n_px: usize,
+        first_word: u32,
+    ) -> (bool, bool) {
+        let lim = (n_px / 4) * 4;
+        // SAFETY: Caller guarantees SSSE3, `src` readable and `dst` writable
+        // for `n_px * 4` bytes and non-overlapping.
+        unsafe {
+            let alpha_mask = _mm_set1_epi32(XRGB_ALPHA_MASK_U32 as i32);
+            let first_vec = _mm_set1_epi32(first_word as i32);
+            let mut dacc = _mm_setzero_si128();
+            let mut aand = _mm_set1_epi8(-1);
+            let mut i = 0usize;
+            while i < lim {
+                let off = i * 4;
+                let r = _mm_loadu_si128(src.add(off).cast());
+                _mm_storeu_si128(dst.add(off).cast(), r);
+                let m = if HAS_ALPHA {
+                    r
+                } else {
+                    _mm_or_si128(r, alpha_mask)
+                };
+                dacc = _mm_or_si128(dacc, _mm_xor_si128(m, first_vec));
+                if HAS_ALPHA {
+                    aand = _mm_and_si128(aand, m);
+                }
+                i += 4;
+            }
+            let mut tail_diff = 0u32;
+            let mut tail_alpha = u32::MAX;
+            for j in lim..n_px {
+                let off = j * 4;
+                let raw = src.add(off).cast::<u32>().read_unaligned();
+                dst.add(off).cast::<u32>().write_unaligned(raw);
+                let canon = if HAS_ALPHA {
+                    raw
+                } else {
+                    raw | XRGB_ALPHA_MASK_U32
+                };
+                tail_diff |= canon ^ first_word;
+                if HAS_ALPHA {
+                    tail_alpha &= canon;
+                }
+            }
+            let solid = tail_diff == 0
+                && _mm_movemask_epi8(_mm_cmpeq_epi8(dacc, _mm_setzero_si128())) == 0xFFFF;
+            let opaque = !HAS_ALPHA
+                || ((tail_alpha & XRGB_ALPHA_MASK_U32) == XRGB_ALPHA_MASK_U32
+                    && (_mm_movemask_epi8(_mm_cmpeq_epi8(aand, _mm_set1_epi8(-1))) & 0x8888)
+                        == 0x8888);
+            (solid, opaque)
+        }
+    }
+
     #[derive(Copy, Clone)]
     pub(super) struct Kernel(());
 
@@ -2690,6 +2899,19 @@ mod ssse3 {
         }
 
         #[inline(always)]
+        unsafe fn copy_and_scan_row<const HAS_ALPHA: bool>(
+            self,
+            src: *const u8,
+            dst: *mut u8,
+            n_px: usize,
+            first_word: u32,
+        ) -> (bool, bool) {
+            // SAFETY: `self` witnesses `ssse3` support, and caller upholds
+            // pointer bounds and non-overlapping invariants.
+            unsafe { copy_and_scan_row_impl::<HAS_ALPHA>(src, dst, n_px, first_word) }
+        }
+
+        #[inline(always)]
         fn fence_stream(self) {
             // SAFETY: `_mm_sfence` is baseline SSE (mandatory on all x86_64 CPUs).
             unsafe { _mm_sfence() };
@@ -2719,8 +2941,9 @@ macro_rules! define_tier_wrappers {
             use crate::filtering::FrameRows;
             use crate::filtering::ScanSubBand;
             use crate::filtering::ShadowRows;
-            use crate::filtering::tile_cache::SlotHashes;
+            use crate::filtering::tile_cache::SlotScans;
             use crate::filtering::tile_cache::ValidatedCacheHit;
+            use crate::filtering::tile_hash::RectScanMeta;
             use crate::prelude::*;
             use crate::serialization::framing::AlphaChannel;
             use crate::serialization::framing::CompressedTile;
@@ -2848,6 +3071,25 @@ macro_rules! define_tier_wrappers {
 
             #[target_feature(enable = $feat)]
             #[inline]
+            pub(super) unsafe fn copy_and_scan_rect_to_shadow<const HAS_ALPHA: bool>(
+                src: BufferPointer<u8>,
+                shadow: &ShadowRows,
+                stride: usize,
+                rect: TileRect,
+            ) -> RectScanMeta {
+                // SAFETY: Caller verified CPU feature support via `X86Tier::detect()`
+                // and upheld disjoint-rect shadow invariants.
+                unsafe {
+                    let kernel = super::$tier_mod::Kernel::new_unchecked();
+                    crate::filtering::copy_and_scan_rect_to_shadow_with::<
+                        super::$tier_mod::Kernel,
+                        HAS_ALPHA,
+                    >(kernel, src, shadow, stride, rect)
+                }
+            }
+
+            #[target_feature(enable = $feat)]
+            #[inline]
             pub(super) unsafe fn diff_and_update_worker<const HAS_ALPHA: bool>(
                 data: BufferPointer<u8>,
                 aos: BufferPointer<Vec4u8>,
@@ -2858,7 +3100,7 @@ macro_rules! define_tier_wrappers {
                 n_qx: usize,
                 sub_bands: &[ScanSubBand],
                 dirty_slots: &[AtomicU32],
-                slot_hashes: Option<&SlotHashes>,
+                slot_scans: Option<&SlotScans>,
                 cache_non_empty: bool,
                 next_sub: &AtomicUsize,
             ) {
@@ -2880,7 +3122,7 @@ macro_rules! define_tier_wrappers {
                         n_qx,
                         sub_bands,
                         dirty_slots,
-                        slot_hashes,
+                        slot_scans,
                         cache_non_empty,
                         next_sub,
                     );
@@ -2900,7 +3142,7 @@ macro_rules! define_tier_wrappers {
                 sub_bands: &[ScanSubBand],
                 sr: ScrollRect,
                 dirty_slots: &[AtomicU32],
-                slot_hashes: Option<&SlotHashes>,
+                slot_scans: Option<&SlotScans>,
                 cache_non_empty: bool,
                 next_sub: &AtomicUsize,
             ) {
@@ -2923,7 +3165,7 @@ macro_rules! define_tier_wrappers {
                         sub_bands,
                         sr,
                         dirty_slots,
-                        slot_hashes,
+                        slot_scans,
                         cache_non_empty,
                         next_sub,
                     );
@@ -3406,6 +3648,64 @@ impl X86Tier {
     }
 
     /// # Safety
+    /// Caller must uphold [`super::copy_and_scan_rect_to_shadow_with`] invariants.
+    #[inline(always)]
+    pub(super) unsafe fn copy_and_scan_rect_to_shadow<const HAS_ALPHA: bool>(
+        self,
+        src: BufferPointer<u8>,
+        shadow: &ShadowRows,
+        stride: usize,
+        rect: TileRect,
+    ) -> RectScanMeta {
+        // SAFETY: Each arm's tier witness verifies required CPU features, and
+        // caller upholds disjoint-rect shadow invariants.
+        unsafe {
+            match self {
+                #[cfg(all(
+                    not(target_feature = "ssse3"),
+                    not(target_feature = "avx2"),
+                    not(all(
+                        target_feature = "avx512bw",
+                        target_feature = "avx512vl",
+                        target_feature = "avx512vbmi",
+                    )),
+                ))]
+                Self::Scalar => {
+                    super::copy_and_scan_rect_to_shadow_with::<ScalarKernel, HAS_ALPHA>(
+                        ScalarKernel,
+                        src,
+                        shadow,
+                        stride,
+                        rect,
+                    )
+                },
+                #[cfg(all(
+                    not(target_feature = "avx2"),
+                    not(all(
+                        target_feature = "avx512bw",
+                        target_feature = "avx512vl",
+                        target_feature = "avx512vbmi",
+                    )),
+                ))]
+                Self::Ssse3 => dispatch_ssse3::copy_and_scan_rect_to_shadow::<HAS_ALPHA>(
+                    src, shadow, stride, rect,
+                ),
+                #[cfg(not(all(
+                    target_feature = "avx512bw",
+                    target_feature = "avx512vl",
+                    target_feature = "avx512vbmi",
+                )))]
+                Self::Avx2 => dispatch_avx2::copy_and_scan_rect_to_shadow::<HAS_ALPHA>(
+                    src, shadow, stride, rect,
+                ),
+                Self::Avx512 => dispatch_avx512::copy_and_scan_rect_to_shadow::<HAS_ALPHA>(
+                    src, shadow, stride, rect,
+                ),
+            }
+        }
+    }
+
+    /// # Safety
     /// Caller must uphold [`super::diff_and_update_worker_with`] invariants.
     #[inline(always)]
     pub(super) unsafe fn diff_and_update_worker(
@@ -3420,7 +3720,7 @@ impl X86Tier {
         n_qx: usize,
         sub_bands: &[ScanSubBand],
         dirty_slots: &[AtomicU32],
-        slot_hashes: Option<&SlotHashes>,
+        slot_scans: Option<&SlotScans>,
         cache_non_empty: bool,
         next_sub: &AtomicUsize,
     ) {
@@ -3450,7 +3750,7 @@ impl X86Tier {
                             n_qx,
                             sub_bands,
                             dirty_slots,
-                            slot_hashes,
+                            slot_scans,
                             cache_non_empty,
                             next_sub,
                         );
@@ -3466,7 +3766,7 @@ impl X86Tier {
                             n_qx,
                             sub_bands,
                             dirty_slots,
-                            slot_hashes,
+                            slot_scans,
                             cache_non_empty,
                             next_sub,
                         );
@@ -3492,7 +3792,7 @@ impl X86Tier {
                             n_qx,
                             sub_bands,
                             dirty_slots,
-                            slot_hashes,
+                            slot_scans,
                             cache_non_empty,
                             next_sub,
                         );
@@ -3507,7 +3807,7 @@ impl X86Tier {
                             n_qx,
                             sub_bands,
                             dirty_slots,
-                            slot_hashes,
+                            slot_scans,
                             cache_non_empty,
                             next_sub,
                         );
@@ -3530,7 +3830,7 @@ impl X86Tier {
                             n_qx,
                             sub_bands,
                             dirty_slots,
-                            slot_hashes,
+                            slot_scans,
                             cache_non_empty,
                             next_sub,
                         );
@@ -3545,7 +3845,7 @@ impl X86Tier {
                             n_qx,
                             sub_bands,
                             dirty_slots,
-                            slot_hashes,
+                            slot_scans,
                             cache_non_empty,
                             next_sub,
                         );
@@ -3563,7 +3863,7 @@ impl X86Tier {
                             n_qx,
                             sub_bands,
                             dirty_slots,
-                            slot_hashes,
+                            slot_scans,
                             cache_non_empty,
                             next_sub,
                         );
@@ -3578,7 +3878,7 @@ impl X86Tier {
                             n_qx,
                             sub_bands,
                             dirty_slots,
-                            slot_hashes,
+                            slot_scans,
                             cache_non_empty,
                             next_sub,
                         );
@@ -3604,7 +3904,7 @@ impl X86Tier {
         sub_bands: &[ScanSubBand],
         sr: ScrollRect,
         dirty_slots: &[AtomicU32],
-        slot_hashes: Option<&SlotHashes>,
+        slot_scans: Option<&SlotScans>,
         cache_non_empty: bool,
         next_sub: &AtomicUsize,
     ) {
@@ -3635,7 +3935,7 @@ impl X86Tier {
                             sub_bands,
                             sr,
                             dirty_slots,
-                            slot_hashes,
+                            slot_scans,
                             cache_non_empty,
                             next_sub,
                         );
@@ -3652,7 +3952,7 @@ impl X86Tier {
                             sub_bands,
                             sr,
                             dirty_slots,
-                            slot_hashes,
+                            slot_scans,
                             cache_non_empty,
                             next_sub,
                         );
@@ -3679,7 +3979,7 @@ impl X86Tier {
                             sub_bands,
                             sr,
                             dirty_slots,
-                            slot_hashes,
+                            slot_scans,
                             cache_non_empty,
                             next_sub,
                         );
@@ -3695,7 +3995,7 @@ impl X86Tier {
                             sub_bands,
                             sr,
                             dirty_slots,
-                            slot_hashes,
+                            slot_scans,
                             cache_non_empty,
                             next_sub,
                         );
@@ -3719,7 +4019,7 @@ impl X86Tier {
                             sub_bands,
                             sr,
                             dirty_slots,
-                            slot_hashes,
+                            slot_scans,
                             cache_non_empty,
                             next_sub,
                         );
@@ -3735,7 +4035,7 @@ impl X86Tier {
                             sub_bands,
                             sr,
                             dirty_slots,
-                            slot_hashes,
+                            slot_scans,
                             cache_non_empty,
                             next_sub,
                         );
@@ -3754,7 +4054,7 @@ impl X86Tier {
                             sub_bands,
                             sr,
                             dirty_slots,
-                            slot_hashes,
+                            slot_scans,
                             cache_non_empty,
                             next_sub,
                         );
@@ -3770,7 +4070,7 @@ impl X86Tier {
                             sub_bands,
                             sr,
                             dirty_slots,
-                            slot_hashes,
+                            slot_scans,
                             cache_non_empty,
                             next_sub,
                         );
