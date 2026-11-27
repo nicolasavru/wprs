@@ -575,13 +575,21 @@ pub(crate) trait RowKernel: Copy {
         dst_alpha: &mut [u8],
     );
 
-    fn sad_signed_bytes(self, data: &[u8]) -> u64;
+    /// Computes `(sad(cur), sad(Sub3(cur)))` in one read pass while writing
+    /// `Sub3(cur)` into `dst` (for row 0, where only `None` and `Sub` are valid).
+    fn row_sub3_forward_and_sads(self, cur: &[u8], dst: &mut [u8]) -> (u64, u64);
 
-    fn row_sub3_forward_sad(self, src: &[u8], dst: &mut [u8]) -> u64;
+    /// Computes `[sad(None), sad(Sub), sad(Up), sad(SubUp)]` in a single read
+    /// pass over `(cur, prev)` while speculatively writing `Up(cur, prev)` into
+    /// `dst_up` (skipping a second pass whenever `Up` wins).
+    fn row_up_forward_and_sads_all4(self, cur: &[u8], prev: &[u8], dst_up: &mut [u8]) -> [u64; 4];
 
-    fn row_up_forward_sad(self, cur: &[u8], prev: &[u8], dst: &mut [u8]) -> u64;
+    fn row_sub3_forward(self, src: &[u8], dst: &mut [u8]);
 
-    fn row_subup3_forward_sad(self, cur: &[u8], prev: &[u8], dst: &mut [u8]) -> u64;
+    /// Applies `Sub3` (`buf[j] -= buf[j - 3]`) in place; applied to `dst_up`
+    /// from [`Self::row_up_forward_and_sads_all4`] to materialize `SubUp`
+    /// without re-reading `cur` or `prev`.
+    fn row_sub3_forward_in_place(self, buf: &mut [u8]);
 
     fn row_sub3_inverse(self, src: &[u8], dst: &mut [u8]);
 
@@ -773,58 +781,65 @@ impl RowKernel for ScalarKernel {
     }
 
     #[inline(always)]
-    fn sad_signed_bytes(self, data: &[u8]) -> u64 {
-        data.iter()
-            .map(|&b| u64::from((b as i8).unsigned_abs()))
-            .sum()
+    fn row_sub3_forward_and_sads(self, cur: &[u8], dst: &mut [u8]) -> (u64, u64) {
+        let len = cur.len();
+        debug_assert_eq!(dst.len(), len);
+        let mut s_none = 0u64;
+        let mut s_sub = 0u64;
+        for j in 0..len {
+            let c = cur[j];
+            let p = if j >= 3 { cur[j - 3] } else { 0 };
+            let sub = c.wrapping_sub(p);
+            dst[j] = sub;
+            s_none += u64::from((c as i8).unsigned_abs());
+            s_sub += u64::from((sub as i8).unsigned_abs());
+        }
+        (s_none, s_sub)
     }
 
     #[inline(always)]
-    fn row_sub3_forward_sad(self, src: &[u8], dst: &mut [u8]) -> u64 {
+    fn row_up_forward_and_sads_all4(self, cur: &[u8], prev: &[u8], dst_up: &mut [u8]) -> [u64; 4] {
+        let len = cur.len();
+        debug_assert_eq!(prev.len(), len);
+        debug_assert_eq!(dst_up.len(), len);
+        let mut s_none = 0u64;
+        let mut s_sub = 0u64;
+        let mut s_up = 0u64;
+        let mut s_su = 0u64;
+        for j in 0..len {
+            let c = cur[j];
+            let up = c.wrapping_sub(prev[j]);
+            dst_up[j] = up;
+            let (pc, pu) = if j >= 3 {
+                (cur[j - 3], cur[j - 3].wrapping_sub(prev[j - 3]))
+            } else {
+                (0, 0)
+            };
+            let sub = c.wrapping_sub(pc);
+            let su = up.wrapping_sub(pu);
+            s_none += u64::from((c as i8).unsigned_abs());
+            s_sub += u64::from((sub as i8).unsigned_abs());
+            s_up += u64::from((up as i8).unsigned_abs());
+            s_su += u64::from((su as i8).unsigned_abs());
+        }
+        [s_none, s_sub, s_up, s_su]
+    }
+
+    #[inline(always)]
+    fn row_sub3_forward(self, src: &[u8], dst: &mut [u8]) {
         let len = src.len();
         debug_assert_eq!(dst.len(), len);
-        let mut sum = 0u64;
         for j in 0..len {
             let p = if j >= 3 { src[j - 3] } else { 0 };
-            let d = src[j].wrapping_sub(p);
-            dst[j] = d;
-            sum += u64::from((d as i8).unsigned_abs());
+            dst[j] = src[j].wrapping_sub(p);
         }
-        sum
     }
 
     #[inline(always)]
-    fn row_up_forward_sad(self, cur: &[u8], prev: &[u8], dst: &mut [u8]) -> u64 {
-        let len = cur.len();
-        debug_assert_eq!(prev.len(), len);
-        debug_assert_eq!(dst.len(), len);
-        let mut sum = 0u64;
-        for j in 0..len {
-            let d = cur[j].wrapping_sub(prev[j]);
-            dst[j] = d;
-            sum += u64::from((d as i8).unsigned_abs());
+    fn row_sub3_forward_in_place(self, buf: &mut [u8]) {
+        for j in (3..buf.len()).rev() {
+            buf[j] = buf[j].wrapping_sub(buf[j - 3]);
         }
-        sum
-    }
-
-    #[inline(always)]
-    fn row_subup3_forward_sad(self, cur: &[u8], prev: &[u8], dst: &mut [u8]) -> u64 {
-        let len = cur.len();
-        debug_assert_eq!(prev.len(), len);
-        debug_assert_eq!(dst.len(), len);
-        let mut sum = 0u64;
-        for j in 0..len {
-            let up = cur[j].wrapping_sub(prev[j]);
-            let prev_u = if j >= 3 {
-                cur[j - 3].wrapping_sub(prev[j - 3])
-            } else {
-                0
-            };
-            let d = up.wrapping_sub(prev_u);
-            dst[j] = d;
-            sum += u64::from((d as i8).unsigned_abs());
-        }
-        sum
     }
 
     #[inline(always)]
@@ -1091,42 +1106,37 @@ fn select_and_filter_row<K: RowKernel>(
     cur_raw: &[u8],
     prev_raw: &[u8],
     filt_row: &mut [u8],
-    cand_sub: &mut [u8],
-    cand_up: &mut [u8],
-    cand_su: &mut [u8],
 ) -> u8 {
-    let mut best_p = 0u8;
-    let mut best_cost = kernel.sad_signed_bytes(cur_raw);
-    if best_cost == 0 {
+    if ry == 0 {
+        let (cost_none, cost_sub) = kernel.row_sub3_forward_and_sads(cur_raw, filt_row);
+        if cost_sub < cost_none {
+            return 1;
+        }
         filt_row.copy_from_slice(cur_raw);
         return 0;
     }
 
-    let cost_sub = kernel.row_sub3_forward_sad(cur_raw, cand_sub);
+    let [cost_none, cost_sub, cost_up, cost_su] =
+        kernel.row_up_forward_and_sads_all4(cur_raw, prev_raw, filt_row);
+    let mut best_p = 0u8;
+    let mut best_cost = cost_none;
     if cost_sub < best_cost {
         best_cost = cost_sub;
         best_p = 1;
     }
-    if ry > 0 && best_cost > 0 {
-        let cost_up = kernel.row_up_forward_sad(cur_raw, prev_raw, cand_up);
-        if cost_up < best_cost {
-            best_cost = cost_up;
-            best_p = 2;
-        }
-        if best_cost > 0 {
-            let cost_su = kernel.row_subup3_forward_sad(cur_raw, prev_raw, cand_su);
-            if cost_su < best_cost {
-                best_p = 3;
-            }
-        }
+    if cost_up < best_cost {
+        best_cost = cost_up;
+        best_p = 2;
     }
-    let chosen: &[u8] = match best_p {
-        0 => cur_raw,
-        1 => cand_sub,
-        2 => cand_up,
-        _ => cand_su,
-    };
-    filt_row.copy_from_slice(chosen);
+    if cost_su < best_cost {
+        best_p = 3;
+    }
+    match best_p {
+        0 => filt_row.copy_from_slice(cur_raw),
+        1 => kernel.row_sub3_forward(cur_raw, filt_row),
+        2 => {},
+        _ => kernel.row_sub3_forward_in_place(filt_row),
+    }
     best_p
 }
 
@@ -1269,11 +1279,8 @@ fn filter_aos_zstd_leaf_with<K: RowKernel, const HAS_ALPHA: bool>(
     let row_b = tw * 3;
     let total_b = row_b * th;
     ensure_len(&mut state.raw_row_a, row_b);
-    ensure_len(&mut state.cand_sub, row_b);
     if th > 1 {
         ensure_len(&mut state.raw_row_b, row_b);
-        ensure_len(&mut state.cand_up, row_b);
-        ensure_len(&mut state.cand_su, row_b);
     }
     if HAS_ALPHA {
         ensure_len(&mut state.raw_alpha, TILE_PIXELS);
@@ -1282,9 +1289,6 @@ fn filter_aos_zstd_leaf_with<K: RowKernel, const HAS_ALPHA: bool>(
     let raw_row_a = &mut state.raw_row_a[..row_b];
     let raw_row_b = &mut state.raw_row_b[..if th > 1 { row_b } else { 0 }];
     let filt_bgr = &mut state.filt_bgr[..total_b];
-    let cand_sub = &mut state.cand_sub[..row_b];
-    let cand_up = &mut state.cand_up[..if th > 1 { row_b } else { 0 }];
-    let cand_su = &mut state.cand_su[..if th > 1 { row_b } else { 0 }];
     let raw_alpha = &mut state.raw_alpha[..if HAS_ALPHA { tw * th } else { 0 }];
 
     let mut predictors = vec![0u8; th.div_ceil(4)];
@@ -1310,9 +1314,7 @@ fn filter_aos_zstd_leaf_with<K: RowKernel, const HAS_ALPHA: bool>(
             kernel.bgra_to_subgreen_bgr3::<false>(row_ptr, cur_raw, &mut []);
         }
 
-        let best_p = select_and_filter_row::<K>(
-            kernel, ry, cur_raw, prev_raw, filt_row, cand_sub, cand_up, cand_su,
-        );
+        let best_p = select_and_filter_row::<K>(kernel, ry, cur_raw, prev_raw, filt_row);
         predictors[ry >> 2] |= best_p << ((ry & 3) * 2);
         use_a = !use_a;
     }
@@ -5376,45 +5378,79 @@ mod tests {
             kernel.bgra_to_subgreen_bgr3::<true>(bp1, &mut bgr1_a, &mut alp1_a);
             assert_eq!(bgr1_a, bgr1_s);
 
+            // Fused row-0 (`None`/`Sub`) and 4-predictor SADs + forward/inverse.
+            let (mut f_s, mut f_a) = (vec![0u8; row_b], vec![0u8; row_b]);
             assert_eq!(
-                kernel.sad_signed_bytes(&bgr0_a),
-                ScalarKernel.sad_signed_bytes(&bgr0_s),
-                "[{tier_name}] sad_signed_bytes tw={tw}"
+                kernel.row_sub3_forward_and_sads(&bgr0_a, &mut f_a),
+                ScalarKernel.row_sub3_forward_and_sads(&bgr0_s, &mut f_s),
+                "[{tier_name}] row_sub3_forward_and_sads tw={tw}"
+            );
+            assert_eq!(f_a, f_s, "[{tier_name}] sub3 fwd_and_sads out tw={tw}");
+
+            let (mut up_s, mut up_a) = (vec![0xBBu8; row_b], vec![0xBBu8; row_b]);
+            assert_eq!(
+                kernel.row_up_forward_and_sads_all4(&bgr1_a, &bgr0_a, &mut up_a),
+                ScalarKernel.row_up_forward_and_sads_all4(&bgr1_s, &bgr0_s, &mut up_s),
+                "[{tier_name}] row_up_forward_and_sads_all4 tw={tw}"
+            );
+            assert_eq!(
+                up_a, up_s,
+                "[{tier_name}] row_up_forward_and_sads_all4 out tw={tw}"
             );
 
             // Sub3 forward + inverse
-            let (mut f_s, mut f_a) = (vec![0u8; row_b], vec![0u8; row_b]);
-            assert_eq!(
-                kernel.row_sub3_forward_sad(&bgr0_a, &mut f_a),
-                ScalarKernel.row_sub3_forward_sad(&bgr0_s, &mut f_s),
-                "[{tier_name}] sub3 sad tw={tw}"
-            );
+            f_a.fill(0xAA);
+            f_s.fill(0xAA);
+            kernel.row_sub3_forward(&bgr0_a, &mut f_a);
+            ScalarKernel.row_sub3_forward(&bgr0_s, &mut f_s);
             assert_eq!(f_a, f_s, "[{tier_name}] sub3 fwd tw={tw}");
             let mut inv = vec![0xAAu8; row_b];
             kernel.row_sub3_inverse(&f_a, &mut inv);
             assert_eq!(inv, bgr0_s, "[{tier_name}] sub3 inv tw={tw}");
 
             // Up forward + inverse
-            assert_eq!(
-                kernel.row_up_forward_sad(&bgr1_a, &bgr0_a, &mut f_a),
-                ScalarKernel.row_up_forward_sad(&bgr1_s, &bgr0_s, &mut f_s),
-                "[{tier_name}] up sad tw={tw}"
-            );
+            f_a.fill(0xAA);
+            f_s.fill(0xAA);
+            kernel.row_up_forward(&bgr1_a, &bgr0_a, &mut f_a);
+            ScalarKernel.row_up_forward(&bgr1_s, &bgr0_s, &mut f_s);
             assert_eq!(f_a, f_s, "[{tier_name}] up fwd tw={tw}");
             inv.fill(0xAA);
             kernel.row_up_inverse(&f_a, &bgr0_a, &mut inv);
             assert_eq!(inv, bgr1_s, "[{tier_name}] up inv tw={tw}");
 
-            // SubUp3 forward + inverse
-            assert_eq!(
-                kernel.row_subup3_forward_sad(&bgr1_a, &bgr0_a, &mut f_a),
-                ScalarKernel.row_subup3_forward_sad(&bgr1_s, &bgr0_s, &mut f_s),
-                "[{tier_name}] subup3 sad tw={tw}"
-            );
-            assert_eq!(f_a, f_s, "[{tier_name}] subup3 fwd tw={tw}");
+            // Sub3 in-place (on `up` -> produces `SubUp3`) + inverse
+            let mut su_a = up_a.clone();
+            let mut su_s = up_s.clone();
+            kernel.row_sub3_forward_in_place(&mut su_a);
+            ScalarKernel.row_sub3_forward_in_place(&mut su_s);
+            assert_eq!(su_a, su_s, "[{tier_name}] sub3 in-place tw={tw}");
             inv.fill(0xAA);
-            kernel.row_subup3_inverse(&f_a, &bgr0_a, &mut inv);
+            kernel.row_subup3_inverse(&su_a, &bgr0_a, &mut inv);
             assert_eq!(inv, bgr1_s, "[{tier_name}] subup3 inv tw={tw}");
+
+            // End-to-end `select_and_filter_row` parity for row 0 and row > 0.
+            let (mut sel_s, mut sel_a) = (vec![0xAAu8; row_b], vec![0xAAu8; row_b]);
+            let p0_s = select_and_filter_row(ScalarKernel, 0, &bgr0_s, &[], &mut sel_s);
+            let p0_a = select_and_filter_row(kernel, 0, &bgr0_a, &[], &mut sel_a);
+            assert_eq!(
+                p0_a, p0_s,
+                "[{tier_name}] select_and_filter row 0 p tw={tw}"
+            );
+            assert_eq!(
+                sel_a, sel_s,
+                "[{tier_name}] select_and_filter row 0 out tw={tw}"
+            );
+
+            let p1_s = select_and_filter_row(ScalarKernel, 1, &bgr1_s, &bgr0_s, &mut sel_s);
+            let p1_a = select_and_filter_row(kernel, 1, &bgr1_a, &bgr0_a, &mut sel_a);
+            assert_eq!(
+                p1_a, p1_s,
+                "[{tier_name}] select_and_filter row 1 p tw={tw}"
+            );
+            assert_eq!(
+                sel_a, sel_s,
+                "[{tier_name}] select_and_filter row 1 out tw={tw}"
+            );
 
             // Sub1 & Up on alpha plane
             let (mut af_s, mut af_a) = (vec![0u8; tw], vec![0u8; tw]);
@@ -5711,14 +5747,135 @@ mod tests {
             );
             assert_eq!(dst_k, row_tr);
         }
+        // Exhaustive width sweep (`0..=256`, covering every SIMD main-loop,
+        // 16B/8px/4px tail, and scalar-tail boundary) for `bgra_to_subgreen_bgr3`
+        // and the fused 4-predictor selector/filter, plus `i8::MIN` (`0x80`) and
+        // exact tie-breaking parity checks.
+        for tw in 0..=256usize {
+            let row_b = tw * 3;
+            let raw0: Vec<Vec4u8> = (0..tw)
+                .map(|i| {
+                    let k = (i * 37 + tw * 13 + 1) as u32;
+                    Vec4u8(
+                        ((k * 19 + 3) & 0xFF) as u8,
+                        ((k * 11 + 128) & 0xFF) as u8,
+                        ((k * 23 + 77) & 0xFF) as u8,
+                        ((k * 7 + 19) & 0xFF) as u8,
+                    )
+                })
+                .collect();
+            let raw1: Vec<Vec4u8> = (0..tw)
+                .map(|i| {
+                    let k = (i * 41 + tw * 5 + 9) as u32;
+                    Vec4u8(
+                        ((k * 13 + 128) & 0xFF) as u8,
+                        ((k * 29 + 7) & 0xFF) as u8,
+                        ((k * 17 + 211) & 0xFF) as u8,
+                        ((k * 31 + 55) & 0xFF) as u8,
+                    )
+                })
+                .collect();
+            let p0 = raw0.as_ptr();
+            let p1 = raw1.as_ptr();
+            let bp0 = unsafe { BufferPointer::new(&p0, tw) };
+            let bp1 = unsafe { BufferPointer::new(&p1, tw) };
+
+            let (mut bgr0_s, mut bgr0_a) = (vec![0xCCu8; row_b], vec![0xCCu8; row_b]);
+            let (mut bgr1_s, mut bgr1_a) = (vec![0xCCu8; row_b], vec![0xCCu8; row_b]);
+            let (mut alp0_s, mut alp0_a) = (vec![0xCCu8; tw], vec![0xCCu8; tw]);
+            ScalarKernel.bgra_to_subgreen_bgr3::<true>(bp0, &mut bgr0_s, &mut alp0_s);
+            kernel.bgra_to_subgreen_bgr3::<true>(bp0, &mut bgr0_a, &mut alp0_a);
+            assert_eq!(bgr0_a, bgr0_s, "[{tier_name}] sweep subgreen<true> tw={tw}");
+            assert_eq!(alp0_a, alp0_s, "[{tier_name}] sweep alpha tw={tw}");
+
+            let mut bgr0_noa = vec![0xCCu8; row_b];
+            kernel.bgra_to_subgreen_bgr3::<false>(bp0, &mut bgr0_noa, &mut []);
+            assert_eq!(
+                bgr0_noa, bgr0_s,
+                "[{tier_name}] sweep subgreen<false> tw={tw}"
+            );
+
+            ScalarKernel.bgra_to_subgreen_bgr3::<false>(bp1, &mut bgr1_s, &mut []);
+            kernel.bgra_to_subgreen_bgr3::<false>(bp1, &mut bgr1_a, &mut []);
+            assert_eq!(bgr1_a, bgr1_s, "[{tier_name}] sweep subgreen row1 tw={tw}");
+
+            let (mut up_s, mut up_a) = (vec![0xBBu8; row_b], vec![0xBBu8; row_b]);
+            assert_eq!(
+                kernel.row_up_forward_and_sads_all4(&bgr1_a, &bgr0_a, &mut up_a),
+                ScalarKernel.row_up_forward_and_sads_all4(&bgr1_s, &bgr0_s, &mut up_s),
+                "[{tier_name}] sweep row_up_forward_and_sads_all4 tw={tw}"
+            );
+            assert_eq!(up_a, up_s, "[{tier_name}] sweep up_out tw={tw}");
+
+            let (mut ip_s, mut ip_a) = (up_s.clone(), up_a.clone());
+            kernel.row_sub3_forward_in_place(&mut ip_a);
+            ScalarKernel.row_sub3_forward_in_place(&mut ip_s);
+            assert_eq!(
+                ip_a, ip_s,
+                "[{tier_name}] sweep row_sub3_forward_in_place tw={tw}"
+            );
+
+            let (mut o_s, mut o_a) = (vec![0xAAu8; row_b], vec![0xAAu8; row_b]);
+            let m0_s = select_and_filter_row(ScalarKernel, 0, &bgr0_s, &[], &mut o_s);
+            let m0_a = select_and_filter_row(kernel, 0, &bgr0_a, &[], &mut o_a);
+            assert_eq!(m0_a, m0_s, "[{tier_name}] sweep sel r0 mode tw={tw}");
+            assert_eq!(o_a, o_s, "[{tier_name}] sweep sel r0 out tw={tw}");
+
+            let m1_s = select_and_filter_row(ScalarKernel, 1, &bgr1_s, &bgr0_s, &mut o_s);
+            let m1_a = select_and_filter_row(kernel, 1, &bgr1_a, &bgr0_a, &mut o_a);
+            assert_eq!(m1_a, m1_s, "[{tier_name}] sweep sel r1 mode tw={tw}");
+            assert_eq!(o_a, o_s, "[{tier_name}] sweep sel r1 out tw={tw}");
+
+            // Force each predictor (`0=None`, `1=Sub`, `2=Up`, `3=SubUp`) and
+            // exact ties at 0 (`zeros`) to verify strict `<` tie-breaking.
+            let zeros = vec![0u8; row_b];
+            let (mut z_s, mut z_a) = (vec![0xEEu8; row_b], vec![0xEEu8; row_b]);
+            assert_eq!(select_and_filter_row(kernel, 0, &zeros, &[], &mut z_a), 0);
+            assert_eq!(z_a, zeros);
+            assert_eq!(
+                select_and_filter_row(kernel, 1, &zeros, &zeros, &mut z_a),
+                0
+            );
+            assert_eq!(z_a, zeros);
+
+            // Constant non-zero row over zero prev -> Sub wins (`cost_sub = 3*v < cost_none = row_b*v`)
+            // and equals SubUp (`Sub == SubUp`), so strict `<` must pick `1` (`Sub`).
+            let const_row = vec![5u8; row_b];
+            let p_cs = select_and_filter_row(ScalarKernel, 1, &const_row, &zeros, &mut z_s);
+            let p_ca = select_and_filter_row(kernel, 1, &const_row, &zeros, &mut z_a);
+            assert_eq!(p_ca, p_cs, "[{tier_name}] tie Sub==SubUp tw={tw}");
+            assert_eq!(z_a, z_s, "[{tier_name}] tie Sub==SubUp out tw={tw}");
+
+            // Identical cur == prev -> Up == SubUp == 0 < None/Sub, strict `<` picks `2` (`Up`).
+            let p_us = select_and_filter_row(ScalarKernel, 1, &bgr0_s, &bgr0_s, &mut z_s);
+            let p_ua = select_and_filter_row(kernel, 1, &bgr0_a, &bgr0_a, &mut z_a);
+            assert_eq!(p_ua, p_us, "[{tier_name}] tie Up==SubUp==0 tw={tw}");
+            assert_eq!(z_a, z_s, "[{tier_name}] tie Up==SubUp==0 out tw={tw}");
+
+            // Linear ramp shifted by constant delta from prev -> `Up` is constant,
+            // so `SubUp` wins (`3`) for `tw >= 2`.
+            let ramp_prev: Vec<u8> = (0..row_b).map(|j| ((j * 7) & 0xFF) as u8).collect();
+            let ramp_cur: Vec<u8> = ramp_prev.iter().map(|&b| b.wrapping_add(11)).collect();
+            let p_sus = select_and_filter_row(ScalarKernel, 1, &ramp_cur, &ramp_prev, &mut z_s);
+            let p_sua = select_and_filter_row(kernel, 1, &ramp_cur, &ramp_prev, &mut z_a);
+            assert_eq!(p_sua, p_sus, "[{tier_name}] SubUp winner tw={tw}");
+            assert_eq!(z_a, z_s, "[{tier_name}] SubUp winner out tw={tw}");
+        }
+
         // `i8::MIN` (`0x80` = `-128`) unsigned abs must equal `128` across all backends
         // (covers 16B, 32B, and 64B SIMD loops plus scalar tails).
         let min_bytes = [0x80u8; 73];
+        let zero_bytes = [0u8; 73];
+        let mut min_dst = [0u8; 73];
+        let (min_none, min_sub) = kernel.row_sub3_forward_and_sads(&min_bytes, &mut min_dst);
+        assert_eq!(min_none, 73 * 128, "[{tier_name}] i8::MIN row0 none sad");
+        assert_eq!(min_sub, 3 * 128, "[{tier_name}] i8::MIN row0 sub sad");
         assert_eq!(
-            kernel.sad_signed_bytes(&min_bytes),
-            73 * 128,
-            "[{tier_name}] i8::MIN sad"
+            kernel.row_up_forward_and_sads_all4(&min_bytes, &zero_bytes, &mut min_dst),
+            [73 * 128, 3 * 128, 73 * 128, 3 * 128],
+            "[{tier_name}] i8::MIN all4 sads"
         );
+        assert_eq!(min_dst, min_bytes, "[{tier_name}] i8::MIN up out");
         assert_eq!(kernel.is_constant_plane(&[]), None);
 
         // Palette SIMD validation, packing, and 1/2/4/8-bpp row decoding
@@ -11930,16 +12087,10 @@ mod tests {
         assert_eq!(cli.used_bytes(), 0);
         assert_eq!(cli.capacity_bytes(), 0);
 
-        // 3. `select_and_filter_row` with reusable candidate scratch across
-        //    short cropped (`tw < 256`), full `256`, and wide 1D strip (`tw > 256`).
-        let mut cand_sub = vec![0u8; TILE_W * 3];
-        let mut cand_up = vec![0u8; TILE_W * 3];
-        let mut cand_su = vec![0u8; TILE_W * 3];
+        // 3. `select_and_filter_row` across short cropped (`tw < 256`),
+        //    full `256`, and wide 1D strip (`tw > 256`).
         for tw in [1usize, 7, 16, 128, 256, 300] {
             let row_b = tw * 3;
-            ensure_len(&mut cand_sub, row_b);
-            ensure_len(&mut cand_up, row_b);
-            ensure_len(&mut cand_su, row_b);
             let row0 = test_vec(row_b);
             let row1: Vec<u8> = row0
                 .iter()
@@ -11948,27 +12099,9 @@ mod tests {
                 .collect();
             let mut filt0 = vec![0u8; row_b];
             let mut filt1 = vec![0u8; row_b];
-            let p0 = select_and_filter_row(
-                ScalarKernel,
-                0,
-                &row0,
-                &[],
-                &mut filt0,
-                &mut cand_sub[..row_b],
-                &mut [],
-                &mut [],
-            );
+            let p0 = select_and_filter_row(ScalarKernel, 0, &row0, &[], &mut filt0);
             assert!(p0 < 2, "row 0 predictor must be None or Sub, got {p0}");
-            let p1 = select_and_filter_row(
-                ScalarKernel,
-                1,
-                &row1,
-                &row0,
-                &mut filt1,
-                &mut cand_sub[..row_b],
-                &mut cand_up[..row_b],
-                &mut cand_su[..row_b],
-            );
+            let p1 = select_and_filter_row(ScalarKernel, 1, &row1, &row0, &mut filt1);
 
             let mut dec0 = vec![0u8; row_b];
             match p0 {

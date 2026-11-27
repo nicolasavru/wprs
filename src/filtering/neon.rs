@@ -27,6 +27,7 @@
 //! `unsafe` unless the *caller* also carries a matching `#[target_feature]`
 //! annotation — the compilation target's default features alone do not suffice.
 
+use std::arch::aarch64::uint8x8x3_t;
 use std::arch::aarch64::uint8x16_t;
 use std::arch::aarch64::uint8x16x3_t;
 use std::arch::aarch64::uint8x16x4_t;
@@ -52,6 +53,7 @@ use std::arch::aarch64::vld1q_u8;
 use std::arch::aarch64::vld1q_u32;
 use std::arch::aarch64::vld2q_u8;
 use std::arch::aarch64::vld3q_u8;
+use std::arch::aarch64::vld4_u8;
 use std::arch::aarch64::vld4q_u8;
 use std::arch::aarch64::vmaxq_u8;
 use std::arch::aarch64::vmaxvq_u8;
@@ -68,9 +70,12 @@ use std::arch::aarch64::vreinterpretq_u32_u8;
 use std::arch::aarch64::vshlq_n_u8;
 use std::arch::aarch64::vshr_n_u8;
 use std::arch::aarch64::vshrq_n_u8;
+use std::arch::aarch64::vst1_u8;
 use std::arch::aarch64::vst1q_u8;
+use std::arch::aarch64::vst3_u8;
 use std::arch::aarch64::vst3q_u8;
 use std::arch::aarch64::vst4q_u8;
+use std::arch::aarch64::vsub_u8;
 use std::arch::aarch64::vsubq_u8;
 use std::arch::aarch64::vtstq_u8;
 use std::arch::aarch64::vtstq_u32;
@@ -148,8 +153,8 @@ impl RowKernel for Kernel {
 
         let lim = (tw / 16) * 16;
         let mut x = 0usize;
-        // SAFETY: `x + 16 <= tw`, so `vld4q_u8` reads 64 bytes in bounds,
-        // `vst3q_u8` writes 48 bytes in bounds, and `vst1q_u8` writes 16 bytes in bounds.
+        // SAFETY: `x + 16 <= tw` in the loop and `x + 8 <= tw` in the 8-pixel
+        // tail, so all structure loads/stores stay strictly in bounds.
         unsafe {
             let src_base = src.ptr().cast::<u8>();
             while x < lim {
@@ -163,14 +168,25 @@ impl RowKernel for Kernel {
                 }
                 x += 16;
             }
+            if x + 8 <= tw {
+                let px = vld4_u8(src_base.add(x * 4));
+                let b = vsub_u8(px.0, px.1);
+                let g = px.1;
+                let r = vsub_u8(px.2, px.1);
+                vst3_u8(dst_bgr.as_mut_ptr().add(x * 3), uint8x8x3_t(b, g, r));
+                if HAS_ALPHA {
+                    vst1_u8(dst_alpha.as_mut_ptr().add(x), px.3);
+                }
+                x += 8;
+            }
         }
-        for (off, bgr) in dst_bgr[lim * 3..]
+        for (off, bgr) in dst_bgr[x * 3..]
             .as_chunks_mut::<3>()
             .0
             .iter_mut()
             .enumerate()
         {
-            let i = lim + off;
+            let i = x + off;
             // SAFETY: `i < tw == src.len()`.
             let px = unsafe { src.ptr().add(i).read() };
             bgr[0] = px.0.wrapping_sub(px.1);
@@ -183,134 +199,159 @@ impl RowKernel for Kernel {
     }
 
     #[inline(always)]
-    fn sad_signed_bytes(self, data: &[u8]) -> u64 {
-        let mut sum = 0u64;
-        for block in data.chunks(SAD_CHUNK_BYTES) {
-            let lim = (block.len() / 16) * 16;
-            // SAFETY: NEON is mandatory on AArch64 and `i + 16 <= block.len()`.
-            unsafe {
-                let mut acc = vdupq_n_u32(0);
-                let mut i = 0usize;
-                while i < lim {
-                    let v = vld1q_u8(block.as_ptr().add(i));
-                    acc = vpadalq_u16(acc, vpaddlq_u8(abs_signed_u8(v)));
-                    i += 16;
-                }
-                sum += u64::from(vaddvq_u32(acc));
-            }
-            for &b in &block[lim..] {
-                sum += u64::from((b as i8).unsigned_abs());
-            }
-        }
-        sum
-    }
-
-    #[inline(always)]
-    fn row_sub3_forward_sad(self, src: &[u8], dst: &mut [u8]) -> u64 {
-        let len = src.len();
+    fn row_sub3_forward_and_sads(self, cur: &[u8], dst: &mut [u8]) -> (u64, u64) {
+        let len = cur.len();
         debug_assert_eq!(dst.len(), len);
         let lim = (len / 16) * 16;
-        let mut sum = 0u64;
+        let mut s_none = 0u64;
+        let mut s_sub = 0u64;
         // SAFETY: NEON is mandatory on AArch64 and `i + 16 <= len`.
         unsafe {
             let mut prev = vdupq_n_u8(0);
             let mut i = 0usize;
             while i < lim {
                 let chunk_end = (i + SAD_CHUNK_BYTES).min(lim);
-                let mut acc = vdupq_n_u32(0);
-                while i < chunk_end {
-                    let v = vld1q_u8(src.as_ptr().add(i));
-                    let shifted = vextq_u8::<13>(prev, v);
-                    let diff = vsubq_u8(v, shifted);
-                    prev = v;
-                    vst1q_u8(dst.as_mut_ptr().add(i), diff);
-                    acc = vpadalq_u16(acc, vpaddlq_u8(abs_signed_u8(diff)));
-                    i += 16;
-                }
-                sum += u64::from(vaddvq_u32(acc));
-            }
-        }
-        for j in lim..len {
-            let p = if j >= 3 { src[j - 3] } else { 0 };
-            let d = src[j].wrapping_sub(p);
-            dst[j] = d;
-            sum += u64::from((d as i8).unsigned_abs());
-        }
-        sum
-    }
-
-    #[inline(always)]
-    fn row_up_forward_sad(self, cur: &[u8], prev: &[u8], dst: &mut [u8]) -> u64 {
-        let len = cur.len();
-        debug_assert_eq!(prev.len(), len);
-        debug_assert_eq!(dst.len(), len);
-        let lim = (len / 16) * 16;
-        let mut sum = 0u64;
-        // SAFETY: NEON is mandatory on AArch64 and `i + 16 <= len`.
-        unsafe {
-            let mut i = 0usize;
-            while i < lim {
-                let chunk_end = (i + SAD_CHUNK_BYTES).min(lim);
-                let mut acc = vdupq_n_u32(0);
+                let mut acc_none = vdupq_n_u32(0);
+                let mut acc_sub = vdupq_n_u32(0);
                 while i < chunk_end {
                     let c = vld1q_u8(cur.as_ptr().add(i));
-                    let u = vld1q_u8(prev.as_ptr().add(i));
-                    let diff = vsubq_u8(c, u);
-                    vst1q_u8(dst.as_mut_ptr().add(i), diff);
-                    acc = vpadalq_u16(acc, vpaddlq_u8(abs_signed_u8(diff)));
+                    let shifted = vextq_u8::<13>(prev, c);
+                    let sub = vsubq_u8(c, shifted);
+                    prev = c;
+                    vst1q_u8(dst.as_mut_ptr().add(i), sub);
+                    acc_none = vpadalq_u16(acc_none, vpaddlq_u8(abs_signed_u8(c)));
+                    acc_sub = vpadalq_u16(acc_sub, vpaddlq_u8(abs_signed_u8(sub)));
                     i += 16;
                 }
-                sum += u64::from(vaddvq_u32(acc));
+                s_none += u64::from(vaddvq_u32(acc_none));
+                s_sub += u64::from(vaddvq_u32(acc_sub));
             }
         }
         for j in lim..len {
-            let d = cur[j].wrapping_sub(prev[j]);
-            dst[j] = d;
-            sum += u64::from((d as i8).unsigned_abs());
+            let c = cur[j];
+            let p = if j >= 3 { cur[j - 3] } else { 0 };
+            let sub = c.wrapping_sub(p);
+            dst[j] = sub;
+            s_none += u64::from((c as i8).unsigned_abs());
+            s_sub += u64::from((sub as i8).unsigned_abs());
         }
-        sum
+        (s_none, s_sub)
     }
 
     #[inline(always)]
-    fn row_subup3_forward_sad(self, cur: &[u8], prev: &[u8], dst: &mut [u8]) -> u64 {
+    fn row_up_forward_and_sads_all4(self, cur: &[u8], prev: &[u8], dst_up: &mut [u8]) -> [u64; 4] {
         let len = cur.len();
         debug_assert_eq!(prev.len(), len);
-        debug_assert_eq!(dst.len(), len);
+        debug_assert_eq!(dst_up.len(), len);
         let lim = (len / 16) * 16;
-        let mut sum = 0u64;
+        let mut s_none = 0u64;
+        let mut s_sub = 0u64;
+        let mut s_up = 0u64;
+        let mut s_su = 0u64;
         // SAFETY: NEON is mandatory on AArch64 and `i + 16 <= len`.
         unsafe {
+            let mut prev_c = vdupq_n_u8(0);
             let mut prev_up = vdupq_n_u8(0);
             let mut i = 0usize;
             while i < lim {
                 let chunk_end = (i + SAD_CHUNK_BYTES).min(lim);
-                let mut acc = vdupq_n_u32(0);
+                let mut acc0 = vdupq_n_u32(0);
+                let mut acc1 = vdupq_n_u32(0);
+                let mut acc2 = vdupq_n_u32(0);
+                let mut acc3 = vdupq_n_u32(0);
                 while i < chunk_end {
                     let c = vld1q_u8(cur.as_ptr().add(i));
                     let u = vld1q_u8(prev.as_ptr().add(i));
                     let up = vsubq_u8(c, u);
-                    let shifted = vextq_u8::<13>(prev_up, up);
-                    let diff = vsubq_u8(up, shifted);
+                    vst1q_u8(dst_up.as_mut_ptr().add(i), up);
+                    let sub = vsubq_u8(c, vextq_u8::<13>(prev_c, c));
+                    let su = vsubq_u8(up, vextq_u8::<13>(prev_up, up));
+                    prev_c = c;
                     prev_up = up;
-                    vst1q_u8(dst.as_mut_ptr().add(i), diff);
-                    acc = vpadalq_u16(acc, vpaddlq_u8(abs_signed_u8(diff)));
+                    acc0 = vpadalq_u16(acc0, vpaddlq_u8(abs_signed_u8(c)));
+                    acc1 = vpadalq_u16(acc1, vpaddlq_u8(abs_signed_u8(sub)));
+                    acc2 = vpadalq_u16(acc2, vpaddlq_u8(abs_signed_u8(up)));
+                    acc3 = vpadalq_u16(acc3, vpaddlq_u8(abs_signed_u8(su)));
                     i += 16;
                 }
-                sum += u64::from(vaddvq_u32(acc));
+                s_none += u64::from(vaddvq_u32(acc0));
+                s_sub += u64::from(vaddvq_u32(acc1));
+                s_up += u64::from(vaddvq_u32(acc2));
+                s_su += u64::from(vaddvq_u32(acc3));
             }
         }
         for j in lim..len {
-            let up = cur[j].wrapping_sub(prev[j]);
-            let prev_u = if j >= 3 {
-                cur[j - 3].wrapping_sub(prev[j - 3])
+            let c = cur[j];
+            let up = c.wrapping_sub(prev[j]);
+            dst_up[j] = up;
+            let (pc, pu) = if j >= 3 {
+                (cur[j - 3], cur[j - 3].wrapping_sub(prev[j - 3]))
             } else {
-                0
+                (0, 0)
             };
-            let d = up.wrapping_sub(prev_u);
-            dst[j] = d;
-            sum += u64::from((d as i8).unsigned_abs());
+            let sub = c.wrapping_sub(pc);
+            let su = up.wrapping_sub(pu);
+            s_none += u64::from((c as i8).unsigned_abs());
+            s_sub += u64::from((sub as i8).unsigned_abs());
+            s_up += u64::from((up as i8).unsigned_abs());
+            s_su += u64::from((su as i8).unsigned_abs());
         }
-        sum
+        [s_none, s_sub, s_up, s_su]
+    }
+
+    #[inline(always)]
+    fn row_sub3_forward(self, src: &[u8], dst: &mut [u8]) {
+        let len = src.len();
+        debug_assert_eq!(dst.len(), len);
+        let lim = (len / 16) * 16;
+        // SAFETY: NEON is mandatory on AArch64 and `i + 16 <= len`.
+        unsafe {
+            let mut prev = vdupq_n_u8(0);
+            let mut i = 0usize;
+            while i < lim {
+                let v = vld1q_u8(src.as_ptr().add(i));
+                let shifted = vextq_u8::<13>(prev, v);
+                vst1q_u8(dst.as_mut_ptr().add(i), vsubq_u8(v, shifted));
+                prev = v;
+                i += 16;
+            }
+        }
+        for j in lim..len {
+            let p = if j >= 3 { src[j - 3] } else { 0 };
+            dst[j] = src[j].wrapping_sub(p);
+        }
+    }
+
+    #[inline(always)]
+    fn row_sub3_forward_in_place(self, buf: &mut [u8]) {
+        let len = buf.len();
+        let mut i = len;
+        // SAFETY: NEON is mandatory on AArch64; backwards 16-byte steps write
+        // `i..i + 16` strictly above all subsequent reads `..i`.
+        unsafe {
+            let p = buf.as_mut_ptr();
+            while i >= 19 {
+                i -= 16;
+                let v = vld1q_u8(p.add(i));
+                let sh = vld1q_u8(p.add(i - 3));
+                vst1q_u8(p.add(i), vsubq_u8(v, sh));
+            }
+            if i >= 16 {
+                if i == 18 {
+                    *p.add(17) = (*p.add(17)).wrapping_sub(*p.add(14));
+                }
+                if i >= 17 {
+                    *p.add(16) = (*p.add(16)).wrapping_sub(*p.add(13));
+                }
+                let v0 = vld1q_u8(p);
+                let sh0 = vextq_u8::<13>(vdupq_n_u8(0), v0);
+                vst1q_u8(p, vsubq_u8(v0, sh0));
+                return;
+            }
+            for j in (3..i).rev() {
+                *p.add(j) = (*p.add(j)).wrapping_sub(*p.add(j - 3));
+            }
+        }
     }
 
     #[inline(always)]

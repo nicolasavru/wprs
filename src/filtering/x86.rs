@@ -217,6 +217,7 @@ mod avx512 {
     use std::arch::x86_64::_mm512_mask_storeu_epi8;
     use std::arch::x86_64::_mm512_maskz_loadu_epi8;
     use std::arch::x86_64::_mm512_maskz_permutexvar_epi8;
+    use std::arch::x86_64::_mm512_maskz_sub_epi8;
     use std::arch::x86_64::_mm512_max_epu8;
     use std::arch::x86_64::_mm512_or_si512;
     use std::arch::x86_64::_mm512_permutex2var_epi8;
@@ -420,13 +421,14 @@ mod avx512 {
         debug_assert!(!HAS_ALPHA || dst_alpha.len() == tw);
 
         // Masked 48-byte stores suppress faults and never touch bytes `48..64`,
-        // so every full 16-pixel block needs zero tail margin.
+        // and the masked tail handles `1..=15` trailing pixels with zero scalar loop.
         let lim = (tw / 16) * 16;
         let mut x = 0usize;
         let mut di = 0usize;
 
         // SAFETY: Caller guarantees AVX-512BW/VL/VBMI; `x + 16 <= tw`,
-        // `di + 48 <= dst_bgr.len()`, and `x + 16 <= dst_alpha.len()` when `HAS_ALPHA`.
+        // `di + 48 <= dst_bgr.len()`, `x + 16 <= dst_alpha.len()` when `HAS_ALPHA`,
+        // and the masked tail accesses strictly `lim..tw` (`rem <= 15`).
         unsafe {
             let shuf_g = load_table(&SHUF_G);
             let pack_idx = load_table(&PACK_BGR_ALPHA_IDX);
@@ -446,155 +448,200 @@ mod avx512 {
                 x += 16;
                 di += 48;
             }
-        }
-
-        for (off, bgr) in dst_bgr[lim * 3..]
-            .as_chunks_mut::<3>()
-            .0
-            .iter_mut()
-            .enumerate()
-        {
-            let i = lim + off;
-            // SAFETY: `i < tw == src.len()`.
-            let px = unsafe { src.ptr().add(i).read() };
-            bgr[0] = px.0.wrapping_sub(px.1);
-            bgr[1] = px.1;
-            bgr[2] = px.2.wrapping_sub(px.1);
-            if HAS_ALPHA {
-                dst_alpha[i] = px.3;
+            let rem = tw - lim;
+            if rem != 0 {
+                let src_mask = (1u64 << (rem * 4)) - 1;
+                let bgr_mask = (1u64 << (rem * 3)) - 1;
+                let v = _mm512_maskz_loadu_epi8(src_mask, src.ptr().add(lim).cast());
+                let g = _mm512_shuffle_epi8(v, shuf_g);
+                let sg = _mm512_sub_epi8(v, g);
+                let packed = _mm512_permutexvar_epi8(pack_idx, sg);
+                _mm512_mask_storeu_epi8(dst_bgr.as_mut_ptr().add(di).cast(), bgr_mask, packed);
+                if HAS_ALPHA {
+                    let alpha_mask = (1u64 << rem) - 1;
+                    let a128 = _mm512_extracti32x4_epi32::<3>(packed);
+                    _mm512_mask_storeu_epi8(
+                        dst_alpha.as_mut_ptr().add(lim).cast(),
+                        alpha_mask,
+                        _mm512_zextsi128_si512(a128),
+                    );
+                }
             }
         }
     }
 
     #[target_feature(enable = "avx512bw,avx512vl,avx512vbmi")]
     #[inline]
-    unsafe fn sad_signed_bytes_impl(data: &[u8]) -> u64 {
-        let lim = (data.len() / 64) * 64;
-        let mut sum = 0u64;
-        // SAFETY: Caller guarantees AVX-512BW and `i + 64 <= data.len()`.
+    unsafe fn row_sub3_forward_and_sads_impl(cur: &[u8], dst: &mut [u8]) -> (u64, u64) {
+        let len = cur.len();
+        debug_assert_eq!(dst.len(), len);
+        let lim = (len / 64) * 64;
+        // SAFETY: Caller guarantees AVX-512BW/VL/VBMI; full iterations access
+        // `i..i + 64 <= len` and the masked tail accesses strictly `lim..len`.
         unsafe {
             let zero = _mm512_setzero_si512();
-            let mut acc = _mm512_setzero_si512();
+            let shift_idx = load_table(&SHIFT_LEFT3_IDX);
+            let mut acc_none = zero;
+            let mut acc_sub = zero;
+            let mut prev = zero;
+            let cur_p = cur.as_ptr();
+            let dst_p = dst.as_mut_ptr();
             let mut i = 0usize;
             while i < lim {
-                let v = _mm512_loadu_si512(data.as_ptr().add(i).cast());
-                let ab = _mm512_abs_epi8(v);
-                acc = _mm512_add_epi64(acc, _mm512_sad_epu8(ab, zero));
+                let c = _mm512_loadu_si512(cur_p.add(i).cast());
+                let shifted = _mm512_permutex2var_epi8(prev, shift_idx, c);
+                let sub = _mm512_sub_epi8(c, shifted);
+                prev = c;
+                _mm512_storeu_si512(dst_p.add(i).cast(), sub);
+                acc_none = _mm512_add_epi64(acc_none, _mm512_sad_epu8(_mm512_abs_epi8(c), zero));
+                acc_sub = _mm512_add_epi64(acc_sub, _mm512_sad_epu8(_mm512_abs_epi8(sub), zero));
                 i += 64;
             }
-            sum += _mm512_reduce_add_epi64(acc) as u64;
+            let rem = len - lim;
+            if rem != 0 {
+                let mask = (1u64 << rem) - 1;
+                let c = _mm512_maskz_loadu_epi8(mask, cur_p.add(lim).cast());
+                let shifted = _mm512_permutex2var_epi8(prev, shift_idx, c);
+                let sub = _mm512_maskz_sub_epi8(mask, c, shifted);
+                _mm512_mask_storeu_epi8(dst_p.add(lim).cast(), mask, sub);
+                acc_none = _mm512_add_epi64(acc_none, _mm512_sad_epu8(_mm512_abs_epi8(c), zero));
+                acc_sub = _mm512_add_epi64(acc_sub, _mm512_sad_epu8(_mm512_abs_epi8(sub), zero));
+            }
+            (
+                _mm512_reduce_add_epi64(acc_none) as u64,
+                _mm512_reduce_add_epi64(acc_sub) as u64,
+            )
         }
-        for &b in &data[lim..] {
-            sum += u64::from((b as i8).unsigned_abs());
-        }
-        sum
     }
 
     #[target_feature(enable = "avx512bw,avx512vl,avx512vbmi")]
     #[inline]
-    unsafe fn row_sub3_forward_sad_impl(src: &[u8], dst: &mut [u8]) -> u64 {
+    unsafe fn row_up_forward_and_sads_all4_impl(
+        cur: &[u8],
+        prev: &[u8],
+        dst_up: &mut [u8],
+    ) -> [u64; 4] {
+        let len = cur.len();
+        debug_assert_eq!(prev.len(), len);
+        debug_assert_eq!(dst_up.len(), len);
+        let lim = (len / 64) * 64;
+        // SAFETY: Caller guarantees AVX-512BW/VL/VBMI; full iterations access
+        // `i..i + 64 <= len` and the masked tail accesses strictly `lim..len`.
+        unsafe {
+            let zero = _mm512_setzero_si512();
+            let shift_idx = load_table(&SHIFT_LEFT3_IDX);
+            let mut acc0 = zero;
+            let mut acc1 = zero;
+            let mut acc2 = zero;
+            let mut acc3 = zero;
+            let mut prev_c = zero;
+            let mut prev_up = zero;
+            let cur_p = cur.as_ptr();
+            let prev_p = prev.as_ptr();
+            let dst_p = dst_up.as_mut_ptr();
+            let mut i = 0usize;
+            while i < lim {
+                let c = _mm512_loadu_si512(cur_p.add(i).cast());
+                let u = _mm512_loadu_si512(prev_p.add(i).cast());
+                let up = _mm512_sub_epi8(c, u);
+                _mm512_storeu_si512(dst_p.add(i).cast(), up);
+                let sub = _mm512_sub_epi8(c, _mm512_permutex2var_epi8(prev_c, shift_idx, c));
+                let su = _mm512_sub_epi8(up, _mm512_permutex2var_epi8(prev_up, shift_idx, up));
+                prev_c = c;
+                prev_up = up;
+                acc0 = _mm512_add_epi64(acc0, _mm512_sad_epu8(_mm512_abs_epi8(c), zero));
+                acc1 = _mm512_add_epi64(acc1, _mm512_sad_epu8(_mm512_abs_epi8(sub), zero));
+                acc2 = _mm512_add_epi64(acc2, _mm512_sad_epu8(_mm512_abs_epi8(up), zero));
+                acc3 = _mm512_add_epi64(acc3, _mm512_sad_epu8(_mm512_abs_epi8(su), zero));
+                i += 64;
+            }
+            let rem = len - lim;
+            if rem != 0 {
+                let mask = (1u64 << rem) - 1;
+                let c = _mm512_maskz_loadu_epi8(mask, cur_p.add(lim).cast());
+                let u = _mm512_maskz_loadu_epi8(mask, prev_p.add(lim).cast());
+                let up = _mm512_sub_epi8(c, u);
+                _mm512_mask_storeu_epi8(dst_p.add(lim).cast(), mask, up);
+                let sub =
+                    _mm512_maskz_sub_epi8(mask, c, _mm512_permutex2var_epi8(prev_c, shift_idx, c));
+                let su = _mm512_maskz_sub_epi8(
+                    mask,
+                    up,
+                    _mm512_permutex2var_epi8(prev_up, shift_idx, up),
+                );
+                acc0 = _mm512_add_epi64(acc0, _mm512_sad_epu8(_mm512_abs_epi8(c), zero));
+                acc1 = _mm512_add_epi64(acc1, _mm512_sad_epu8(_mm512_abs_epi8(sub), zero));
+                acc2 = _mm512_add_epi64(acc2, _mm512_sad_epu8(_mm512_abs_epi8(up), zero));
+                acc3 = _mm512_add_epi64(acc3, _mm512_sad_epu8(_mm512_abs_epi8(su), zero));
+            }
+            [
+                _mm512_reduce_add_epi64(acc0) as u64,
+                _mm512_reduce_add_epi64(acc1) as u64,
+                _mm512_reduce_add_epi64(acc2) as u64,
+                _mm512_reduce_add_epi64(acc3) as u64,
+            ]
+        }
+    }
+
+    #[target_feature(enable = "avx512bw,avx512vl,avx512vbmi")]
+    #[inline]
+    unsafe fn row_sub3_forward_impl(src: &[u8], dst: &mut [u8]) {
         let len = src.len();
         debug_assert_eq!(dst.len(), len);
         let lim = (len / 64) * 64;
-        let mut sum = 0u64;
-        // SAFETY: Caller guarantees AVX-512BW/VBMI and `i + 64 <= len`.
+        // SAFETY: Caller guarantees AVX-512BW/VL/VBMI; full iterations access
+        // `i..i + 64 <= len` and the masked tail accesses strictly `lim..len`.
         unsafe {
-            let zero = _mm512_setzero_si512();
             let shift_idx = load_table(&SHIFT_LEFT3_IDX);
-            let mut acc = _mm512_setzero_si512();
             let mut prev = _mm512_setzero_si512();
+            let src_p = src.as_ptr();
+            let dst_p = dst.as_mut_ptr();
             let mut i = 0usize;
             while i < lim {
-                let v = _mm512_loadu_si512(src.as_ptr().add(i).cast());
+                let v = _mm512_loadu_si512(src_p.add(i).cast());
                 let shifted = _mm512_permutex2var_epi8(prev, shift_idx, v);
-                let diff = _mm512_sub_epi8(v, shifted);
+                _mm512_storeu_si512(dst_p.add(i).cast(), _mm512_sub_epi8(v, shifted));
                 prev = v;
-                _mm512_storeu_si512(dst.as_mut_ptr().add(i).cast(), diff);
-                acc = _mm512_add_epi64(acc, _mm512_sad_epu8(_mm512_abs_epi8(diff), zero));
                 i += 64;
             }
-            sum += _mm512_reduce_add_epi64(acc) as u64;
+            let rem = len - lim;
+            if rem != 0 {
+                let mask = (1u64 << rem) - 1;
+                let v = _mm512_maskz_loadu_epi8(mask, src_p.add(lim).cast());
+                let shifted = _mm512_permutex2var_epi8(prev, shift_idx, v);
+                _mm512_mask_storeu_epi8(dst_p.add(lim).cast(), mask, _mm512_sub_epi8(v, shifted));
+            }
         }
-        for j in lim..len {
-            let p = if j >= 3 { src[j - 3] } else { 0 };
-            let d = src[j].wrapping_sub(p);
-            dst[j] = d;
-            sum += u64::from((d as i8).unsigned_abs());
-        }
-        sum
     }
 
     #[target_feature(enable = "avx512bw,avx512vl,avx512vbmi")]
     #[inline]
-    unsafe fn row_up_forward_sad_impl(cur: &[u8], prev: &[u8], dst: &mut [u8]) -> u64 {
-        let len = cur.len();
-        debug_assert_eq!(prev.len(), len);
-        debug_assert_eq!(dst.len(), len);
+    unsafe fn row_sub3_forward_in_place_impl(buf: &mut [u8]) {
+        let len = buf.len();
         let lim = (len / 64) * 64;
-        let mut sum = 0u64;
-        // SAFETY: Caller guarantees AVX-512BW and `i + 64 <= len`.
+        // SAFETY: Caller guarantees AVX-512BW/VL/VBMI; full iterations load `v`
+        // before overwriting `i..i + 64 <= len`, and the masked tail uses the
+        // pre-overwrite `prev` register while accessing strictly `lim..len`.
         unsafe {
-            let zero = _mm512_setzero_si512();
-            let mut acc = _mm512_setzero_si512();
-            let mut i = 0usize;
-            while i < lim {
-                let c = _mm512_loadu_si512(cur.as_ptr().add(i).cast());
-                let u = _mm512_loadu_si512(prev.as_ptr().add(i).cast());
-                let diff = _mm512_sub_epi8(c, u);
-                _mm512_storeu_si512(dst.as_mut_ptr().add(i).cast(), diff);
-                acc = _mm512_add_epi64(acc, _mm512_sad_epu8(_mm512_abs_epi8(diff), zero));
-                i += 64;
-            }
-            sum += _mm512_reduce_add_epi64(acc) as u64;
-        }
-        for j in lim..len {
-            let d = cur[j].wrapping_sub(prev[j]);
-            dst[j] = d;
-            sum += u64::from((d as i8).unsigned_abs());
-        }
-        sum
-    }
-
-    #[target_feature(enable = "avx512bw,avx512vl,avx512vbmi")]
-    #[inline]
-    unsafe fn row_subup3_forward_sad_impl(cur: &[u8], prev: &[u8], dst: &mut [u8]) -> u64 {
-        let len = cur.len();
-        debug_assert_eq!(prev.len(), len);
-        debug_assert_eq!(dst.len(), len);
-        let lim = (len / 64) * 64;
-        let mut sum = 0u64;
-        // SAFETY: Caller guarantees AVX-512BW/VBMI and `i + 64 <= len`.
-        unsafe {
-            let zero = _mm512_setzero_si512();
             let shift_idx = load_table(&SHIFT_LEFT3_IDX);
-            let mut acc = _mm512_setzero_si512();
-            let mut prev_up = _mm512_setzero_si512();
+            let mut prev = _mm512_setzero_si512();
+            let p = buf.as_mut_ptr();
             let mut i = 0usize;
             while i < lim {
-                let c = _mm512_loadu_si512(cur.as_ptr().add(i).cast());
-                let u = _mm512_loadu_si512(prev.as_ptr().add(i).cast());
-                let up = _mm512_sub_epi8(c, u);
-                let shifted = _mm512_permutex2var_epi8(prev_up, shift_idx, up);
-                let diff = _mm512_sub_epi8(up, shifted);
-                prev_up = up;
-                _mm512_storeu_si512(dst.as_mut_ptr().add(i).cast(), diff);
-                acc = _mm512_add_epi64(acc, _mm512_sad_epu8(_mm512_abs_epi8(diff), zero));
+                let v = _mm512_loadu_si512(p.add(i).cast());
+                let shifted = _mm512_permutex2var_epi8(prev, shift_idx, v);
+                _mm512_storeu_si512(p.add(i).cast(), _mm512_sub_epi8(v, shifted));
+                prev = v;
                 i += 64;
             }
-            sum += _mm512_reduce_add_epi64(acc) as u64;
+            let rem = len - lim;
+            if rem != 0 {
+                let mask = (1u64 << rem) - 1;
+                let v = _mm512_maskz_loadu_epi8(mask, p.add(lim).cast());
+                let shifted = _mm512_permutex2var_epi8(prev, shift_idx, v);
+                _mm512_mask_storeu_epi8(p.add(lim).cast(), mask, _mm512_sub_epi8(v, shifted));
+            }
         }
-        for j in lim..len {
-            let up = cur[j].wrapping_sub(prev[j]);
-            let prev_u = if j >= 3 {
-                cur[j - 3].wrapping_sub(prev[j - 3])
-            } else {
-                0
-            };
-            let d = up.wrapping_sub(prev_u);
-            dst[j] = d;
-            sum += u64::from((d as i8).unsigned_abs());
-        }
-        sum
     }
 
     #[target_feature(enable = "avx512bw,avx512vl,avx512vbmi")]
@@ -1439,27 +1486,32 @@ mod avx512 {
         }
 
         #[inline(always)]
-        fn sad_signed_bytes(self, data: &[u8]) -> u64 {
+        fn row_sub3_forward_and_sads(self, cur: &[u8], dst: &mut [u8]) -> (u64, u64) {
             // SAFETY: `self` witnesses `avx512bw + avx512vl + avx512vbmi` support.
-            unsafe { sad_signed_bytes_impl(data) }
+            unsafe { row_sub3_forward_and_sads_impl(cur, dst) }
         }
 
         #[inline(always)]
-        fn row_sub3_forward_sad(self, src: &[u8], dst: &mut [u8]) -> u64 {
+        fn row_up_forward_and_sads_all4(
+            self,
+            cur: &[u8],
+            prev: &[u8],
+            dst_up: &mut [u8],
+        ) -> [u64; 4] {
             // SAFETY: `self` witnesses `avx512bw + avx512vl + avx512vbmi` support.
-            unsafe { row_sub3_forward_sad_impl(src, dst) }
+            unsafe { row_up_forward_and_sads_all4_impl(cur, prev, dst_up) }
         }
 
         #[inline(always)]
-        fn row_up_forward_sad(self, cur: &[u8], prev: &[u8], dst: &mut [u8]) -> u64 {
+        fn row_sub3_forward(self, src: &[u8], dst: &mut [u8]) {
             // SAFETY: `self` witnesses `avx512bw + avx512vl + avx512vbmi` support.
-            unsafe { row_up_forward_sad_impl(cur, prev, dst) }
+            unsafe { row_sub3_forward_impl(src, dst) }
         }
 
         #[inline(always)]
-        fn row_subup3_forward_sad(self, cur: &[u8], prev: &[u8], dst: &mut [u8]) -> u64 {
+        fn row_sub3_forward_in_place(self, buf: &mut [u8]) {
             // SAFETY: `self` witnesses `avx512bw + avx512vl + avx512vbmi` support.
-            unsafe { row_subup3_forward_sad_impl(cur, prev, dst) }
+            unsafe { row_sub3_forward_in_place_impl(buf) }
         }
 
         #[inline(always)]
@@ -1645,11 +1697,18 @@ mod avx512 {
 mod avx2 {
     use std::arch::x86_64::__m128i;
     use std::arch::x86_64::__m256i;
+    use std::arch::x86_64::_mm_abs_epi8;
     use std::arch::x86_64::_mm_add_epi8;
+    use std::arch::x86_64::_mm_add_epi64;
+    use std::arch::x86_64::_mm_alignr_epi8;
     use std::arch::x86_64::_mm_cvtsi64_si128;
     use std::arch::x86_64::_mm_cvtsi128_si32;
+    use std::arch::x86_64::_mm_cvtsi128_si64;
+    use std::arch::x86_64::_mm_extract_epi64;
     use std::arch::x86_64::_mm_loadl_epi64;
     use std::arch::x86_64::_mm_loadu_si128;
+    use std::arch::x86_64::_mm_or_si128;
+    use std::arch::x86_64::_mm_sad_epu8;
     use std::arch::x86_64::_mm_set_epi8;
     use std::arch::x86_64::_mm_set1_epi8;
     use std::arch::x86_64::_mm_setr_epi8;
@@ -1660,6 +1719,8 @@ mod avx2 {
     use std::arch::x86_64::_mm_srli_si128;
     use std::arch::x86_64::_mm_storel_epi64;
     use std::arch::x86_64::_mm_storeu_si128;
+    use std::arch::x86_64::_mm_sub_epi8;
+    use std::arch::x86_64::_mm_unpacklo_epi32;
     use std::arch::x86_64::_mm256_abs_epi8;
     use std::arch::x86_64::_mm256_add_epi8;
     use std::arch::x86_64::_mm256_add_epi64;
@@ -1706,8 +1767,10 @@ mod avx2 {
     use std::arch::x86_64::_mm256_testz_si256;
     use std::arch::x86_64::_mm256_unpackhi_epi8;
     use std::arch::x86_64::_mm256_unpackhi_epi16;
+    use std::arch::x86_64::_mm256_unpackhi_epi64;
     use std::arch::x86_64::_mm256_unpacklo_epi8;
     use std::arch::x86_64::_mm256_unpacklo_epi16;
+    use std::arch::x86_64::_mm256_unpacklo_epi64;
     use std::arch::x86_64::_mm256_xor_si256;
     use std::arch::x86_64::_mm256_zextsi128_si256;
     use std::mem::MaybeUninit;
@@ -1728,13 +1791,24 @@ mod avx2 {
 
     #[target_feature(enable = "avx2")]
     #[inline]
-    fn hsum_epi64(acc: __m256i) -> u64 {
-        let mut tmp = [0u64; 4];
-        // SAFETY: `tmp` is 32 bytes and caller guarantees AVX2.
-        unsafe {
-            _mm256_storeu_si256(tmp.as_mut_ptr().cast::<__m256i>(), acc);
-        }
-        tmp[0] + tmp[1] + tmp[2] + tmp[3]
+    fn hsum2_epi64(a0: __m256i, a1: __m256i) -> (u64, u64) {
+        let s01 = _mm256_add_epi64(_mm256_unpacklo_epi64(a0, a1), _mm256_unpackhi_epi64(a0, a1));
+        let v01 = _mm_add_epi64(
+            _mm256_castsi256_si128(s01),
+            _mm256_extracti128_si256::<1>(s01),
+        );
+        (
+            _mm_cvtsi128_si64(v01) as u64,
+            _mm_extract_epi64::<1>(v01) as u64,
+        )
+    }
+
+    #[target_feature(enable = "avx2")]
+    #[inline]
+    fn hsum4_epi64(a0: __m256i, a1: __m256i, a2: __m256i, a3: __m256i) -> [u64; 4] {
+        let (s0, s1) = hsum2_epi64(a0, a1);
+        let (s2, s3) = hsum2_epi64(a2, a3);
+        [s0, s1, s2, s3]
     }
 
     #[target_feature(enable = "avx2")]
@@ -1748,15 +1822,22 @@ mod avx2 {
         debug_assert_eq!(dst_bgr.len(), tw * 3);
         debug_assert!(!HAS_ALPHA || dst_alpha.len() == tw);
 
-        // Each 8-pixel iteration writes 16 bytes at `di` and 16 bytes at `di + 12`
-        // (reaching `di + 28`). Stopping at `lim <= tw - 2` ensures `di + 28 <= tw * 3`
-        // with zero out-of-row writes and no slack bytes required.
+        // Main 8-pixel loop writes overlapping 16 B at `di` and `di + 12` (fast
+        // single-instruction `vextracti128` memory store, safe for `di + 28 <= tw * 3`,
+        // i.e. `x < lim`). Any trailing full 8-pixel block (`x < full8`, e.g. the
+        // final 8 px of `tw = 8, 24, 40, 72, 120, 256`) uses strictly in-bounds
+        // non-overlapping 16 B + 8 B stores, followed by an optional 4-pixel SSE
+        // block (`full8 < full4`) so at most `0..=3` scalar tail pixels remain.
+        let full8 = tw & !7;
+        let full4 = tw & !3;
         let lim = if tw >= 10 { ((tw - 2) / 8) * 8 } else { 0 };
         let mut x = 0usize;
         let mut di = 0usize;
 
-        // SAFETY: Caller guarantees AVX2; `x + 8 <= tw` and `di + 28 <= dst_bgr.len()`
-        // for all iterations `x < lim`.
+        // SAFETY: Caller guarantees AVX2; `di + 28 <= dst_bgr.len()` for `x < lim`,
+        // `di + 24 <= dst_bgr.len()` for `x < full8`, `di + 12 <= dst_bgr.len()`
+        // for `full8 < full4`, `di + 3 <= dst_bgr.len()` in the `tw & 3` tail,
+        // and `dst_alpha.len() == tw` when `HAS_ALPHA`.
         unsafe {
             let shuf_g = _mm256_set_epi8(
                 -1, 13, -1, 13, -1, 9, -1, 9, -1, 5, -1, 5, -1, 1, -1, 1, -1, 13, -1, 13, -1, 9,
@@ -1770,179 +1851,327 @@ mod avx2 {
                 -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, 15, 11, 7, 3, -1, -1, -1, -1, -1,
                 -1, -1, -1, -1, -1, -1, -1, 15, 11, 7, 3,
             );
+            let dst_p = dst_bgr.as_mut_ptr();
+            let alpha_p = dst_alpha.as_mut_ptr();
 
             while x < lim {
                 let v = _mm256_loadu_si256(src.ptr().add(x).cast::<__m256i>());
                 let g = _mm256_shuffle_epi8(v, shuf_g);
                 let sg = _mm256_sub_epi8(v, g);
                 let pk = _mm256_shuffle_epi8(sg, pack12);
+                _mm_storeu_si128(dst_p.add(di).cast::<__m128i>(), _mm256_castsi256_si128(pk));
                 _mm_storeu_si128(
-                    dst_bgr.as_mut_ptr().add(di).cast::<__m128i>(),
-                    _mm256_castsi256_si128(pk),
-                );
-                _mm_storeu_si128(
-                    dst_bgr.as_mut_ptr().add(di + 12).cast::<__m128i>(),
+                    dst_p.add(di + 12).cast::<__m128i>(),
                     _mm256_extracti128_si256::<1>(pk),
                 );
                 if HAS_ALPHA {
                     let a_pk = _mm256_shuffle_epi8(v, shuf_a);
-                    let a_lo = _mm_cvtsi128_si32(_mm256_castsi256_si128(a_pk)) as u32;
-                    let a_hi = _mm_cvtsi128_si32(_mm256_extracti128_si256::<1>(a_pk)) as u32;
-                    dst_alpha[x..x + 4].copy_from_slice(&a_lo.to_le_bytes());
-                    dst_alpha[x + 4..x + 8].copy_from_slice(&a_hi.to_le_bytes());
+                    let a8 = _mm_unpacklo_epi32(
+                        _mm256_castsi256_si128(a_pk),
+                        _mm256_extracti128_si256::<1>(a_pk),
+                    );
+                    _mm_storel_epi64(alpha_p.add(x).cast::<__m128i>(), a8);
                 }
                 x += 8;
                 di += 24;
             }
-        }
-
-        for (off, bgr) in dst_bgr[lim * 3..]
-            .as_chunks_mut::<3>()
-            .0
-            .iter_mut()
-            .enumerate()
-        {
-            let i = lim + off;
-            // SAFETY: `i < tw == src.len()`.
-            let px = unsafe { src.ptr().add(i).read() };
-            bgr[0] = px.0.wrapping_sub(px.1);
-            bgr[1] = px.1;
-            bgr[2] = px.2.wrapping_sub(px.1);
-            if HAS_ALPHA {
-                dst_alpha[i] = px.3;
+            if x < full8 {
+                let v = _mm256_loadu_si256(src.ptr().add(x).cast::<__m256i>());
+                let g = _mm256_shuffle_epi8(v, shuf_g);
+                let sg = _mm256_sub_epi8(v, g);
+                let pk = _mm256_shuffle_epi8(sg, pack12);
+                let lo = _mm256_castsi256_si128(pk);
+                let hi = _mm256_extracti128_si256::<1>(pk);
+                let b0_15 = _mm_or_si128(lo, _mm_slli_si128::<12>(hi));
+                let b16_23 = _mm_srli_si128::<4>(hi);
+                _mm_storeu_si128(dst_p.add(di).cast::<__m128i>(), b0_15);
+                _mm_storel_epi64(dst_p.add(di + 16).cast::<__m128i>(), b16_23);
+                if HAS_ALPHA {
+                    let a_pk = _mm256_shuffle_epi8(v, shuf_a);
+                    let a8 = _mm_unpacklo_epi32(
+                        _mm256_castsi256_si128(a_pk),
+                        _mm256_extracti128_si256::<1>(a_pk),
+                    );
+                    _mm_storel_epi64(alpha_p.add(x).cast::<__m128i>(), a8);
+                }
+                x += 8;
+                di += 24;
+            }
+            if full8 < full4 {
+                let v = _mm_loadu_si128(src.ptr().add(x).cast::<__m128i>());
+                let g = _mm_shuffle_epi8(v, _mm256_castsi256_si128(shuf_g));
+                let sg = _mm_sub_epi8(v, g);
+                let pk = _mm_shuffle_epi8(sg, _mm256_castsi256_si128(pack12));
+                _mm_storel_epi64(dst_p.add(di).cast::<__m128i>(), pk);
+                let last4 = _mm_cvtsi128_si32(_mm_srli_si128::<8>(pk)) as u32;
+                dst_p
+                    .add(di + 8)
+                    .cast::<u32>()
+                    .write_unaligned(last4.to_le());
+                if HAS_ALPHA {
+                    let a4 = _mm_cvtsi128_si32(_mm_shuffle_epi8(v, _mm256_castsi256_si128(shuf_a)))
+                        as u32;
+                    alpha_p.add(x).cast::<u32>().write_unaligned(a4.to_le());
+                }
+                x += 4;
+                di += 12;
+            }
+            for _ in 0..(tw & 3) {
+                let px = src.ptr().add(x).read();
+                let out = dst_p.add(di);
+                out.write(px.0.wrapping_sub(px.1));
+                out.add(1).write(px.1);
+                out.add(2).write(px.2.wrapping_sub(px.1));
+                if HAS_ALPHA {
+                    alpha_p.add(x).write(px.3);
+                }
+                x += 1;
+                di += 3;
             }
         }
     }
 
     #[target_feature(enable = "avx2")]
     #[inline]
-    unsafe fn sad_signed_bytes_impl(data: &[u8]) -> u64 {
-        let lim = (data.len() / 32) * 32;
-        let mut sum = 0u64;
-        // SAFETY: Caller guarantees AVX2 and `i + 32 <= data.len()`.
+    unsafe fn row_sub3_forward_and_sads_impl(cur: &[u8], dst: &mut [u8]) -> (u64, u64) {
+        let len = cur.len();
+        debug_assert_eq!(dst.len(), len);
+        let lim32 = (len / 32) * 32;
+        let mut i = 0usize;
+        // SAFETY: Caller guarantees AVX2, `i + 32 <= len` in main loop,
+        // `i + 16 <= len` in 16-byte tail, and `j < len` in scalar tail.
         unsafe {
             let zero = _mm256_setzero_si256();
-            let mut acc = _mm256_setzero_si256();
-            let mut i = 0usize;
-            while i < lim {
-                let v = _mm256_loadu_si256(data.as_ptr().add(i).cast::<__m256i>());
-                let ab = _mm256_abs_epi8(v);
-                acc = _mm256_add_epi64(acc, _mm256_sad_epu8(ab, zero));
+            let mut acc_none = zero;
+            let mut acc_sub = zero;
+            let mut prev = zero;
+            let cur_p = cur.as_ptr();
+            let dst_p = dst.as_mut_ptr();
+            while i < lim32 {
+                let c = _mm256_loadu_si256(cur_p.add(i).cast::<__m256i>());
+                let sub = _mm256_sub_epi8(
+                    c,
+                    _mm256_alignr_epi8::<13>(c, _mm256_permute2x128_si256::<0x21>(prev, c)),
+                );
+                prev = c;
+                _mm256_storeu_si256(dst_p.add(i).cast::<__m256i>(), sub);
+                acc_none = _mm256_add_epi64(acc_none, _mm256_sad_epu8(_mm256_abs_epi8(c), zero));
+                acc_sub = _mm256_add_epi64(acc_sub, _mm256_sad_epu8(_mm256_abs_epi8(sub), zero));
                 i += 32;
             }
-            sum += hsum_epi64(acc);
+            if i + 16 <= len {
+                let z128 = _mm_setzero_si128();
+                let c128 = _mm_loadu_si128(cur_p.add(i).cast::<__m128i>());
+                let prev128 = _mm256_extracti128_si256::<1>(prev);
+                let sub128 = _mm_sub_epi8(c128, _mm_alignr_epi8::<13>(c128, prev128));
+                _mm_storeu_si128(dst_p.add(i).cast::<__m128i>(), sub128);
+                acc_none = _mm256_add_epi64(
+                    acc_none,
+                    _mm256_zextsi128_si256(_mm_sad_epu8(_mm_abs_epi8(c128), z128)),
+                );
+                acc_sub = _mm256_add_epi64(
+                    acc_sub,
+                    _mm256_zextsi128_si256(_mm_sad_epu8(_mm_abs_epi8(sub128), z128)),
+                );
+                i += 16;
+            }
+            let (mut s_none, mut s_sub) = hsum2_epi64(acc_none, acc_sub);
+            for j in i..len {
+                let c = *cur_p.add(j);
+                let p = if j >= 3 { *cur_p.add(j - 3) } else { 0 };
+                let sub = c.wrapping_sub(p);
+                *dst_p.add(j) = sub;
+                s_none += u64::from((c as i8).unsigned_abs());
+                s_sub += u64::from((sub as i8).unsigned_abs());
+            }
+            (s_none, s_sub)
         }
-        for &b in &data[lim..] {
-            sum += u64::from((b as i8).unsigned_abs());
-        }
-        sum
     }
 
     #[target_feature(enable = "avx2")]
     #[inline]
-    unsafe fn row_sub3_forward_sad_impl(src: &[u8], dst: &mut [u8]) -> u64 {
+    unsafe fn row_up_forward_and_sads_all4_impl(
+        cur: &[u8],
+        prev: &[u8],
+        dst_up: &mut [u8],
+    ) -> [u64; 4] {
+        let len = cur.len();
+        debug_assert_eq!(prev.len(), len);
+        debug_assert_eq!(dst_up.len(), len);
+        let lim32 = (len / 32) * 32;
+        let mut i = 0usize;
+        // SAFETY: Caller guarantees AVX2, `i + 32 <= len` in main loop,
+        // `i + 16 <= len` in 16-byte tail, and `j < len` in scalar tail.
+        unsafe {
+            let zero = _mm256_setzero_si256();
+            let mut acc0 = zero;
+            let mut acc1 = zero;
+            let mut acc2 = zero;
+            let mut acc3 = zero;
+            let mut prev_c = zero;
+            let mut prev_up = zero;
+            let cur_p = cur.as_ptr();
+            let prev_p = prev.as_ptr();
+            let dst_p = dst_up.as_mut_ptr();
+            while i < lim32 {
+                let c = _mm256_loadu_si256(cur_p.add(i).cast::<__m256i>());
+                let u = _mm256_loadu_si256(prev_p.add(i).cast::<__m256i>());
+                let up = _mm256_sub_epi8(c, u);
+                _mm256_storeu_si256(dst_p.add(i).cast::<__m256i>(), up);
+                let sub = _mm256_sub_epi8(
+                    c,
+                    _mm256_alignr_epi8::<13>(c, _mm256_permute2x128_si256::<0x21>(prev_c, c)),
+                );
+                let su = _mm256_sub_epi8(
+                    up,
+                    _mm256_alignr_epi8::<13>(up, _mm256_permute2x128_si256::<0x21>(prev_up, up)),
+                );
+                prev_c = c;
+                prev_up = up;
+
+                acc0 = _mm256_add_epi64(acc0, _mm256_sad_epu8(_mm256_abs_epi8(c), zero));
+                acc1 = _mm256_add_epi64(acc1, _mm256_sad_epu8(_mm256_abs_epi8(sub), zero));
+                acc2 = _mm256_add_epi64(acc2, _mm256_sad_epu8(_mm256_abs_epi8(up), zero));
+                acc3 = _mm256_add_epi64(acc3, _mm256_sad_epu8(_mm256_abs_epi8(su), zero));
+                i += 32;
+            }
+            if i + 16 <= len {
+                let z128 = _mm_setzero_si128();
+                let c128 = _mm_loadu_si128(cur_p.add(i).cast::<__m128i>());
+                let u128 = _mm_loadu_si128(prev_p.add(i).cast::<__m128i>());
+                let up128 = _mm_sub_epi8(c128, u128);
+                _mm_storeu_si128(dst_p.add(i).cast::<__m128i>(), up128);
+                let sub128 = _mm_sub_epi8(
+                    c128,
+                    _mm_alignr_epi8::<13>(c128, _mm256_extracti128_si256::<1>(prev_c)),
+                );
+                let su128 = _mm_sub_epi8(
+                    up128,
+                    _mm_alignr_epi8::<13>(up128, _mm256_extracti128_si256::<1>(prev_up)),
+                );
+                acc0 = _mm256_add_epi64(
+                    acc0,
+                    _mm256_zextsi128_si256(_mm_sad_epu8(_mm_abs_epi8(c128), z128)),
+                );
+                acc1 = _mm256_add_epi64(
+                    acc1,
+                    _mm256_zextsi128_si256(_mm_sad_epu8(_mm_abs_epi8(sub128), z128)),
+                );
+                acc2 = _mm256_add_epi64(
+                    acc2,
+                    _mm256_zextsi128_si256(_mm_sad_epu8(_mm_abs_epi8(up128), z128)),
+                );
+                acc3 = _mm256_add_epi64(
+                    acc3,
+                    _mm256_zextsi128_si256(_mm_sad_epu8(_mm_abs_epi8(su128), z128)),
+                );
+                i += 16;
+            }
+            let mut sums = hsum4_epi64(acc0, acc1, acc2, acc3);
+            for j in i..len {
+                let c = *cur_p.add(j);
+                let up = c.wrapping_sub(*prev_p.add(j));
+                *dst_p.add(j) = up;
+                let (pc, pu) = if j >= 3 {
+                    let cp = *cur_p.add(j - 3);
+                    (cp, cp.wrapping_sub(*prev_p.add(j - 3)))
+                } else {
+                    (0, 0)
+                };
+                let sub = c.wrapping_sub(pc);
+                let su = up.wrapping_sub(pu);
+                sums[0] += u64::from((c as i8).unsigned_abs());
+                sums[1] += u64::from((sub as i8).unsigned_abs());
+                sums[2] += u64::from((up as i8).unsigned_abs());
+                sums[3] += u64::from((su as i8).unsigned_abs());
+            }
+            sums
+        }
+    }
+
+    #[target_feature(enable = "avx2")]
+    #[inline]
+    unsafe fn row_sub3_forward_impl(src: &[u8], dst: &mut [u8]) {
         let len = src.len();
         debug_assert_eq!(dst.len(), len);
-        let lim = (len / 32) * 32;
-        let mut sum = 0u64;
-        // SAFETY: Caller guarantees AVX2 and `i + 32 <= len`.
+        let lim32 = (len / 32) * 32;
+        let mut i = 0usize;
+        // SAFETY: Caller guarantees AVX2; `i + 32 <= len` in main loop,
+        // `i - 3 >= 29` for `i >= 32`, `i + 16 <= len` in 16-byte tail, and
+        // `j < len` in scalar tail.
         unsafe {
-            let zero = _mm256_setzero_si256();
-            let mut acc = _mm256_setzero_si256();
-            let mut prev = _mm256_setzero_si256();
-            let mut i = 0usize;
-            while i < lim {
-                let v = _mm256_loadu_si256(src.as_ptr().add(i).cast::<__m256i>());
-                let prev_lane = _mm256_permute2x128_si256::<0x21>(prev, v);
-                let shifted = _mm256_alignr_epi8::<13>(v, prev_lane);
-                let diff = _mm256_sub_epi8(v, shifted);
-                prev = v;
-                _mm256_storeu_si256(dst.as_mut_ptr().add(i).cast::<__m256i>(), diff);
-                acc = _mm256_add_epi64(acc, _mm256_sad_epu8(_mm256_abs_epi8(diff), zero));
-                i += 32;
+            let src_p = src.as_ptr();
+            let dst_p = dst.as_mut_ptr();
+            if lim32 >= 32 {
+                let v0 = _mm256_loadu_si256(src_p.cast::<__m256i>());
+                let prev_lane = _mm256_permute2x128_si256::<0x21>(_mm256_setzero_si256(), v0);
+                let sh0 = _mm256_alignr_epi8::<13>(v0, prev_lane);
+                _mm256_storeu_si256(dst_p.cast::<__m256i>(), _mm256_sub_epi8(v0, sh0));
+                i = 32;
+                while i < lim32 {
+                    let v = _mm256_loadu_si256(src_p.add(i).cast::<__m256i>());
+                    let sh = _mm256_loadu_si256(src_p.add(i - 3).cast::<__m256i>());
+                    _mm256_storeu_si256(dst_p.add(i).cast::<__m256i>(), _mm256_sub_epi8(v, sh));
+                    i += 32;
+                }
             }
-            sum += hsum_epi64(acc);
+            if i + 16 <= len {
+                let v = _mm_loadu_si128(src_p.add(i).cast::<__m128i>());
+                let sh = if i >= 3 {
+                    _mm_loadu_si128(src_p.add(i - 3).cast::<__m128i>())
+                } else {
+                    _mm_slli_si128::<3>(v)
+                };
+                _mm_storeu_si128(dst_p.add(i).cast::<__m128i>(), _mm_sub_epi8(v, sh));
+                i += 16;
+            }
+            for j in i..len {
+                let p = if j >= 3 { *src_p.add(j - 3) } else { 0 };
+                *dst_p.add(j) = (*src_p.add(j)).wrapping_sub(p);
+            }
         }
-        for j in lim..len {
-            let p = if j >= 3 { src[j - 3] } else { 0 };
-            let d = src[j].wrapping_sub(p);
-            dst[j] = d;
-            sum += u64::from((d as i8).unsigned_abs());
-        }
-        sum
     }
 
     #[target_feature(enable = "avx2")]
     #[inline]
-    unsafe fn row_up_forward_sad_impl(cur: &[u8], prev: &[u8], dst: &mut [u8]) -> u64 {
-        let len = cur.len();
-        debug_assert_eq!(prev.len(), len);
-        debug_assert_eq!(dst.len(), len);
-        let lim = (len / 32) * 32;
-        let mut sum = 0u64;
-        // SAFETY: Caller guarantees AVX2 and `i + 32 <= len`.
+    unsafe fn row_sub3_forward_in_place_impl(buf: &mut [u8]) {
+        let len = buf.len();
+        let mut i = len;
+        // SAFETY: Caller guarantees AVX2; backwards 32-byte and 16-byte steps
+        // write `i..i + step` strictly above all subsequent reads `..i` with
+        // `i >= 3`, and `0..32` stays in bounds when `i >= 32` (`i <= 34`).
         unsafe {
-            let zero = _mm256_setzero_si256();
-            let mut acc = _mm256_setzero_si256();
-            let mut i = 0usize;
-            while i < lim {
-                let c = _mm256_loadu_si256(cur.as_ptr().add(i).cast::<__m256i>());
-                let u = _mm256_loadu_si256(prev.as_ptr().add(i).cast::<__m256i>());
-                let diff = _mm256_sub_epi8(c, u);
-                _mm256_storeu_si256(dst.as_mut_ptr().add(i).cast::<__m256i>(), diff);
-                acc = _mm256_add_epi64(acc, _mm256_sad_epu8(_mm256_abs_epi8(diff), zero));
-                i += 32;
+            let p = buf.as_mut_ptr();
+            while i >= 35 {
+                i -= 32;
+                let v = _mm256_loadu_si256(p.add(i).cast::<__m256i>());
+                let sh = _mm256_loadu_si256(p.add(i - 3).cast::<__m256i>());
+                _mm256_storeu_si256(p.add(i).cast::<__m256i>(), _mm256_sub_epi8(v, sh));
             }
-            sum += hsum_epi64(acc);
-        }
-        for j in lim..len {
-            let d = cur[j].wrapping_sub(prev[j]);
-            dst[j] = d;
-            sum += u64::from((d as i8).unsigned_abs());
-        }
-        sum
-    }
-
-    #[target_feature(enable = "avx2")]
-    #[inline]
-    unsafe fn row_subup3_forward_sad_impl(cur: &[u8], prev: &[u8], dst: &mut [u8]) -> u64 {
-        let len = cur.len();
-        debug_assert_eq!(prev.len(), len);
-        debug_assert_eq!(dst.len(), len);
-        let lim = (len / 32) * 32;
-        let mut sum = 0u64;
-        // SAFETY: Caller guarantees AVX2 and `i + 32 <= len`.
-        unsafe {
-            let zero = _mm256_setzero_si256();
-            let mut acc = _mm256_setzero_si256();
-            let mut prev_up = _mm256_setzero_si256();
-            let mut i = 0usize;
-            while i < lim {
-                let c = _mm256_loadu_si256(cur.as_ptr().add(i).cast::<__m256i>());
-                let u = _mm256_loadu_si256(prev.as_ptr().add(i).cast::<__m256i>());
-                let up = _mm256_sub_epi8(c, u);
-                let prev_lane = _mm256_permute2x128_si256::<0x21>(prev_up, up);
-                let shifted = _mm256_alignr_epi8::<13>(up, prev_lane);
-                let diff = _mm256_sub_epi8(up, shifted);
-                prev_up = up;
-                _mm256_storeu_si256(dst.as_mut_ptr().add(i).cast::<__m256i>(), diff);
-                acc = _mm256_add_epi64(acc, _mm256_sad_epu8(_mm256_abs_epi8(diff), zero));
-                i += 32;
+            if i >= 32 {
+                // `i` is in `32..=34`; handle the `0..=2` bytes above `32` first.
+                if i == 34 {
+                    *p.add(33) = (*p.add(33)).wrapping_sub(*p.add(30));
+                }
+                if i >= 33 {
+                    *p.add(32) = (*p.add(32)).wrapping_sub(*p.add(29));
+                }
+                let v0 = _mm256_loadu_si256(p.cast::<__m256i>());
+                let prev_lane = _mm256_permute2x128_si256::<0x21>(_mm256_setzero_si256(), v0);
+                let sh0 = _mm256_alignr_epi8::<13>(v0, prev_lane);
+                _mm256_storeu_si256(p.cast::<__m256i>(), _mm256_sub_epi8(v0, sh0));
+                return;
             }
-            sum += hsum_epi64(acc);
+            if i >= 19 {
+                i -= 16;
+                let v = _mm_loadu_si128(p.add(i).cast::<__m128i>());
+                let sh = _mm_loadu_si128(p.add(i - 3).cast::<__m128i>());
+                _mm_storeu_si128(p.add(i).cast::<__m128i>(), _mm_sub_epi8(v, sh));
+            }
+            for j in (3..i).rev() {
+                *p.add(j) = (*p.add(j)).wrapping_sub(*p.add(j - 3));
+            }
         }
-        for j in lim..len {
-            let up = cur[j].wrapping_sub(prev[j]);
-            let prev_u = if j >= 3 {
-                cur[j - 3].wrapping_sub(prev[j - 3])
-            } else {
-                0
-            };
-            let d = up.wrapping_sub(prev_u);
-            dst[j] = d;
-            sum += u64::from((d as i8).unsigned_abs());
-        }
-        sum
     }
 
     #[target_feature(enable = "avx2")]
@@ -2255,20 +2484,27 @@ mod avx2 {
         debug_assert_eq!(prev.len(), len);
         debug_assert_eq!(dst.len(), len);
         let lim = (len / 32) * 32;
-        // SAFETY: Caller guarantees AVX2 and `i + 32 <= len`.
+        let mut i = 0usize;
+        // SAFETY: Caller guarantees AVX2, `i + 32 <= len` in main loop, and
+        // `i + 16 <= len` in optional 16-byte tail.
         unsafe {
-            let mut i = 0usize;
+            let cur_p = cur.as_ptr();
+            let prev_p = prev.as_ptr();
+            let dst_p = dst.as_mut_ptr();
             while i < lim {
-                let c = _mm256_loadu_si256(cur.as_ptr().add(i).cast::<__m256i>());
-                let u = _mm256_loadu_si256(prev.as_ptr().add(i).cast::<__m256i>());
-                _mm256_storeu_si256(
-                    dst.as_mut_ptr().add(i).cast::<__m256i>(),
-                    _mm256_sub_epi8(c, u),
-                );
+                let c = _mm256_loadu_si256(cur_p.add(i).cast::<__m256i>());
+                let u = _mm256_loadu_si256(prev_p.add(i).cast::<__m256i>());
+                _mm256_storeu_si256(dst_p.add(i).cast::<__m256i>(), _mm256_sub_epi8(c, u));
                 i += 32;
             }
+            if i + 16 <= len {
+                let c = _mm_loadu_si128(cur_p.add(i).cast::<__m128i>());
+                let u = _mm_loadu_si128(prev_p.add(i).cast::<__m128i>());
+                _mm_storeu_si128(dst_p.add(i).cast::<__m128i>(), _mm_sub_epi8(c, u));
+                i += 16;
+            }
         }
-        for j in lim..len {
+        for j in i..len {
             dst[j] = cur[j].wrapping_sub(prev[j]);
         }
     }
@@ -2972,27 +3208,32 @@ mod avx2 {
         }
 
         #[inline(always)]
-        fn sad_signed_bytes(self, data: &[u8]) -> u64 {
+        fn row_sub3_forward_and_sads(self, cur: &[u8], dst: &mut [u8]) -> (u64, u64) {
             // SAFETY: `self` witnesses `avx2` support.
-            unsafe { sad_signed_bytes_impl(data) }
+            unsafe { row_sub3_forward_and_sads_impl(cur, dst) }
         }
 
         #[inline(always)]
-        fn row_sub3_forward_sad(self, src: &[u8], dst: &mut [u8]) -> u64 {
+        fn row_up_forward_and_sads_all4(
+            self,
+            cur: &[u8],
+            prev: &[u8],
+            dst_up: &mut [u8],
+        ) -> [u64; 4] {
             // SAFETY: `self` witnesses `avx2` support.
-            unsafe { row_sub3_forward_sad_impl(src, dst) }
+            unsafe { row_up_forward_and_sads_all4_impl(cur, prev, dst_up) }
         }
 
         #[inline(always)]
-        fn row_up_forward_sad(self, cur: &[u8], prev: &[u8], dst: &mut [u8]) -> u64 {
+        fn row_sub3_forward(self, src: &[u8], dst: &mut [u8]) {
             // SAFETY: `self` witnesses `avx2` support.
-            unsafe { row_up_forward_sad_impl(cur, prev, dst) }
+            unsafe { row_sub3_forward_impl(src, dst) }
         }
 
         #[inline(always)]
-        fn row_subup3_forward_sad(self, cur: &[u8], prev: &[u8], dst: &mut [u8]) -> u64 {
+        fn row_sub3_forward_in_place(self, buf: &mut [u8]) {
             // SAFETY: `self` witnesses `avx2` support.
-            unsafe { row_subup3_forward_sad_impl(cur, prev, dst) }
+            unsafe { row_sub3_forward_in_place_impl(buf) }
         }
 
         #[inline(always)]
@@ -3190,6 +3431,7 @@ mod ssse3 {
     use std::arch::x86_64::_mm_cmpeq_epi32;
     use std::arch::x86_64::_mm_cvtsi32_si128;
     use std::arch::x86_64::_mm_cvtsi128_si32;
+    use std::arch::x86_64::_mm_cvtsi128_si64;
     use std::arch::x86_64::_mm_loadl_epi64;
     use std::arch::x86_64::_mm_loadu_si128;
     use std::arch::x86_64::_mm_madd_epi16;
@@ -3213,14 +3455,17 @@ mod ssse3 {
     use std::arch::x86_64::_mm_slli_si128;
     use std::arch::x86_64::_mm_srli_epi16;
     use std::arch::x86_64::_mm_srli_si128;
+    use std::arch::x86_64::_mm_storel_epi64;
     use std::arch::x86_64::_mm_storeu_si128;
     use std::arch::x86_64::_mm_stream_si128;
     use std::arch::x86_64::_mm_sub_epi8;
     use std::arch::x86_64::_mm_subs_epu8;
     use std::arch::x86_64::_mm_unpackhi_epi8;
     use std::arch::x86_64::_mm_unpackhi_epi16;
+    use std::arch::x86_64::_mm_unpackhi_epi64;
     use std::arch::x86_64::_mm_unpacklo_epi8;
     use std::arch::x86_64::_mm_unpacklo_epi16;
+    use std::arch::x86_64::_mm_unpacklo_epi64;
     use std::arch::x86_64::_mm_xor_si128;
     use std::mem::MaybeUninit;
 
@@ -3240,13 +3485,20 @@ mod ssse3 {
 
     #[target_feature(enable = "ssse3")]
     #[inline]
-    fn hsum_epi64_128(acc: __m128i) -> u64 {
-        let mut tmp = [0u64; 2];
-        // SAFETY: `tmp` is 16 bytes and SSE2 is mandatory on x86_64.
-        unsafe {
-            _mm_storeu_si128(tmp.as_mut_ptr().cast::<__m128i>(), acc);
-        }
-        tmp[0] + tmp[1]
+    fn hsum2_epi64_128(a0: __m128i, a1: __m128i) -> (u64, u64) {
+        let s01 = _mm_add_epi64(_mm_unpacklo_epi64(a0, a1), _mm_unpackhi_epi64(a0, a1));
+        (
+            _mm_cvtsi128_si64(s01) as u64,
+            _mm_cvtsi128_si64(_mm_srli_si128::<8>(s01)) as u64,
+        )
+    }
+
+    #[target_feature(enable = "ssse3")]
+    #[inline]
+    fn hsum4_epi64_128(a0: __m128i, a1: __m128i, a2: __m128i, a3: __m128i) -> [u64; 4] {
+        let (s0, s1) = hsum2_epi64_128(a0, a1);
+        let (s2, s3) = hsum2_epi64_128(a2, a3);
+        [s0, s1, s2, s3]
     }
 
     #[target_feature(enable = "ssse3")]
@@ -3260,177 +3512,226 @@ mod ssse3 {
         debug_assert_eq!(dst_bgr.len(), tw * 3);
         debug_assert!(!HAS_ALPHA || dst_alpha.len() == tw);
 
-        // Each 4-pixel iteration stores 16 bytes at `di = x * 3`, reaching `di + 16`.
-        // Stopping at `lim <= tw - 2` ensures `di + 16 <= tw * 3`.
+        // Main 4-pixel loop stores 16 B (`di + 16 <= tw * 3` for `x < lim`), and
+        // any trailing full 4-pixel block (`x < full4`) writes strictly in-bounds
+        // 8 B + 4 B, leaving at most `0..=3` scalar tail pixels.
+        let full4 = tw & !3;
         let lim = if tw >= 6 { ((tw - 2) / 4) * 4 } else { 0 };
         let mut x = 0usize;
         let mut di = 0usize;
 
-        // SAFETY: Caller guarantees SSSE3; `x + 4 <= tw` and `di + 16 <= dst_bgr.len()`.
+        // SAFETY: Caller guarantees SSSE3; `di + 16 <= dst_bgr.len()` for `x < lim`,
+        // `di + 12 <= dst_bgr.len()` for `x < full4`, `di + 3 <= dst_bgr.len()`
+        // in the `tw & 3` tail, and `dst_alpha.len() == tw` when `HAS_ALPHA`.
         unsafe {
             let shuf_g = _mm_set_epi8(-1, 13, -1, 13, -1, 9, -1, 9, -1, 5, -1, 5, -1, 1, -1, 1);
             let pack12 = _mm_set_epi8(-1, -1, -1, -1, 14, 13, 12, 10, 9, 8, 6, 5, 4, 2, 1, 0);
             let shuf_a = _mm_set_epi8(-1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, 15, 11, 7, 3);
+            let dst_p = dst_bgr.as_mut_ptr();
+            let alpha_p = dst_alpha.as_mut_ptr();
 
             while x < lim {
                 let v = _mm_loadu_si128(src.ptr().add(x).cast::<__m128i>());
                 let g = _mm_shuffle_epi8(v, shuf_g);
                 let sg = _mm_sub_epi8(v, g);
                 let pk = _mm_shuffle_epi8(sg, pack12);
-                _mm_storeu_si128(dst_bgr.as_mut_ptr().add(di).cast::<__m128i>(), pk);
+                _mm_storeu_si128(dst_p.add(di).cast::<__m128i>(), pk);
                 if HAS_ALPHA {
                     let a = _mm_cvtsi128_si32(_mm_shuffle_epi8(v, shuf_a)) as u32;
-                    dst_alpha[x..x + 4].copy_from_slice(&a.to_le_bytes());
+                    alpha_p.add(x).cast::<u32>().write_unaligned(a.to_le());
                 }
                 x += 4;
                 di += 12;
             }
-        }
-
-        for (off, bgr) in dst_bgr[lim * 3..]
-            .as_chunks_mut::<3>()
-            .0
-            .iter_mut()
-            .enumerate()
-        {
-            let i = lim + off;
-            // SAFETY: `i < tw == src.len()`.
-            let px = unsafe { src.ptr().add(i).read() };
-            bgr[0] = px.0.wrapping_sub(px.1);
-            bgr[1] = px.1;
-            bgr[2] = px.2.wrapping_sub(px.1);
-            if HAS_ALPHA {
-                dst_alpha[i] = px.3;
+            if x < full4 {
+                let v = _mm_loadu_si128(src.ptr().add(x).cast::<__m128i>());
+                let g = _mm_shuffle_epi8(v, shuf_g);
+                let sg = _mm_sub_epi8(v, g);
+                let pk = _mm_shuffle_epi8(sg, pack12);
+                _mm_storel_epi64(dst_p.add(di).cast::<__m128i>(), pk);
+                let last4 = _mm_cvtsi128_si32(_mm_srli_si128::<8>(pk)) as u32;
+                dst_p
+                    .add(di + 8)
+                    .cast::<u32>()
+                    .write_unaligned(last4.to_le());
+                if HAS_ALPHA {
+                    let a = _mm_cvtsi128_si32(_mm_shuffle_epi8(v, shuf_a)) as u32;
+                    alpha_p.add(x).cast::<u32>().write_unaligned(a.to_le());
+                }
+                x += 4;
+                di += 12;
+            }
+            for _ in 0..(tw & 3) {
+                let px = src.ptr().add(x).read();
+                let out = dst_p.add(di);
+                out.write(px.0.wrapping_sub(px.1));
+                out.add(1).write(px.1);
+                out.add(2).write(px.2.wrapping_sub(px.1));
+                if HAS_ALPHA {
+                    alpha_p.add(x).write(px.3);
+                }
+                x += 1;
+                di += 3;
             }
         }
     }
 
     #[target_feature(enable = "ssse3")]
     #[inline]
-    unsafe fn sad_signed_bytes_impl(data: &[u8]) -> u64 {
-        let lim = (data.len() / 16) * 16;
-        let mut sum = 0u64;
-        // SAFETY: Caller guarantees SSSE3 and `i + 16 <= data.len()`.
+    unsafe fn row_sub3_forward_and_sads_impl(cur: &[u8], dst: &mut [u8]) -> (u64, u64) {
+        let len = cur.len();
+        debug_assert_eq!(dst.len(), len);
+        let lim = (len / 16) * 16;
+        // SAFETY: Caller guarantees SSSE3, `i + 16 <= len` in loop, and `j < len` in tail.
         unsafe {
             let zero = _mm_setzero_si128();
-            let mut acc = _mm_setzero_si128();
+            let mut acc_none = zero;
+            let mut acc_sub = zero;
+            let mut prev = zero;
+            let cur_p = cur.as_ptr();
+            let dst_p = dst.as_mut_ptr();
             let mut i = 0usize;
             while i < lim {
-                let v = _mm_loadu_si128(data.as_ptr().add(i).cast::<__m128i>());
-                acc = _mm_add_epi64(acc, _mm_sad_epu8(_mm_abs_epi8(v), zero));
+                let c = _mm_loadu_si128(cur_p.add(i).cast::<__m128i>());
+                let sub = _mm_sub_epi8(c, _mm_alignr_epi8::<13>(c, prev));
+                prev = c;
+                _mm_storeu_si128(dst_p.add(i).cast::<__m128i>(), sub);
+                acc_none = _mm_add_epi64(acc_none, _mm_sad_epu8(_mm_abs_epi8(c), zero));
+                acc_sub = _mm_add_epi64(acc_sub, _mm_sad_epu8(_mm_abs_epi8(sub), zero));
                 i += 16;
             }
-            sum += hsum_epi64_128(acc);
+            let (mut s_none, mut s_sub) = hsum2_epi64_128(acc_none, acc_sub);
+            for j in lim..len {
+                let c = *cur_p.add(j);
+                let p = if j >= 3 { *cur_p.add(j - 3) } else { 0 };
+                let sub = c.wrapping_sub(p);
+                *dst_p.add(j) = sub;
+                s_none += u64::from((c as i8).unsigned_abs());
+                s_sub += u64::from((sub as i8).unsigned_abs());
+            }
+            (s_none, s_sub)
         }
-        for &b in &data[lim..] {
-            sum += u64::from((b as i8).unsigned_abs());
-        }
-        sum
     }
 
     #[target_feature(enable = "ssse3")]
     #[inline]
-    unsafe fn row_sub3_forward_sad_impl(src: &[u8], dst: &mut [u8]) -> u64 {
+    unsafe fn row_up_forward_and_sads_all4_impl(
+        cur: &[u8],
+        prev: &[u8],
+        dst_up: &mut [u8],
+    ) -> [u64; 4] {
+        let len = cur.len();
+        debug_assert_eq!(prev.len(), len);
+        debug_assert_eq!(dst_up.len(), len);
+        let lim = (len / 16) * 16;
+        // SAFETY: Caller guarantees SSSE3, `i + 16 <= len` in loop, and `j < len` in tail.
+        unsafe {
+            let zero = _mm_setzero_si128();
+            let mut acc0 = zero;
+            let mut acc1 = zero;
+            let mut acc2 = zero;
+            let mut acc3 = zero;
+            let mut prev_c = zero;
+            let mut prev_up = zero;
+            let cur_p = cur.as_ptr();
+            let prev_p = prev.as_ptr();
+            let dst_p = dst_up.as_mut_ptr();
+            let mut i = 0usize;
+            while i < lim {
+                let c = _mm_loadu_si128(cur_p.add(i).cast::<__m128i>());
+                let u = _mm_loadu_si128(prev_p.add(i).cast::<__m128i>());
+                let up = _mm_sub_epi8(c, u);
+                _mm_storeu_si128(dst_p.add(i).cast::<__m128i>(), up);
+                let sub = _mm_sub_epi8(c, _mm_alignr_epi8::<13>(c, prev_c));
+                let su = _mm_sub_epi8(up, _mm_alignr_epi8::<13>(up, prev_up));
+                prev_c = c;
+                prev_up = up;
+                acc0 = _mm_add_epi64(acc0, _mm_sad_epu8(_mm_abs_epi8(c), zero));
+                acc1 = _mm_add_epi64(acc1, _mm_sad_epu8(_mm_abs_epi8(sub), zero));
+                acc2 = _mm_add_epi64(acc2, _mm_sad_epu8(_mm_abs_epi8(up), zero));
+                acc3 = _mm_add_epi64(acc3, _mm_sad_epu8(_mm_abs_epi8(su), zero));
+                i += 16;
+            }
+            let mut sums = hsum4_epi64_128(acc0, acc1, acc2, acc3);
+            for j in lim..len {
+                let c = *cur_p.add(j);
+                let up = c.wrapping_sub(*prev_p.add(j));
+                *dst_p.add(j) = up;
+                let (pc, pu) = if j >= 3 {
+                    let cp = *cur_p.add(j - 3);
+                    (cp, cp.wrapping_sub(*prev_p.add(j - 3)))
+                } else {
+                    (0, 0)
+                };
+                let sub = c.wrapping_sub(pc);
+                let su = up.wrapping_sub(pu);
+                sums[0] += u64::from((c as i8).unsigned_abs());
+                sums[1] += u64::from((sub as i8).unsigned_abs());
+                sums[2] += u64::from((up as i8).unsigned_abs());
+                sums[3] += u64::from((su as i8).unsigned_abs());
+            }
+            sums
+        }
+    }
+
+    #[target_feature(enable = "ssse3")]
+    #[inline]
+    unsafe fn row_sub3_forward_impl(src: &[u8], dst: &mut [u8]) {
         let len = src.len();
         debug_assert_eq!(dst.len(), len);
         let lim = (len / 16) * 16;
-        let mut sum = 0u64;
         // SAFETY: Caller guarantees SSSE3 and `i + 16 <= len`.
         unsafe {
-            let zero = _mm_setzero_si128();
-            let mut acc = _mm_setzero_si128();
             let mut prev = _mm_setzero_si128();
+            let src_p = src.as_ptr();
+            let dst_p = dst.as_mut_ptr();
             let mut i = 0usize;
             while i < lim {
-                let v = _mm_loadu_si128(src.as_ptr().add(i).cast::<__m128i>());
+                let v = _mm_loadu_si128(src_p.add(i).cast::<__m128i>());
                 let shifted = _mm_alignr_epi8::<13>(v, prev);
-                let diff = _mm_sub_epi8(v, shifted);
+                _mm_storeu_si128(dst_p.add(i).cast::<__m128i>(), _mm_sub_epi8(v, shifted));
                 prev = v;
-                _mm_storeu_si128(dst.as_mut_ptr().add(i).cast::<__m128i>(), diff);
-                acc = _mm_add_epi64(acc, _mm_sad_epu8(_mm_abs_epi8(diff), zero));
                 i += 16;
             }
-            sum += hsum_epi64_128(acc);
         }
         for j in lim..len {
             let p = if j >= 3 { src[j - 3] } else { 0 };
-            let d = src[j].wrapping_sub(p);
-            dst[j] = d;
-            sum += u64::from((d as i8).unsigned_abs());
+            dst[j] = src[j].wrapping_sub(p);
         }
-        sum
     }
 
     #[target_feature(enable = "ssse3")]
     #[inline]
-    unsafe fn row_up_forward_sad_impl(cur: &[u8], prev: &[u8], dst: &mut [u8]) -> u64 {
-        let len = cur.len();
-        debug_assert_eq!(prev.len(), len);
-        debug_assert_eq!(dst.len(), len);
-        let lim = (len / 16) * 16;
-        let mut sum = 0u64;
-        // SAFETY: Caller guarantees SSSE3 and `i + 16 <= len`.
+    unsafe fn row_sub3_forward_in_place_impl(buf: &mut [u8]) {
+        let len = buf.len();
+        let mut i = len;
+        // SAFETY: Caller guarantees SSSE3; backwards 16-byte steps write
+        // `i..i + 16` strictly above all subsequent reads `..i` with `i >= 3`,
+        // and `0..16` stays in bounds when `i >= 16`.
         unsafe {
-            let zero = _mm_setzero_si128();
-            let mut acc = _mm_setzero_si128();
-            let mut i = 0usize;
-            while i < lim {
-                let c = _mm_loadu_si128(cur.as_ptr().add(i).cast::<__m128i>());
-                let u = _mm_loadu_si128(prev.as_ptr().add(i).cast::<__m128i>());
-                let diff = _mm_sub_epi8(c, u);
-                _mm_storeu_si128(dst.as_mut_ptr().add(i).cast::<__m128i>(), diff);
-                acc = _mm_add_epi64(acc, _mm_sad_epu8(_mm_abs_epi8(diff), zero));
-                i += 16;
+            let p = buf.as_mut_ptr();
+            while i >= 19 {
+                i -= 16;
+                let v = _mm_loadu_si128(p.add(i).cast::<__m128i>());
+                let sh = _mm_loadu_si128(p.add(i - 3).cast::<__m128i>());
+                _mm_storeu_si128(p.add(i).cast::<__m128i>(), _mm_sub_epi8(v, sh));
             }
-            sum += hsum_epi64_128(acc);
-        }
-        for j in lim..len {
-            let d = cur[j].wrapping_sub(prev[j]);
-            dst[j] = d;
-            sum += u64::from((d as i8).unsigned_abs());
-        }
-        sum
-    }
-
-    #[target_feature(enable = "ssse3")]
-    #[inline]
-    unsafe fn row_subup3_forward_sad_impl(cur: &[u8], prev: &[u8], dst: &mut [u8]) -> u64 {
-        let len = cur.len();
-        debug_assert_eq!(prev.len(), len);
-        debug_assert_eq!(dst.len(), len);
-        let lim = (len / 16) * 16;
-        let mut sum = 0u64;
-        // SAFETY: Caller guarantees SSSE3 and `i + 16 <= len`.
-        unsafe {
-            let zero = _mm_setzero_si128();
-            let mut acc = _mm_setzero_si128();
-            let mut prev_up = _mm_setzero_si128();
-            let mut i = 0usize;
-            while i < lim {
-                let c = _mm_loadu_si128(cur.as_ptr().add(i).cast::<__m128i>());
-                let u = _mm_loadu_si128(prev.as_ptr().add(i).cast::<__m128i>());
-                let up = _mm_sub_epi8(c, u);
-                let shifted = _mm_alignr_epi8::<13>(up, prev_up);
-                let diff = _mm_sub_epi8(up, shifted);
-                prev_up = up;
-                _mm_storeu_si128(dst.as_mut_ptr().add(i).cast::<__m128i>(), diff);
-                acc = _mm_add_epi64(acc, _mm_sad_epu8(_mm_abs_epi8(diff), zero));
-                i += 16;
+            if i >= 16 {
+                if i == 18 {
+                    *p.add(17) = (*p.add(17)).wrapping_sub(*p.add(14));
+                }
+                if i >= 17 {
+                    *p.add(16) = (*p.add(16)).wrapping_sub(*p.add(13));
+                }
+                let v0 = _mm_loadu_si128(p.cast::<__m128i>());
+                let sh0 = _mm_slli_si128::<3>(v0);
+                _mm_storeu_si128(p.cast::<__m128i>(), _mm_sub_epi8(v0, sh0));
+                return;
             }
-            sum += hsum_epi64_128(acc);
+            for j in (3..i).rev() {
+                *p.add(j) = (*p.add(j)).wrapping_sub(*p.add(j - 3));
+            }
         }
-        for j in lim..len {
-            let up = cur[j].wrapping_sub(prev[j]);
-            let prev_u = if j >= 3 {
-                cur[j - 3].wrapping_sub(prev[j - 3])
-            } else {
-                0
-            };
-            let d = up.wrapping_sub(prev_u);
-            dst[j] = d;
-            sum += u64::from((d as i8).unsigned_abs());
-        }
-        sum
     }
 
     #[target_feature(enable = "ssse3")]
@@ -4400,27 +4701,32 @@ mod ssse3 {
         }
 
         #[inline(always)]
-        fn sad_signed_bytes(self, data: &[u8]) -> u64 {
+        fn row_sub3_forward_and_sads(self, cur: &[u8], dst: &mut [u8]) -> (u64, u64) {
             // SAFETY: `self` witnesses `ssse3` support.
-            unsafe { sad_signed_bytes_impl(data) }
+            unsafe { row_sub3_forward_and_sads_impl(cur, dst) }
         }
 
         #[inline(always)]
-        fn row_sub3_forward_sad(self, src: &[u8], dst: &mut [u8]) -> u64 {
+        fn row_up_forward_and_sads_all4(
+            self,
+            cur: &[u8],
+            prev: &[u8],
+            dst_up: &mut [u8],
+        ) -> [u64; 4] {
             // SAFETY: `self` witnesses `ssse3` support.
-            unsafe { row_sub3_forward_sad_impl(src, dst) }
+            unsafe { row_up_forward_and_sads_all4_impl(cur, prev, dst_up) }
         }
 
         #[inline(always)]
-        fn row_up_forward_sad(self, cur: &[u8], prev: &[u8], dst: &mut [u8]) -> u64 {
+        fn row_sub3_forward(self, src: &[u8], dst: &mut [u8]) {
             // SAFETY: `self` witnesses `ssse3` support.
-            unsafe { row_up_forward_sad_impl(cur, prev, dst) }
+            unsafe { row_sub3_forward_impl(src, dst) }
         }
 
         #[inline(always)]
-        fn row_subup3_forward_sad(self, cur: &[u8], prev: &[u8], dst: &mut [u8]) -> u64 {
+        fn row_sub3_forward_in_place(self, buf: &mut [u8]) {
             // SAFETY: `self` witnesses `ssse3` support.
-            unsafe { row_subup3_forward_sad_impl(cur, prev, dst) }
+            unsafe { row_sub3_forward_in_place_impl(buf) }
         }
 
         #[inline(always)]
