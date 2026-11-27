@@ -449,10 +449,12 @@ pub use scroll::apply_scroll_rect_in_place_parallel;
 pub use scroll::detect_scroll_rect;
 pub use tile_cache::ClientTileCache;
 pub use tile_cache::ServerTileCache;
+use zstd::bulk::Compressor;
 use zstd::bulk::Decompressor;
 
 use crate::buffer_pointer::BufferPointer;
-use crate::filtering::palette::TextSafeClass;
+use crate::filtering::palette::HybridScan;
+use crate::filtering::palette::SUBTILE_PIXELS;
 use crate::filtering::palette::decode_palette_row;
 use crate::filtering::palette::prepare_palette_lut;
 use crate::filtering::tile_cache::ColdSubQuads;
@@ -1013,6 +1015,30 @@ pub(crate) fn tile_quadrants(rect: TileRect) -> ([TileRect; 4], usize) {
     (out, n)
 }
 
+fn encode_palette_from_parts<const HAS_ALPHA: bool>(
+    palette: &[u32],
+    packed: &[u8],
+    all_opaque: bool,
+    compressor: &mut Compressor<'static>,
+    zstd_scratch: &mut Vec<u8>,
+) -> LeafPayload {
+    let n_colors = palette.len();
+    debug_assert!((2..=256).contains(&n_colors));
+    let pal_has_alpha = HAS_ALPHA && !all_opaque && palette.iter().any(|&c| (c >> 24) != 0xFF);
+    let entry_bytes = if pal_has_alpha { 4 } else { 3 };
+    let mut palette_bytes = Vec::with_capacity(n_colors * entry_bytes);
+    for &c in palette {
+        let b = c.to_le_bytes();
+        palette_bytes.extend_from_slice(if pal_has_alpha { &b[..] } else { &b[..3] });
+    }
+    let data = compress_bytes(compressor, zstd_scratch, packed);
+    LeafPayload::Palette {
+        has_alpha: pal_has_alpha,
+        palette: palette_bytes,
+        data,
+    }
+}
+
 fn try_encode_palette_leaf<const HAS_ALPHA: bool>(
     aos: BufferPointer<Vec4u8>,
     stride_px: usize,
@@ -1020,33 +1046,22 @@ fn try_encode_palette_leaf<const HAS_ALPHA: bool>(
     all_opaque: bool,
     state: &mut CompressorWorkerState,
 ) -> Option<LeafPayload> {
-    let (n_colors, packed_len) = state
+    let Ok((n_colors, packed_len)) = state
         .palette
-        .try_encode_2d::<HAS_ALPHA>(aos, stride_px, rect)?;
+        .try_encode_2d::<HAS_ALPHA>(aos, stride_px, rect)
+    else {
+        return None;
+    };
     if n_colors == 1 {
         return Some(LeafPayload::Solid(state.palette.palette[0].to_le_bytes()));
     }
-    let pal_has_alpha = HAS_ALPHA
-        && !all_opaque
-        && state.palette.palette[..n_colors]
-            .iter()
-            .any(|&c| (c >> 24) != 0xFF);
-    let entry_bytes = if pal_has_alpha { 4 } else { 3 };
-    let mut palette_bytes = Vec::with_capacity(n_colors * entry_bytes);
-    for &c in &state.palette.palette[..n_colors] {
-        let b = c.to_le_bytes();
-        palette_bytes.extend_from_slice(if pal_has_alpha { &b[..] } else { &b[..3] });
-    }
-    let data = compress_bytes(
+    Some(encode_palette_from_parts::<HAS_ALPHA>(
+        &state.palette.palette[..n_colors],
+        &state.palette.packed[..packed_len],
+        all_opaque,
         &mut state.compressor,
         &mut state.zstd_scratch,
-        &state.palette.packed[..packed_len],
-    );
-    Some(LeafPayload::Palette {
-        has_alpha: pal_has_alpha,
-        palette: palette_bytes,
-        data,
-    })
+    ))
 }
 
 #[inline(always)]
@@ -1264,51 +1279,106 @@ fn filter_hybrid_tile<const HAS_ALPHA: bool>(
         ));
     }
 
-    // Fast path: if the whole tile fits in `<= 256` unique colors, every
-    // quadrant is guaranteed `TextSafe` — emit the encoded `Solid`/`Palette`
-    // leaf directly without re-scanning.
-    if let Some(leaf) =
-        try_encode_palette_leaf::<HAS_ALPHA>(aos, stride_px, rect, meta.tile.all_opaque, state)
-    {
-        return TilePayload::Leaf(leaf);
-    }
-
-    // Non-splittable (`<= 128x128`): classify directly (`try_encode_palette_leaf`
-    // already ran above, so `TextSafe` goes straight to `AosZstd`).
+    // Non-splittable (`<= 128x128`): single-pass fused palette + text-safe
+    // classification — never scans pixels twice on overflow.
     if tw <= SUBTILE_W && th <= SUBTILE_H {
-        return TilePayload::Leaf(
-            if state
+        let scan = if HAS_ALPHA && !meta.tile.all_opaque {
+            state.palette.scan_hybrid_leaf::<true>(aos, stride_px, rect)
+        } else {
+            state
                 .palette
-                .classify_text_safe(aos, stride_px, rect)
-                .is_text_safe()
-            {
+                .scan_hybrid_leaf::<false>(aos, stride_px, rect)
+        };
+        return TilePayload::Leaf(match scan {
+            HybridScan::Solid(px) => LeafPayload::Solid(px),
+            HybridScan::Palette { n_colors } => {
+                let packed_len = state.palette.pack_indices_range(0, tw * th, n_colors);
+                encode_palette_from_parts::<HAS_ALPHA>(
+                    &state.palette.palette[..n_colors],
+                    &state.palette.packed[..packed_len],
+                    meta.tile.all_opaque,
+                    &mut state.compressor,
+                    &mut state.zstd_scratch,
+                )
+            },
+            HybridScan::TextSafeNoPalette => {
                 if HAS_ALPHA && !meta.tile.all_opaque {
                     tier.filter_aos_zstd_leaf::<true>(aos, stride_px, rect, state)
                 } else {
                     tier.filter_aos_zstd_leaf::<false>(aos, stride_px, rect, state)
                 }
-            } else if HAS_ALPHA && !meta.tile.all_opaque {
-                encode_jpeg_leaf::<true>(tier, aos, stride_px, rect, quality, subsamp, state)
-            } else {
-                encode_jpeg_leaf::<false>(tier, aos, stride_px, rect, quality, subsamp, state)
             },
-        );
+            HybridScan::Photo => {
+                if HAS_ALPHA && !meta.tile.all_opaque {
+                    encode_jpeg_leaf::<true>(tier, aos, stride_px, rect, quality, subsamp, state)
+                } else {
+                    encode_jpeg_leaf::<false>(tier, aos, stride_px, rect, quality, subsamp, state)
+                }
+            },
+        });
     }
 
-    // Splittable (`> 128` wide or tall): classify each `128x128` quadrant and
-    // merge uniform tiles into a single leaf or emit a non-recursive `Split`.
+    // Splittable (`> 128` wide or tall): fast path if the whole tile fits in
+    // `<= 256` unique colors — every quadrant is guaranteed `TextSafe`, so emit
+    // the encoded `Solid`/`Palette` leaf directly without re-scanning.
+    let ovf_ry = match state
+        .palette
+        .try_encode_2d::<HAS_ALPHA>(aos, stride_px, rect)
+    {
+        Ok((n_colors, packed_len)) => {
+            if n_colors == 1 {
+                return TilePayload::Leaf(LeafPayload::Solid(
+                    state.palette.palette[0].to_le_bytes(),
+                ));
+            }
+            return TilePayload::Leaf(encode_palette_from_parts::<HAS_ALPHA>(
+                &state.palette.palette[..n_colors],
+                &state.palette.packed[..packed_len],
+                meta.tile.all_opaque,
+                &mut state.compressor,
+                &mut state.zstd_scratch,
+            ));
+        },
+        Err(ry) => ry,
+    };
+
+    // Classify each `128x128` quadrant in a single pass while retaining built
+    // per-quadrant palettes/indices in worker scratch so mixed `Split` tiles
+    // never re-scan palette quadrants.
+    //
+    // If the whole-tile scan already cleared all `SUBTILE_H` top rows before
+    // hitting color #257 (`ovf_ry >= SUBTILE_H`), every top-row quadrant is
+    // guaranteed `<= 256` unique colors (`TextSafe`); skip classifying them so
+    // all-`TextSafe` tiles emit `AosZstd` directly without re-scanning the top
+    // half, and build their quadrant palettes only if a split occurs.
     let (quads, n_quads) = tile_quadrants(rect);
-    let mut classes = [TextSafeClass::Photo; 4];
+    let top_row_known_palette = ovf_ry >= SUBTILE_H;
+    let mut scans = [HybridScan::Photo; 4];
+    let mut top_deferred = [false; 4];
     let mut text_safe_count = 0usize;
     for q in 0..n_quads {
         let qmeta = meta.quads[q];
-        let cls = if qmeta.solid_px.is_some() {
-            TextSafeClass::PaletteCandidate
+        if let Some(px) = qmeta.solid_px {
+            scans[q] = HybridScan::Solid(px);
+            text_safe_count += 1;
+            continue;
+        }
+        if top_row_known_palette && quads[q].y == rect.y {
+            top_deferred[q] = true;
+            text_safe_count += 1;
+            continue;
+        }
+        let scan = if HAS_ALPHA && !qmeta.all_opaque {
+            state
+                .palette
+                .scan_hybrid_quadrant::<true>(q, aos, stride_px, quads[q])
         } else {
-            state.palette.classify_text_safe(aos, stride_px, quads[q])
+            state
+                .palette
+                .scan_hybrid_quadrant::<false>(q, aos, stride_px, quads[q])
         };
-        classes[q] = cls;
-        text_safe_count += usize::from(cls.is_text_safe());
+        scans[q] = scan;
+        text_safe_count += usize::from(scan.is_text_safe());
     }
 
     if text_safe_count == n_quads {
@@ -1328,33 +1398,50 @@ fn filter_hybrid_tile<const HAS_ALPHA: bool>(
         for q in 0..n_quads {
             let qrect = quads[q];
             let qmeta = meta.quads[q];
-            let payload = if let Some(px) = qmeta.solid_px {
-                LeafPayload::Solid(px)
+            let payload = if top_deferred[q] {
+                // Top-row quadrants (`q < 2`, `q_px <= SUBTILE_PIXELS`) were
+                // deferred; `try_encode_2d` writes only `indices[..q_px]` and
+                // `self.palette`, leaving bottom-row quadrant indices
+                // (`>= SUBTILE_PIXELS`) and `quad_palettes` untouched.
+                debug_assert!((qrect.w as usize) * (qrect.h as usize) <= SUBTILE_PIXELS);
+                filter_lossless_leaf::<HAS_ALPHA>(tier, aos, stride_px, qrect, qmeta, state)
             } else {
-                match classes[q] {
-                    TextSafeClass::PaletteCandidate => {
-                        filter_lossless_leaf::<HAS_ALPHA>(tier, aos, stride_px, qrect, qmeta, state)
+                match scans[q] {
+                    HybridScan::Solid(px) => LeafPayload::Solid(px),
+                    HybridScan::Palette { n_colors } => {
+                        let q_px = qrect.w as usize * qrect.h as usize;
+                        let packed_len =
+                            state
+                                .palette
+                                .pack_indices_range(q * SUBTILE_PIXELS, q_px, n_colors);
+                        encode_palette_from_parts::<HAS_ALPHA>(
+                            &state.palette.quad_palette(q)[..n_colors],
+                            &state.palette.packed[..packed_len],
+                            qmeta.all_opaque,
+                            &mut state.compressor,
+                            &mut state.zstd_scratch,
+                        )
                     },
-                    TextSafeClass::DominantBg => {
-                        if HAS_ALPHA && qmeta.all_opaque {
-                            tier.filter_aos_zstd_leaf::<false>(aos, stride_px, qrect, state)
+                    HybridScan::TextSafeNoPalette => {
+                        if HAS_ALPHA && !qmeta.all_opaque {
+                            tier.filter_aos_zstd_leaf::<true>(aos, stride_px, qrect, state)
                         } else {
-                            tier.filter_aos_zstd_leaf::<HAS_ALPHA>(aos, stride_px, qrect, state)
+                            tier.filter_aos_zstd_leaf::<false>(aos, stride_px, qrect, state)
                         }
                     },
-                    TextSafeClass::Photo => {
+                    HybridScan::Photo => {
                         if (qrect.w as usize) < MIN_JPEG_DIM || (qrect.h as usize) < MIN_JPEG_DIM {
-                            if HAS_ALPHA && qmeta.all_opaque {
-                                tier.filter_aos_zstd_leaf::<false>(aos, stride_px, qrect, state)
+                            if HAS_ALPHA && !qmeta.all_opaque {
+                                tier.filter_aos_zstd_leaf::<true>(aos, stride_px, qrect, state)
                             } else {
-                                tier.filter_aos_zstd_leaf::<HAS_ALPHA>(aos, stride_px, qrect, state)
+                                tier.filter_aos_zstd_leaf::<false>(aos, stride_px, qrect, state)
                             }
-                        } else if HAS_ALPHA && qmeta.all_opaque {
-                            encode_jpeg_leaf::<false>(
+                        } else if HAS_ALPHA && !qmeta.all_opaque {
+                            encode_jpeg_leaf::<true>(
                                 tier, aos, stride_px, qrect, quality, subsamp, state,
                             )
                         } else {
-                            encode_jpeg_leaf::<HAS_ALPHA>(
+                            encode_jpeg_leaf::<false>(
                                 tier, aos, stride_px, qrect, quality, subsamp, state,
                             )
                         }
@@ -12797,5 +12884,429 @@ mod tests {
             assert_eq!(b_uncached, 5);
             assert_eq!(srv_bytes.used_bytes(), MAX_TILE_CACHE_BYTES);
         });
+    }
+
+    #[test]
+    #[cfg_attr(miri, ignore)]
+    fn test_filter_hybrid_tile_single_pass_bit_exact_parity() {
+        // Exact oracle for RGB `is_text_safe` matching the reference two-pass
+        // hybrid classifier (`<= 256` unique RGB colors OR `>= 35%` dominant RGB).
+        fn ref_is_text_safe(frame: &[u8], stride_px: usize, rect: TileRect) -> bool {
+            let mut counts = std::collections::HashMap::<u32, usize>::new();
+            let n_px = rect.w as usize * rect.h as usize;
+            for ry in 0..rect.h as usize {
+                for rx in 0..rect.w as usize {
+                    let off = ((rect.y as usize + ry) * stride_px + rect.x as usize + rx) * 4;
+                    let rgb =
+                        u32::from_le_bytes([frame[off], frame[off + 1], frame[off + 2], 0xFF]);
+                    *counts.entry(rgb).or_insert(0) += 1;
+                }
+            }
+            if counts.len() <= 256 {
+                return true;
+            }
+            counts.values().copied().max().unwrap_or(0) * 100 >= n_px * 35
+        }
+
+        fn ref_filter_hybrid_tile<const HAS_ALPHA: bool>(
+            tier: arch::Tier,
+            frame: &[u8],
+            aos: BufferPointer<Vec4u8>,
+            stride_px: usize,
+            rect: TileRect,
+            quality: u8,
+            subsamp: JpegSubsamp,
+            meta: &TileEncodeMeta,
+            state: &mut CompressorWorkerState,
+        ) -> TilePayload {
+            if let Some(px) = meta.tile.solid_px {
+                return TilePayload::Leaf(LeafPayload::Solid(px));
+            }
+            let tw = rect.w as usize;
+            let th = rect.h as usize;
+            if tw < MIN_JPEG_DIM || th < MIN_JPEG_DIM {
+                return TilePayload::Leaf(filter_lossless_leaf::<HAS_ALPHA>(
+                    tier, aos, stride_px, rect, meta.tile, state,
+                ));
+            }
+            if let Some(leaf) = try_encode_palette_leaf::<HAS_ALPHA>(
+                aos,
+                stride_px,
+                rect,
+                meta.tile.all_opaque,
+                state,
+            ) {
+                return TilePayload::Leaf(leaf);
+            }
+            if tw <= SUBTILE_W && th <= SUBTILE_H {
+                return TilePayload::Leaf(if ref_is_text_safe(frame, stride_px, rect) {
+                    if HAS_ALPHA && !meta.tile.all_opaque {
+                        tier.filter_aos_zstd_leaf::<true>(aos, stride_px, rect, state)
+                    } else {
+                        tier.filter_aos_zstd_leaf::<false>(aos, stride_px, rect, state)
+                    }
+                } else if HAS_ALPHA && !meta.tile.all_opaque {
+                    encode_jpeg_leaf::<true>(tier, aos, stride_px, rect, quality, subsamp, state)
+                } else {
+                    encode_jpeg_leaf::<false>(tier, aos, stride_px, rect, quality, subsamp, state)
+                });
+            }
+            let (quads, n_quads) = tile_quadrants(rect);
+            let mut safe = [false; 4];
+            let mut text_safe_count = 0usize;
+            for q in 0..n_quads {
+                safe[q] = meta.quads[q].solid_px.is_some()
+                    || ref_is_text_safe(frame, stride_px, quads[q]);
+                text_safe_count += usize::from(safe[q]);
+            }
+            if text_safe_count == n_quads {
+                TilePayload::Leaf(if HAS_ALPHA && !meta.tile.all_opaque {
+                    tier.filter_aos_zstd_leaf::<true>(aos, stride_px, rect, state)
+                } else {
+                    tier.filter_aos_zstd_leaf::<false>(aos, stride_px, rect, state)
+                })
+            } else if text_safe_count == 0 {
+                TilePayload::Leaf(if HAS_ALPHA && !meta.tile.all_opaque {
+                    encode_jpeg_leaf::<true>(tier, aos, stride_px, rect, quality, subsamp, state)
+                } else {
+                    encode_jpeg_leaf::<false>(tier, aos, stride_px, rect, quality, subsamp, state)
+                })
+            } else {
+                let mut sub_tiles = Vec::with_capacity(n_quads);
+                for q in 0..n_quads {
+                    let qrect = quads[q];
+                    let qmeta = meta.quads[q];
+                    let payload = if let Some(px) = qmeta.solid_px {
+                        LeafPayload::Solid(px)
+                    } else if safe[q] {
+                        filter_lossless_leaf::<HAS_ALPHA>(tier, aos, stride_px, qrect, qmeta, state)
+                    } else if (qrect.w as usize) < MIN_JPEG_DIM || (qrect.h as usize) < MIN_JPEG_DIM
+                    {
+                        if HAS_ALPHA && !qmeta.all_opaque {
+                            tier.filter_aos_zstd_leaf::<true>(aos, stride_px, qrect, state)
+                        } else {
+                            tier.filter_aos_zstd_leaf::<false>(aos, stride_px, qrect, state)
+                        }
+                    } else if HAS_ALPHA && !qmeta.all_opaque {
+                        encode_jpeg_leaf::<true>(
+                            tier, aos, stride_px, qrect, quality, subsamp, state,
+                        )
+                    } else {
+                        encode_jpeg_leaf::<false>(
+                            tier, aos, stride_px, qrect, quality, subsamp, state,
+                        )
+                    };
+                    sub_tiles.push(SubTile {
+                        rect: qrect,
+                        payload,
+                    });
+                }
+                TilePayload::Split(sub_tiles)
+            }
+        }
+
+        fn scan_meta<const HAS_ALPHA: bool>(
+            frame: &[u8],
+            stride_px: usize,
+            rect: TileRect,
+        ) -> RectScanMeta {
+            let mut first = None;
+            let mut solid = true;
+            let mut all_opaque = true;
+            for ry in 0..rect.h as usize {
+                for rx in 0..rect.w as usize {
+                    let off = ((rect.y as usize + ry) * stride_px + rect.x as usize + rx) * 4;
+                    let mut px = [frame[off], frame[off + 1], frame[off + 2], frame[off + 3]];
+                    if !HAS_ALPHA {
+                        px[3] = 0xFF;
+                    } else if px[3] != 0xFF {
+                        all_opaque = false;
+                    }
+                    match first {
+                        None => first = Some(px),
+                        Some(f) if f != px => solid = false,
+                        _ => {},
+                    }
+                }
+            }
+            RectScanMeta {
+                solid_px: if solid { first } else { None },
+                all_opaque,
+            }
+        }
+
+        fn build_tile_meta<const HAS_ALPHA: bool>(
+            frame: &[u8],
+            stride_px: usize,
+            rect: TileRect,
+        ) -> TileEncodeMeta {
+            let tile = scan_meta::<HAS_ALPHA>(frame, stride_px, rect);
+            let mut quads = [RectScanMeta::UNKNOWN; 4];
+            if rect.w as usize > SUBTILE_W || rect.h as usize > SUBTILE_H {
+                let (qs, nq) = tile_quadrants(rect);
+                for q in 0..nq {
+                    quads[q] = scan_meta::<HAS_ALPHA>(frame, stride_px, qs[q]);
+                }
+            }
+            TileEncodeMeta { tile, quads }
+        }
+
+        fn fill_solid(buf: &mut [u8], stride: usize, r: TileRect, px: [u8; 4]) {
+            for ry in 0..r.h as usize {
+                for rx in 0..r.w as usize {
+                    let off = ((r.y as usize + ry) * stride + r.x as usize + rx) * 4;
+                    buf[off..off + 4].copy_from_slice(&px);
+                }
+            }
+        }
+
+        fn fill_n_colors(
+            buf: &mut [u8],
+            stride: usize,
+            r: TileRect,
+            n_colors: usize,
+            salt: usize,
+            alpha_fn: impl Fn(usize) -> u8,
+        ) {
+            for ry in 0..r.h as usize {
+                for rx in 0..r.w as usize {
+                    let i = ry * r.w as usize + rx;
+                    let c = (i % n_colors) + salt;
+                    let off = ((r.y as usize + ry) * stride + r.x as usize + rx) * 4;
+                    buf[off] = (c & 0xFF) as u8;
+                    buf[off + 1] = ((c >> 8) & 0xFF) as u8;
+                    buf[off + 2] = ((c * 37) & 0xFF) as u8;
+                    buf[off + 3] = alpha_fn(i);
+                }
+            }
+        }
+
+        fn fill_dominant_bg(
+            buf: &mut [u8],
+            stride: usize,
+            r: TileRect,
+            dom_count: usize,
+            late: bool,
+            alpha_fn: impl Fn(usize) -> u8,
+        ) {
+            let n = r.w as usize * r.h as usize;
+            for ry in 0..r.h as usize {
+                for rx in 0..r.w as usize {
+                    let i = ry * r.w as usize + rx;
+                    let is_dom = if late {
+                        i >= n - dom_count
+                    } else {
+                        i < dom_count
+                    };
+                    let off = ((r.y as usize + ry) * stride + r.x as usize + rx) * 4;
+                    if is_dom {
+                        buf[off] = 240;
+                        buf[off + 1] = 242;
+                        buf[off + 2] = 245;
+                    } else {
+                        let u = i + 500;
+                        buf[off] = (u & 0xFF) as u8;
+                        buf[off + 1] = ((u >> 8) & 0xFF) as u8;
+                        buf[off + 2] = ((u.wrapping_mul(13)) & 0xFF) as u8;
+                    }
+                    buf[off + 3] = alpha_fn(i);
+                }
+            }
+        }
+
+        let tr = |x, y, w, h| TileRect { x, y, w, h };
+        let tier = arch::Tier::detect();
+        let stride = 300usize;
+        let canvas_h = 280usize;
+        let mut comp_got = ShardingCompressor::new(NonZeroUsize::new(1).unwrap(), 1).unwrap();
+        let mut comp_ref = ShardingCompressor::new(NonZeroUsize::new(1).unwrap(), 1).unwrap();
+
+        let mut check_case = |label: &str, buf: &[u8], rect: TileRect| {
+            let ptr = buf.as_ptr().cast::<Vec4u8>();
+            let aos = unsafe { BufferPointer::new(&ptr, buf.len() / 4) };
+            let meta_xrgb = build_tile_meta::<false>(buf, stride, rect);
+            let meta_argb = build_tile_meta::<true>(buf, stride, rect);
+
+            for (m_tag, m_x, m_a) in [
+                ("known", meta_xrgb, meta_argb),
+                ("unknown", TileEncodeMeta::UNKNOWN, TileEncodeMeta::UNKNOWN),
+            ] {
+                let got_pair = Mutex::new(None);
+                comp_got.pool.execute(1, |st_got| {
+                    let gx = filter_hybrid_tile::<false>(
+                        tier,
+                        aos,
+                        stride,
+                        rect,
+                        85,
+                        JpegSubsamp::Sub420,
+                        &m_x,
+                        st_got,
+                    );
+                    let ga = filter_hybrid_tile::<true>(
+                        tier,
+                        aos,
+                        stride,
+                        rect,
+                        85,
+                        JpegSubsamp::Sub420,
+                        &m_a,
+                        st_got,
+                    );
+                    *got_pair.lock().unwrap() = Some((gx, ga));
+                });
+                let ref_pair = Mutex::new(None);
+                comp_ref.pool.execute(1, |st_ref| {
+                    let rx = ref_filter_hybrid_tile::<false>(
+                        tier,
+                        buf,
+                        aos,
+                        stride,
+                        rect,
+                        85,
+                        JpegSubsamp::Sub420,
+                        &m_x,
+                        st_ref,
+                    );
+                    let ra = ref_filter_hybrid_tile::<true>(
+                        tier,
+                        buf,
+                        aos,
+                        stride,
+                        rect,
+                        85,
+                        JpegSubsamp::Sub420,
+                        &m_a,
+                        st_ref,
+                    );
+                    *ref_pair.lock().unwrap() = Some((rx, ra));
+                });
+                let (got_x, got_a) = got_pair.into_inner().unwrap().unwrap();
+                let (ref_x, ref_a) = ref_pair.into_inner().unwrap().unwrap();
+                assert_eq!(got_x, ref_x, "Xrgb8888 mismatch on {label} ({m_tag})");
+                assert_eq!(got_a, ref_a, "Argb8888 mismatch on {label} ({m_tag})");
+            }
+        };
+
+        // 1. Non-splittable leaves (`<= 128x128`): Solid, 2/16/256 palette, 257 boundary,
+        //    DominantBg (below & above 35%, early & late, translucent RGB dominant), Photo, thin strip.
+        for rect in [
+            tr(8, 6, 128, 128),
+            tr(4, 4, 73, 51),
+            tr(0, 0, 16, 16),
+            tr(0, 0, 128, 8),
+        ] {
+            let n = rect.w as usize * rect.h as usize;
+            let thresh = (n * 35).div_ceil(100);
+            let mut buf = vec![0xAAu8; stride * canvas_h * 4];
+
+            fill_solid(&mut buf, stride, rect, [10, 20, 30, 0xFF]);
+            check_case("leaf_solid", &buf, rect);
+
+            for n_col in [2usize, 16, 256] {
+                fill_n_colors(&mut buf, stride, rect, n_col, 0, |i| {
+                    0x80 + ((i * 7) & 0x7F) as u8
+                });
+                check_case("leaf_palette_var_alpha", &buf, rect);
+                fill_n_colors(&mut buf, stride, rect, n_col, 0, |_| 0xFF);
+                check_case("leaf_palette_opaque", &buf, rect);
+            }
+
+            if n >= 257 {
+                fill_n_colors(&mut buf, stride, rect, 257, 0, |_| 0xFF);
+                check_case("leaf_257_photo", &buf, rect);
+
+                fill_dominant_bg(&mut buf, stride, rect, thresh - 1, false, |_| 0xFF);
+                check_case("leaf_dom_below_early", &buf, rect);
+
+                fill_dominant_bg(&mut buf, stride, rect, thresh, false, |_| 0xFF);
+                check_case("leaf_dom_at_early", &buf, rect);
+
+                fill_dominant_bg(&mut buf, stride, rect, thresh, true, |_| 0xFF);
+                check_case("leaf_dom_at_late", &buf, rect);
+
+                fill_dominant_bg(&mut buf, stride, rect, thresh, true, |i| {
+                    0x80 + (i & 0x3F) as u8
+                });
+                check_case("leaf_dom_at_late_translucent", &buf, rect);
+            }
+        }
+
+        // 2. Splittable `256x256` tiles:
+        //    (a) Whole-tile palette, (b) All-Photo, (c) All-TextSafe (>256 global,
+        //        both `ovf_ry < 128` and `ovf_ry >= 128`!), (d) Mixed Split with
+        //        Solid + Palette + DominantBg + Photo in both `ovf_ry < 128` and
+        //        `ovf_ry >= 128` layouts!
+        let r256 = tr(12, 8, 256, 256);
+        let q0 = tr(12, 8, 128, 128);
+        let q1 = tr(140, 8, 128, 128);
+        let q2 = tr(12, 136, 128, 128);
+        let q3 = tr(140, 136, 128, 128);
+        let mut buf = vec![0x55u8; stride * canvas_h * 4];
+
+        // (a) Whole-tile <= 256 palette
+        fill_n_colors(&mut buf, stride, r256, 200, 0, |_| 0xFF);
+        check_case("split_whole_palette", &buf, r256);
+
+        // (b) All-Photo
+        fill_n_colors(&mut buf, stride, r256, 10_000, 0, |_| 0xFF);
+        check_case("split_all_photo", &buf, r256);
+
+        // (c1) All-TextSafe with `ovf_ry >= 128` (Q0+Q1 <= 200 colors total, Q2+Q3 add 200 more)
+        fill_n_colors(&mut buf, stride, q0, 100, 0, |_| 0xFF);
+        fill_n_colors(&mut buf, stride, q1, 100, 100, |_| 0xFF);
+        fill_n_colors(&mut buf, stride, q2, 100, 200, |_| 0xFF);
+        fill_n_colors(&mut buf, stride, q3, 100, 300, |_| 0xFF);
+        check_case("split_all_textsafe_ovf_ge_128", &buf, r256);
+
+        // (c2) All-TextSafe with `ovf_ry < 128` (Q0+Q1 > 256 colors, each quad DominantBg)
+        let q_thresh = (128 * 128 * 35usize).div_ceil(100);
+        fill_dominant_bg(&mut buf, stride, q0, q_thresh + 200, false, |_| 0xFF);
+        fill_dominant_bg(&mut buf, stride, q1, q_thresh + 200, true, |_| 0xFF);
+        fill_dominant_bg(&mut buf, stride, q2, q_thresh + 200, false, |i| {
+            0x90 + (i & 0x1F) as u8
+        });
+        fill_n_colors(&mut buf, stride, q3, 12, 0, |_| 0xFF);
+        check_case("split_all_textsafe_ovf_lt_128_mixed_alpha", &buf, r256);
+
+        // (d1) Mixed Split with `ovf_ry < 128`: Q0 Solid, Q1 Photo, Q2 Palette, Q3 DominantBg
+        fill_solid(&mut buf, stride, q0, [11, 22, 33, 0xFF]);
+        fill_n_colors(&mut buf, stride, q1, 8000, 0, |_| 0xFF);
+        fill_n_colors(&mut buf, stride, q2, 64, 0, |i| 0xC0 + (i & 3) as u8);
+        fill_dominant_bg(&mut buf, stride, q3, q_thresh, true, |_| 0xFF);
+        check_case("split_mixed_ovf_lt_128", &buf, r256);
+
+        // (d2) Mixed Split with `ovf_ry >= 128`: Q0+Q1 <= 200 colors total (deferred!), Q2 Palette, Q3 Photo
+        fill_n_colors(&mut buf, stride, q0, 80, 0, |_| 0xFF);
+        fill_n_colors(&mut buf, stride, q1, 80, 80, |_| 0xFF);
+        fill_n_colors(&mut buf, stride, q2, 120, 400, |_| 0xFF);
+        fill_n_colors(&mut buf, stride, q3, 8000, 1000, |_| 0xFF);
+        check_case("split_mixed_ovf_ge_128", &buf, r256);
+
+        // (d3) Translucent mixed split where Q0 has <= 256 RGB colors but > 256 BGRA colors
+        fill_n_colors(&mut buf, stride, q0, 32, 0, |i| 0x80 + (i & 0x3F) as u8);
+        fill_n_colors(&mut buf, stride, q1, 16, 0, |_| 0xFF);
+        fill_n_colors(&mut buf, stride, q2, 8000, 0, |i| 0xA0 + (i & 0x1F) as u8);
+        fill_solid(&mut buf, stride, q3, [44, 55, 66, 0x80]);
+        check_case("split_mixed_translucent_rgb_vs_bgra", &buf, r256);
+
+        // 3. Splittable 2-quadrant edge tiles:
+        //    - Vertical `100x200` with `ovf_ry >= 128` (top palette, bottom photo)
+        let rv = tr(10, 10, 100, 200);
+        fill_n_colors(&mut buf, stride, tr(10, 10, 100, 128), 32, 0, |_| 0xFF);
+        fill_n_colors(&mut buf, stride, tr(10, 138, 100, 72), 4000, 0, |_| 0xFF);
+        check_case("edge_vertical_2quad_ovf_ge_128", &buf, rv);
+
+        //    - Horizontal `200x100` (left palette, right photo)
+        let rh = tr(10, 10, 200, 100);
+        fill_n_colors(&mut buf, stride, tr(10, 10, 128, 100), 16, 0, |_| 0xFF);
+        fill_n_colors(&mut buf, stride, tr(138, 10, 72, 100), 4000, 0, |_| 0xFF);
+        check_case("edge_horizontal_2quad", &buf, rh);
+
+        //    - Bottom-strip `< MIN_JPEG_DIM` (`256x136`: top palette, bottom `128x8` photo)
+        let re = tr(0, 0, 256, 136);
+        fill_n_colors(&mut buf, stride, tr(0, 0, 256, 128), 20, 0, |_| 0xFF);
+        fill_n_colors(&mut buf, stride, tr(0, 128, 256, 8), 2000, 0, |_| 0xFF);
+        check_case("edge_256x136_thin_bottom_photo", &buf, re);
     }
 }
