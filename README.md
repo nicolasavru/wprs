@@ -241,7 +241,12 @@ protocol.
 
 ### XWayland
 
-XWayland support is implemented as a separate binary, `xwayland-xdg-shell`. The
+`wprsd` supports choosing the XWayland backend via `--xwayland` (or `xwayland`
+in `wprsd.ron`): `xwayland-xdg-shell` (default), `xwayland-satellite`, or
+`disabled`, with `--xwayland-display` / `xwayland_display` defaulting to `100`
+(`:100`).
+
+The built-in backend is implemented as a separate binary, `xwayland-xdg-shell`. The
 binary implements a wayland compositor (but only for the protocol features used
 by xwayland) and client, just like wprsd and wprsc, but in a single binary (so
 skipping the serialization/deserialization). This is the same model as

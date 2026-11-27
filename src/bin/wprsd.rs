@@ -35,6 +35,7 @@ use wprs::args;
 use wprs::args::Config;
 use wprs::args::OptionalConfig;
 use wprs::args::SerializableLevel;
+use wprs::args::XwaylandBackend;
 use wprs::prelude::*;
 use wprs::serialization::Serializer;
 use wprs::server::WprsServerState;
@@ -59,10 +60,12 @@ pub struct WprsdConfig {
     stderr_log_level: SerializableLevel,
     file_log_level: SerializableLevel,
     log_priv_data: bool,
-    enable_xwayland: bool,
-    xwayland_xdg_shell_path: String,
-    xwayland_xdg_shell_wayland_debug: bool,
-    xwayland_xdg_shell_args: Vec<String>,
+    xwayland: XwaylandBackend,
+    xwayland_display: u32,
+    #[optional_wrap]
+    xwayland_path: Option<String>,
+    xwayland_wayland_debug: bool,
+    xwayland_args: Vec<String>,
     kde_server_side_decorations: bool,
 }
 
@@ -78,10 +81,11 @@ impl Default for WprsdConfig {
             stderr_log_level: SerializableLevel(Level::INFO),
             file_log_level: SerializableLevel(Level::TRACE),
             log_priv_data: false,
-            enable_xwayland: true,
-            xwayland_xdg_shell_path: "xwayland-xdg-shell".to_string(),
-            xwayland_xdg_shell_wayland_debug: false,
-            xwayland_xdg_shell_args: Vec::new(),
+            xwayland: XwaylandBackend::default(),
+            xwayland_display: 100,
+            xwayland_path: None,
+            xwayland_wayland_debug: false,
+            xwayland_args: Vec::new(),
             kde_server_side_decorations: false,
         }
     }
@@ -93,31 +97,33 @@ impl Config for WprsdConfig {
     }
 }
 
-fn enable_xwayland() -> impl Parser<Option<bool>> {
-    bpaf::long("enable-xwayland")
-        .argument::<bool>("BOOL")
+fn xwayland_display() -> impl Parser<Option<u32>> {
+    bpaf::long("xwayland-display")
+        .argument::<u32>("NUM")
+        .help("X11 display number for the XWayland backend (default 100, i.e., :100).")
         .optional()
 }
 
-fn xwayland_xdg_shell_path() -> impl Parser<Option<String>> {
-    bpaf::long("xwayland-xdg-shell-path")
+fn xwayland_path() -> impl Parser<Option<Option<String>>> {
+    bpaf::long("xwayland-path")
         .argument::<String>("PATH")
+        .help("Override the XWayland backend executable path.")
         .optional()
+        .map(|path| path.map(Some))
 }
 
-fn xwayland_xdg_shell_wayland_debug() -> impl Parser<Option<bool>> {
-    bpaf::long("xwayland-xdg-shell-wayland-debug")
+fn xwayland_wayland_debug() -> impl Parser<Option<bool>> {
+    bpaf::long("xwayland-wayland-debug")
         .argument::<bool>("BOOL")
         .optional()
 }
 
-fn xwayland_xdg_shell_args() -> impl Parser<Option<Vec<String>>> {
-    bpaf::long("xwayland-xdg-shell-args")
+fn xwayland_args() -> impl Parser<Option<Vec<String>>> {
+    bpaf::long("xwayland-args")
         .argument::<String>("ARG1,ARG2,...,ARGN")
         .map(|s| s.split(',').map(str::to_string).collect::<Vec<_>>())
         .many()
-        .map(|nested| nested.into_iter().flatten().collect())
-        .optional()
+        .map(|nested| (!nested.is_empty()).then(|| nested.into_iter().flatten().collect()))
 }
 
 fn kde_server_side_decorations() -> impl Parser<Option<bool>> {
@@ -127,8 +133,8 @@ fn kde_server_side_decorations() -> impl Parser<Option<bool>> {
         .optional()
 }
 
-impl OptionalConfig<WprsdConfig> for OptionalWprsdConfig {
-    fn parse_args() -> Self {
+impl OptionalWprsdConfig {
+    fn args_parser() -> impl Parser<Self> {
         let print_default_config_and_exit = args::print_default_config_and_exit();
         let config_file = args::config_file();
         let wayland_display = args::wayland_display();
@@ -138,10 +144,11 @@ impl OptionalConfig<WprsdConfig> for OptionalWprsdConfig {
         let stderr_log_level = args::stderr_log_level();
         let file_log_level = args::file_log_level();
         let log_priv_data = args::log_priv_data();
-        let enable_xwayland = enable_xwayland();
-        let xwayland_xdg_shell_path = xwayland_xdg_shell_path();
-        let xwayland_xdg_shell_wayland_debug = xwayland_xdg_shell_wayland_debug();
-        let xwayland_xdg_shell_args = xwayland_xdg_shell_args();
+        let xwayland = args::xwayland();
+        let xwayland_display = xwayland_display();
+        let xwayland_path = xwayland_path();
+        let xwayland_wayland_debug = xwayland_wayland_debug();
+        let xwayland_args = xwayland_args();
         let kde_server_side_decorations = kde_server_side_decorations();
         bpaf::construct!(Self {
             print_default_config_and_exit,
@@ -153,14 +160,19 @@ impl OptionalConfig<WprsdConfig> for OptionalWprsdConfig {
             stderr_log_level,
             file_log_level,
             log_priv_data,
-            enable_xwayland,
-            xwayland_xdg_shell_path,
-            xwayland_xdg_shell_wayland_debug,
-            xwayland_xdg_shell_args,
+            xwayland,
+            xwayland_display,
+            xwayland_path,
+            xwayland_wayland_debug,
+            xwayland_args,
             kde_server_side_decorations,
         })
-        .to_options()
-        .run()
+    }
+}
+
+impl OptionalConfig<WprsdConfig> for OptionalWprsdConfig {
+    fn parse_args() -> Self {
+        Self::args_parser().to_options().run()
     }
 
     fn print_default_config_and_exit(&self) -> Option<bool> {
@@ -208,28 +220,44 @@ fn init_wayland_listener(
     Ok(())
 }
 
-fn start_xwayland_xdg_shell(
-    wayland_display: &str,
-    xwayland_xdg_shell_path: &str,
-    xwayland_xdg_shell_wayland_debug: bool,
-    xwayland_xdg_shell_args: &[String],
-) {
-    let mut child = Command::new(xwayland_xdg_shell_path)
-        .env("WAYLAND_DISPLAY", wayland_display)
-        .env(
-            "WAYLAND_DEBUG",
-            if xwayland_xdg_shell_wayland_debug {
-                "1"
-            } else {
-                "0"
-            },
-        )
-        .args(xwayland_xdg_shell_args)
+fn build_xwayland_command(config: &WprsdConfig) -> Option<Command> {
+    let default_binary = config.xwayland.default_binary()?;
+    let program = config.xwayland_path.as_deref().unwrap_or(default_binary);
+    let mut cmd = Command::new(program);
+    cmd.env("WAYLAND_DISPLAY", &config.wayland_display).env(
+        "WAYLAND_DEBUG",
+        if config.xwayland_wayland_debug {
+            "1"
+        } else {
+            "0"
+        },
+    );
+    match config.xwayland {
+        XwaylandBackend::Disabled => unreachable!("default_binary returned Some"),
+        XwaylandBackend::XwaylandXdgShell => {
+            cmd.args(["--display", &config.xwayland_display.to_string()]);
+        },
+        XwaylandBackend::XwaylandSatellite => {
+            cmd.arg(format!(":{}", config.xwayland_display));
+        },
+    }
+    cmd.args(&config.xwayland_args);
+    Some(cmd)
+}
+
+fn start_xwayland(config: &WprsdConfig) {
+    let Some(mut cmd) = build_xwayland_command(config) else {
+        return;
+    };
+    let backend = config.xwayland;
+    let mut child = cmd
         .spawn()
-        .expect("failed executing xwayland-xdg-shell");
+        .unwrap_or_else(|err| panic!("failed executing {backend}: {err}"));
 
     std::thread::spawn(move || {
-        child.wait().expect("failed waiting xwayland-xdg-shell");
+        child
+            .wait()
+            .unwrap_or_else(|err| panic!("failed waiting {backend}: {err}"));
     });
 }
 
@@ -239,7 +267,7 @@ pub fn main() -> Result<()> {
     args::set_log_priv_data(config.log_priv_data);
     utils::configure_tracing(
         config.stderr_log_level.0,
-        config.log_file,
+        config.log_file.clone(),
         config.file_log_level.0,
     )
     .location(loc!())?;
@@ -258,7 +286,7 @@ pub fn main() -> Result<()> {
         display.handle(),
         event_loop.handle(),
         serializer,
-        config.enable_xwayland,
+        config.xwayland.is_enabled(),
         frame_interval,
         config.kde_server_side_decorations,
     );
@@ -266,14 +294,7 @@ pub fn main() -> Result<()> {
     init_wayland_listener(&config.wayland_display, display, &mut state, &event_loop)
         .location(loc!())?;
 
-    if config.enable_xwayland {
-        start_xwayland_xdg_shell(
-            &config.wayland_display,
-            &config.xwayland_xdg_shell_path,
-            config.xwayland_xdg_shell_wayland_debug,
-            &config.xwayland_xdg_shell_args,
-        );
-    }
+    start_xwayland(&config);
 
     // TODO: do this in WprsServerState::new;
     let _keyboard = state
@@ -300,4 +321,243 @@ pub fn main() -> Result<()> {
         .location(loc!())?;
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use std::ffi::OsStr;
+
+    use optional_struct::Applicable;
+    use ron::Options;
+    use ron::extensions::Extensions;
+
+    use super::*;
+
+    fn command_envs(cmd: &Command) -> Vec<(&OsStr, Option<&OsStr>)> {
+        cmd.get_envs().collect()
+    }
+
+    fn command_args(cmd: &Command) -> Vec<&OsStr> {
+        cmd.get_args().collect()
+    }
+
+    #[test]
+    fn test_wprsd_config_xwayland_ron_and_cli() {
+        let default_cfg = WprsdConfig::default();
+        assert_eq!(default_cfg.xwayland, XwaylandBackend::XwaylandXdgShell);
+        assert_eq!(default_cfg.xwayland_display, 100);
+        assert_eq!(default_cfg.xwayland_path, None);
+        assert!(!default_cfg.xwayland_wayland_debug);
+        assert!(default_cfg.xwayland_args.is_empty());
+        assert!(default_cfg.xwayland.is_enabled());
+
+        // `--print-default-config-and-exit` output must roundtrip through `OptionalWprsdConfig`.
+        let printed =
+            ron::ser::to_string_pretty(&default_cfg, ron::ser::PrettyConfig::default()).unwrap();
+        let parsed_opt: OptionalWprsdConfig = Options::default()
+            .with_default_extension(Extensions::IMPLICIT_SOME)
+            .from_str(&printed)
+            .unwrap();
+        let mut applied = WprsdConfig::default();
+        parsed_opt.apply_to(&mut applied);
+        assert_eq!(applied, default_cfg);
+
+        // RON overrides for all three XWayland variants, including `Disabled`
+        // under `Extensions::IMPLICIT_SOME`, plus preserving `xwayland_args`
+        // when the CLI omits `--xwayland-args`.
+        let sat_ron = r#"(
+            xwayland: XwaylandSatellite,
+            xwayland_display: 105,
+            xwayland_path: "/opt/bin/xwayland-satellite",
+            xwayland_wayland_debug: true,
+            xwayland_args: ["--extra", "foo"],
+        )"#;
+        let sat_opt: OptionalWprsdConfig = Options::default()
+            .with_default_extension(Extensions::IMPLICIT_SOME)
+            .from_str(sat_ron)
+            .unwrap();
+        let mut sat_cfg = WprsdConfig::default();
+        sat_opt.apply_to(&mut sat_cfg);
+        let empty: &[&str] = &[];
+        let empty_cli = OptionalWprsdConfig::args_parser()
+            .to_options()
+            .run_inner(empty)
+            .unwrap();
+        assert_eq!(empty_cli.xwayland_args, None);
+        empty_cli.apply_to(&mut sat_cfg);
+        assert_eq!(sat_cfg.xwayland, XwaylandBackend::XwaylandSatellite);
+        assert_eq!(sat_cfg.xwayland_display, 105);
+        assert_eq!(
+            sat_cfg.xwayland_path.as_deref(),
+            Some("/opt/bin/xwayland-satellite")
+        );
+        assert!(sat_cfg.xwayland_wayland_debug);
+        assert_eq!(sat_cfg.xwayland_args, vec!["--extra", "foo"]);
+        assert!(sat_cfg.xwayland.is_enabled());
+
+        let disabled_opt: OptionalWprsdConfig = Options::default()
+            .with_default_extension(Extensions::IMPLICIT_SOME)
+            .from_str("(xwayland: Disabled)")
+            .unwrap();
+        let mut disabled_cfg = WprsdConfig::default();
+        disabled_opt.apply_to(&mut disabled_cfg);
+        assert_eq!(disabled_cfg.xwayland, XwaylandBackend::Disabled);
+        assert!(!disabled_cfg.xwayland.is_enabled());
+
+        assert!(
+            Options::default()
+                .with_default_extension(Extensions::IMPLICIT_SOME)
+                .from_str::<OptionalWprsdConfig>("(xwayland: Unknown)")
+                .is_err()
+        );
+
+        // CLI flag parsing via `OptionalWprsdConfig::args_parser`.
+        let cli_opt = OptionalWprsdConfig::args_parser()
+            .to_options()
+            .run_inner(
+                &[
+                    "--xwayland",
+                    "xwayland-satellite",
+                    "--xwayland-display",
+                    "102",
+                    "--xwayland-path",
+                    "/usr/local/bin/xwayland-satellite",
+                    "--xwayland-wayland-debug",
+                    "true",
+                    "--xwayland-args=--arg1,--arg2",
+                    "--xwayland-args=--arg3",
+                ][..],
+            )
+            .unwrap();
+        let mut cli_cfg = WprsdConfig::default();
+        cli_opt.apply_to(&mut cli_cfg);
+        assert_eq!(cli_cfg.xwayland, XwaylandBackend::XwaylandSatellite);
+        assert_eq!(cli_cfg.xwayland_display, 102);
+        assert_eq!(
+            cli_cfg.xwayland_path.as_deref(),
+            Some("/usr/local/bin/xwayland-satellite")
+        );
+        assert!(cli_cfg.xwayland_wayland_debug);
+        assert_eq!(cli_cfg.xwayland_args, vec!["--arg1", "--arg2", "--arg3"]);
+
+        let cli_disabled = OptionalWprsdConfig::args_parser()
+            .to_options()
+            .run_inner(&["--xwayland", "disabled"][..])
+            .unwrap();
+        let mut cli_disabled_cfg = WprsdConfig::default();
+        cli_disabled.apply_to(&mut cli_disabled_cfg);
+        assert_eq!(cli_disabled_cfg.xwayland, XwaylandBackend::Disabled);
+        assert!(!cli_disabled_cfg.xwayland.is_enabled());
+
+        assert!(
+            OptionalWprsdConfig::args_parser()
+                .to_options()
+                .run_inner(&["--xwayland", "invalid"][..])
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn test_build_xwayland_command_all_backends() {
+        // Disabled -> None (no child process, Capabilities.xwayland == false).
+        let disabled = WprsdConfig {
+            xwayland: XwaylandBackend::Disabled,
+            ..WprsdConfig::default()
+        };
+        assert!(!disabled.xwayland.is_enabled());
+        assert!(build_xwayland_command(&disabled).is_none());
+
+        // Default XwaylandXdgShell.
+        let xdg_default = WprsdConfig::default();
+        assert!(xdg_default.xwayland.is_enabled());
+        let cmd = build_xwayland_command(&xdg_default).unwrap();
+        assert_eq!(cmd.get_program(), OsStr::new("xwayland-xdg-shell"));
+        assert_eq!(
+            command_envs(&cmd),
+            vec![
+                (OsStr::new("WAYLAND_DEBUG"), Some(OsStr::new("0"))),
+                (OsStr::new("WAYLAND_DISPLAY"), Some(OsStr::new("wprs-0"))),
+            ]
+        );
+        assert_eq!(
+            command_args(&cmd),
+            vec![OsStr::new("--display"), OsStr::new("100")]
+        );
+
+        // Customized XwaylandXdgShell.
+        let xdg_custom = WprsdConfig {
+            wayland_display: "wprs-custom".to_string(),
+            xwayland: XwaylandBackend::XwaylandXdgShell,
+            xwayland_display: 107,
+            xwayland_path: Some("/custom/xwayland-xdg-shell".to_string()),
+            xwayland_wayland_debug: true,
+            xwayland_args: vec![
+                "--decoration-behavior".to_string(),
+                "AlwaysEnabled".to_string(),
+            ],
+            ..WprsdConfig::default()
+        };
+        let cmd = build_xwayland_command(&xdg_custom).unwrap();
+        assert_eq!(cmd.get_program(), OsStr::new("/custom/xwayland-xdg-shell"));
+        assert_eq!(
+            command_envs(&cmd),
+            vec![
+                (OsStr::new("WAYLAND_DEBUG"), Some(OsStr::new("1"))),
+                (
+                    OsStr::new("WAYLAND_DISPLAY"),
+                    Some(OsStr::new("wprs-custom"))
+                ),
+            ]
+        );
+        assert_eq!(
+            command_args(&cmd),
+            vec![
+                OsStr::new("--display"),
+                OsStr::new("107"),
+                OsStr::new("--decoration-behavior"),
+                OsStr::new("AlwaysEnabled"),
+            ]
+        );
+
+        // Default XwaylandSatellite.
+        let sat_default = WprsdConfig {
+            xwayland: XwaylandBackend::XwaylandSatellite,
+            ..WprsdConfig::default()
+        };
+        assert!(sat_default.xwayland.is_enabled());
+        let cmd = build_xwayland_command(&sat_default).unwrap();
+        assert_eq!(cmd.get_program(), OsStr::new("xwayland-satellite"));
+        assert_eq!(
+            command_envs(&cmd),
+            vec![
+                (OsStr::new("WAYLAND_DEBUG"), Some(OsStr::new("0"))),
+                (OsStr::new("WAYLAND_DISPLAY"), Some(OsStr::new("wprs-0"))),
+            ]
+        );
+        assert_eq!(command_args(&cmd), vec![OsStr::new(":100")]);
+
+        // Customized XwaylandSatellite.
+        let sat_custom = WprsdConfig {
+            wayland_display: "wprs-1".to_string(),
+            xwayland: XwaylandBackend::XwaylandSatellite,
+            xwayland_display: 103,
+            xwayland_path: Some("/opt/xwayland-satellite".to_string()),
+            xwayland_wayland_debug: true,
+            xwayland_args: vec!["--extra-flag".to_string()],
+            ..WprsdConfig::default()
+        };
+        let cmd = build_xwayland_command(&sat_custom).unwrap();
+        assert_eq!(cmd.get_program(), OsStr::new("/opt/xwayland-satellite"));
+        assert_eq!(
+            command_envs(&cmd),
+            vec![
+                (OsStr::new("WAYLAND_DEBUG"), Some(OsStr::new("1"))),
+                (OsStr::new("WAYLAND_DISPLAY"), Some(OsStr::new("wprs-1"))),
+            ]
+        );
+        assert_eq!(
+            command_args(&cmd),
+            vec![OsStr::new(":103"), OsStr::new("--extra-flag")]
+        );
+    }
 }

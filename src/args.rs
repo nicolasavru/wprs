@@ -354,6 +354,62 @@ pub fn jpeg_subsamp() -> impl Parser<Option<JpegSubsamp>> {
         .optional()
 }
 
+/// CLI/config selector for `wprsd`'s XWayland backend.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Deserialize, Serialize)]
+pub enum XwaylandBackend {
+    Disabled,
+    #[default]
+    XwaylandXdgShell,
+    XwaylandSatellite,
+}
+
+impl XwaylandBackend {
+    pub const fn is_enabled(self) -> bool {
+        !matches!(self, Self::Disabled)
+    }
+
+    pub const fn default_binary(self) -> Option<&'static str> {
+        match self {
+            Self::Disabled => None,
+            Self::XwaylandXdgShell => Some("xwayland-xdg-shell"),
+            Self::XwaylandSatellite => Some("xwayland-satellite"),
+        }
+    }
+}
+
+impl fmt::Display for XwaylandBackend {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(match self {
+            Self::Disabled => "disabled",
+            Self::XwaylandXdgShell => "xwayland-xdg-shell",
+            Self::XwaylandSatellite => "xwayland-satellite",
+        })
+    }
+}
+
+impl FromStr for XwaylandBackend {
+    type Err = anyhow::Error;
+
+    fn from_str(s: &str) -> Result<Self> {
+        match s {
+            "disabled" => Ok(Self::Disabled),
+            "xwayland-xdg-shell" => Ok(Self::XwaylandXdgShell),
+            "xwayland-satellite" => Ok(Self::XwaylandSatellite),
+            _ => bail!(
+                "invalid XWayland backend {s:?}: expected \"disabled\", \"xwayland-xdg-shell\", or \"xwayland-satellite\""
+            ),
+        }
+    }
+}
+
+pub fn xwayland() -> impl Parser<Option<XwaylandBackend>> {
+    bpaf::long("xwayland")
+        .argument::<String>("BACKEND")
+        .help("XWayland backend: xwayland-xdg-shell (default), xwayland-satellite, or disabled.")
+        .parse(|s| XwaylandBackend::from_str(&s))
+        .optional()
+}
+
 pub static LOG_PRIV_DATA: AtomicBool = AtomicBool::new(false);
 
 pub fn set_log_priv_data(val: bool) {
@@ -433,5 +489,63 @@ mod tests {
             Some(JpegSubsamp::Sub420)
         );
         assert!(sub_opts.run_inner(&["--jpeg-subsamp", "411"][..]).is_err());
+    }
+
+    #[test]
+    fn test_xwayland_backend_cli_and_ron_parsing() {
+        assert_eq!(
+            XwaylandBackend::default(),
+            XwaylandBackend::XwaylandXdgShell
+        );
+        for (s, expected, enabled, binary) in [
+            ("disabled", XwaylandBackend::Disabled, false, None),
+            (
+                "xwayland-xdg-shell",
+                XwaylandBackend::XwaylandXdgShell,
+                true,
+                Some("xwayland-xdg-shell"),
+            ),
+            (
+                "xwayland-satellite",
+                XwaylandBackend::XwaylandSatellite,
+                true,
+                Some("xwayland-satellite"),
+            ),
+        ] {
+            assert_eq!(XwaylandBackend::from_str(s).unwrap(), expected);
+            assert_eq!(expected.to_string(), s);
+            assert_eq!(expected.is_enabled(), enabled);
+            assert_eq!(expected.default_binary(), binary);
+
+            let serialized = ron::to_string(&expected).unwrap();
+            assert_eq!(
+                ron::from_str::<XwaylandBackend>(&serialized).unwrap(),
+                expected
+            );
+        }
+        for bad in ["", "none", "true", "false", "XwaylandSatellite", "xwayland"] {
+            assert!(XwaylandBackend::from_str(bad).is_err());
+        }
+
+        let empty: &[&str] = &[];
+        let xw_opts = xwayland().to_options();
+        assert_eq!(xw_opts.run_inner(empty).unwrap(), None);
+        assert_eq!(
+            xw_opts.run_inner(&["--xwayland", "disabled"][..]).unwrap(),
+            Some(XwaylandBackend::Disabled)
+        );
+        assert_eq!(
+            xw_opts
+                .run_inner(&["--xwayland", "xwayland-xdg-shell"][..])
+                .unwrap(),
+            Some(XwaylandBackend::XwaylandXdgShell)
+        );
+        assert_eq!(
+            xw_opts
+                .run_inner(&["--xwayland", "xwayland-satellite"][..])
+                .unwrap(),
+            Some(XwaylandBackend::XwaylandSatellite)
+        );
+        assert!(xw_opts.run_inner(&["--xwayland", "none"][..]).is_err());
     }
 }
