@@ -58,6 +58,7 @@ use crate::prelude::*;
 use crate::serialization::framing::AlphaChannel;
 use crate::serialization::framing::CompressedTile;
 use crate::serialization::framing::LeafPayload;
+use crate::serialization::framing::ScrollRect;
 use crate::serialization::framing::TileRect;
 use crate::sharding_compression::CompressorWorkerState;
 use crate::sharding_compression::DecompressorWorkerState;
@@ -2612,6 +2613,7 @@ macro_rules! define_tier_wrappers {
             use crate::serialization::framing::AlphaChannel;
             use crate::serialization::framing::CompressedTile;
             use crate::serialization::framing::LeafPayload;
+            use crate::serialization::framing::ScrollRect;
             use crate::serialization::framing::TileRect;
             use crate::sharding_compression::CompressorWorkerState;
             use crate::sharding_compression::DecompressorWorkerState;
@@ -2742,6 +2744,45 @@ macro_rules! define_tier_wrappers {
                         stride_px,
                         n_qx,
                         sub_bands,
+                        dirty_flags,
+                        next_sub,
+                    );
+                }
+            }
+
+            #[target_feature(enable = $feat)]
+            #[inline]
+            pub(super) unsafe fn diff_and_update_scroll_worker<const HAS_ALPHA: bool>(
+                data: BufferPointer<u8>,
+                aos: BufferPointer<Vec4u8>,
+                shadow: &ShadowRows,
+                width: usize,
+                stride: usize,
+                stride_px: usize,
+                n_qx: usize,
+                sub_bands: &[ScanSubBand],
+                sr: ScrollRect,
+                dirty_flags: &[AtomicBool],
+                next_sub: &AtomicUsize,
+            ) {
+                // SAFETY: Caller verified CPU feature support via `X86Tier::detect()`
+                // and upheld disjoint-band and scroll-band shadow invariants.
+                unsafe {
+                    let kernel = super::$tier_mod::Kernel::new_unchecked();
+                    crate::filtering::diff_and_update_scroll_worker_with::<
+                        super::$tier_mod::Kernel,
+                        HAS_ALPHA,
+                    >(
+                        kernel,
+                        data,
+                        aos,
+                        shadow,
+                        width,
+                        stride,
+                        stride_px,
+                        n_qx,
+                        sub_bands,
+                        sr,
                         dirty_flags,
                         next_sub,
                     );
@@ -3309,6 +3350,180 @@ impl X86Tier {
                             stride_px,
                             n_qx,
                             sub_bands,
+                            dirty_flags,
+                            next_sub,
+                        );
+                    }
+                },
+            }
+        }
+    }
+
+    /// # Safety
+    /// Caller must uphold [`super::diff_and_update_scroll_worker_with`] invariants.
+    #[inline(never)]
+    pub(super) unsafe fn diff_and_update_scroll_worker(
+        self,
+        has_alpha: bool,
+        data: BufferPointer<u8>,
+        aos: BufferPointer<Vec4u8>,
+        shadow: &ShadowRows,
+        width: usize,
+        stride: usize,
+        stride_px: usize,
+        n_qx: usize,
+        sub_bands: &[ScanSubBand],
+        sr: ScrollRect,
+        dirty_flags: &[AtomicBool],
+        next_sub: &AtomicUsize,
+    ) {
+        // SAFETY: Each arm's tier witness verifies required CPU features, and
+        // caller upholds disjoint-band and scroll-band shadow invariants.
+        unsafe {
+            match self {
+                #[cfg(all(
+                    not(target_feature = "ssse3"),
+                    not(target_feature = "avx2"),
+                    not(all(
+                        target_feature = "avx512bw",
+                        target_feature = "avx512vl",
+                        target_feature = "avx512vbmi",
+                    )),
+                ))]
+                Self::Scalar => {
+                    if has_alpha {
+                        super::diff_and_update_scroll_worker_with::<ScalarKernel, true>(
+                            ScalarKernel,
+                            data,
+                            aos,
+                            shadow,
+                            width,
+                            stride,
+                            stride_px,
+                            n_qx,
+                            sub_bands,
+                            sr,
+                            dirty_flags,
+                            next_sub,
+                        );
+                    } else {
+                        super::diff_and_update_scroll_worker_with::<ScalarKernel, false>(
+                            ScalarKernel,
+                            data,
+                            aos,
+                            shadow,
+                            width,
+                            stride,
+                            stride_px,
+                            n_qx,
+                            sub_bands,
+                            sr,
+                            dirty_flags,
+                            next_sub,
+                        );
+                    }
+                },
+                #[cfg(all(
+                    not(target_feature = "avx2"),
+                    not(all(
+                        target_feature = "avx512bw",
+                        target_feature = "avx512vl",
+                        target_feature = "avx512vbmi",
+                    )),
+                ))]
+                Self::Ssse3 => {
+                    if has_alpha {
+                        dispatch_ssse3::diff_and_update_scroll_worker::<true>(
+                            data,
+                            aos,
+                            shadow,
+                            width,
+                            stride,
+                            stride_px,
+                            n_qx,
+                            sub_bands,
+                            sr,
+                            dirty_flags,
+                            next_sub,
+                        );
+                    } else {
+                        dispatch_ssse3::diff_and_update_scroll_worker::<false>(
+                            data,
+                            aos,
+                            shadow,
+                            width,
+                            stride,
+                            stride_px,
+                            n_qx,
+                            sub_bands,
+                            sr,
+                            dirty_flags,
+                            next_sub,
+                        );
+                    }
+                },
+                #[cfg(not(all(
+                    target_feature = "avx512bw",
+                    target_feature = "avx512vl",
+                    target_feature = "avx512vbmi",
+                )))]
+                Self::Avx2 => {
+                    if has_alpha {
+                        dispatch_avx2::diff_and_update_scroll_worker::<true>(
+                            data,
+                            aos,
+                            shadow,
+                            width,
+                            stride,
+                            stride_px,
+                            n_qx,
+                            sub_bands,
+                            sr,
+                            dirty_flags,
+                            next_sub,
+                        );
+                    } else {
+                        dispatch_avx2::diff_and_update_scroll_worker::<false>(
+                            data,
+                            aos,
+                            shadow,
+                            width,
+                            stride,
+                            stride_px,
+                            n_qx,
+                            sub_bands,
+                            sr,
+                            dirty_flags,
+                            next_sub,
+                        );
+                    }
+                },
+                Self::Avx512 => {
+                    if has_alpha {
+                        dispatch_avx512::diff_and_update_scroll_worker::<true>(
+                            data,
+                            aos,
+                            shadow,
+                            width,
+                            stride,
+                            stride_px,
+                            n_qx,
+                            sub_bands,
+                            sr,
+                            dirty_flags,
+                            next_sub,
+                        );
+                    } else {
+                        dispatch_avx512::diff_and_update_scroll_worker::<false>(
+                            data,
+                            aos,
+                            shadow,
+                            width,
+                            stride,
+                            stride_px,
+                            n_qx,
+                            sub_bands,
+                            sr,
                             dirty_flags,
                             next_sub,
                         );

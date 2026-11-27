@@ -67,9 +67,12 @@ use crate::client_utils::SeatObject;
 use crate::client_utils::SwapchainStep;
 use crate::client_utils::advance_two_slot_swapchain;
 use crate::client_utils::combine_rect_history;
+use crate::client_utils::rect_complement;
+use crate::client_utils::rect_contains;
 use crate::client_utils::rect_covered_by;
 use crate::client_utils::snapshot_rect_history;
 use crate::constants;
+use crate::filtering;
 use crate::prelude::*;
 use crate::serialization::Capabilities;
 use crate::serialization::ClientId;
@@ -78,9 +81,11 @@ use crate::serialization::Event;
 use crate::serialization::Request;
 use crate::serialization::SendType;
 use crate::serialization::Serializer;
+use crate::serialization::framing::ScrollRect;
 use crate::serialization::framing::TILE_PIXELS;
 use crate::serialization::framing::TileRect;
 use crate::serialization::geometry::Point;
+use crate::serialization::geometry::Rectangle;
 use crate::serialization::wayland::BufferAssignment;
 use crate::serialization::wayland::BufferMetadata;
 use crate::serialization::wayland::CursorImage;
@@ -428,6 +433,7 @@ const SLOT_COPY_CHUNK: usize = TILE_PIXELS * 4;
 enum SlotCopyRegion<'a> {
     Full,
     Rects(&'a [TileRect]),
+    Scroll(ScrollRect),
 }
 
 fn copy_slot_region_with<P, S>(
@@ -491,6 +497,49 @@ fn copy_slot_region_with<P, S>(
                 }
             }
         },
+        SlotCopyRegion::Scroll(sr) => {
+            let x_bytes = sr.x as usize * 4;
+            let row_bytes = sr.width as usize * 4;
+            let shift = sr.dy.unsigned_abs() as usize;
+            let copy_h = sr.height as usize - shift;
+            let src_y0 = if sr.dy < 0 {
+                sr.y as usize + shift
+            } else {
+                sr.y as usize
+            };
+            let dst_y0 = if sr.dy < 0 {
+                sr.y as usize
+            } else {
+                sr.y as usize + shift
+            };
+            let rows_per_batch = (SLOT_COPY_CHUNK / row_bytes).max(1);
+            let mut ry = 0;
+            while ry < copy_h {
+                let batch_rows = (copy_h - ry).min(rows_per_batch);
+                let batch_bytes = batch_rows * row_bytes;
+                if scratch.len() < batch_bytes {
+                    scratch.resize(batch_bytes.max(SLOT_COPY_CHUNK), 0);
+                }
+                {
+                    let src = slot_data(pool, src_slot);
+                    for i in 0..batch_rows {
+                        let src_off = (src_y0 + ry + i) * stride + x_bytes;
+                        scratch[i * row_bytes..(i + 1) * row_bytes]
+                            .copy_from_slice(&src[src_off..src_off + row_bytes]);
+                    }
+                }
+                {
+                    let dst = slot_data(pool, dst_slot);
+                    for i in 0..batch_rows {
+                        let dst_off = (dst_y0 + ry + i) * stride + x_bytes;
+                        dst[dst_off..dst_off + row_bytes]
+                            .copy_from_slice(&scratch[i * row_bytes..(i + 1) * row_bytes]);
+                    }
+                }
+                bytes_copied += batch_bytes;
+                ry += batch_rows;
+            }
+        },
     }
     bytes_copied
 }
@@ -516,20 +565,43 @@ fn copy_slot_region(
     );
 }
 
+/// Advances the 2-slot swapchain and synchronizes stale regions (and any
+/// cross-slot [`ScrollRect`] copy) from the previous active slot.
+///
+/// Returns `Ok(true)` when `active_buffer` was reused in place and the caller
+/// must apply `scroll_rect` in place on the active canvas.
 fn prepare_remote_swapchain<P, B>(
     pool: &mut P,
     active_buffer: &mut B,
     back_buffer: &mut Option<(B, Option<Vec<TileRect>>)>,
+    width: u32,
+    height: u32,
     cur_rects: Option<&[TileRect]>,
+    scroll_rect: Option<ScrollRect>,
     is_released: impl FnMut(&mut P, &B) -> bool,
     alloc_buffer: impl FnOnce(&mut P, bool) -> Result<B>,
-    copy_region: impl FnOnce(&mut P, &B, &B, SlotCopyRegion<'_>),
-) -> Result<()> {
+    mut copy_region: impl FnMut(&mut P, &B, &B, SlotCopyRegion<'_>),
+) -> Result<bool> {
+    // Include `scroll_rect`'s destination rectangle in the dirty history
+    // recorded on `back_buffer` so a future swap back sees every shifted pixel
+    // as stale relative to `active_buffer`.
+    let scroll_history_buf: Vec<TileRect>;
+    let cur_history: Option<&[TileRect]> = match (cur_rects, scroll_rect) {
+        (Some(tiles), Some(sr)) => {
+            let sr_dst = sr.dst_rect();
+            scroll_history_buf = std::iter::once(sr_dst)
+                .chain(tiles.iter().copied().filter(|&r| !rect_contains(sr_dst, r)))
+                .collect();
+            Some(scroll_history_buf.as_slice())
+        },
+        (rects, _) => rects,
+    };
+
     let step = advance_two_slot_swapchain(
         pool,
         active_buffer,
         back_buffer,
-        cur_rects,
+        cur_history,
         is_released,
         combine_rect_history,
         snapshot_rect_history,
@@ -537,30 +609,67 @@ fn prepare_remote_swapchain<P, B>(
     )?;
     if let Some(cur) = cur_rects {
         let prev_rects = match step {
-            SwapchainStep::ReusedActive => return Ok(()),
+            SwapchainStep::ReusedActive => return Ok(true),
             SwapchainStep::Swapped { prev_history } => prev_history,
             SwapchainStep::Allocated => None,
         };
         let old_active = &back_buffer.as_ref().unwrap().0;
-        match prev_rects {
-            Some(prev) => {
-                let to_copy: Vec<TileRect> = prev
-                    .into_iter()
-                    .filter(|&r| !rect_covered_by(r, cur))
-                    .collect();
-                if !to_copy.is_empty() {
-                    copy_region(
-                        pool,
-                        old_active,
-                        active_buffer,
-                        SlotCopyRegion::Rects(&to_copy),
-                    );
-                }
-            },
-            None => copy_region(pool, old_active, active_buffer, SlotCopyRegion::Full),
+        if let Some(sr) = scroll_rect {
+            let sr_dst = sr.dst_rect();
+            match prev_rects {
+                Some(prev) => {
+                    let to_copy: Vec<TileRect> = prev
+                        .into_iter()
+                        .filter(|&r| !rect_covered_by(r, cur) && !rect_contains(sr_dst, r))
+                        .collect();
+                    if !to_copy.is_empty() {
+                        copy_region(
+                            pool,
+                            old_active,
+                            active_buffer,
+                            SlotCopyRegion::Rects(&to_copy),
+                        );
+                    }
+                },
+                None => {
+                    let (comp, n_comp) = rect_complement(width, height, sr_dst);
+                    let to_copy: Vec<TileRect> = comp[..n_comp]
+                        .iter()
+                        .copied()
+                        .filter(|&r| !rect_covered_by(r, cur))
+                        .collect();
+                    if !to_copy.is_empty() {
+                        copy_region(
+                            pool,
+                            old_active,
+                            active_buffer,
+                            SlotCopyRegion::Rects(&to_copy),
+                        );
+                    }
+                },
+            }
+            copy_region(pool, old_active, active_buffer, SlotCopyRegion::Scroll(sr));
+        } else {
+            match prev_rects {
+                Some(prev) => {
+                    let to_copy: Vec<TileRect> = prev
+                        .into_iter()
+                        .filter(|&r| !rect_covered_by(r, cur))
+                        .collect();
+                    if !to_copy.is_empty() {
+                        copy_region(
+                            pool,
+                            old_active,
+                            active_buffer,
+                            SlotCopyRegion::Rects(&to_copy),
+                        );
+                    }
+                },
+                None => copy_region(pool, old_active, active_buffer, SlotCopyRegion::Full),
+            }
         }
     }
-    Ok(())
+    Ok(false)
 }
 
 #[derive(Debug, Copy, Clone, Eq, PartialEq)]
@@ -607,22 +716,28 @@ impl RemoteBuffer {
     fn canvas<'a>(
         &mut self,
         incremental_rects: Option<&[TileRect]>,
+        scroll_rect: Option<ScrollRect>,
         pool: &'a mut SlotPool,
         copy_scratch: &mut Vec<u8>,
+        decompressor: &mut ShardingDecompressor,
     ) -> Result<&'a mut [u8]> {
         let metadata = self.metadata;
         let stride = metadata.stride as usize;
         let byte_len = metadata.height as usize * stride;
-        prepare_remote_swapchain(
+        let reused_active = prepare_remote_swapchain(
             pool,
             &mut self.active_buffer,
             &mut self.back_buffer,
+            metadata.width as u32,
+            metadata.height as u32,
             incremental_rects,
+            scroll_rect,
             |pool, buf| pool.canvas(buf).is_some(),
             |pool, back_buffer_held| {
                 debug!(
                     back_buffer_held,
                     incremental = incremental_rects.is_some(),
+                    scroll = scroll_rect.is_some(),
                     tiles = incremental_rects.map_or(0, <[_]>::len),
                     width = metadata.width,
                     height = metadata.height,
@@ -650,7 +765,11 @@ impl RemoteBuffer {
                 );
             },
         )?;
-        pool.canvas(&self.active_buffer).location(loc!())
+        let canvas = pool.canvas(&self.active_buffer).location(loc!())?;
+        if reused_active && let Some(sr) = scroll_rect {
+            filtering::apply_scroll_rect_in_place_parallel(canvas, stride, sr, decompressor);
+        }
+        Ok(canvas)
     }
 }
 
@@ -821,6 +940,7 @@ pub struct RemoteSurface {
     pub z_ordered_children: Vec<SubsurfacePosition>,
     pub frame_callback_completed: bool,
     pub frame_damage: FrameDamage,
+    pub pending_scroll_damage: Option<Rectangle<i32>>,
     pub pending_buffer_delta: Option<Point<i32>>,
     pub viewport: Option<WpViewport>,
     pub current_viewport_state: Option<ViewportState>,
@@ -855,6 +975,7 @@ impl RemoteSurface {
             }],
             frame_callback_completed: true,
             frame_damage: FrameDamage::Empty,
+            pending_scroll_damage: None,
             pending_buffer_delta: None,
             viewport: None,
             current_viewport_state: None,
@@ -872,13 +993,15 @@ impl RemoteSurface {
         )
     }
 
-    #[instrument(skip(self, pool, copy_scratch), level = "debug")]
+    #[instrument(skip(self, pool, copy_scratch, decompressor), level = "debug")]
     pub(crate) fn prepare_buffer_canvas<'a>(
         &mut self,
         metadata: BufferMetadata,
         incremental_rects: Option<&[TileRect]>,
+        scroll_rect: Option<ScrollRect>,
         pool: &'a mut SlotPool,
         copy_scratch: &mut Vec<u8>,
+        decompressor: &mut ShardingDecompressor,
     ) -> Result<&'a mut [u8]> {
         let buffer = if let Some(buffer) = &mut self.buffer
             && buffer.metadata == metadata
@@ -886,7 +1009,7 @@ impl RemoteSurface {
             buffer.state = RemoteBufferState::Prepared;
             buffer
         } else {
-            if incremental_rects.is_some() {
+            if incremental_rects.is_some() || scroll_rect.is_some() {
                 bail!(
                     "received incremental tile update without a matching buffer ({:?} -> {metadata:?})",
                     self.buffer.as_ref().map(|b| b.metadata)
@@ -896,14 +1019,23 @@ impl RemoteSurface {
             self.buffer
                 .insert(RemoteBuffer::new(metadata, pool).location(loc!())?)
         };
-        buffer
-            .canvas(incremental_rects, pool, copy_scratch)
-            .location(loc!())
+        let canvas = buffer
+            .canvas(
+                incremental_rects,
+                scroll_rect,
+                pool,
+                copy_scratch,
+                decompressor,
+            )
+            .location(loc!())?;
+        self.pending_scroll_damage = scroll_rect.map(ScrollRect::dst_damage_rect);
+        Ok(canvas)
     }
 
     pub(crate) fn drop_buffer(&mut self) {
         self.buffer = None;
         self.frame_damage = FrameDamage::Empty;
+        self.pending_scroll_damage = None;
         self.pending_buffer_delta = None;
     }
 
@@ -1269,17 +1401,23 @@ mod tests {
         released: &[bool],
         frame: &[u8],
         incremental_rects: Option<&[TileRect]>,
+        scroll_rect: Option<ScrollRect>,
+        width: usize,
+        height: usize,
         stride: usize,
     ) -> (usize, Option<bool>) {
         let byte_len = frame.len();
         let mut bytes_copied = 0usize;
         let mut alloc_back_held = None;
 
-        prepare_remote_swapchain(
+        let reused_active = prepare_remote_swapchain(
             slots,
             active,
             back,
+            width as u32,
+            height as u32,
             incremental_rects,
+            scroll_rect,
             |_, &idx| released[idx],
             |slots, back_buffer_held| {
                 alloc_back_held = Some(back_buffer_held);
@@ -1303,9 +1441,12 @@ mod tests {
         )
         .unwrap();
 
-        // Simulate `decompress_and_unfilter_streaming` writing only `incremental_rects`
-        // (or the full frame when `None`).
+        // Simulate `apply_scroll_rect_in_place` + `decompress_and_unfilter_streaming`
+        // writing only `incremental_rects` (or the full frame when `None`).
         let canvas = &mut slots[*active];
+        if reused_active && let Some(sr) = scroll_rect {
+            filtering::apply_scroll_rect_in_place(canvas, stride, sr);
+        }
         match incremental_rects {
             Some(rects) => {
                 for &rect in rects {
@@ -1414,6 +1555,9 @@ mod tests {
             &[true],
             &frame,
             Some(&[q_left]),
+            None,
+            width,
+            height,
             stride,
         );
         assert_eq!((active, slots.len(), copied, alloc), (0, 1, 0, None));
@@ -1432,6 +1576,9 @@ mod tests {
             &[false],
             &frame,
             Some(&[q_left]),
+            None,
+            width,
+            height,
             stride,
         );
         assert_eq!(
@@ -1454,6 +1601,9 @@ mod tests {
             &[true, false],
             &frame,
             Some(&[q_right_same_band]),
+            None,
+            width,
+            height,
             stride,
         );
         assert_eq!(
@@ -1473,6 +1623,9 @@ mod tests {
             &[false, true],
             &frame,
             Some(&[q_right_same_band]),
+            None,
+            width,
+            height,
             stride,
         );
         assert_eq!((active, slots.len(), copied, alloc), (1, 2, 0, None));
@@ -1490,6 +1643,9 @@ mod tests {
             &[false, true],
             &frame,
             Some(&[q_left]),
+            None,
+            width,
+            height,
             stride,
         );
         assert_eq!((active, slots.len(), copied, alloc), (1, 2, 0, None));
@@ -1505,6 +1661,9 @@ mod tests {
             &[true, false],
             &frame,
             Some(&[q_parent_left]),
+            None,
+            width,
+            height,
             stride,
         );
         assert_eq!(
@@ -1525,6 +1684,9 @@ mod tests {
             &[true, false],
             &frame,
             None,
+            None,
+            width,
+            height,
             stride,
         );
         assert_eq!((active, slots.len(), copied, alloc), (0, 2, 0, None));
@@ -1540,6 +1702,9 @@ mod tests {
             &[false, true],
             &frame,
             Some(&[q_bottom]),
+            None,
+            width,
+            height,
             stride,
         );
         assert_eq!((active, slots.len(), copied, alloc), (1, 2, byte_len, None));
@@ -1556,6 +1721,9 @@ mod tests {
             &[true, false],
             &frame,
             None,
+            None,
+            width,
+            height,
             stride,
         );
         assert_eq!((active, slots.len(), copied, alloc), (0, 2, 0, None));
@@ -1573,6 +1741,9 @@ mod tests {
             &[false, false],
             &frame,
             Some(&[q_left]),
+            None,
+            width,
+            height,
             stride,
         );
         assert_eq!(
@@ -1592,11 +1763,134 @@ mod tests {
             &[false, false, false],
             &frame,
             None,
+            None,
+            width,
+            height,
             stride,
         );
         assert_eq!((active, slots.len(), copied, alloc), (3, 4, 0, Some(true)));
         assert_eq!(back, Some((2, None)));
         assert_visible_eq(&slots[active], &frame, width, height, stride);
+    }
+
+    #[test]
+    fn test_remote_buffer_swapchain_smooth_scroll_sequence() {
+        let width = 640usize;
+        let height = 512usize;
+        let stride = width * 4 + 16; // padded stride
+        let byte_len = height * stride;
+
+        // Split-pane layout: fixed left sidebar `[0..160)`, fixed top bar `[0..48)`,
+        // scrolling right pane `[160..640) x [48..512)`.
+        let pane_x = 160usize;
+        let pane_y = 48usize;
+        let pane_w = width - pane_x;
+        let pane_h = height - pane_y;
+        let doc_h = pane_h + 400;
+
+        let mut doc = vec![0u8; doc_h * stride];
+        for y in 0..doc_h {
+            for x in 0..width {
+                let off = y * stride + x * 4;
+                doc[off] = ((x * 7 + y * 13) & 0xFF) as u8;
+                doc[off + 1] = ((x * 3 + y * 19 + 55) & 0xFF) as u8;
+                doc[off + 2] = ((x * 11 + y * 5 + 111) & 0xFF) as u8;
+                doc[off + 3] = 0xFF;
+            }
+        }
+
+        let render_frame = |scroll_y: usize, sidebar_seed: u8| -> Vec<u8> {
+            let mut out = vec![0xDDu8; byte_len];
+            for y in 0..height {
+                for x in 0..width {
+                    let off = y * stride + x * 4;
+                    out[off] = sidebar_seed.wrapping_add((x * 5 + y) as u8);
+                    out[off + 1] = sidebar_seed.wrapping_mul(3).wrapping_add((y * 7) as u8);
+                    out[off + 2] = (x ^ y) as u8;
+                    out[off + 3] = 0xFF;
+                }
+            }
+            for ry in 0..pane_h {
+                let src = (scroll_y + ry) * stride + pane_x * 4;
+                let dst = (pane_y + ry) * stride + pane_x * 4;
+                out[dst..dst + pane_w * 4].copy_from_slice(&doc[src..src + pane_w * 4]);
+            }
+            out
+        };
+
+        let mut scroll_y = 120usize;
+        let mut frame = render_frame(scroll_y, 1);
+        let mut slots = vec![frame.clone()];
+        let mut scratch = Vec::new();
+        let mut active = 0usize;
+        let mut back: Option<(usize, Option<Vec<TileRect>>)> = None;
+
+        // 10 consecutive smooth scroll frames mixing `dy < 0`, `dy > 0`, in-place reuse,
+        // 2-slot ping-pong swap, triple-buffer fallback, and a sidebar edit mid-sequence.
+        let steps: [(i32, [bool; 3], bool); 10] = [
+            (-6, [true, true, true], false),    // in-place reuse (slot 0)
+            (-12, [false, true, true], false),  // first swap allocates slot 1
+            (-8, [true, false, true], false),   // ping-pong back to slot 0
+            (-6, [false, true, true], false),   // ping-pong to slot 1
+            (8, [true, false, true], true),     // reverse scroll + sidebar edit -> slot 0
+            (12, [false, true, true], false),   // reverse scroll -> slot 1
+            (-10, [false, true, true], false),  // in-place reuse on slot 1
+            (8, [true, false, true], false),    // swap back to slot 0 after in-place scroll
+            (-6, [false, false, true], false),  // both slots held -> triple-buffer alloc slot 2
+            (-12, [false, false, true], false), // in-place reuse on slot 2
+        ];
+
+        let mut sidebar_seed = 1u8;
+        for (idx, (dy, rel_mask, edit_sidebar)) in steps.into_iter().enumerate() {
+            scroll_y = (scroll_y as isize - dy as isize) as usize;
+            if edit_sidebar {
+                sidebar_seed = 99;
+            }
+            frame = render_frame(scroll_y, sidebar_seed);
+            let sr = ScrollRect {
+                x: pane_x as u32,
+                y: pane_y as u32,
+                width: pane_w as u32,
+                height: pane_h as u32,
+                dy,
+            };
+            // Newly exposed strip + optional sidebar tile.
+            let shift = dy.unsigned_abs();
+            let exposed_y = if dy < 0 {
+                pane_y as u32 + pane_h as u32 - shift
+            } else {
+                pane_y as u32
+            };
+            let mut tiles = vec![tr(pane_x as u32, exposed_y, pane_w as u32, shift)];
+            if edit_sidebar {
+                tiles.push(tr(0, 0, pane_x as u32, height as u32));
+                tiles.push(tr(pane_x as u32, 0, pane_w as u32, pane_y as u32));
+            }
+            let rel = &rel_mask[..slots.len()];
+            let (copied, _) = apply_remote_frame(
+                &mut active,
+                &mut back,
+                &mut slots,
+                &mut scratch,
+                rel,
+                &frame,
+                Some(&tiles),
+                Some(sr),
+                width,
+                height,
+                stride,
+            );
+            assert_visible_eq(&slots[active], &frame, width, height, stride);
+            // Verify steady-state 2-slot ping-pong scroll (step 3) only copies
+            // the scrolled pane once (not the full buffer twice!).
+            if idx == 3 {
+                let pane_bytes = pane_w * (pane_h - shift as usize) * 4;
+                assert!(
+                    copied <= pane_bytes + pane_w * 32 * 4,
+                    "step 3 copied {copied} B, expected ~{pane_bytes} B"
+                );
+            }
+        }
     }
 
     #[test]

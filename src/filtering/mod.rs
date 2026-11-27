@@ -66,6 +66,7 @@ mod arch {
     use crate::serialization::framing::AlphaChannel;
     use crate::serialization::framing::CompressedTile;
     use crate::serialization::framing::LeafPayload;
+    use crate::serialization::framing::ScrollRect;
     use crate::serialization::framing::TileRect;
     use crate::sharding_compression::CompressorWorkerState;
     use crate::sharding_compression::DecompressorWorkerState;
@@ -236,6 +237,60 @@ mod arch {
             }
         }
 
+        /// # Safety
+        /// Caller must uphold [`super::diff_and_update_scroll_worker_with`] invariants.
+        #[inline(never)]
+        pub(super) unsafe fn diff_and_update_scroll_worker(
+            self,
+            has_alpha: bool,
+            data: BufferPointer<u8>,
+            aos: BufferPointer<Vec4u8>,
+            shadow: &ShadowRows,
+            width: usize,
+            stride: usize,
+            stride_px: usize,
+            n_qx: usize,
+            sub_bands: &[ScanSubBand],
+            sr: ScrollRect,
+            dirty_flags: &[AtomicBool],
+            next_sub: &AtomicUsize,
+        ) {
+            // SAFETY: Caller upholds disjoint-band and scroll-band invariants.
+            unsafe {
+                if has_alpha {
+                    super::diff_and_update_scroll_worker_with::<ScalarKernel, true>(
+                        ScalarKernel,
+                        data,
+                        aos,
+                        shadow,
+                        width,
+                        stride,
+                        stride_px,
+                        n_qx,
+                        sub_bands,
+                        sr,
+                        dirty_flags,
+                        next_sub,
+                    );
+                } else {
+                    super::diff_and_update_scroll_worker_with::<ScalarKernel, false>(
+                        ScalarKernel,
+                        data,
+                        aos,
+                        shadow,
+                        width,
+                        stride,
+                        stride_px,
+                        n_qx,
+                        sub_bands,
+                        sr,
+                        dirty_flags,
+                        next_sub,
+                    );
+                }
+            }
+        }
+
         #[cfg(test)]
         pub(super) unsafe fn diff_and_update_strip<const HAS_ALPHA: bool>(
             self,
@@ -298,17 +353,22 @@ mod arch {
 }
 
 pub(crate) mod palette;
+pub(crate) mod scroll;
 
 use std::borrow::Cow;
 use std::cmp::Reverse;
 use std::collections::BTreeMap;
 use std::collections::BinaryHeap;
+use std::ptr;
 use std::slice;
 use std::sync::Mutex;
 use std::sync::atomic::AtomicBool;
 use std::sync::atomic::AtomicUsize;
 use std::sync::atomic::Ordering;
 
+pub use scroll::apply_scroll_rect_in_place;
+pub use scroll::apply_scroll_rect_in_place_parallel;
+pub use scroll::detect_scroll_rect;
 use zstd::bulk::Decompressor;
 
 use crate::buffer_pointer::BufferPointer;
@@ -330,6 +390,7 @@ use crate::serialization::framing::RawBufferHeader;
 use crate::serialization::framing::RowBand;
 use crate::serialization::framing::SUBTILE_H;
 use crate::serialization::framing::SUBTILE_W;
+use crate::serialization::framing::ScrollRect;
 use crate::serialization::framing::StreamingCompressedTiles;
 use crate::serialization::framing::SubTile;
 use crate::serialization::framing::TILE_H;
@@ -2071,7 +2132,140 @@ unsafe fn diff_and_update_row_band_2d_with<K: RowKernel, const HAS_ALPHA: bool>(
     }
 }
 
-/// Worker loop for Phase A incremental shadow diffing.
+/// Scans a single `SUBTILE_W`-wide vertical column stripe `qx` across all
+/// `RowBand2D`s overlapping `scroll_rect`, fusing overlap-safe in-place shadow
+/// scrolling with SIMD sub-tile dirty detection and shadow update in a single
+/// parallel pass.
+///
+/// # Safety
+/// Every entry in `scroll_bands` must be [`ScanSubBand::RowBand2D`] in
+/// ascending `y` order covering `[sr.y, sr.y + sr.height)`, and column stripe
+/// `qx` must be exclusively owned by this worker across `scroll_bands`.
+#[inline(always)]
+unsafe fn diff_and_update_scroll_column_with<K: RowKernel, const HAS_ALPHA: bool>(
+    kernel: K,
+    aos: BufferPointer<Vec4u8>,
+    shadow: &ShadowRows,
+    width: usize,
+    stride_px: usize,
+    scroll_bands: &[ScanSubBand],
+    sr: ScrollRect,
+    qx: usize,
+    dirty_flags: &[AtomicBool],
+) {
+    let cx0 = qx * SUBTILE_W;
+    let cx1 = (cx0 + SUBTILE_W).min(width);
+    let cw = cx1 - cx0;
+    let sr_x0 = sr.x as usize;
+    let sr_x1 = (sr.x + sr.width) as usize;
+    let ov_start = cx0.max(sr_x0).min(cx1);
+    let ov_end = cx1.min(sr_x1).max(ov_start);
+    let ov_bytes = (ov_end - ov_start) * 4;
+    let ov_x_bytes = ov_start * 4;
+    let cx0_bytes = cx0 * 4;
+
+    let shift = sr.dy.unsigned_abs() as usize;
+    let copy_h = sr.height as usize - shift;
+    let (sr_dst_y0, sr_dst_y1) = if sr.dy < 0 {
+        (sr.y as usize, sr.y as usize + copy_h)
+    } else {
+        (sr.y as usize + shift, sr.y as usize + sr.height as usize)
+    };
+    let move_up = sr.dy < 0;
+
+    let process_band = |band: &ScanSubBand| {
+        let ScanSubBand::RowBand2D { y0, y1, slot_base } = *band else {
+            unreachable!("scroll bands must be RowBand2D");
+        };
+        let y0 = y0 as usize;
+        let y1 = y1 as usize;
+        let mut is_dirty = false;
+        let band_overlaps_dst = ov_bytes > 0 && y1 > sr_dst_y0 && y0 < sr_dst_y1;
+
+        let mut process_row = |y: usize| {
+            let (_, row_after) = aos.split_at(y * stride_px + cx0);
+            let (src_chunk, _) = row_after.split_at(cw);
+            if is_dirty {
+                // SAFETY: Column stripe `[cx0, cx1)` is exclusively owned by
+                // this worker across `scroll_bands`, and `Vec4u8` has align 1.
+                let dst_chunk = unsafe {
+                    slice::from_raw_parts_mut(shadow.row_ptr(y, cx0_bytes).cast::<Vec4u8>(), cw)
+                };
+                src_chunk.copy_to_nonoverlapping(dst_chunk);
+            } else {
+                if band_overlaps_dst && y >= sr_dst_y0 && y < sr_dst_y1 {
+                    let src_y = (y as isize - sr.dy as isize) as usize;
+                    // SAFETY: `src_y != y` (`dy != 0`), `[ov_start, ov_end)` lies
+                    // within this worker's exclusive column stripe `[cx0, cx1)`,
+                    // and overlap-safe row traversal guarantees `shadow[src_y]`
+                    // has not yet been overwritten.
+                    unsafe {
+                        ptr::copy_nonoverlapping(
+                            shadow.row_ptr(src_y, ov_x_bytes),
+                            shadow.row_ptr(y, ov_x_bytes),
+                            ov_bytes,
+                        );
+                    }
+                }
+                // SAFETY: Created after `ptr::copy_nonoverlapping` completes;
+                // column stripe `[cx0, cx1)` is exclusively owned by this worker.
+                let dst_chunk = unsafe {
+                    slice::from_raw_parts_mut(shadow.row_ptr(y, cx0_bytes).cast::<Vec4u8>(), cw)
+                };
+                if kernel.diff_and_update_row::<HAS_ALPHA>(src_chunk, dst_chunk) {
+                    is_dirty = true;
+                }
+            }
+        };
+
+        if move_up {
+            for y in y0..y1 {
+                process_row(y);
+            }
+        } else {
+            for y in (y0..y1).rev() {
+                process_row(y);
+            }
+        }
+
+        if is_dirty {
+            dirty_flags[slot_base + qx].store(true, Ordering::Relaxed);
+        }
+    };
+
+    if move_up {
+        for band in scroll_bands {
+            process_band(band);
+        }
+    } else {
+        for band in scroll_bands.iter().rev() {
+            process_band(band);
+        }
+    }
+}
+
+/// Finds the contiguous `sub_bands` index range `[sb_start, sb_end)` that
+/// overlaps `[sr.y, sr.y + sr.height)`.
+fn scroll_sub_band_range(sub_bands: &[ScanSubBand], sr: ScrollRect) -> (usize, usize) {
+    let sr_y0 = sr.y;
+    let sr_y1 = sr.y + sr.height;
+    let mut start = sub_bands.len();
+    let mut end = 0usize;
+    for (idx, sb) in sub_bands.iter().enumerate() {
+        let (y0, y1) = match *sb {
+            ScanSubBand::RowBand2D { y0, y1, .. } => (y0, y1),
+            ScanSubBand::Strip1D { rect, .. } => (rect.y, rect.y + rect.h),
+        };
+        if y1 > sr_y0 && y0 < sr_y1 {
+            debug_assert!(matches!(sb, ScanSubBand::RowBand2D { .. }));
+            start = start.min(idx);
+            end = idx + 1;
+        }
+    }
+    if start > end { (0, 0) } else { (start, end) }
+}
+
+/// Worker loop for Phase A incremental shadow diffing on non-scroll frames.
 ///
 /// # Safety
 /// Every entry in `sub_bands` must cover strictly in-bounds, pairwise disjoint
@@ -2123,6 +2317,97 @@ unsafe fn diff_and_update_worker_with<K: RowKernel, const HAS_ALPHA: bool>(
                     );
                 }
             },
+        }
+    }
+}
+
+/// Worker loop for Phase A incremental shadow diffing fused with overlap-safe
+/// vertical scroll replay.
+///
+/// # Safety
+/// Every entry in `sub_bands` must cover strictly in-bounds, pairwise disjoint
+/// regions in `shadow`, and `sr` must lie within a single contiguous
+/// `RowBand2D` range of `sub_bands`.
+#[inline(always)]
+unsafe fn diff_and_update_scroll_worker_with<K: RowKernel, const HAS_ALPHA: bool>(
+    kernel: K,
+    data: BufferPointer<u8>,
+    aos: BufferPointer<Vec4u8>,
+    shadow: &ShadowRows,
+    width: usize,
+    stride: usize,
+    stride_px: usize,
+    n_qx: usize,
+    sub_bands: &[ScanSubBand],
+    sr: ScrollRect,
+    dirty_flags: &[AtomicBool],
+    next_sub: &AtomicUsize,
+) {
+    let (sb_start, sb_end) = scroll_sub_band_range(sub_bands, sr);
+    let scroll_bands = &sub_bands[sb_start..sb_end];
+    let n_before = sb_start;
+    let n_after = sub_bands.len() - sb_end;
+    let n_outside = n_before + n_after;
+    let total_tasks = n_outside + n_qx;
+
+    loop {
+        let task = next_sub.fetch_add(1, Ordering::Relaxed);
+        if task >= total_tasks {
+            break;
+        }
+        if task < n_qx {
+            // SAFETY: `scroll_bands` are all `RowBand2D` covering `sr`, and
+            // each column `task` is claimed at most once.
+            unsafe {
+                diff_and_update_scroll_column_with::<K, HAS_ALPHA>(
+                    kernel,
+                    aos,
+                    shadow,
+                    width,
+                    stride_px,
+                    scroll_bands,
+                    sr,
+                    task,
+                    dirty_flags,
+                );
+            }
+        } else {
+            let out_idx = task - n_qx;
+            let sb_idx = if out_idx < n_before {
+                out_idx
+            } else {
+                sb_end + (out_idx - n_before)
+            };
+            match sub_bands[sb_idx] {
+                ScanSubBand::Strip1D { rect, slot_idx } => {
+                    // SAFETY: Outside `sb_start..sb_end`, disjoint from `sr`.
+                    let dirty = unsafe {
+                        diff_and_update_strip_with::<K, HAS_ALPHA>(
+                            kernel, aos, shadow, stride_px, rect,
+                        )
+                    };
+                    if dirty {
+                        dirty_flags[slot_idx].store(true, Ordering::Relaxed);
+                    }
+                },
+                ScanSubBand::RowBand2D { y0, y1, slot_base } => {
+                    let slots = &dirty_flags[slot_base..slot_base + n_qx];
+                    // SAFETY: Outside `sb_start..sb_end`, disjoint from `sr`.
+                    unsafe {
+                        diff_and_update_row_band_2d_with::<K, HAS_ALPHA>(
+                            kernel,
+                            data,
+                            aos,
+                            shadow,
+                            width,
+                            stride,
+                            y0 as usize,
+                            y1 as usize,
+                            slots,
+                        );
+                    }
+                },
+            }
         }
     }
 }
@@ -2239,6 +2524,7 @@ fn filter_and_compress_full_streaming_with_tier(
         surface,
         metadata,
         incremental: false,
+        scroll_rect: None,
         tile_rects,
     };
     on_stream_ready(StreamingCompressedTiles {
@@ -2324,6 +2610,22 @@ pub fn filter_and_compress_full_streaming(
     );
 }
 
+/// Outcome of an incremental shadow diff, optional vertical scroll blit, and
+/// dirty-tile encode.
+#[derive(Debug, Clone, Eq, PartialEq)]
+pub struct IncrementalFrameResult {
+    pub scroll_rect: Option<ScrollRect>,
+    pub dirty_tiles: Vec<TileRect>,
+}
+
+impl IncrementalFrameResult {
+    /// Returns `true` when neither a scroll blit nor any dirty tile was emitted.
+    #[inline]
+    pub fn is_unchanged(&self) -> bool {
+        self.scroll_rect.is_none() && self.dirty_tiles.is_empty()
+    }
+}
+
 fn filter_and_compress_incremental_streaming_with_tier(
     tier: arch::Tier,
     data: BufferPointer<u8>,
@@ -2335,7 +2637,7 @@ fn filter_and_compress_incremental_streaming_with_tier(
     shadow: &mut [u8],
     compressor: &mut ShardingCompressor,
     on_stream_ready: impl FnOnce(StreamingCompressedTiles),
-) -> Vec<TileRect> {
+) -> IncrementalFrameResult {
     assert!(data.len().is_multiple_of(4));
     let total_pixels = metadata
         .validate()
@@ -2349,7 +2651,10 @@ fn filter_and_compress_incremental_streaming_with_tier(
     let (sub_bands, base_entries, total_slots) =
         plan_incremental_scan(&metadata, bands).expect("server generated invalid row bands");
     if sub_bands.is_empty() {
-        return Vec::new();
+        return IncrementalFrameResult {
+            scroll_rect: None,
+            dirty_tiles: Vec::new(),
+        };
     }
 
     let width = metadata.width as usize;
@@ -2362,31 +2667,61 @@ fn filter_and_compress_incremental_streaming_with_tier(
     // SAFETY: Vec4u8 is a repr(C, packed) wrapper around [u8; 4].
     let aos = unsafe { data.cast::<Vec4u8>() };
 
-    // Phase A: parallel linear horizontal-band dirty scan + shadow update.
+    // Detect vertical scroll blit and fuse overlap-safe parallel column-stripe
+    // shadow scrolling into Phase A when present, leaving the non-scroll Phase
+    // A worker loop untouched for zero codegen overhead on non-scroll frames.
+    let scroll_rect = scroll::detect_scroll_rect(data, shadow, metadata, bands);
+
+    // Phase A: parallel dirty scan + shadow update (with optional fused scroll).
     {
         let shadow_rows = ShadowRows {
             base: shadow.as_mut_ptr(),
             stride,
         };
         let next_sub = AtomicUsize::new(0);
-        compressor.pool.execute(n_sub, |_| {
-            // SAFETY: `sub_bands` cover disjoint regions in `shadow`.
-            unsafe {
-                tier.diff_and_update_worker(
-                    has_alpha,
-                    data,
-                    aos,
-                    &shadow_rows,
-                    width,
-                    stride,
-                    stride_px,
-                    n_qx,
-                    &sub_bands,
-                    &dirty_flags,
-                    &next_sub,
-                );
-            }
-        });
+        if let Some(sr) = scroll_rect {
+            let (sb_start, sb_end) = scroll_sub_band_range(&sub_bands, sr);
+            let phase_a_tasks = (sub_bands.len() - (sb_end - sb_start)) + n_qx;
+            compressor.pool.execute(phase_a_tasks, |_| {
+                // SAFETY: `sub_bands` cover disjoint regions in `shadow`, and
+                // `sr` lies inside a contiguous `RowBand2D` slice.
+                unsafe {
+                    tier.diff_and_update_scroll_worker(
+                        has_alpha,
+                        data,
+                        aos,
+                        &shadow_rows,
+                        width,
+                        stride,
+                        stride_px,
+                        n_qx,
+                        &sub_bands,
+                        sr,
+                        &dirty_flags,
+                        &next_sub,
+                    );
+                }
+            });
+        } else {
+            compressor.pool.execute(n_sub, |_| {
+                // SAFETY: `sub_bands` cover disjoint regions in `shadow`.
+                unsafe {
+                    tier.diff_and_update_worker(
+                        has_alpha,
+                        data,
+                        aos,
+                        &shadow_rows,
+                        width,
+                        stride,
+                        stride_px,
+                        n_qx,
+                        &sub_bands,
+                        &dirty_flags,
+                        &next_sub,
+                    );
+                }
+            });
+        }
     }
 
     let mut dirty_tiles = Vec::new();
@@ -2426,8 +2761,11 @@ fn filter_and_compress_incremental_streaming_with_tier(
         }
     }
 
-    if dirty_tiles.is_empty() {
-        return dirty_tiles;
+    if scroll_rect.is_none() && dirty_tiles.is_empty() {
+        return IncrementalFrameResult {
+            scroll_rect: None,
+            dirty_tiles,
+        };
     }
 
     // Phase B: stream dirty tiles encoded directly from the updated `shadow`
@@ -2440,6 +2778,7 @@ fn filter_and_compress_incremental_streaming_with_tier(
         surface,
         metadata,
         incremental: true,
+        scroll_rect,
         tile_rects: dirty_tiles.clone(),
     };
     on_stream_ready(StreamingCompressedTiles {
@@ -2477,17 +2816,20 @@ fn filter_and_compress_incremental_streaming_with_tier(
         }
     });
 
-    dirty_tiles
+    IncrementalFrameResult {
+        scroll_rect,
+        dirty_tiles,
+    }
 }
 
 /// Diffs `data` against `shadow` across `bands` (or the full frame when `bands`
-/// is `None`), updates `shadow` for every changed `128x128` quadrant or
-/// `< 8`-row 1D strip, and streams only the dirty tiles (`incremental = true`)
-/// from `shadow`.
+/// is `None`), optionally detects and applies a vertical [`ScrollRect`], updates
+/// `shadow` for every changed `128x128` quadrant or `< 8`-row 1D strip, and
+/// streams only the dirty tiles (`incremental = true`) from `shadow`.
 ///
-/// Returns the transmitted dirty [`TileRect`]s in deterministic raster order.
-/// When no pixels changed, returns an empty `Vec` without invoking
-/// `on_stream_ready`.
+/// Returns the optional [`ScrollRect`] and transmitted dirty [`TileRect`]s in
+/// deterministic raster order. When no pixels changed, returns an unchanged
+/// result without invoking `on_stream_ready`.
 #[instrument(skip_all, level = "debug")]
 pub fn filter_and_compress_incremental_streaming(
     data: BufferPointer<u8>,
@@ -2499,7 +2841,7 @@ pub fn filter_and_compress_incremental_streaming(
     shadow: &mut [u8],
     compressor: &mut ShardingCompressor,
     on_stream_ready: impl FnOnce(StreamingCompressedTiles),
-) -> Vec<TileRect> {
+) -> IncrementalFrameResult {
     filter_and_compress_incremental_streaming_with_tier(
         arch::Tier::detect(),
         data,
@@ -2655,6 +2997,12 @@ impl ValidatedTileStream {
                 header.tile_rects.len(),
             );
         }
+        if let Some(sr) = header.scroll_rect {
+            if !header.incremental {
+                bail!("non-incremental frame cannot carry ScrollRect");
+            }
+            sr.validate_in_bounds(width, height).location(loc!())?;
+        }
         let covered_pixels =
             validate_tile_rects(&header.tile_rects, width, height).location(loc!())?;
         if !header.incremental && covered_pixels != u64::from(width) * u64::from(height) {
@@ -2667,6 +3015,10 @@ impl ValidatedTileStream {
 
     pub fn metadata(&self) -> BufferMetadata {
         self.stream.header.metadata
+    }
+
+    pub fn scroll_rect(&self) -> Option<ScrollRect> {
+        self.stream.header.scroll_rect
     }
 
     pub fn incremental_tile_rects(&self) -> Option<&[TileRect]> {
@@ -3382,7 +3734,8 @@ mod tests {
                     &mut shadow,
                     compressor,
                     |s| streaming = Some(s),
-                );
+                )
+                .dirty_tiles;
                 assert!(streaming.is_some());
                 assert_eq!(shadow, edited, "shadow sync mismatch for {tier:?}");
                 if let Some(prev_dirty) = &ref_dirty {
@@ -4230,7 +4583,7 @@ mod tests {
                         let ptr = frame.as_ptr();
                         let bp = unsafe { BufferPointer::new(&ptr, len) };
                         let mut called = false;
-                        let dirty = filter_and_compress_incremental_streaming(
+                        let diff = filter_and_compress_incremental_streaming(
                             bp,
                             ClientId(1),
                             WlSurfaceId(2),
@@ -4241,7 +4594,7 @@ mod tests {
                             compressor,
                             |_| called = true,
                         );
-                        assert!(dirty.is_empty());
+                        assert!(diff.is_unchanged());
                         assert!(!called);
                     }
 
@@ -4252,7 +4605,7 @@ mod tests {
                         let ptr = frame.as_ptr();
                         let bp = unsafe { BufferPointer::new(&ptr, len) };
                         let mut streaming = None;
-                        let dirty = filter_and_compress_incremental_streaming(
+                        let diff = filter_and_compress_incremental_streaming(
                             bp,
                             ClientId(1),
                             WlSurfaceId(2),
@@ -4264,10 +4617,11 @@ mod tests {
                             |s| streaming = Some(s),
                         );
                         if format == BufferFormat::Xrgb8888 {
-                            assert!(dirty.is_empty());
+                            assert!(diff.is_unchanged());
                             assert!(streaming.is_none());
                         } else {
-                            assert_eq!(dirty, vec![tr(0, 0, 128, 128)]);
+                            assert_eq!(diff.scroll_rect, None);
+                            assert_eq!(diff.dirty_tiles, vec![tr(0, 0, 128, 128)]);
                             apply_stream(streaming.unwrap(), decompressor, &mut client_canvas);
                         }
                     }
@@ -4283,7 +4637,7 @@ mod tests {
                         let ptr = frame.as_ptr();
                         let bp = unsafe { BufferPointer::new(&ptr, len) };
                         let mut streaming = None;
-                        let dirty = filter_and_compress_incremental_streaming(
+                        let diff = filter_and_compress_incremental_streaming(
                             bp,
                             ClientId(1),
                             WlSurfaceId(2),
@@ -4294,8 +4648,9 @@ mod tests {
                             compressor,
                             |s| streaming = Some(s),
                         );
+                        assert_eq!(diff.scroll_rect, None);
                         assert_eq!(
-                            dirty,
+                            diff.dirty_tiles,
                             vec![
                                 tr(128, 0, 128, 128),
                                 tr(384, 0, 16, 128),
@@ -4320,7 +4675,7 @@ mod tests {
                         let ptr = frame.as_ptr();
                         let bp = unsafe { BufferPointer::new(&ptr, len) };
                         let mut streaming = None;
-                        let dirty = filter_and_compress_incremental_streaming(
+                        let diff = filter_and_compress_incremental_streaming(
                             bp,
                             ClientId(1),
                             WlSurfaceId(2),
@@ -4331,7 +4686,11 @@ mod tests {
                             compressor,
                             |s| streaming = Some(s),
                         );
-                        assert_eq!(dirty, vec![tr(0, 0, 256, 256), tr(256, 256, 144, 104)]);
+                        assert_eq!(diff.scroll_rect, None);
+                        assert_eq!(
+                            diff.dirty_tiles,
+                            vec![tr(0, 0, 256, 256), tr(256, 256, 144, 104)]
+                        );
                         apply_stream(streaming.unwrap(), decompressor, &mut client_canvas);
                     }
                     check_canvas(&client_canvas, &frame);
@@ -4342,7 +4701,7 @@ mod tests {
                     {
                         let ptr = frame.as_ptr();
                         let bp = unsafe { BufferPointer::new(&ptr, len) };
-                        let dirty = filter_and_compress_incremental_streaming(
+                        let diff = filter_and_compress_incremental_streaming(
                             bp,
                             ClientId(1),
                             WlSurfaceId(2),
@@ -4353,14 +4712,14 @@ mod tests {
                             compressor,
                             |_| panic!("unchanged 1D strip must not emit stream"),
                         );
-                        assert!(dirty.is_empty());
+                        assert!(diff.is_unchanged());
                     }
                     set_px(&mut frame, 300, 41, 0x77, 0);
                     {
                         let ptr = frame.as_ptr();
                         let bp = unsafe { BufferPointer::new(&ptr, len) };
                         let mut streaming = None;
-                        let dirty = filter_and_compress_incremental_streaming(
+                        let diff = filter_and_compress_incremental_streaming(
                             bp,
                             ClientId(1),
                             WlSurfaceId(2),
@@ -4371,7 +4730,8 @@ mod tests {
                             compressor,
                             |s| streaming = Some(s),
                         );
-                        assert_eq!(dirty, vec![tr(0, 40, 400, 3)]);
+                        assert_eq!(diff.scroll_rect, None);
+                        assert_eq!(diff.dirty_tiles, vec![tr(0, 40, 400, 3)]);
                         apply_stream(streaming.unwrap(), decompressor, &mut client_canvas);
                     }
                     check_canvas(&client_canvas, &frame);
@@ -4381,7 +4741,7 @@ mod tests {
                     {
                         let ptr = frame.as_ptr();
                         let bp = unsafe { BufferPointer::new(&ptr, len) };
-                        let dirty = filter_and_compress_incremental_streaming(
+                        let diff = filter_and_compress_incremental_streaming(
                             bp,
                             ClientId(1),
                             WlSurfaceId(2),
@@ -4392,14 +4752,14 @@ mod tests {
                             compressor,
                             |_| panic!("shadow desynchronized after multi-frame edits"),
                         );
-                        assert!(dirty.is_empty());
+                        assert!(diff.is_unchanged());
                     }
 
                     // Step 7: Empty bands slice returns empty immediately.
                     {
                         let ptr = frame.as_ptr();
                         let bp = unsafe { BufferPointer::new(&ptr, len) };
-                        let dirty = filter_and_compress_incremental_streaming(
+                        let diff = filter_and_compress_incremental_streaming(
                             bp,
                             ClientId(1),
                             WlSurfaceId(2),
@@ -4410,7 +4770,7 @@ mod tests {
                             compressor,
                             |_| panic!("empty bands must not emit stream"),
                         );
-                        assert!(dirty.is_empty());
+                        assert!(diff.is_unchanged());
                     }
                 }
             }
@@ -4689,6 +5049,7 @@ mod tests {
                     surface: WlSurfaceId(1),
                     metadata: meta_2,
                     incremental: false,
+                    scroll_rect: None,
                     tile_rects: two_tiles.tile_rects.clone(),
                 },
                 tiles: rx_short,
@@ -4701,6 +5062,8 @@ mod tests {
 
             // Upfront `ValidatedTileStream::new` rejections:
             // - non-incremental incomplete coverage (missing pixels / empty)
+            // - non-incremental with ScrollRect
+            // - invalid ScrollRect bounds (`dy == 0`, out-of-bounds)
             // - overlapping rects
             // - out-of-bounds rect
             // - zero-dim rect
@@ -4713,6 +5076,60 @@ mod tests {
                     surface: WlSurfaceId(1),
                     metadata: meta,
                     incremental: false,
+                    scroll_rect: None,
+                    tile_rects: vec![],
+                },
+                // Non-incremental with ScrollRect.
+                RawBufferHeader {
+                    frame_seq: 0,
+                    client: ClientId(1),
+                    surface: WlSurfaceId(1),
+                    metadata: meta,
+                    incremental: false,
+                    scroll_rect: Some(ScrollRect {
+                        x: 0,
+                        y: 0,
+                        width: 64,
+                        height: 64,
+                        dy: -4,
+                    }),
+                    tile_rects: vec![TileRect {
+                        x: 0,
+                        y: 0,
+                        w: 64,
+                        h: 64,
+                    }],
+                },
+                // Incremental with invalid ScrollRect (`dy == 0`).
+                RawBufferHeader {
+                    frame_seq: 0,
+                    client: ClientId(1),
+                    surface: WlSurfaceId(1),
+                    metadata: meta,
+                    incremental: true,
+                    scroll_rect: Some(ScrollRect {
+                        x: 0,
+                        y: 0,
+                        width: 64,
+                        height: 64,
+                        dy: 0,
+                    }),
+                    tile_rects: vec![],
+                },
+                // Incremental with out-of-bounds ScrollRect.
+                RawBufferHeader {
+                    frame_seq: 0,
+                    client: ClientId(1),
+                    surface: WlSurfaceId(1),
+                    metadata: meta,
+                    incremental: true,
+                    scroll_rect: Some(ScrollRect {
+                        x: 32,
+                        y: 0,
+                        width: 33,
+                        height: 64,
+                        dy: -4,
+                    }),
                     tile_rects: vec![],
                 },
                 // Non-incremental covering only half the frame.
@@ -4722,6 +5139,7 @@ mod tests {
                     surface: WlSurfaceId(1),
                     metadata: meta,
                     incremental: false,
+                    scroll_rect: None,
                     tile_rects: vec![TileRect {
                         x: 0,
                         y: 0,
@@ -4736,6 +5154,7 @@ mod tests {
                     surface: WlSurfaceId(1),
                     metadata: meta,
                     incremental: true,
+                    scroll_rect: None,
                     tile_rects: vec![
                         TileRect {
                             x: 0,
@@ -4758,6 +5177,7 @@ mod tests {
                     surface: WlSurfaceId(1),
                     metadata: meta,
                     incremental: true,
+                    scroll_rect: None,
                     tile_rects: vec![TileRect {
                         x: 32,
                         y: 0,
@@ -4772,6 +5192,7 @@ mod tests {
                     surface: WlSurfaceId(1),
                     metadata: meta,
                     incremental: true,
+                    scroll_rect: None,
                     tile_rects: vec![TileRect {
                         x: 0,
                         y: 0,
@@ -4791,6 +5212,7 @@ mod tests {
                         format: BufferFormat::Xrgb8888,
                     },
                     incremental: true,
+                    scroll_rect: None,
                     tile_rects: vec![
                         TileRect {
                             x: 0,
@@ -5217,7 +5639,7 @@ mod tests {
             {
                 let ptr = frame.as_ptr();
                 let bp = unsafe { BufferPointer::new(&ptr, frame.len()) };
-                let dirty = filter_and_compress_incremental_streaming(
+                let diff = filter_and_compress_incremental_streaming(
                     bp,
                     ClientId(1),
                     WlSurfaceId(2),
@@ -5228,7 +5650,7 @@ mod tests {
                     compressor,
                     |_| panic!("unchanged hybrid frame must emit 0 tiles"),
                 );
-                assert!(dirty.is_empty());
+                assert!(diff.is_unchanged());
             }
 
             // Edit only top-left `128x128` quadrant -> only TL transmitted; untouched
@@ -5238,7 +5660,7 @@ mod tests {
                 let ptr = frame.as_ptr();
                 let bp = unsafe { BufferPointer::new(&ptr, frame.len()) };
                 let mut streaming = None;
-                let dirty = filter_and_compress_incremental_streaming(
+                let diff = filter_and_compress_incremental_streaming(
                     bp,
                     ClientId(1),
                     WlSurfaceId(2),
@@ -5249,7 +5671,8 @@ mod tests {
                     compressor,
                     |s| streaming = Some(s),
                 );
-                assert_eq!(dirty, vec![tr(0, 0, 128, 128)]);
+                assert_eq!(diff.scroll_rect, None);
+                assert_eq!(diff.dirty_tiles, vec![tr(0, 0, 128, 128)]);
                 let mut wire = Vec::new();
                 streaming.unwrap().framed_write(&mut wire).unwrap();
                 let mut rx = None;
@@ -5447,6 +5870,820 @@ mod tests {
                     }],
                 };
                 assert!(decompress_and_unfilter(&bad, decompressor, &mut out_256).is_err());
+            }
+        });
+    }
+
+    /// Generates a deterministic, textured document buffer (`doc_h` rows tall,
+    /// `width` px wide, padded to `stride`) where every row has rich unique
+    /// text/UI-like patterns.
+    fn make_textured_document(
+        width: usize,
+        doc_h: usize,
+        stride: usize,
+        format: BufferFormat,
+    ) -> Vec<u8> {
+        let mut doc = vec![0xAAu8; doc_h * stride];
+        for y in 0..doc_h {
+            let line_id = y / 18;
+            let row_in_line = y % 18;
+            for x in 0..width {
+                let off = y * stride + x * 4;
+                let bg_luma = if (line_id % 5) == 0 { 244u8 } else { 250u8 };
+                let is_glyph = (3..=14).contains(&row_in_line)
+                    && x >= 24
+                    && x < width.saturating_sub(24)
+                    && ((x.wrapping_mul(31) ^ y.wrapping_mul(17) ^ line_id.wrapping_mul(131)) % 7)
+                        < 2;
+                let (b, g, r) = if is_glyph {
+                    (
+                        ((line_id * 29 + x * 3) & 0x7F) as u8,
+                        ((line_id * 17 + y * 5) & 0x7F) as u8,
+                        ((line_id * 43 + x * 7) & 0x7F) as u8,
+                    )
+                } else {
+                    (bg_luma, bg_luma.wrapping_sub(2), bg_luma.wrapping_sub(4))
+                };
+                let a = if format == BufferFormat::Xrgb8888 {
+                    // Deliberately non-0xFF X-byte to verify Xrgb8888 ignores byte 3.
+                    ((x.wrapping_mul(13) ^ y.wrapping_mul(7)) & 0xFF) as u8
+                } else {
+                    180u8.wrapping_add(((line_id * 11 + x / 16) & 0x3F) as u8)
+                };
+                doc[off] = b;
+                doc[off + 1] = g;
+                doc[off + 2] = r;
+                doc[off + 3] = a;
+            }
+        }
+        doc
+    }
+
+    fn blit_doc_window(dst: &mut [u8], doc: &[u8], stride: usize, rect: TileRect, doc_y0: usize) {
+        let x_bytes = rect.x as usize * 4;
+        let row_bytes = rect.w as usize * 4;
+        for ry in 0..rect.h as usize {
+            let src_off = (doc_y0 + ry) * stride + x_bytes;
+            let dst_off = (rect.y as usize + ry) * stride + x_bytes;
+            dst[dst_off..dst_off + row_bytes].copy_from_slice(&doc[src_off..src_off + row_bytes]);
+        }
+    }
+
+    fn assert_canvas_matches_frame(
+        canvas: &[u8],
+        expected: &[u8],
+        metadata: BufferMetadata,
+        pad_sentinel: u8,
+    ) {
+        let w = metadata.width as usize;
+        let h = metadata.height as usize;
+        let stride = metadata.stride as usize;
+        let vis = w * 4;
+        for y in 0..h {
+            let row = y * stride;
+            for x in 0..w {
+                let off = row + x * 4;
+                let exp_a = if metadata.format == BufferFormat::Xrgb8888 {
+                    0xFF
+                } else {
+                    expected[off + 3]
+                };
+                assert_eq!(
+                    &canvas[off..off + 4],
+                    &[expected[off], expected[off + 1], expected[off + 2], exp_a],
+                    "pixel mismatch at ({x}, {y}) format={:?}",
+                    metadata.format
+                );
+            }
+            if stride > vis {
+                assert!(
+                    canvas[row + vis..row + stride]
+                        .iter()
+                        .all(|&b| b == pad_sentinel),
+                    "stride padding modified on row {y}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    #[cfg_attr(miri, ignore)]
+    fn test_scroll_blit_full_window_up_and_down_and_wire_reduction() {
+        with_test_codec(|compressor, decompressor| {
+            let width = 1024usize;
+            let height = 768usize;
+            for (format, pad) in [
+                (BufferFormat::Xrgb8888, 0usize),
+                (BufferFormat::Xrgb8888, 16usize),
+                (BufferFormat::Argb8888, 8usize),
+            ] {
+                let stride = width * 4 + pad;
+                let len = height * stride;
+                let meta = BufferMetadata {
+                    width: width as i32,
+                    height: height as i32,
+                    stride: stride as i32,
+                    format,
+                };
+                let doc = make_textured_document(width, height + 600, stride, format);
+                let full_rect = TileRect {
+                    x: 0,
+                    y: 0,
+                    w: width as u32,
+                    h: height as u32,
+                };
+
+                let mut scroll_y = 200usize;
+                let mut frame = vec![0xBBu8; len];
+                blit_doc_window(&mut frame, &doc, stride, full_rect, scroll_y);
+
+                let mut shadow = Vec::new();
+                let mut canvas = vec![0xCCu8; len];
+
+                // Initial full frame.
+                let full_wire_len = {
+                    let ptr = frame.as_ptr();
+                    let bp = unsafe { BufferPointer::new(&ptr, len) };
+                    let mut streaming = None;
+                    filter_and_compress_full_streaming(
+                        bp,
+                        ClientId(1),
+                        WlSurfaceId(2),
+                        meta,
+                        CompressionMode::Lossless,
+                        Some(&mut shadow),
+                        compressor,
+                        |s| streaming = Some(s),
+                    );
+                    let mut wire = Vec::new();
+                    streaming.unwrap().framed_write(&mut wire).unwrap();
+                    let mut rx = None;
+                    CompressedTileStream::read_from_stream(&mut wire.as_slice(), |s| {
+                        rx = Some(s);
+                        Ok(())
+                    })
+                    .unwrap();
+                    let validated = ValidatedTileStream::new(rx.unwrap()).unwrap();
+                    decompress_and_unfilter_streaming(validated, decompressor, &mut canvas)
+                        .unwrap();
+                    wire.len()
+                };
+                assert_canvas_matches_frame(&canvas, &frame, meta, 0xCC);
+
+                // Scroll up (content moves up -> dy < 0) and down (content moves down -> dy > 0).
+                for (delta_doc, expected_dy) in [(36isize, -36i32), (120, -120), (-120, 120)] {
+                    scroll_y = (scroll_y as isize + delta_doc) as usize;
+                    blit_doc_window(&mut frame, &doc, stride, full_rect, scroll_y);
+                    // Perturb X byte on Xrgb8888 to confirm detector ignores it.
+                    if format == BufferFormat::Xrgb8888 {
+                        for y in 0..height {
+                            for x in 0..width {
+                                frame[y * stride + x * 4 + 3] ^= 0x5A;
+                            }
+                        }
+                    }
+
+                    let ptr = frame.as_ptr();
+                    let bp = unsafe { BufferPointer::new(&ptr, len) };
+                    let mut streaming = None;
+                    let diff = filter_and_compress_incremental_streaming(
+                        bp,
+                        ClientId(1),
+                        WlSurfaceId(2),
+                        meta,
+                        CompressionMode::Lossless,
+                        None,
+                        &mut shadow,
+                        compressor,
+                        |s| streaming = Some(s),
+                    );
+                    let sr = diff
+                        .scroll_rect
+                        .expect("expected ScrollRect to be detected");
+                    assert_eq!(sr.dy, expected_dy, "format={format:?} pad={pad}");
+
+                    let mut wire = Vec::new();
+                    streaming.unwrap().framed_write(&mut wire).unwrap();
+                    assert!(
+                        wire.len() * 5 < full_wire_len,
+                        "expected >5x wire reduction for dy={expected_dy}: scroll={} B vs full={} B",
+                        wire.len(),
+                        full_wire_len
+                    );
+
+                    let mut rx = None;
+                    let mut rdr = wire.as_slice();
+                    CompressedTileStream::read_from_stream(&mut rdr, |s| {
+                        rx = Some(s);
+                        Ok(())
+                    })
+                    .unwrap();
+                    assert!(rdr.is_empty());
+                    let validated = ValidatedTileStream::new(rx.unwrap()).unwrap();
+                    let wire_sr = validated.scroll_rect().unwrap();
+                    assert_eq!(wire_sr, sr);
+                    apply_scroll_rect_in_place(&mut canvas, stride, wire_sr);
+                    decompress_and_unfilter_streaming(validated, decompressor, &mut canvas)
+                        .unwrap();
+                    assert_canvas_matches_frame(&canvas, &frame, meta, 0xCC);
+                }
+            }
+        });
+    }
+
+    #[test]
+    #[cfg_attr(miri, ignore)]
+    fn test_scroll_blit_split_pane_with_sidebar_header_and_scrollbar_overlay() {
+        with_test_codec(|compressor, decompressor| {
+            let width = 1280usize;
+            let height = 800usize;
+            let stride = width * 4;
+            let len = height * stride;
+            let meta = BufferMetadata {
+                width: width as i32,
+                height: height as i32,
+                stride: stride as i32,
+                format: BufferFormat::Xrgb8888,
+            };
+
+            let sidebar_w = 260usize;
+            let header_h = 64usize;
+            let footer_h = 32usize;
+            let scrollbar_w = 16usize;
+            let pane_rect = TileRect {
+                x: sidebar_w as u32,
+                y: header_h as u32,
+                w: (width - sidebar_w - scrollbar_w) as u32,
+                h: (height - header_h - footer_h) as u32,
+            };
+
+            let doc = make_textured_document(width, height + 500, stride, BufferFormat::Xrgb8888);
+
+            let render_split_frame = |scroll_y: usize| -> Vec<u8> {
+                let mut buf = vec![0u8; len];
+                // Fixed header + sidebar + footer chrome with rich distinct pixels.
+                for y in 0..height {
+                    for x in 0..width {
+                        let off = y * stride + x * 4;
+                        buf[off] = ((x * 5 + y * 3) & 0xFF) as u8;
+                        buf[off + 1] = ((x * 2 + y * 7 + 40) & 0xFF) as u8;
+                        buf[off + 2] = ((x * 11 + y * 13 + 80) & 0xFF) as u8;
+                        buf[off + 3] = 0xFF;
+                    }
+                }
+                // Scrolling content pane.
+                blit_doc_window(&mut buf, &doc, stride, pane_rect, scroll_y);
+
+                // Fixed scrollbar track + moving thumb at the right edge.
+                let thumb_y = header_h + (scroll_y / 3).min(pane_rect.h as usize - 80);
+                for y in header_h..(height - footer_h) {
+                    let is_thumb = (thumb_y..thumb_y + 80).contains(&y);
+                    let px = if is_thumb {
+                        [110, 110, 120, 0xFF]
+                    } else {
+                        [225, 225, 230, 0xFF]
+                    };
+                    for x in (width - scrollbar_w)..width {
+                        let off = y * stride + x * 4;
+                        buf[off..off + 4].copy_from_slice(&px);
+                    }
+                }
+
+                // Fixed floating overlay badge inside the scrolling pane.
+                for y in 350..410 {
+                    for x in 700..760 {
+                        let off = y * stride + x * 4;
+                        buf[off..off + 4].copy_from_slice(&[20, 120, 230, 0xFF]);
+                    }
+                }
+                buf
+            };
+
+            let mut scroll_y = 100usize;
+            let frame0 = render_split_frame(scroll_y);
+            let mut shadow = Vec::new();
+            let mut canvas = vec![0xEEu8; len];
+            {
+                let ptr = frame0.as_ptr();
+                let bp = unsafe { BufferPointer::new(&ptr, len) };
+                let mut streaming = None;
+                filter_and_compress_full_streaming(
+                    bp,
+                    ClientId(1),
+                    WlSurfaceId(2),
+                    meta,
+                    CompressionMode::Lossless,
+                    Some(&mut shadow),
+                    compressor,
+                    |s| streaming = Some(s),
+                );
+                let mut wire = Vec::new();
+                streaming.unwrap().framed_write(&mut wire).unwrap();
+                let mut rx = None;
+                CompressedTileStream::read_from_stream(&mut wire.as_slice(), |s| {
+                    rx = Some(s);
+                    Ok(())
+                })
+                .unwrap();
+                let validated = ValidatedTileStream::new(rx.unwrap()).unwrap();
+                decompress_and_unfilter_streaming(validated, decompressor, &mut canvas).unwrap();
+            }
+            assert_canvas_matches_frame(&canvas, &frame0, meta, 0xEE);
+
+            for (delta_doc, expected_dy) in [(48isize, -48i32), (-64, 64)] {
+                scroll_y = (scroll_y as isize + delta_doc) as usize;
+                let next = render_split_frame(scroll_y);
+                let ptr = next.as_ptr();
+                let bp = unsafe { BufferPointer::new(&ptr, len) };
+                let mut streaming = None;
+                let diff = filter_and_compress_incremental_streaming(
+                    bp,
+                    ClientId(1),
+                    WlSurfaceId(2),
+                    meta,
+                    CompressionMode::Lossless,
+                    None,
+                    &mut shadow,
+                    compressor,
+                    |s| streaming = Some(s),
+                );
+                let sr = diff
+                    .scroll_rect
+                    .expect("expected split-pane ScrollRect to be detected");
+                assert_eq!(sr.dy, expected_dy);
+                // Must stay strictly outside fixed sidebar and header/footer.
+                assert!(sr.x >= sidebar_w as u32);
+                assert!(sr.x + sr.width <= (width - scrollbar_w) as u32);
+                assert!(sr.y >= header_h as u32);
+                assert!(sr.y + sr.height <= (height - footer_h) as u32);
+
+                let mut wire = Vec::new();
+                streaming.unwrap().framed_write(&mut wire).unwrap();
+                let mut rx = None;
+                CompressedTileStream::read_from_stream(&mut wire.as_slice(), |s| {
+                    rx = Some(s);
+                    Ok(())
+                })
+                .unwrap();
+                let validated = ValidatedTileStream::new(rx.unwrap()).unwrap();
+                apply_scroll_rect_in_place(&mut canvas, stride, validated.scroll_rect().unwrap());
+                decompress_and_unfilter_streaming(validated, decompressor, &mut canvas).unwrap();
+                assert_canvas_matches_frame(&canvas, &next, meta, 0xEE);
+            }
+        });
+    }
+
+    #[test]
+    #[cfg_attr(miri, ignore)]
+    fn test_scroll_blit_hybrid_textsafe_zero_generation_loss() {
+        with_test_codec(|compressor, decompressor| {
+            let width = 1024usize;
+            let height = 768usize;
+            let stride = width * 4;
+            let len = height * stride;
+            let meta = BufferMetadata {
+                width: width as i32,
+                height: height as i32,
+                stride: stride as i32,
+                format: BufferFormat::Xrgb8888,
+            };
+            let mode = CompressionMode::Hybrid {
+                quality: 85,
+                subsamp: JpegSubsamp::Sub420,
+            };
+
+            // Build a tall mixed document: left half crisp UI text, right half smooth photo.
+            let doc_h = height + 256;
+            let mut doc = make_textured_document(width, doc_h, stride, BufferFormat::Xrgb8888);
+            fill_smooth_photo(
+                &mut doc,
+                width,
+                TileRect {
+                    x: 512,
+                    y: 0,
+                    w: 512,
+                    h: doc_h as u32,
+                },
+                0xFF,
+            );
+
+            let full_rect = TileRect {
+                x: 0,
+                y: 0,
+                w: width as u32,
+                h: height as u32,
+            };
+            let mut frame = vec![0u8; len];
+            blit_doc_window(&mut frame, &doc, stride, full_rect, 0);
+            let mut shadow = Vec::new();
+            let mut canvas = vec![0u8; len];
+
+            // Frame 1: full Hybrid encode.
+            {
+                let ptr = frame.as_ptr();
+                let bp = unsafe { BufferPointer::new(&ptr, len) };
+                let mut streaming = None;
+                filter_and_compress_full_streaming(
+                    bp,
+                    ClientId(1),
+                    WlSurfaceId(2),
+                    meta,
+                    mode,
+                    Some(&mut shadow),
+                    compressor,
+                    |s| streaming = Some(s),
+                );
+                let mut wire = Vec::new();
+                streaming.unwrap().framed_write(&mut wire).unwrap();
+                let mut rx = None;
+                CompressedTileStream::read_from_stream(&mut wire.as_slice(), |s| {
+                    rx = Some(s);
+                    Ok(())
+                })
+                .unwrap();
+                let validated = ValidatedTileStream::new(rx.unwrap()).unwrap();
+                decompress_and_unfilter_streaming(validated, decompressor, &mut canvas).unwrap();
+            }
+            let canvas_f1 = canvas.clone();
+
+            // Frame 2: scroll down by 64 rows (`dy = -64`).
+            blit_doc_window(&mut frame, &doc, stride, full_rect, 64);
+            {
+                let ptr = frame.as_ptr();
+                let bp = unsafe { BufferPointer::new(&ptr, len) };
+                let mut streaming = None;
+                let diff = filter_and_compress_incremental_streaming(
+                    bp,
+                    ClientId(1),
+                    WlSurfaceId(2),
+                    meta,
+                    mode,
+                    None,
+                    &mut shadow,
+                    compressor,
+                    |s| streaming = Some(s),
+                );
+                let sr = diff.scroll_rect.expect("expected Hybrid ScrollRect");
+                assert_eq!(sr.dy, -64);
+
+                let mut wire = Vec::new();
+                streaming.unwrap().framed_write(&mut wire).unwrap();
+                let mut rx = None;
+                CompressedTileStream::read_from_stream(&mut wire.as_slice(), |s| {
+                    rx = Some(s);
+                    Ok(())
+                })
+                .unwrap();
+                let validated = ValidatedTileStream::new(rx.unwrap()).unwrap();
+                apply_scroll_rect_in_place(&mut canvas, stride, validated.scroll_rect().unwrap());
+                decompress_and_unfilter_streaming(validated, decompressor, &mut canvas).unwrap();
+            }
+
+            // Scrolled photo pixels (`x >= 512, y < 640`) must be BYTE-IDENTICAL to
+            // Frame 1 shifted up by 64 rows -> zero generation loss!
+            for y in 0..640usize {
+                for x in 512..width {
+                    let dst = (y * width + x) * 4;
+                    let src = ((y + 64) * width + x) * 4;
+                    assert_eq!(
+                        &canvas[dst..dst + 4],
+                        &canvas_f1[src..src + 4],
+                        "generation loss on scrolled Hybrid photo at ({x},{y})"
+                    );
+                }
+            }
+            // Newly exposed bottom photo strip (`y = 704..768, x >= 512`) decodes with high PSNR.
+            assert!(
+                rect_psnr_rgb(
+                    &frame,
+                    &canvas,
+                    width,
+                    TileRect {
+                        x: 512,
+                        y: 704,
+                        w: 512,
+                        h: 64
+                    }
+                ) >= 34.0
+            );
+            // Left UI text half stays bit-exact (`PSNR == inf`).
+            assert!(
+                rect_psnr_rgb(
+                    &frame,
+                    &canvas,
+                    width,
+                    TileRect {
+                        x: 0,
+                        y: 0,
+                        w: 512,
+                        h: height as u32
+                    }
+                )
+                .is_infinite()
+            );
+        });
+    }
+
+    #[test]
+    #[cfg_attr(miri, ignore)]
+    fn test_scroll_blit_non_scroll_no_false_positives_and_zero_tile_scroll() {
+        with_test_codec(|compressor, decompressor| {
+            let width = 640usize;
+            let height = 512usize;
+            let stride = width * 4;
+            let len = height * stride;
+            let meta = BufferMetadata {
+                width: width as i32,
+                height: height as i32,
+                stride: stride as i32,
+                format: BufferFormat::Xrgb8888,
+            };
+
+            // 1. Solid color fill (unchanged and solid red -> solid blue) -> None.
+            let solid_a: Vec<u8> = [10u8, 20, 30, 0xFF].repeat(width * height);
+            let solid_b: Vec<u8> = [40u8, 50, 60, 0xFF].repeat(width * height);
+            for (prev, curr) in [(&solid_a, &solid_a), (&solid_a, &solid_b)] {
+                let ptr = curr.as_ptr();
+                let bp = unsafe { BufferPointer::new(&ptr, len) };
+                assert_eq!(detect_scroll_rect(bp, prev, meta, None), None);
+            }
+
+            // 2. Static textured frame -> None.
+            let doc = make_textured_document(width, height + 200, stride, BufferFormat::Xrgb8888);
+            let f0 = doc[..len].to_vec();
+            {
+                let ptr = f0.as_ptr();
+                let bp = unsafe { BufferPointer::new(&ptr, len) };
+                assert_eq!(detect_scroll_rect(bp, &f0, meta, None), None);
+            }
+
+            // 3. Random noise (unrelated full-frame repaint) -> None.
+            let mut noise = vec![0u8; len];
+            let mut prng = 0x9E37_79B9_7F4A_7C15u64;
+            for chunk in noise.as_chunks_mut::<8>().0 {
+                prng = prng.wrapping_add(0x9E37_79B9_7F4A_7C15);
+                let mut z = prng;
+                z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+                z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+                z ^= z >> 31;
+                chunk.copy_from_slice(&z.to_le_bytes());
+            }
+            {
+                let ptr = noise.as_ptr();
+                let bp = unsafe { BufferPointer::new(&ptr, len) };
+                assert_eq!(detect_scroll_rect(bp, &f0, meta, None), None);
+            }
+
+            // 4. Small typing update (200x24 box) -> None.
+            let mut typed = f0.clone();
+            for y in 100..124 {
+                for x in 80..280 {
+                    let off = y * stride + x * 4;
+                    typed[off] ^= 0x55;
+                    typed[off + 1] ^= 0x33;
+                }
+            }
+            {
+                let ptr = typed.as_ptr();
+                let bp = unsafe { BufferPointer::new(&ptr, len) };
+                assert_eq!(detect_scroll_rect(bp, &f0, meta, None), None);
+            }
+
+            // 5. Partial RowBand shorter than 256 rows -> None even if buffer scrolled.
+            let f_scrolled = doc[32 * stride..32 * stride + len].to_vec();
+            {
+                let ptr = f_scrolled.as_ptr();
+                let bp = unsafe { BufferPointer::new(&ptr, len) };
+                let short_band = [RowBand { y0: 100, y1: 300 }];
+                assert_eq!(detect_scroll_rect(bp, &f0, meta, Some(&short_band)), None);
+                // Small dimensions `< 256` -> None.
+                let small_meta = BufferMetadata {
+                    width: 240,
+                    height: 512,
+                    stride: 240 * 4,
+                    format: BufferFormat::Xrgb8888,
+                };
+                assert_eq!(detect_scroll_rect(bp, &f0, small_meta, None), None);
+            }
+
+            // 6. Zero-dirty-tile scroll: newly exposed bottom rows match the old
+            //    bottom rows (solid white footer below scrolled text), so after
+            //    ScrollRect is applied `dirty_tiles` is EMPTY — frame must still be
+            //    emitted and reconstruct bit-exactly!
+            let mut z_prev = vec![0xFFu8; len];
+            // Put unique text in rows 64..448, solid white in 0..64 and 448..512.
+            z_prev[64 * stride..448 * stride].copy_from_slice(&doc[0..384 * stride]);
+            let mut z_curr = vec![0xFFu8; len];
+            // Scroll up by 32 rows: text moves to 32..416; rows 416..512 are all white
+            // (matching rows 448..512 in z_prev!).
+            z_curr[32 * stride..416 * stride].copy_from_slice(&doc[0..384 * stride]);
+
+            let mut shadow = Vec::new();
+            let mut canvas = vec![0xFFu8; len];
+            {
+                let ptr = z_prev.as_ptr();
+                let bp = unsafe { BufferPointer::new(&ptr, len) };
+                let mut streaming = None;
+                filter_and_compress_full_streaming(
+                    bp,
+                    ClientId(1),
+                    WlSurfaceId(2),
+                    meta,
+                    CompressionMode::Lossless,
+                    Some(&mut shadow),
+                    compressor,
+                    |s| streaming = Some(s),
+                );
+                let mut wire = Vec::new();
+                streaming.unwrap().framed_write(&mut wire).unwrap();
+                let mut rx = None;
+                CompressedTileStream::read_from_stream(&mut wire.as_slice(), |s| {
+                    rx = Some(s);
+                    Ok(())
+                })
+                .unwrap();
+                let validated = ValidatedTileStream::new(rx.unwrap()).unwrap();
+                decompress_and_unfilter_streaming(validated, decompressor, &mut canvas).unwrap();
+            }
+            let ptr = z_curr.as_ptr();
+            let bp = unsafe { BufferPointer::new(&ptr, len) };
+            let mut streaming = None;
+            let diff = filter_and_compress_incremental_streaming(
+                bp,
+                ClientId(1),
+                WlSurfaceId(2),
+                meta,
+                CompressionMode::Lossless,
+                None,
+                &mut shadow,
+                compressor,
+                |s| streaming = Some(s),
+            );
+            assert!(!diff.is_unchanged());
+            let sr = diff.scroll_rect.expect("expected ScrollRect");
+            assert_eq!(sr.dy, -32);
+            let mut wire = Vec::new();
+            streaming.unwrap().framed_write(&mut wire).unwrap();
+            let mut rx = None;
+            CompressedTileStream::read_from_stream(&mut wire.as_slice(), |s| {
+                rx = Some(s);
+                Ok(())
+            })
+            .unwrap();
+            let validated = ValidatedTileStream::new(rx.unwrap()).unwrap();
+            apply_scroll_rect_in_place(&mut canvas, stride, validated.scroll_rect().unwrap());
+            decompress_and_unfilter_streaming(validated, decompressor, &mut canvas).unwrap();
+            assert_canvas_matches_frame(&canvas, &z_curr, meta, 0xFF);
+        });
+    }
+
+    #[test]
+    #[cfg_attr(miri, ignore)]
+    fn test_scroll_blit_parallel_replay_and_partial_row_bands() {
+        with_test_codec(|compressor, decompressor| {
+            // 1. Parallel column-stripe replay (`>= 512 KiB`) must match the
+            //    serial implementation bit-for-bit across full-width,
+            //    split-pane, padded-stride, up (`dy < 0`), and down (`dy > 0`)
+            //    scrolls.
+            let width = 1024usize;
+            let height = 768usize;
+            let stride = width * 4 + 32;
+            let base = make_textured_document(width, height, stride, BufferFormat::Argb8888);
+            for sr in [
+                ScrollRect {
+                    x: 0,
+                    y: 0,
+                    width: width as u32,
+                    height: height as u32,
+                    dy: -73,
+                },
+                ScrollRect {
+                    x: 0,
+                    y: 0,
+                    width: width as u32,
+                    height: height as u32,
+                    dy: 91,
+                },
+                ScrollRect {
+                    x: 137,
+                    y: 48,
+                    width: 811,
+                    height: 680,
+                    dy: -45,
+                },
+                ScrollRect {
+                    x: 137,
+                    y: 48,
+                    width: 811,
+                    height: 680,
+                    dy: 61,
+                },
+            ] {
+                let mut serial = base.clone();
+                let mut parallel = base.clone();
+                apply_scroll_rect_in_place(&mut serial, stride, sr);
+                apply_scroll_rect_in_place_parallel(&mut parallel, stride, sr, decompressor);
+                assert_eq!(parallel, serial, "parallel mismatch for {sr:?}");
+            }
+
+            // 2. Partial RowBands combining a `< 8`-row `Strip1D` top band and
+            //    a scrolling `>= 256`-row `RowBand2D` band in the same
+            //    incremental commit (tests mixed outside-scroll + fused
+            //    scroll-column worker tasks).
+            let stride0 = width * 4;
+            let len0 = height * stride0;
+            let meta = BufferMetadata {
+                width: width as i32,
+                height: height as i32,
+                stride: stride0 as i32,
+                format: BufferFormat::Argb8888,
+            };
+            let doc = make_textured_document(width, height + 300, stride0, BufferFormat::Argb8888);
+            let mut frame = doc[..len0].to_vec();
+            let mut shadow = Vec::new();
+            let mut canvas = vec![0u8; len0];
+            {
+                let ptr = frame.as_ptr();
+                let bp = unsafe { BufferPointer::new(&ptr, len0) };
+                let mut streaming = None;
+                filter_and_compress_full_streaming(
+                    bp,
+                    ClientId(1),
+                    WlSurfaceId(7),
+                    meta,
+                    CompressionMode::Lossless,
+                    Some(&mut shadow),
+                    compressor,
+                    |s| streaming = Some(s),
+                );
+                let mut wire = Vec::new();
+                streaming.unwrap().framed_write(&mut wire).unwrap();
+                let mut rx = None;
+                CompressedTileStream::read_from_stream(&mut wire.as_slice(), |s| {
+                    rx = Some(s);
+                    Ok(())
+                })
+                .unwrap();
+                let validated = ValidatedTileStream::new(rx.unwrap()).unwrap();
+                decompress_and_unfilter_streaming(validated, decompressor, &mut canvas).unwrap();
+            }
+
+            let bands = [RowBand { y0: 0, y1: 4 }, RowBand { y0: 64, y1: 640 }];
+            for (delta_doc, expected_dy) in [(48isize, -48i32), (-48, 48)] {
+                // Mutate the `< 8`-row top strip band.
+                for y in 0..4 {
+                    for x in 0..160 {
+                        let off = y * stride0 + x * 4;
+                        frame[off] ^= 0x5A;
+                        frame[off + 2] ^= 0xA5;
+                    }
+                }
+                // Scroll only rows `64..640` (within the second band).
+                let doc_y0 = if delta_doc > 0 { 64 + 48usize } else { 64usize };
+                let band_rect = TileRect {
+                    x: 120,
+                    y: 64,
+                    w: width as u32 - 140,
+                    h: 640 - 64,
+                };
+                blit_doc_window(&mut frame, &doc, stride0, band_rect, doc_y0);
+
+                let ptr = frame.as_ptr();
+                let bp = unsafe { BufferPointer::new(&ptr, len0) };
+                let mut streaming = None;
+                let diff = filter_and_compress_incremental_streaming(
+                    bp,
+                    ClientId(1),
+                    WlSurfaceId(7),
+                    meta,
+                    CompressionMode::Lossless,
+                    Some(&bands),
+                    &mut shadow,
+                    compressor,
+                    |s| streaming = Some(s),
+                );
+                let sr = diff
+                    .scroll_rect
+                    .expect("expected ScrollRect inside partial RowBand");
+                assert_eq!(sr.dy, expected_dy);
+                assert!(sr.y >= 64 && sr.y + sr.height <= 640);
+                let mut wire = Vec::new();
+                streaming.unwrap().framed_write(&mut wire).unwrap();
+                let mut rx = None;
+                CompressedTileStream::read_from_stream(&mut wire.as_slice(), |s| {
+                    rx = Some(s);
+                    Ok(())
+                })
+                .unwrap();
+                let validated = ValidatedTileStream::new(rx.unwrap()).unwrap();
+                apply_scroll_rect_in_place_parallel(
+                    &mut canvas,
+                    stride0,
+                    validated.scroll_rect().unwrap(),
+                    decompressor,
+                );
+                decompress_and_unfilter_streaming(validated, decompressor, &mut canvas).unwrap();
+                assert_canvas_matches_frame(&canvas, &frame, meta, 0);
             }
         });
     }

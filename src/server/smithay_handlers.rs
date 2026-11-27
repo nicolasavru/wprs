@@ -202,7 +202,7 @@ impl WprsServerState {
                             metadata.stride as usize,
                             scan_bands.as_deref(),
                         );
-                        let dirty_tiles = filtering::filter_and_compress_incremental_streaming(
+                        let diff = filtering::filter_and_compress_incremental_streaming(
                             data,
                             surface_state.client,
                             surface_state.id,
@@ -218,20 +218,21 @@ impl WprsServerState {
                                 writer.send(SendType::RawBuffer(raw_buffer_to_send));
                             },
                         );
-                        if dirty_tiles.is_empty() {
+                        if diff.is_unchanged() {
                             return Ok(InnerOutcome::Unchanged { synced });
                         }
-                        let damage =
-                            (dirty_tiles.len() < constants::SENT_DAMAGE_LIMIT).then(|| {
-                                dirty_tiles
-                                    .into_iter()
-                                    .map(|r| {
-                                        Rectangle::new(
-                                            r.x as i32, r.y as i32, r.w as i32, r.h as i32,
-                                        )
-                                    })
-                                    .collect()
-                            });
+                        let total_damage =
+                            usize::from(diff.scroll_rect.is_some()) + diff.dirty_tiles.len();
+                        let damage = (total_damage < constants::SENT_DAMAGE_LIMIT).then(|| {
+                            let mut rects = Vec::with_capacity(total_damage);
+                            if let Some(sr) = diff.scroll_rect {
+                                rects.push(sr.dst_damage_rect());
+                            }
+                            rects.extend(diff.dirty_tiles.into_iter().map(|r| {
+                                Rectangle::new(r.x as i32, r.y as i32, r.w as i32, r.h as i32)
+                            }));
+                            rects
+                        });
                         Ok(InnerOutcome::Sent {
                             synced,
                             metadata,
@@ -4510,5 +4511,174 @@ mod tests {
         commit_frame(&mut h, &mut file, 0x60, 400);
         h.pump_timers(Duration::from_millis(20));
         assert_eq!(h.client_data.frame_callbacks_done, vec![400]);
+    }
+
+    #[test]
+    #[cfg_attr(miri, ignore)]
+    fn test_wprsd_scroll_blit_commit_damage_and_bit_exact_decode_wire() {
+        use std::io::Seek;
+        use std::io::Write;
+        use std::num::NonZeroUsize;
+
+        use crate::filtering::ValidatedTileStream;
+        use crate::serialization::framing::CompressedTileStream;
+        use crate::sharding_compression::ShardingDecompressor;
+
+        let mut h = WaylandTestHarness::new(true);
+        let compositor = h.client_data.compositor.clone().unwrap();
+        let shm = h.client_data.shm.clone().unwrap();
+
+        let width = 640usize;
+        let height = 512usize;
+        let stride = width * 4;
+        let byte_len = height * stride;
+
+        let mut doc = vec![0u8; (height + 200) * stride];
+        for y in 0..(height + 200) {
+            let line = y / 16;
+            for x in 0..width {
+                let off = y * stride + x * 4;
+                let glyph = (3..=12).contains(&(y % 16))
+                    && x >= 16
+                    && x < width - 16
+                    && (((x * 29) ^ (y * 17) ^ (line * 83)) % 5) < 2;
+                let px = if glyph {
+                    [
+                        ((line * 23 + x) & 0x7F) as u8,
+                        ((line * 37 + y) & 0x7F) as u8,
+                        ((line * 13 + x * 5) & 0x7F) as u8,
+                        0xFF,
+                    ]
+                } else {
+                    [246, 248, 250, 0xFF]
+                };
+                doc[off..off + 4].copy_from_slice(&px);
+            }
+        }
+
+        let path = std::env::temp_dir().join(format!(
+            "wprs_scroll_test_{}_{}.bin",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let mut file = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create_new(true)
+            .open(&path)
+            .unwrap();
+        file.write_all(&doc[100 * stride..100 * stride + byte_len])
+            .unwrap();
+        _ = std::fs::remove_file(&path);
+        let pool = shm.create_pool(file.as_fd(), byte_len as i32, &h.qh, ());
+        let buf = pool.create_buffer(
+            0,
+            width as i32,
+            height as i32,
+            stride as i32,
+            wl_shm::Format::Xrgb8888,
+            &h.qh,
+            (),
+        );
+        let surface = compositor.create_surface(&h.qh, ());
+        let mut decompressor = ShardingDecompressor::new(NonZeroUsize::new(2).unwrap()).unwrap();
+        let mut canvas = vec![0u8; byte_len];
+
+        let mut decode_rb = |rb: crate::serialization::framing::StreamingCompressedTiles,
+                             canvas: &mut [u8]| {
+            let mut wire = Vec::new();
+            rb.framed_write(&mut wire).unwrap();
+            let wire_len = wire.len();
+            let (tx, rx) = crossbeam_channel::bounded(1);
+            let reader = std::thread::spawn(move || {
+                CompressedTileStream::read_from_stream(&mut wire.as_slice(), |stream| {
+                    tx.send(stream).unwrap();
+                    Ok(())
+                })
+                .unwrap();
+            });
+            let stream = rx.recv().unwrap();
+            let seq = stream.header.frame_seq;
+            let validated = ValidatedTileStream::new(stream).unwrap();
+            let sr = validated.scroll_rect();
+            let tiles = validated
+                .incremental_tile_rects()
+                .map(<[_]>::to_vec)
+                .unwrap_or_default();
+            if let Some(sr) = sr {
+                filtering::apply_scroll_rect_in_place(canvas, stride, sr);
+            }
+            filtering::decompress_and_unfilter_streaming(validated, &mut decompressor, canvas)
+                .unwrap();
+            reader.join().unwrap();
+            (seq, sr, tiles, wire_len)
+        };
+
+        // 1. Initial full commit.
+        let mut scroll_y = 100usize;
+        surface.attach(Some(&buf), 0, 0);
+        surface.commit();
+        h.roundtrip();
+        let msgs = h.drain_messages();
+        let mut full_wire_len = 0usize;
+        for msg in msgs {
+            if let SendType::RawBuffer(rb) = msg {
+                let (seq, sr, _, wire_len) = decode_rb(rb, &mut canvas);
+                assert_eq!(sr, None);
+                full_wire_len = wire_len;
+                h.ack_frame(seq);
+            }
+        }
+        assert_eq!(canvas, doc[scroll_y * stride..scroll_y * stride + byte_len]);
+
+        // 2. Scroll down (`dy = -48`) and scroll up (`dy = +32`) commits.
+        for expected_dy in [-48i32, 32i32] {
+            scroll_y = (scroll_y as isize - expected_dy as isize) as usize;
+            let expected = &doc[scroll_y * stride..scroll_y * stride + byte_len];
+            file.rewind().unwrap();
+            file.write_all(expected).unwrap();
+            surface.attach(Some(&buf), 0, 0);
+            surface.damage_buffer(0, 0, width as i32, height as i32);
+            surface.commit();
+            h.roundtrip();
+
+            let mut got_sr = None;
+            let mut got_tiles = Vec::new();
+            let mut got_damage = None;
+            for msg in h.drain_messages() {
+                match msg {
+                    SendType::RawBuffer(rb) => {
+                        let (seq, sr, tiles, wire_len) = decode_rb(rb, &mut canvas);
+                        assert!(
+                            wire_len * 3 < full_wire_len,
+                            "expected >=3x wire reduction for dy={expected_dy}: {wire_len} vs {full_wire_len}"
+                        );
+                        got_sr = sr;
+                        got_tiles = tiles;
+                        h.ack_frame(seq);
+                    },
+                    SendType::Object(Request::Surface(SurfaceRequest {
+                        payload: SurfaceRequestPayload::Commit(st),
+                        ..
+                    })) => {
+                        got_damage = st.damage;
+                    },
+                    _ => {},
+                }
+            }
+            let sr = got_sr.expect("wprsd must emit ScrollRect");
+            assert_eq!(sr.dy, expected_dy);
+            let dmg = got_damage.expect("wprsd must emit explicit damage list");
+            assert!(dmg.contains(&sr.dst_damage_rect()));
+            for t in &got_tiles {
+                assert!(dmg.contains(&Rectangle::new(
+                    t.x as i32, t.y as i32, t.w as i32, t.h as i32
+                )));
+            }
+            assert_eq!(canvas, expected);
+        }
     }
 }

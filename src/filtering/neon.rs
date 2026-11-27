@@ -67,6 +67,7 @@ use crate::prelude::*;
 use crate::serialization::framing::AlphaChannel;
 use crate::serialization::framing::CompressedTile;
 use crate::serialization::framing::LeafPayload;
+use crate::serialization::framing::ScrollRect;
 use crate::serialization::framing::TileRect;
 use crate::sharding_compression::CompressorWorkerState;
 use crate::sharding_compression::DecompressorWorkerState;
@@ -718,6 +719,58 @@ impl Tier {
                     stride_px,
                     n_qx,
                     sub_bands,
+                    dirty_flags,
+                    next_sub,
+                );
+            }
+        }
+    }
+
+    #[inline(never)]
+    pub(super) unsafe fn diff_and_update_scroll_worker(
+        self,
+        has_alpha: bool,
+        data: BufferPointer<u8>,
+        aos: BufferPointer<Vec4u8>,
+        shadow: &ShadowRows,
+        width: usize,
+        stride: usize,
+        stride_px: usize,
+        n_qx: usize,
+        sub_bands: &[ScanSubBand],
+        sr: ScrollRect,
+        dirty_flags: &[AtomicBool],
+        next_sub: &AtomicUsize,
+    ) {
+        // SAFETY: Caller upholds disjoint-band and scroll-band shadow invariants.
+        unsafe {
+            if has_alpha {
+                super::diff_and_update_scroll_worker_with::<Kernel, true>(
+                    Kernel,
+                    data,
+                    aos,
+                    shadow,
+                    width,
+                    stride,
+                    stride_px,
+                    n_qx,
+                    sub_bands,
+                    sr,
+                    dirty_flags,
+                    next_sub,
+                );
+            } else {
+                super::diff_and_update_scroll_worker_with::<Kernel, false>(
+                    Kernel,
+                    data,
+                    aos,
+                    shadow,
+                    width,
+                    stride,
+                    stride_px,
+                    n_qx,
+                    sub_bands,
+                    sr,
                     dirty_flags,
                     next_sub,
                 );

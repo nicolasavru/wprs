@@ -75,6 +75,35 @@ impl FrameDamage {
         }
     }
 
+    /// Ensures every pixel in `rect` is covered by `self`, appending `rect`
+    /// only when not already contained by an existing rect (or [`Self::Full`]).
+    pub(crate) fn ensure_covered(&mut self, rect: Rectangle<i32>) {
+        if rect.size.w <= 0 || rect.size.h <= 0 {
+            return;
+        }
+        match self {
+            Self::Full => {},
+            Self::Empty => *self = Self::Rects(vec![rect]),
+            Self::Rects(existing) => {
+                let rx1 = i64::from(rect.loc.x) + i64::from(rect.size.w);
+                let ry1 = i64::from(rect.loc.y) + i64::from(rect.size.h);
+                let covered = existing.iter().any(|r| {
+                    rect.loc.x >= r.loc.x
+                        && rect.loc.y >= r.loc.y
+                        && rx1 <= i64::from(r.loc.x) + i64::from(r.size.w)
+                        && ry1 <= i64::from(r.loc.y) + i64::from(r.size.h)
+                });
+                if !covered {
+                    if existing.len() + 1 >= constants::SENT_DAMAGE_LIMIT {
+                        *self = Self::Full;
+                    } else {
+                        existing.push(rect);
+                    }
+                }
+            },
+        }
+    }
+
     pub(crate) fn apply_and_clear(&mut self, wl_surface: &WlSurface) {
         match std::mem::replace(self, Self::Empty) {
             Self::Empty => {},
@@ -125,6 +154,61 @@ pub(crate) fn rect_contains(outer: TileRect, inner: TileRect) -> bool {
 #[inline]
 pub(crate) fn rect_covered_by(rect: TileRect, cover: &[TileRect]) -> bool {
     cover.iter().any(|&c| rect_contains(c, rect))
+}
+
+/// Partitions `[0, width) x [0, height) \ hole` into up to 4 pairwise-disjoint
+/// rectangles. Caller must ensure `hole` lies within `[0, width) x [0, height)`.
+pub(crate) fn rect_complement(width: u32, height: u32, hole: TileRect) -> ([TileRect; 4], usize) {
+    let dummy = TileRect {
+        x: 0,
+        y: 0,
+        w: 0,
+        h: 0,
+    };
+    let mut out = [dummy; 4];
+    let mut n = 0;
+    let hx0 = hole.x;
+    let hy0 = hole.y;
+    let hx1 = hole.x + hole.w;
+    let hy1 = hole.y + hole.h;
+
+    if hy0 > 0 {
+        out[n] = TileRect {
+            x: 0,
+            y: 0,
+            w: width,
+            h: hy0,
+        };
+        n += 1;
+    }
+    if hy1 < height {
+        out[n] = TileRect {
+            x: 0,
+            y: hy1,
+            w: width,
+            h: height - hy1,
+        };
+        n += 1;
+    }
+    if hx0 > 0 && hole.h > 0 {
+        out[n] = TileRect {
+            x: 0,
+            y: hy0,
+            w: hx0,
+            h: hole.h,
+        };
+        n += 1;
+    }
+    if hx1 < width && hole.h > 0 {
+        out[n] = TileRect {
+            x: hx1,
+            y: hy0,
+            w: width - hx1,
+            h: hole.h,
+        };
+        n += 1;
+    }
+    (out, n)
 }
 
 /// Captures a frame's 2D dirty tile rects as initial back-slot history,
@@ -381,5 +465,48 @@ mod tests {
         let mut partial_empty_new_buf = FrameDamage::Rects(vec![rect]);
         partial_empty_new_buf.merge_commit(Some(Vec::new()), true);
         assert_eq!(partial_empty_new_buf, FrameDamage::Full);
+
+        // `ensure_covered` adds uncovered rects, skips covered ones, and respects `Full`/limit.
+        let mut dmg = FrameDamage::Empty;
+        let big = Rectangle::new(0, 0, 100, 100);
+        let inside = Rectangle::new(10, 10, 20, 20);
+        let outside = Rectangle::new(100, 0, 20, 20);
+        dmg.ensure_covered(big);
+        assert_eq!(dmg, FrameDamage::Rects(vec![big]));
+        dmg.ensure_covered(inside);
+        assert_eq!(dmg, FrameDamage::Rects(vec![big]));
+        dmg.ensure_covered(outside);
+        assert_eq!(dmg, FrameDamage::Rects(vec![big, outside]));
+        let mut near_limit = FrameDamage::Rects(vec![rect; limit - 1]);
+        near_limit.ensure_covered(outside);
+        assert_eq!(near_limit, FrameDamage::Full);
+        near_limit.ensure_covered(big);
+        assert_eq!(near_limit, FrameDamage::Full);
+    }
+
+    #[test]
+    fn test_rect_complement_exact_partition() {
+        let w = 640u32;
+        let h = 480u32;
+        for hole in [
+            tr(0, 0, 640, 444),
+            tr(0, 36, 640, 444),
+            tr(200, 60, 400, 360),
+            tr(0, 0, 640, 480),
+            tr(100, 0, 200, 480),
+        ] {
+            let (parts, n) = rect_complement(w, h, hole);
+            let mut area = u64::from(hole.w) * u64::from(hole.h);
+            for (i, &p) in parts[..n].iter().enumerate() {
+                assert!(p.w > 0 && p.h > 0);
+                assert!(p.x + p.w <= w && p.y + p.h <= h);
+                assert!(!p.overlaps(hole));
+                for &q in &parts[..i] {
+                    assert!(!p.overlaps(q));
+                }
+                area += u64::from(p.w) * u64::from(p.h);
+            }
+            assert_eq!(area, u64::from(w) * u64::from(h));
+        }
     }
 }

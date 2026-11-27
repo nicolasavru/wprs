@@ -31,6 +31,7 @@ use zstd::zstd_safe;
 
 use crate::prelude::*;
 use crate::serialization::ClientId;
+use crate::serialization::geometry::Rectangle;
 use crate::serialization::wayland::BufferFormat;
 use crate::serialization::wayland::BufferMetadata;
 use crate::serialization::wayland::WlSurfaceId;
@@ -488,6 +489,106 @@ impl TileRect {
     }
 }
 
+/// Vertical scroll-blit region replayed before decoding incremental tiles.
+///
+/// Shifts pixels within `[x, x + width) x [y, y + height)` vertically by `dy`
+/// rows:
+/// - `dy < 0` (content moves up): copies rows `[y + |dy|, y + height)` to
+///   `[y, y + height - |dy|)`.
+/// - `dy > 0` (content moves down): copies rows `[y, y + height - dy)` to
+///   `[y + dy, y + height)`.
+#[derive(Debug, Copy, Clone, Eq, PartialEq)]
+pub struct ScrollRect {
+    pub x: u32,
+    pub y: u32,
+    pub width: u32,
+    pub height: u32,
+    pub dy: i32,
+}
+
+const SCROLL_RECT_LEN: usize = 20;
+
+impl ScrollRect {
+    /// Validates that `self` is non-empty, strictly inside
+    /// `[0, buf_width) x [0, buf_height)` without integer overflow, and shifts
+    /// by a non-zero `dy` with `|dy| < height`.
+    #[inline]
+    pub fn validate_in_bounds(self, buf_width: u32, buf_height: u32) -> Result<()> {
+        if self.width == 0 || self.height == 0 {
+            bail!("empty ScrollRect: {self:?}");
+        }
+        let x1 = self
+            .x
+            .checked_add(self.width)
+            .context(loc!(), "ScrollRect x + width overflow")?;
+        let y1 = self
+            .y
+            .checked_add(self.height)
+            .context(loc!(), "ScrollRect y + height overflow")?;
+        if x1 > buf_width || y1 > buf_height {
+            bail!("ScrollRect {self:?} out of bounds for {buf_width}x{buf_height}");
+        }
+        if self.dy == 0 {
+            bail!("zero dy in ScrollRect: {self:?}");
+        }
+        if self.dy.unsigned_abs() >= self.height {
+            bail!(
+                "ScrollRect dy={} shift magnitude >= height {} ({self:?})",
+                self.dy,
+                self.height
+            );
+        }
+        Ok(())
+    }
+
+    /// Returns the destination rectangle overwritten by this scroll blit as a
+    /// 2D pixel rectangle (`w * h` may exceed [`TILE_PIXELS`]).
+    ///
+    /// Caller must have validated `self` via [`Self::validate_in_bounds`].
+    #[inline]
+    pub fn dst_rect(self) -> TileRect {
+        let shift = self.dy.unsigned_abs();
+        let dst_y = if self.dy < 0 { self.y } else { self.y + shift };
+        TileRect {
+            x: self.x,
+            y: dst_y,
+            w: self.width,
+            h: self.height - shift,
+        }
+    }
+
+    /// Returns the destination rectangle in buffer-space damage coordinates.
+    ///
+    /// Caller must have validated `self` against a valid [`BufferMetadata`].
+    #[inline]
+    pub fn dst_damage_rect(self) -> Rectangle<i32> {
+        let dst = self.dst_rect();
+        Rectangle::new(dst.x as i32, dst.y as i32, dst.w as i32, dst.h as i32)
+    }
+
+    fn write_framed<W: Write>(self, stream: &mut W) -> Result<()> {
+        let mut buf = [0u8; SCROLL_RECT_LEN];
+        buf[0..4].copy_from_slice(&self.x.to_be_bytes());
+        buf[4..8].copy_from_slice(&self.y.to_be_bytes());
+        buf[8..12].copy_from_slice(&self.width.to_be_bytes());
+        buf[12..16].copy_from_slice(&self.height.to_be_bytes());
+        buf[16..20].copy_from_slice(&self.dy.to_be_bytes());
+        stream.write_all(&buf).location(loc!())
+    }
+
+    fn read_framed<R: Read>(stream: &mut R) -> Result<Self> {
+        let mut buf = [0u8; SCROLL_RECT_LEN];
+        stream.read_exact(&mut buf).location(loc!())?;
+        Ok(Self {
+            x: u32::from_be_bytes(buf[0..4].try_into().unwrap()),
+            y: u32::from_be_bytes(buf[4..8].try_into().unwrap()),
+            width: u32::from_be_bytes(buf[8..12].try_into().unwrap()),
+            height: u32::from_be_bytes(buf[12..16].try_into().unwrap()),
+            dy: i32::from_be_bytes(buf[16..20].try_into().unwrap()),
+        })
+    }
+}
+
 #[derive(Debug, Clone, Eq, PartialEq)]
 pub struct RawBufferHeader {
     pub frame_seq: u64,
@@ -495,15 +596,35 @@ pub struct RawBufferHeader {
     pub surface: WlSurfaceId,
     pub metadata: BufferMetadata,
     pub incremental: bool,
+    pub scroll_rect: Option<ScrollRect>,
     pub tile_rects: Vec<TileRect>,
 }
 
 const RAW_BUFFER_HEADER_LEN: usize = 42;
+const HEADER_FLAG_INCREMENTAL: u8 = 0x01;
+const HEADER_FLAG_SCROLL_RECT: u8 = 0x02;
 
 impl Framed for RawBufferHeader {
     fn framed_write<W: Write>(&self, stream: &mut W) -> Result<()> {
+        if let Some(sr) = self.scroll_rect {
+            if !self.incremental {
+                bail!("non-incremental RawBufferHeader cannot carry ScrollRect");
+            }
+            let width = u32::try_from(self.metadata.width)
+                .context(loc!(), "negative BufferMetadata width")?;
+            let height = u32::try_from(self.metadata.height)
+                .context(loc!(), "negative BufferMetadata height")?;
+            sr.validate_in_bounds(width, height).location(loc!())?;
+        }
         let n_tiles = u32::try_from(self.tile_rects.len())
             .context(loc!(), "tile_rects length exceeds u32::MAX")?;
+        let mut flags = 0u8;
+        if self.incremental {
+            flags |= HEADER_FLAG_INCREMENTAL;
+        }
+        if self.scroll_rect.is_some() {
+            flags |= HEADER_FLAG_SCROLL_RECT;
+        }
         let mut buf = [0u8; RAW_BUFFER_HEADER_LEN];
         buf[0..8].copy_from_slice(&self.frame_seq.to_be_bytes());
         buf[8..16].copy_from_slice(&self.client.0.to_be_bytes());
@@ -515,9 +636,12 @@ impl Framed for RawBufferHeader {
             BufferFormat::Argb8888 => 0,
             BufferFormat::Xrgb8888 => 1,
         };
-        buf[37] = u8::from(self.incremental);
+        buf[37] = flags;
         buf[38..42].copy_from_slice(&n_tiles.to_be_bytes());
         stream.write_all(&buf).location(loc!())?;
+        if let Some(sr) = self.scroll_rect {
+            sr.write_framed(stream).location(loc!())?;
+        }
         for &rect in &self.tile_rects {
             rect.write_framed(stream).location(loc!())?;
         }
@@ -538,10 +662,11 @@ impl Framed for RawBufferHeader {
             1 => BufferFormat::Xrgb8888,
             tag => bail!("invalid BufferFormat tag: {tag}"),
         };
-        let incremental = match buf[37] {
-            0 => false,
-            1 => true,
-            tag => bail!("invalid incremental tag: {tag}"),
+        let (incremental, has_scroll_rect) = match buf[37] {
+            0 => (false, false),
+            HEADER_FLAG_INCREMENTAL => (true, false),
+            tag if tag == HEADER_FLAG_INCREMENTAL | HEADER_FLAG_SCROLL_RECT => (true, true),
+            tag => bail!("invalid RawBufferHeader flags: {tag}"),
         };
         let n_tiles = u32::from_be_bytes(buf[38..42].try_into().unwrap()) as usize;
         let metadata = BufferMetadata {
@@ -557,6 +682,14 @@ impl Framed for RawBufferHeader {
         if n_tiles as u64 > max_tiles {
             bail!("tile count {n_tiles} exceeds maximum {max_tiles} for {width}x{height}");
         }
+        let scroll_rect = if has_scroll_rect {
+            let sr = ScrollRect::read_framed(stream).location(loc!())?;
+            sr.validate_in_bounds(width_u32, height_u32)
+                .location(loc!())?;
+            Some(sr)
+        } else {
+            None
+        };
         let mut tile_rects = Vec::with_capacity(n_tiles.min(1024));
         for _ in 0..n_tiles {
             let (rect, _) = TileRect::read_framed(stream).location(loc!())?;
@@ -570,6 +703,7 @@ impl Framed for RawBufferHeader {
             surface,
             metadata,
             incremental,
+            scroll_rect,
             tile_rects,
         })
     }
@@ -1517,6 +1651,7 @@ mod tests {
                         format,
                     },
                     incremental,
+                    scroll_rect: None,
                     tile_rects,
                 };
                 let mut wire = Vec::new();
@@ -1827,6 +1962,7 @@ mod tests {
                 format: BufferFormat::Xrgb8888,
             },
             incremental: true,
+            scroll_rect: None,
             tile_rects: vec![rect0, rect1],
         };
         let tile0 = CompressedTile {
@@ -2007,6 +2143,7 @@ mod tests {
                 format: BufferFormat::Xrgb8888,
             },
             incremental: false,
+            scroll_rect: None,
             tile_rects: large_rects.to_vec(),
         };
         let mut expected_hdr_wire = Vec::new();
@@ -2472,5 +2609,237 @@ mod tests {
                     .is_err()
             );
         }
+    }
+
+    #[test]
+    fn test_scroll_rect_framing_and_malformed_bounds() {
+        let meta = BufferMetadata {
+            width: 1920,
+            height: 1080,
+            stride: 1920 * 4,
+            format: BufferFormat::Xrgb8888,
+        };
+
+        // Roundtrip both scroll directions (`dy < 0` and `dy > 0`), with and without tiles.
+        for (sr, expected_dst, tiles) in [
+            (
+                ScrollRect {
+                    x: 0,
+                    y: 80,
+                    width: 1920,
+                    height: 1000,
+                    dy: -36,
+                },
+                TileRect {
+                    x: 0,
+                    y: 80,
+                    w: 1920,
+                    h: 964,
+                },
+                vec![TileRect {
+                    x: 0,
+                    y: 1024,
+                    w: 256,
+                    h: 56,
+                }],
+            ),
+            (
+                ScrollRect {
+                    x: 300,
+                    y: 60,
+                    width: 1608,
+                    height: 1000,
+                    dy: 120,
+                },
+                TileRect {
+                    x: 300,
+                    y: 180,
+                    w: 1608,
+                    h: 880,
+                },
+                vec![],
+            ),
+        ] {
+            sr.validate_in_bounds(1920, 1080).unwrap();
+            assert_eq!(sr.dst_rect(), expected_dst);
+            assert_eq!(
+                sr.dst_damage_rect(),
+                Rectangle::new(
+                    expected_dst.x as i32,
+                    expected_dst.y as i32,
+                    expected_dst.w as i32,
+                    expected_dst.h as i32,
+                )
+            );
+            let hdr = RawBufferHeader {
+                frame_seq: 77,
+                client: ClientId(5),
+                surface: WlSurfaceId(9),
+                metadata: meta,
+                incremental: true,
+                scroll_rect: Some(sr),
+                tile_rects: tiles.clone(),
+            };
+            let mut wire = Vec::new();
+            hdr.framed_write(&mut wire).unwrap();
+            assert_eq!(
+                wire.len(),
+                RAW_BUFFER_HEADER_LEN + SCROLL_RECT_LEN + tiles.len() * TILE_RECT_LEN
+            );
+            assert_eq!(wire[37], HEADER_FLAG_INCREMENTAL | HEADER_FLAG_SCROLL_RECT);
+            let decoded = RawBufferHeader::framed_read(&mut wire.as_slice()).unwrap();
+            assert_eq!(decoded, hdr);
+        }
+
+        // Non-scroll header adds zero wire bytes (still 42 B fixed prefix).
+        let plain_hdr = RawBufferHeader {
+            frame_seq: 78,
+            client: ClientId(5),
+            surface: WlSurfaceId(9),
+            metadata: meta,
+            incremental: true,
+            scroll_rect: None,
+            tile_rects: vec![],
+        };
+        let mut plain_wire = Vec::new();
+        plain_hdr.framed_write(&mut plain_wire).unwrap();
+        assert_eq!(plain_wire.len(), RAW_BUFFER_HEADER_LEN);
+
+        // Non-incremental header with `scroll_rect: Some(_)` must fail on write AND read.
+        let valid_sr = ScrollRect {
+            x: 0,
+            y: 0,
+            width: 640,
+            height: 480,
+            dy: -16,
+        };
+        let bad_non_inc = RawBufferHeader {
+            frame_seq: 1,
+            client: ClientId(1),
+            surface: WlSurfaceId(1),
+            metadata: meta,
+            incremental: false,
+            scroll_rect: Some(valid_sr),
+            tile_rects: vec![],
+        };
+        assert!(bad_non_inc.framed_write(&mut Vec::new()).is_err());
+
+        // Malformed ScrollRect bounds: `dy == 0`, `|dy| >= height`, `i32::MIN`,
+        // `width == 0`, `height == 0`, out-of-bounds, and u32::MAX overflow.
+        let bad_scrolls = [
+            ScrollRect {
+                x: 0,
+                y: 0,
+                width: 640,
+                height: 480,
+                dy: 0,
+            },
+            ScrollRect {
+                x: 0,
+                y: 0,
+                width: 640,
+                height: 480,
+                dy: 480,
+            },
+            ScrollRect {
+                x: 0,
+                y: 0,
+                width: 640,
+                height: 480,
+                dy: -480,
+            },
+            ScrollRect {
+                x: 0,
+                y: 0,
+                width: 640,
+                height: 480,
+                dy: -481,
+            },
+            ScrollRect {
+                x: 0,
+                y: 0,
+                width: 640,
+                height: 480,
+                dy: i32::MIN,
+            },
+            ScrollRect {
+                x: 0,
+                y: 0,
+                width: 0,
+                height: 480,
+                dy: -10,
+            },
+            ScrollRect {
+                x: 0,
+                y: 0,
+                width: 640,
+                height: 0,
+                dy: -10,
+            },
+            ScrollRect {
+                x: 1900,
+                y: 0,
+                width: 21,
+                height: 480,
+                dy: -10,
+            },
+            ScrollRect {
+                x: 0,
+                y: 1000,
+                width: 640,
+                height: 81,
+                dy: -10,
+            },
+            ScrollRect {
+                x: u32::MAX,
+                y: 0,
+                width: 1,
+                height: 480,
+                dy: -10,
+            },
+            ScrollRect {
+                x: 0,
+                y: u32::MAX,
+                width: 640,
+                height: 1,
+                dy: -1,
+            },
+        ];
+
+        for bad_sr in bad_scrolls {
+            assert!(bad_sr.validate_in_bounds(1920, 1080).is_err());
+            let mut wire = [0u8; RAW_BUFFER_HEADER_LEN].to_vec();
+            wire[24..28].copy_from_slice(&1920i32.to_be_bytes());
+            wire[28..32].copy_from_slice(&1080i32.to_be_bytes());
+            wire[32..36].copy_from_slice(&(1920i32 * 4).to_be_bytes());
+            wire[36] = 1; // Xrgb8888
+            wire[37] = HEADER_FLAG_INCREMENTAL | HEADER_FLAG_SCROLL_RECT;
+            wire[38..42].copy_from_slice(&0u32.to_be_bytes());
+            bad_sr.write_framed(&mut wire).unwrap();
+            assert!(
+                RawBufferHeader::framed_read(&mut wire.as_slice()).is_err(),
+                "expected error for malformed ScrollRect {bad_sr:?}"
+            );
+        }
+
+        // Invalid flags (`0x02` = non-incremental + scroll, `0x04` = reserved bit)
+        // and truncated ScrollRect payload must fail cleanly.
+        for bad_flag in [HEADER_FLAG_SCROLL_RECT, 0x04, 0xFF] {
+            let mut wire = [0u8; RAW_BUFFER_HEADER_LEN].to_vec();
+            wire[24..28].copy_from_slice(&640i32.to_be_bytes());
+            wire[28..32].copy_from_slice(&480i32.to_be_bytes());
+            wire[32..36].copy_from_slice(&(640i32 * 4).to_be_bytes());
+            wire[36] = 1;
+            wire[37] = bad_flag;
+            valid_sr.write_framed(&mut wire).unwrap();
+            assert!(RawBufferHeader::framed_read(&mut wire.as_slice()).is_err());
+        }
+        let mut truncated = [0u8; RAW_BUFFER_HEADER_LEN + 10];
+        truncated[24..28].copy_from_slice(&640i32.to_be_bytes());
+        truncated[28..32].copy_from_slice(&480i32.to_be_bytes());
+        truncated[32..36].copy_from_slice(&(640i32 * 4).to_be_bytes());
+        truncated[36] = 1;
+        truncated[37] = HEADER_FLAG_INCREMENTAL | HEADER_FLAG_SCROLL_RECT;
+        assert!(RawBufferHeader::framed_read(&mut truncated.as_slice()).is_err());
     }
 }

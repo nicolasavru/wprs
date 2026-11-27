@@ -169,6 +169,13 @@ impl<S: Send + 'static> WorkerPool<S> {
         })
     }
 
+    /// Total number of threads participating in [`Self::execute`] (caller plus
+    /// background workers).
+    #[inline]
+    pub(crate) fn parallelism(&self) -> usize {
+        self.n_workers + 1
+    }
+
     /// Runs `f` concurrently across the caller thread and up to
     /// `(max_tasks - 1).min(self.n_workers)` background worker threads, passing
     /// each participant its exclusive `&mut S` state. A worker may re-enter `f`

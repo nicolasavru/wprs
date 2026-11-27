@@ -143,6 +143,9 @@ impl WprsClientState {
             remote_surface
                 .frame_damage
                 .merge_commit(surface_state.damage.take(), had_new_buffer);
+            if let Some(scroll_damage) = remote_surface.pending_scroll_damage.take() {
+                remote_surface.frame_damage.ensure_covered(scroll_damage);
+            }
             remote_surface.add_buffer_delta(surface_state.buffer_delta.take());
 
             remote_surface.frame_callback_completed
@@ -732,8 +735,10 @@ impl WprsClientState {
                 .prepare_buffer_canvas(
                     metadata,
                     validated.incremental_tile_rects(),
+                    validated.scroll_rect(),
                     &mut self.pool,
                     &mut self.slot_copy_scratch,
+                    &mut self.decompressor,
                 )
                 .location(loc!())?;
             filtering::decompress_and_unfilter_streaming(validated, &mut self.decompressor, canvas)
@@ -947,6 +952,9 @@ mod tests {
         data_device: Option<ServerWlDataDevice>,
         surfaces: Vec<ServerWlSurface>,
         pending_buffers: HashMap<u32, ServerWlBuffer>,
+        hold_committed_buffers: bool,
+        held_buffers: Vec<ServerWlBuffer>,
+        damage_buffers: Vec<(u32, i32, i32, i32, i32)>,
         pending_frame_callbacks: Vec<ServerWlCallback>,
         subsurface_stacks: HashMap<u32, Vec<u32>>,
         subsurface_positions: HashMap<u32, (i32, i32)>,
@@ -1085,6 +1093,14 @@ mod tests {
                         .xdg_reqs
                         .push(HostXdgReq::SurfaceOffset { surface_id, x, y });
                 },
+                server_surface::Request::DamageBuffer {
+                    x,
+                    y,
+                    width,
+                    height,
+                } => {
+                    state.damage_buffers.push((surface_id, x, y, width, height));
+                },
                 server_surface::Request::Frame { callback } => {
                     let cb = data_init.init(callback, ());
                     state.pending_frame_callbacks.push(cb);
@@ -1094,7 +1110,17 @@ mod tests {
                         .xdg_reqs
                         .push(HostXdgReq::SurfaceCommit { surface_id });
                     if let Some(buf) = state.pending_buffers.remove(&surface_id) {
-                        buf.release();
+                        if state.hold_committed_buffers {
+                            // Hold the newly attached buffer and release any
+                            // previously held buffer (modeling a real 2-slot
+                            // Wayland compositor scanout swap).
+                            for old in state.held_buffers.drain(..) {
+                                old.release();
+                            }
+                            state.held_buffers.push(buf);
+                        } else {
+                            buf.release();
+                        }
                     }
                 },
                 _ => {},
@@ -2839,6 +2865,7 @@ mod tests {
                     surface: sid_corrupt,
                     metadata: meta,
                     incremental: false,
+                    scroll_rect: None,
                     tile_rects: vec![TileRect {
                         x: 0,
                         y: 0,
@@ -3024,5 +3051,277 @@ mod tests {
         );
         assert!(h.client.timed_out());
         assert!(!h.client.serializer.other_end_connected());
+    }
+
+    #[test]
+    #[cfg_attr(miri, ignore)]
+    fn test_wprsc_scroll_blit_end_to_end_swapchain_damage_and_resync() {
+        use std::num::NonZeroUsize;
+
+        use crate::buffer_pointer::BufferPointer;
+        use crate::serialization::framing::RawBufferHeader;
+        use crate::serialization::framing::ScrollRect;
+        use crate::serialization::geometry::Rectangle;
+        use crate::serialization::wayland::BufferFormat;
+        use crate::serialization::wayland::BufferMetadata;
+        use crate::sharding_compression::ShardingCompressor;
+
+        let mut h = ClientDndHarness::new();
+        // Force real 2-slot `SlotPool` swapchain ping-pong (compositor holds the
+        // currently scanning-out buffer until the next commit replaces it).
+        h.host.hold_committed_buffers = true;
+
+        let client_id = ClientId(3);
+        let sid = WlSurfaceId(301);
+        let width = 640usize;
+        let height = 512usize;
+        let stride = width * 4;
+        let len = height * stride;
+        let meta = BufferMetadata {
+            width: width as i32,
+            height: height as i32,
+            stride: stride as i32,
+            format: BufferFormat::Xrgb8888,
+        };
+
+        let mut doc = vec![0u8; (height + 300) * stride];
+        for y in 0..(height + 300) {
+            let line = y / 16;
+            for x in 0..width {
+                let off = y * stride + x * 4;
+                let glyph = (3..=12).contains(&(y % 16))
+                    && x >= 16
+                    && x < width - 16
+                    && (((x * 23) ^ (y * 13) ^ (line * 97)) % 5) < 2;
+                let px = if glyph {
+                    [
+                        ((line * 31 + x) & 0x7F) as u8,
+                        ((line * 17 + y) & 0x7F) as u8,
+                        ((line * 47 + x * 3) & 0x7F) as u8,
+                        0xFF,
+                    ]
+                } else {
+                    [248, 248, 250, 0xFF]
+                };
+                doc[off..off + 4].copy_from_slice(&px);
+            }
+        }
+
+        let mut compressor = ShardingCompressor::new(NonZeroUsize::new(4).unwrap(), 1).unwrap();
+        let mut shadow = Vec::new();
+        let mut next_seq = 1u64;
+
+        let send_wire_stream =
+            |h: &mut ClientDndHarness,
+             mut streaming: crate::serialization::framing::StreamingCompressedTiles,
+             seq: u64| {
+                streaming.header.frame_seq = seq;
+                let mut wire = Vec::new();
+                streaming.framed_write(&mut wire).unwrap();
+                let (tx, rx) = crossbeam_channel::bounded(1);
+                let reader = std::thread::spawn(move || {
+                    CompressedTileStream::read_from_stream(&mut wire.as_slice(), |stream| {
+                        tx.send(stream).unwrap();
+                        Ok(())
+                    })
+                    .unwrap();
+                });
+                let stream = rx.recv().unwrap();
+                h.client.handle_request(RecvType::RawBuffer(stream));
+                reader.join().unwrap();
+            };
+
+        let commit_surface = |h: &mut ClientDndHarness, damage: Option<Vec<Rectangle<i32>>>| {
+            let state = SurfaceState {
+                client: client_id,
+                id: sid,
+                buffer: Some(BufferAssignment::New(meta)),
+                role: None,
+                buffer_delta: None,
+                buffer_scale: 1,
+                buffer_transform: None,
+                opaque_region: None,
+                input_region: None,
+                z_ordered_children: vec![wayland::SubsurfacePosition {
+                    id: sid,
+                    position: (0, 0).into(),
+                }],
+                damage,
+                output_ids: Vec::new(),
+                viewport_state: None,
+                xdg_surface_state: None,
+            };
+            h.client
+                .handle_request(RecvType::Object(Request::Surface(SurfaceRequest {
+                    client: client_id,
+                    surface: sid,
+                    payload: SurfaceRequestPayload::Commit(state),
+                })));
+            h.sync();
+            h.fire_frame_callbacks();
+        };
+
+        // 1. Frame 0: initial full sync.
+        let mut scroll_y = 100usize;
+        let frame0 = doc[scroll_y * stride..scroll_y * stride + len].to_vec();
+        {
+            let ptr = frame0.as_ptr();
+            let bp = unsafe { BufferPointer::new(&ptr, len) };
+            let mut streaming = None;
+            filtering::filter_and_compress_full_streaming(
+                bp,
+                client_id,
+                sid,
+                meta,
+                CompressionMode::Lossless,
+                Some(&mut shadow),
+                &mut compressor,
+                |s| streaming = Some(s),
+            );
+            let seq = next_seq;
+            next_seq += 1;
+            send_wire_stream(&mut h, streaming.unwrap(), seq);
+            assert_eq!(h.drain_events(), vec![Event::FrameAck { seq }]);
+            commit_surface(&mut h, None);
+        }
+        let host_surface_id = h
+            .client
+            .remote_display
+            .client(&client_id)
+            .surfaces
+            .get(&sid)
+            .unwrap()
+            .wl_surface()
+            .id()
+            .protocol_id();
+
+        // 2. 10-frame smooth scroll sequence (`dy = -6, -12, +8, ...`) across the
+        //    real 2-slot `SlotPool` swapchain.
+        let deltas: [i32; 10] = [-6, -12, -6, -12, 8, 8, -12, 8, -6, -12];
+        for (step_idx, expected_dy) in deltas.into_iter().enumerate() {
+            h.host.damage_buffers.clear();
+            scroll_y = (scroll_y as isize - expected_dy as isize) as usize;
+            let frame = doc[scroll_y * stride..scroll_y * stride + len].to_vec();
+
+            let ptr = frame.as_ptr();
+            let bp = unsafe { BufferPointer::new(&ptr, len) };
+            let mut streaming = None;
+            let diff = filtering::filter_and_compress_incremental_streaming(
+                bp,
+                client_id,
+                sid,
+                meta,
+                CompressionMode::Lossless,
+                None,
+                &mut shadow,
+                &mut compressor,
+                |s| streaming = Some(s),
+            );
+            let sr = diff
+                .scroll_rect
+                .expect("expected ScrollRect on smooth scroll frame");
+            assert_eq!(sr.dy, expected_dy, "step {step_idx}");
+
+            let seq = next_seq;
+            next_seq += 1;
+            send_wire_stream(&mut h, streaming.unwrap(), seq);
+            assert_eq!(h.drain_events(), vec![Event::FrameAck { seq }]);
+
+            // On step 5, deliberately omit `sr.dst_damage_rect()` from `Commit.damage`
+            // to verify `wprsc`'s `pending_scroll_damage` safety net still damages it!
+            let tile_damage: Vec<Rectangle<i32>> = diff
+                .dirty_tiles
+                .iter()
+                .map(|r| Rectangle::new(r.x as i32, r.y as i32, r.w as i32, r.h as i32))
+                .collect();
+            let commit_damage = if step_idx == 5 {
+                tile_damage.clone()
+            } else {
+                let mut d = Vec::with_capacity(1 + tile_damage.len());
+                d.push(sr.dst_damage_rect());
+                d.extend_from_slice(&tile_damage);
+                d
+            };
+            commit_surface(&mut h, Some(commit_damage));
+
+            // Verify exact `wl_surface.damage_buffer` rects on the host compositor.
+            let got_damage: Vec<Rectangle<i32>> = h
+                .host
+                .damage_buffers
+                .iter()
+                .filter(|&&(id, ..)| id == host_surface_id)
+                .map(|&(_, x, y, w, hh)| Rectangle::new(x, y, w, hh))
+                .collect();
+            assert!(
+                got_damage.contains(&sr.dst_damage_rect()),
+                "step {step_idx}: missing scroll dst damage {:?} in {got_damage:?}",
+                sr.dst_damage_rect()
+            );
+            for tile_rect in &tile_damage {
+                assert!(
+                    got_damage.contains(tile_rect),
+                    "step {step_idx}: missing tile damage {tile_rect:?} in {got_damage:?}"
+                );
+            }
+            assert_eq!(
+                got_damage.len(),
+                1 + tile_damage.len(),
+                "step {step_idx}: duplicate damage rects emitted: {got_damage:?}"
+            );
+
+            // Verify bit-exact pixels in `wprsc`'s active `SlotPool` buffer!
+            let active_slot = h
+                .client
+                .remote_display
+                .client(&client_id)
+                .surfaces
+                .get(&sid)
+                .unwrap()
+                .buffer
+                .as_ref()
+                .unwrap()
+                .active_buffer
+                .slot();
+            let slot_bytes = h.client.pool.raw_data_mut(&active_slot);
+            assert_eq!(
+                &slot_bytes[..len],
+                &frame[..],
+                "pixel mismatch in SlotPool on smooth scroll step {step_idx} (dy={expected_dy})"
+            );
+        }
+
+        // 3. Receiving a `ScrollRect` on a surface with no valid previous buffer
+        //    must fail safely and emit `BufferResyncRequested` BEFORE `FrameAck`.
+        let unknown_sid = WlSurfaceId(999);
+        let (_tx, rx) = crossbeam_channel::unbounded();
+        h.client
+            .handle_request(RecvType::RawBuffer(CompressedTileStream {
+                header: RawBufferHeader {
+                    frame_seq: 555,
+                    client: client_id,
+                    surface: unknown_sid,
+                    metadata: meta,
+                    incremental: true,
+                    scroll_rect: Some(ScrollRect {
+                        x: 0,
+                        y: 0,
+                        width: width as u32,
+                        height: height as u32,
+                        dy: -16,
+                    }),
+                    tile_rects: vec![],
+                },
+                tiles: rx,
+            }));
+        assert_eq!(
+            h.drain_events(),
+            vec![
+                Event::Surface(SurfaceEvent {
+                    surface_id: unknown_sid,
+                    payload: SurfaceEventPayload::BufferResyncRequested,
+                }),
+                Event::FrameAck { seq: 555 },
+            ]
+        );
     }
 }
