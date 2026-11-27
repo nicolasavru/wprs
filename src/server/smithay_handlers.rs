@@ -23,6 +23,7 @@ use smithay::input::pointer::CursorImageStatus as SmithayCursorImageStatus;
 use smithay::input::Seat;
 use smithay::input::SeatHandler;
 use smithay::input::SeatState;
+use smithay::output::Output;
 use smithay::reexports::calloop::timer::TimeoutAction;
 use smithay::reexports::calloop::timer::Timer;
 use smithay::reexports::wayland_protocols::xdg::decoration::zv1::server::zxdg_toplevel_decoration_v1::Mode as XdgDecorationMode;
@@ -99,6 +100,7 @@ use crate::serialization::wayland::SurfaceState;
 use crate::serialization::wayland::Transform;
 use crate::serialization::wayland::WlSurfaceId;
 use crate::serialization::xdg_shell::DecorationMode;
+use crate::serialization::xdg_shell::FullscreenState;
 use crate::serialization::xdg_shell::Move;
 use crate::serialization::xdg_shell::PopupRequest;
 use crate::serialization::xdg_shell::PopupRequestPayload;
@@ -177,6 +179,24 @@ impl WprsServerState {
         }
     }
 
+    pub(crate) fn output_id_for_wl_output(&self, wl_output: &wl_output::WlOutput) -> Option<u32> {
+        let output = Output::from_resource(wl_output)?;
+        self.outputs
+            .iter()
+            .find_map(|(&id, (candidate, _))| (*candidate == output).then_some(id))
+    }
+
+    pub(crate) fn client_wl_output_for_id(
+        &self,
+        surface: &WlSurface,
+        output_id: u32,
+    ) -> Option<wl_output::WlOutput> {
+        let client = surface.client()?;
+        self.outputs
+            .get(&output_id)
+            .and_then(|(output, _)| output.client_outputs(&client).next())
+    }
+
     fn send_detached_toplevel_configure(&self, toplevel: &ToplevelSurface) {
         let (decoration_mode, maximized, fullscreen) =
             compositor::with_states(toplevel.wl_surface(), |surface_data| {
@@ -191,6 +211,12 @@ impl WprsServerState {
                     })
                     .unwrap_or((None, None, None))
             });
+        let fullscreen_output = match fullscreen {
+            Some(FullscreenState::Set(output_id)) => {
+                output_id.and_then(|id| self.client_wl_output_for_id(toplevel.wl_surface(), id))
+            },
+            _ => None,
+        };
         toplevel.with_pending_state(|state| {
             state.states.set(xdg_toplevel::State::Activated);
             match maximized {
@@ -203,14 +229,15 @@ impl WprsServerState {
                 None => {},
             }
             match fullscreen {
-                Some(true) => {
+                Some(FullscreenState::Set(_)) => {
                     state.states.set(xdg_toplevel::State::Fullscreen);
                 },
-                Some(false) => {
+                Some(FullscreenState::Unset) => {
                     state.states.unset(xdg_toplevel::State::Fullscreen);
                 },
                 None => {},
             }
+            state.fullscreen_output = fullscreen_output;
             state.decoration_mode = Some(
                 decoration_mode
                     .map(Into::into)
@@ -383,22 +410,22 @@ impl XdgShellHandler for WprsServerState {
     fn fullscreen_request(
         &mut self,
         surface: ToplevelSurface,
-        _output: Option<wl_output::WlOutput>,
+        output: Option<wl_output::WlOutput>,
     ) {
-        // TODO: do anything with output? Probably not, but also depends on how
-        // exactly we handle output enter/exit events and updating outputs
-        // between client reconnections.
+        let output_id = output
+            .as_ref()
+            .and_then(|wl_output| self.output_id_for_wl_output(wl_output));
         self.update_state_and_send_toplevel_request(
             &surface,
-            |toplevel_state| toplevel_state.fullscreen = Some(true),
-            ToplevelRequestPayload::SetFullscreen,
+            |toplevel_state| toplevel_state.fullscreen = Some(FullscreenState::Set(output_id)),
+            ToplevelRequestPayload::SetFullscreen(output_id),
         );
     }
 
     fn unfullscreen_request(&mut self, surface: ToplevelSurface) {
         self.update_state_and_send_toplevel_request(
             &surface,
-            |toplevel_state| toplevel_state.fullscreen = Some(false),
+            |toplevel_state| toplevel_state.fullscreen = Some(FullscreenState::Unset),
             ToplevelRequestPayload::UnsetFullscreen,
         );
     }
@@ -873,6 +900,11 @@ pub fn commit_impl(
     let surface_attributes = guard.current();
     compositor_utils::cap_surface_damage(&mut surface_attributes.damage);
     let mut frame_callbacks = mem::take(&mut surface_attributes.frame_callbacks);
+    let buffer_delta = surface_attributes
+        .buffer_delta
+        .take()
+        .filter(|delta| delta.x != 0 || delta.y != 0)
+        .map(Into::into);
 
     if !frame_callbacks.is_empty() {
         let surface = surface.clone();
@@ -1129,6 +1161,7 @@ pub fn commit_impl(
 
     let mut surface_state_to_send = tracked.state.clone_without_buffer();
     surface_state_to_send.buffer = buffer_to_send;
+    surface_state_to_send.buffer_delta = buffer_delta;
     if was_committed
         && !was_dirty
         && surface_state_to_send.buffer.is_none()
@@ -2008,6 +2041,7 @@ mod tests {
             id: WlSurfaceId(id),
             buffer: None,
             role,
+            buffer_delta: None,
             buffer_scale: 1,
             buffer_transform: None,
             opaque_region: None,
@@ -3479,5 +3513,298 @@ mod tests {
         toplevel.show_window_menu(&seat, server_button_serial, 30, 40);
         h.roundtrip();
         assert!(h.drain_requests().is_empty());
+    }
+
+    #[test]
+    #[cfg_attr(miri, ignore)]
+    fn test_buffer_delta_forwarded_once_and_not_replayed_wire() {
+        use std::io::Seek;
+        use std::io::Write;
+
+        let mut h = WaylandTestHarness::new(true);
+        let compositor = h.client_data.compositor.clone().unwrap();
+        let shm = h.client_data.shm.clone().unwrap();
+
+        let surface = compositor.create_surface(&h.qh, ());
+        let shm_path = std::env::temp_dir().join(format!(
+            "wprs_delta_shm_test_{}_{}.bin",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let mut shm_file = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create_new(true)
+            .open(&shm_path)
+            .unwrap();
+        shm_file.write_all(&[0x11; 16]).unwrap();
+        _ = std::fs::remove_file(&shm_path);
+        let pool = shm.create_pool(shm_file.as_fd(), 16, &h.qh, ());
+        let buf = pool.create_buffer(0, 2, 2, 8, wl_shm::Format::Argb8888, &h.qh, ());
+
+        // 1. Commit with non-zero `wl_surface.offset(-12, 7)` forwards `buffer_delta`.
+        surface.attach(Some(&buf), 0, 0);
+        surface.offset(-12, 7);
+        surface.commit();
+        h.roundtrip();
+        let sid = h.server_surface_id(&surface);
+        let reqs = h.drain_requests();
+        let first_commit = reqs
+            .iter()
+            .find_map(|r| match r {
+                Request::Surface(SurfaceRequest {
+                    surface,
+                    payload: SurfaceRequestPayload::Commit(st),
+                    ..
+                }) if *surface == sid => Some(st),
+                _ => None,
+            })
+            .expect("first commit must be forwarded");
+        assert_eq!(first_commit.buffer_delta, Some((-12, 7).into()));
+
+        // 2. Next commit with updated pixels and NO offset must NOT replay `(-12, 7)`.
+        shm_file.rewind().unwrap();
+        shm_file.write_all(&[0x22; 16]).unwrap();
+        surface.attach(Some(&buf), 0, 0);
+        surface.commit();
+        h.roundtrip();
+        let reqs = h.drain_requests();
+        let second_commit = reqs
+            .iter()
+            .find_map(|r| match r {
+                Request::Surface(SurfaceRequest {
+                    surface,
+                    payload: SurfaceRequestPayload::Commit(st),
+                    ..
+                }) if *surface == sid => Some(st),
+                _ => None,
+            })
+            .expect("second commit with new pixels must be forwarded");
+        assert_eq!(second_commit.buffer_delta, None);
+
+        // 3. Unchanged-pixel commit with a non-zero offset is NOT deduplicated away.
+        surface.attach(Some(&buf), 0, 0);
+        surface.offset(4, -3);
+        surface.commit();
+        h.roundtrip();
+        let reqs = h.drain_requests();
+        let third_commit = reqs
+            .iter()
+            .find_map(|r| match r {
+                Request::Surface(SurfaceRequest {
+                    surface,
+                    payload: SurfaceRequestPayload::Commit(st),
+                    ..
+                }) if *surface == sid => Some(st),
+                _ => None,
+            })
+            .expect("offset-only commit must not be deduplicated");
+        assert_eq!(third_commit.buffer, None);
+        assert_eq!(third_commit.buffer_delta, Some((4, -3).into()));
+
+        // 4. Subsequent zero-offset / delta-less bufferless commit is deduplicated.
+        surface.offset(0, 0);
+        surface.commit();
+        h.roundtrip();
+        assert!(h.drain_requests().is_empty());
+    }
+
+    #[test]
+    #[cfg_attr(miri, ignore)]
+    fn test_fullscreen_output_forwarding_and_configure_state_wire() {
+        use crate::serialization::wayland::Mode as SerMode;
+        use crate::serialization::wayland::OutputEvent;
+        use crate::serialization::wayland::OutputInfo;
+        use crate::serialization::wayland::Subpixel as SerSubpixel;
+        use crate::serialization::wayland::Transform as SerTransform;
+
+        let mut h = WaylandTestHarness::new(true);
+        let conn_id = h.conn_id.unwrap();
+
+        let make_output = |id: u32, name: &str, x: i32| OutputInfo {
+            id,
+            model: format!("Model-{id}"),
+            make: "Vendor".to_string(),
+            location: (x, 0).into(),
+            physical_size: (600, 340).into(),
+            subpixel: SerSubpixel::HorizontalRgb,
+            transform: SerTransform::Normal,
+            scale_factor: 1,
+            mode: SerMode {
+                dimensions: (1920, 1080).into(),
+                refresh_rate: 60000,
+                current: true,
+                preferred: true,
+            },
+            logical_position: Some((x, 0).into()),
+            logical_size: Some((1920, 1080).into()),
+            name: Some(name.to_string()),
+            description: None,
+        };
+
+        for output in [make_output(10, "DP-1", 0), make_output(20, "DP-2", 1920)] {
+            h.state.handle_event(
+                conn_id,
+                RecvType::Object(Event::Output(OutputEvent::New(output))),
+            );
+        }
+        h.roundtrip();
+        h.roundtrip();
+
+        let find_client_output = |h: &WaylandTestHarness, suffix: &str| {
+            let global_name = *h
+                .client_data
+                .output_snapshots
+                .iter()
+                .find_map(|(name, snap)| {
+                    snap.wl_name
+                        .as_deref()
+                        .is_some_and(|n| n.ends_with(suffix))
+                        .then_some(name)
+                })
+                .expect("client must bind output global");
+            h.client_data.wl_outputs[&global_name].clone()
+        };
+        let out_10 = find_client_output(&h, "_DP-1");
+        let out_20 = find_client_output(&h, "_DP-2");
+
+        let compositor = h.client_data.compositor.clone().unwrap();
+        let wm_base = h.client_data.xdg_wm_base.clone().unwrap();
+        let surface = compositor.create_surface(&h.qh, ());
+        let xdg_surf = wm_base.get_xdg_surface(&surface, &h.qh, ());
+        let toplevel = xdg_surf.get_toplevel(&h.qh, ());
+
+        // 1. Pre-commit `set_fullscreen(Some(out_20))` records `FullscreenState::Set(Some(20))`.
+        toplevel.set_fullscreen(Some(&out_20));
+        surface.commit();
+        h.roundtrip();
+        let sid = h.server_surface_id(&surface);
+        let reqs = h.drain_requests();
+        assert!(reqs.iter().any(|r| matches!(
+            r,
+            Request::Surface(SurfaceRequest {
+                surface,
+                payload: SurfaceRequestPayload::Commit(st),
+                ..
+            }) if *surface == sid
+                && matches!(
+                    &st.role,
+                    Some(Role::XdgToplevel(tl)) if tl.fullscreen == Some(FullscreenState::Set(Some(20)))
+                )
+        )));
+
+        // 2. Post-commit `set_fullscreen(Some(out_10))` sends `SetFullscreen(Some(10))`.
+        toplevel.set_fullscreen(Some(&out_10));
+        h.roundtrip();
+        let reqs = h.drain_requests();
+        assert!(reqs.iter().any(|r| matches!(
+            r,
+            Request::Toplevel(ToplevelRequest {
+                surface,
+                payload: ToplevelRequestPayload::SetFullscreen(Some(10)),
+                ..
+            }) if *surface == sid
+        )));
+
+        // 3. Host fullscreen configure populates `state.fullscreen_output` on Smithay's
+        //    pending toplevel state, and non-fullscreen configure clears it.
+        let mut fs_configure =
+            smithay_client_toolkit::shell::xdg::window::WindowConfigure::default();
+        fs_configure.state = smithay_client_toolkit::reexports::csd_frame::WindowState::FULLSCREEN
+            | smithay_client_toolkit::reexports::csd_frame::WindowState::ACTIVATED;
+        h.state.handle_event(
+            conn_id,
+            RecvType::Object(Event::Toplevel(ToplevelEvent::Configure(
+                ToplevelConfigure::from_smithay(&sid, fs_configure),
+            ))),
+        );
+        let server_tl = h
+            .state
+            .xdg_shell_state
+            .toplevel_surfaces()
+            .iter()
+            .find(|tl| WlSurfaceId::new(tl.wl_surface()) == sid)
+            .unwrap()
+            .clone();
+        let configured_fs_out = compositor::with_states(server_tl.wl_surface(), |data| {
+            data.data_map
+                .get::<XdgToplevelSurfaceData>()
+                .unwrap()
+                .lock()
+                .unwrap()
+                .current_server_state()
+                .fullscreen_output
+                .clone()
+        });
+        assert_eq!(
+            configured_fs_out
+                .as_ref()
+                .and_then(|o| h.state.output_id_for_wl_output(o)),
+            Some(10)
+        );
+
+        let mut normal_configure =
+            smithay_client_toolkit::shell::xdg::window::WindowConfigure::default();
+        normal_configure.state =
+            smithay_client_toolkit::reexports::csd_frame::WindowState::ACTIVATED;
+        h.state.handle_event(
+            conn_id,
+            RecvType::Object(Event::Toplevel(ToplevelEvent::Configure(
+                ToplevelConfigure::from_smithay(&sid, normal_configure),
+            ))),
+        );
+        let cleared_fs_out = compositor::with_states(server_tl.wl_surface(), |data| {
+            data.data_map
+                .get::<XdgToplevelSurfaceData>()
+                .unwrap()
+                .lock()
+                .unwrap()
+                .current_server_state()
+                .fullscreen_output
+                .clone()
+        });
+        assert!(cleared_fs_out.is_none());
+
+        // 4. Reconnect clears stale `output_id` in `FullscreenState::Set` so the
+        //    new session does not bind to an unrelated output ID.
+        h.connect_wprsc();
+        let sync_reqs = h.drain_requests();
+        assert!(sync_reqs.iter().any(|r| matches!(
+            r,
+            Request::Surface(SurfaceRequest {
+                surface,
+                payload: SurfaceRequestPayload::Commit(st),
+                ..
+            }) if *surface == sid
+                && matches!(
+                    &st.role,
+                    Some(Role::XdgToplevel(tl)) if tl.fullscreen == Some(FullscreenState::Set(None))
+                )
+        )));
+
+        // 5. `set_fullscreen(None)` and `unset_fullscreen()` forward cleanly.
+        toplevel.set_fullscreen(None);
+        toplevel.unset_fullscreen();
+        h.roundtrip();
+        let reqs = h.drain_requests();
+        assert!(reqs.iter().any(|r| matches!(
+            r,
+            Request::Toplevel(ToplevelRequest {
+                surface,
+                payload: ToplevelRequestPayload::SetFullscreen(None),
+                ..
+            }) if *surface == sid
+        )));
+        assert!(reqs.iter().any(|r| matches!(
+            r,
+            Request::Toplevel(ToplevelRequest {
+                surface,
+                payload: ToplevelRequestPayload::UnsetFullscreen,
+                ..
+            }) if *surface == sid
+        )));
     }
 }

@@ -656,7 +656,9 @@ pub struct SurfaceState {
     pub id: WlSurfaceId,
     pub buffer: Option<BufferAssignment>,
     pub role: Option<Role>,
-    // TODO: include buffer_delta, transform from SurfaceAttributes
+    /// Per-commit surface-local buffer offset (`wl_surface.offset` on v5+ or
+    /// `wl_surface.attach(x, y)` on v<5); never persisted across commits.
+    pub buffer_delta: Option<Point<i32>>,
     pub buffer_scale: i32,
     pub buffer_transform: Option<Transform>,
     pub opaque_region: Option<Region>,
@@ -680,6 +682,7 @@ impl SurfaceState {
             id: WlSurfaceId::new(surface),
             buffer,
             role: None,
+            buffer_delta: None,
             buffer_scale: 1,
             buffer_transform: None,
             opaque_region: None,

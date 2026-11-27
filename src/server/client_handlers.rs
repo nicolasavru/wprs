@@ -37,6 +37,7 @@ use smithay::input::pointer::CursorImageSurfaceData;
 use smithay::input::pointer::MotionEvent;
 use smithay::output::Output;
 use smithay::output::PhysicalProperties;
+use smithay::reexports::wayland_protocols::xdg::shell::server::xdg_toplevel;
 use smithay::reexports::wayland_server::Client;
 use smithay::reexports::wayland_server::backend::ObjectId;
 use smithay::reexports::wayland_server::protocol::wl_buffer::WlBuffer;
@@ -51,6 +52,7 @@ use smithay::wayland::compositor::SurfaceAttributes;
 use smithay::wayland::compositor::SurfaceData;
 use smithay::wayland::compositor::TraversalAction;
 use smithay::wayland::selection::primary_selection;
+use smithay::wayland::shell::xdg::ToplevelStateSet;
 
 use crate::args;
 use crate::compositor_utils;
@@ -91,6 +93,7 @@ use crate::serialization::wayland::SurfaceRequest;
 use crate::serialization::wayland::SurfaceRequestPayload;
 use crate::serialization::wayland::SurfaceState;
 use crate::serialization::wayland::WlSurfaceId;
+use crate::serialization::xdg_shell::FullscreenState;
 use crate::serialization::xdg_shell::PopupConfigure;
 use crate::serialization::xdg_shell::PopupConfigureKind;
 use crate::serialization::xdg_shell::PopupEvent;
@@ -780,12 +783,30 @@ impl WprsServerState {
                     )
                         .into(),
                 );
+                let states: ToplevelStateSet = configure.state.into();
+                let fullscreen_output = if states.contains(xdg_toplevel::State::Fullscreen) {
+                    let requested_output_id =
+                        compositor::with_states(surface.wl_surface(), |surface_data| {
+                            surface_data
+                                .data_map
+                                .get::<LockedSurfaceState>()
+                                .and_then(|locked| match &locked.0.lock().unwrap().state.role {
+                                    Some(Role::XdgToplevel(tl)) => match tl.fullscreen {
+                                        Some(FullscreenState::Set(output_id)) => output_id,
+                                        _ => None,
+                                    },
+                                    _ => None,
+                                })
+                        });
+                    requested_output_id
+                        .and_then(|id| self.client_wl_output_for_id(surface.wl_surface(), id))
+                } else {
+                    None
+                };
                 surface.with_pending_state(|ref mut state| {
                     state.size = size;
-                    state.states = configure.state.into();
-                    // TODO: probably set this, see also other TODO related to
-                    // fullscreen output.
-                    state.fullscreen_output = None;
+                    state.states = states;
+                    state.fullscreen_output = fullscreen_output;
                     state.decoration_mode = Some(configure.decoration_mode.into());
                 });
                 surface.send_configure();
@@ -895,6 +916,11 @@ impl WprsServerState {
                 output.leave(surface);
             }
             surface_state.output_ids.retain(|id| *id != output_id);
+            if let Some(Role::XdgToplevel(tl)) = &mut surface_state.role
+                && tl.fullscreen == Some(FullscreenState::Set(Some(output_id)))
+            {
+                tl.fullscreen = Some(FullscreenState::Set(None));
+            }
         });
     }
 
@@ -979,8 +1005,16 @@ impl WprsServerState {
                 local_output.leave(surface);
             }
             surface_state.output_ids.clear();
-            if let Some(Role::XdgPopup(popup_state)) = &mut surface_state.role {
-                popup_state.grab_serial = None;
+            match &mut surface_state.role {
+                Some(Role::XdgPopup(popup_state)) => {
+                    popup_state.grab_serial = None;
+                },
+                Some(Role::XdgToplevel(toplevel_state)) => {
+                    if let Some(FullscreenState::Set(output_id)) = &mut toplevel_state.fullscreen {
+                        *output_id = None;
+                    }
+                },
+                _ => {},
             }
         });
         for (_, (_, global_id)) in old_outputs {

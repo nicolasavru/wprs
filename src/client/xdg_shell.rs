@@ -14,6 +14,7 @@
 
 use std::collections::HashMap;
 
+use smithay_client_toolkit::output::OutputState;
 use smithay_client_toolkit::reexports::client::QueueHandle;
 use smithay_client_toolkit::reexports::client::protocol::wl_seat::WlSeat;
 use smithay_client_toolkit::reexports::protocols::xdg::shell::client::xdg_positioner;
@@ -27,11 +28,13 @@ use smithay_client_toolkit::shell::xdg::window::WindowDecorations;
 use crate::client::RemoteSurface;
 use crate::client::Role;
 use crate::client::WprsClientState;
+use crate::client::find_output;
 use crate::prelude::*;
 use crate::serialization::geometry::Size;
 use crate::serialization::wayland::SurfaceState;
 use crate::serialization::wayland::WlSurfaceId;
 use crate::serialization::xdg_shell::DecorationMode;
+use crate::serialization::xdg_shell::FullscreenState;
 use crate::serialization::xdg_shell::XdgPositioner;
 
 #[derive(Debug)]
@@ -55,6 +58,7 @@ impl RemoteXdgToplevel {
         surface_id: WlSurfaceId,
         surfaces: &mut HashMap<WlSurfaceId, RemoteSurface>,
         xdg_shell_state: &XdgShell,
+        output_state: &OutputState,
         qh: &QueueHandle<WprsClientState>,
         title_prefix: &str,
     ) -> Result<()> {
@@ -99,12 +103,15 @@ impl RemoteXdgToplevel {
             }
         }
 
-        if let Some(fullscreen) = toplevel_state.fullscreen {
-            if fullscreen {
-                local_window.set_fullscreen(None);
-            } else {
+        match toplevel_state.fullscreen {
+            Some(FullscreenState::Set(output_id)) => {
+                let output = output_id.and_then(|id| find_output(output_state, id));
+                local_window.set_fullscreen(output.as_ref());
+            },
+            Some(FullscreenState::Unset) => {
                 local_window.unset_fullscreen();
-            }
+            },
+            None => {},
         }
 
         let new_toplevel = Self {
@@ -241,6 +248,7 @@ impl RemoteXdgToplevel {
         surface_id: WlSurfaceId,
         surfaces: &mut HashMap<WlSurfaceId, RemoteSurface>,
         xdg_shell_state: &XdgShell,
+        output_state: &OutputState,
         qh: &QueueHandle<WprsClientState>,
         title_prefix: &str,
     ) -> Result<()> {
@@ -249,6 +257,7 @@ impl RemoteXdgToplevel {
             surface_id,
             surfaces,
             xdg_shell_state,
+            output_state,
             qh,
             title_prefix,
         )

@@ -143,6 +143,7 @@ impl WprsClientState {
             remote_surface
                 .frame_damage
                 .merge_commit(surface_state.damage.take(), had_new_buffer);
+            remote_surface.add_buffer_delta(surface_state.buffer_delta.take());
 
             remote_surface.frame_callback_completed
         };
@@ -184,6 +185,7 @@ impl WprsClientState {
                 surface_id,
                 surfaces,
                 &self.xdg_shell_state,
+                &self.output_state,
                 &self.qh,
                 &self.title_prefix,
             )
@@ -298,8 +300,10 @@ impl WprsClientState {
                 ToplevelRequestPayload::UnsetMaximized => {
                     toplevel.local_window.unset_maximized();
                 },
-                ToplevelRequestPayload::SetFullscreen => {
-                    toplevel.local_window.set_fullscreen(None);
+                ToplevelRequestPayload::SetFullscreen(output_id) => {
+                    let output =
+                        output_id.and_then(|id| crate::client::find_output(&self.output_state, id));
+                    toplevel.local_window.set_fullscreen(output.as_ref());
                 },
                 ToplevelRequestPayload::UnsetFullscreen => {
                     toplevel.local_window.unset_fullscreen();
@@ -800,6 +804,7 @@ mod tests {
     use smithay::reexports::wayland_server::backend::ClientId as ServerClientId;
     use smithay::reexports::wayland_server::backend::DisconnectReason;
     use smithay::reexports::wayland_server::protocol::wl_buffer::WlBuffer as ServerWlBuffer;
+    use smithay::reexports::wayland_server::protocol::wl_callback::WlCallback as ServerWlCallback;
     use smithay::reexports::wayland_server::protocol::wl_compositor;
     use smithay::reexports::wayland_server::protocol::wl_compositor::WlCompositor as ServerWlCompositor;
     use smithay::reexports::wayland_server::protocol::wl_data_device as server_data_device;
@@ -811,6 +816,8 @@ mod tests {
     use smithay::reexports::wayland_server::protocol::wl_data_offer::WlDataOffer as ServerWlDataOffer;
     use smithay::reexports::wayland_server::protocol::wl_data_source as server_data_source;
     use smithay::reexports::wayland_server::protocol::wl_data_source::WlDataSource as ServerWlDataSource;
+    use smithay::reexports::wayland_server::protocol::wl_output as server_output;
+    use smithay::reexports::wayland_server::protocol::wl_output::WlOutput as ServerWlOutput;
     use smithay::reexports::wayland_server::protocol::wl_pointer as server_pointer;
     use smithay::reexports::wayland_server::protocol::wl_pointer::WlPointer as ServerWlPointer;
     use smithay::reexports::wayland_server::protocol::wl_region::WlRegion as ServerWlRegion;
@@ -876,6 +883,17 @@ mod tests {
 
     #[derive(Debug, Eq, PartialEq)]
     enum HostXdgReq {
+        SurfaceAttach {
+            surface_id: u32,
+            has_buffer: bool,
+            x: i32,
+            y: i32,
+        },
+        SurfaceOffset {
+            surface_id: u32,
+            x: i32,
+            y: i32,
+        },
         SurfaceCommit {
             surface_id: u32,
         },
@@ -897,6 +915,13 @@ mod tests {
             x: i32,
             y: i32,
         },
+        ToplevelSetFullscreen {
+            surface_id: u32,
+            output_tag: Option<u32>,
+        },
+        ToplevelUnsetFullscreen {
+            surface_id: u32,
+        },
     }
 
     #[derive(Default)]
@@ -905,6 +930,8 @@ mod tests {
         pointer: Option<ServerWlPointer>,
         data_device: Option<ServerWlDataDevice>,
         surfaces: Vec<ServerWlSurface>,
+        pending_buffers: HashMap<u32, ServerWlBuffer>,
+        pending_frame_callbacks: Vec<ServerWlCallback>,
         subsurface_stacks: HashMap<u32, Vec<u32>>,
         subsurface_positions: HashMap<u32, (i32, i32)>,
         xdg_popups: HashMap<u32, ServerXdgPopup>,
@@ -1020,13 +1047,100 @@ mod tests {
             request: server_surface::Request,
             _data: &(),
             _dh: &DisplayHandle,
+            data_init: &mut DataInit<'_, Self>,
+        ) {
+            let surface_id = resource.id().protocol_id();
+            match request {
+                server_surface::Request::Attach { buffer, x, y } => {
+                    state.xdg_reqs.push(HostXdgReq::SurfaceAttach {
+                        surface_id,
+                        has_buffer: buffer.is_some(),
+                        x,
+                        y,
+                    });
+                    if let Some(buffer) = buffer {
+                        state.pending_buffers.insert(surface_id, buffer);
+                    } else {
+                        state.pending_buffers.remove(&surface_id);
+                    }
+                },
+                server_surface::Request::Offset { x, y } => {
+                    state
+                        .xdg_reqs
+                        .push(HostXdgReq::SurfaceOffset { surface_id, x, y });
+                },
+                server_surface::Request::Frame { callback } => {
+                    let cb = data_init.init(callback, ());
+                    state.pending_frame_callbacks.push(cb);
+                },
+                server_surface::Request::Commit => {
+                    state
+                        .xdg_reqs
+                        .push(HostXdgReq::SurfaceCommit { surface_id });
+                    if let Some(buf) = state.pending_buffers.remove(&surface_id) {
+                        buf.release();
+                    }
+                },
+                _ => {},
+            }
+        }
+    }
+
+    impl ServerDispatch<ServerWlCallback, ()> for MockHostState {
+        fn request(
+            _state: &mut Self,
+            _client: &ServerClient,
+            _resource: &ServerWlCallback,
+            _request: <ServerWlCallback as Resource>::Request,
+            _data: &(),
+            _dh: &DisplayHandle,
             _data_init: &mut DataInit<'_, Self>,
         ) {
-            if matches!(request, server_surface::Request::Commit) {
-                state.xdg_reqs.push(HostXdgReq::SurfaceCommit {
-                    surface_id: resource.id().protocol_id(),
-                });
-            }
+        }
+    }
+
+    impl GlobalDispatch<ServerWlOutput, u32> for MockHostState {
+        fn bind(
+            _state: &mut Self,
+            _dh: &DisplayHandle,
+            _client: &ServerClient,
+            resource: New<ServerWlOutput>,
+            &tag: &u32,
+            data_init: &mut DataInit<'_, Self>,
+        ) {
+            let output = data_init.init(resource, tag);
+            output.geometry(
+                (tag as i32 - 1) * 1920,
+                0,
+                600,
+                340,
+                server_output::Subpixel::HorizontalRgb,
+                "Vendor".to_string(),
+                format!("Model-{tag}"),
+                server_output::Transform::Normal,
+            );
+            output.mode(
+                server_output::Mode::Current | server_output::Mode::Preferred,
+                1920,
+                1080,
+                60000,
+            );
+            output.scale(1);
+            output.name(format!("OUT-{tag}"));
+            output.done();
+        }
+    }
+
+    impl ServerDispatch<ServerWlOutput, u32> for MockHostState {
+        fn request(
+            _state: &mut Self,
+            _client: &ServerClient,
+            _resource: &ServerWlOutput,
+            _request: <ServerWlOutput as Resource>::Request,
+            _data: &u32,
+            _dh: &DisplayHandle,
+            _data_init: &mut DataInit<'_, Self>,
+        ) {
         }
     }
 
@@ -1213,13 +1327,28 @@ mod tests {
             _dh: &DisplayHandle,
             _data_init: &mut DataInit<'_, Self>,
         ) {
-            if let server_xdg_toplevel::Request::ShowWindowMenu { serial, x, y, .. } = request {
-                state.xdg_reqs.push(HostXdgReq::ToplevelShowWindowMenu {
-                    surface_id,
-                    serial,
-                    x,
-                    y,
-                });
+            match request {
+                server_xdg_toplevel::Request::ShowWindowMenu { serial, x, y, .. } => {
+                    state.xdg_reqs.push(HostXdgReq::ToplevelShowWindowMenu {
+                        surface_id,
+                        serial,
+                        x,
+                        y,
+                    });
+                },
+                server_xdg_toplevel::Request::SetFullscreen { output } => {
+                    let output_tag = output.as_ref().and_then(|o| o.data::<u32>().copied());
+                    state.xdg_reqs.push(HostXdgReq::ToplevelSetFullscreen {
+                        surface_id,
+                        output_tag,
+                    });
+                },
+                server_xdg_toplevel::Request::UnsetFullscreen => {
+                    state
+                        .xdg_reqs
+                        .push(HostXdgReq::ToplevelUnsetFullscreen { surface_id });
+                },
+                _ => {},
             }
         }
     }
@@ -1427,14 +1556,20 @@ mod tests {
 
     impl ClientDndHarness {
         fn new() -> Self {
+            Self::new_with_compositor_version(5).0
+        }
+
+        fn new_with_compositor_version(compositor_version: u32) -> (Self, HashMap<String, u32>) {
             let mut display: Display<MockHostState> = Display::new().unwrap();
             let mut dh = display.handle();
             dh.create_global::<MockHostState, ServerWlShm, _>(1, ());
-            dh.create_global::<MockHostState, ServerWlCompositor, _>(4, ());
+            dh.create_global::<MockHostState, ServerWlCompositor, _>(compositor_version, ());
             dh.create_global::<MockHostState, ServerWlSubcompositor, _>(1, ());
             dh.create_global::<MockHostState, ServerXdgWmBase, _>(5, ());
             dh.create_global::<MockHostState, ServerWlDataDeviceManager, _>(3, ());
             dh.create_global::<MockHostState, ServerWlSeat, _>(7, ());
+            dh.create_global::<MockHostState, ServerWlOutput, u32>(4, 1);
+            dh.create_global::<MockHostState, ServerWlOutput, u32>(4, 2);
 
             let (server_sock, client_sock) = UnixStream::pair().unwrap();
             let server_client = dh
@@ -1484,12 +1619,20 @@ mod tests {
                 client,
                 rx,
             };
-            // Pump seat capabilities -> pointer + data_device creation.
+            // Pump seat capabilities -> pointer + data_device creation and initial outputs.
             harness.sync();
             harness.sync();
-            harness.drain_events();
+            let mut outputs_by_name = HashMap::new();
+            for ev in harness.drain_events() {
+                if let Event::Output(wayland::OutputEvent::New(info)) = ev
+                    && let Some(name) = info.name
+                {
+                    outputs_by_name.insert(name, info.id);
+                }
+            }
             harness.host.reqs.clear();
-            harness
+            harness.host.xdg_reqs.clear();
+            (harness, outputs_by_name)
         }
 
         fn sync(&mut self) {
@@ -1505,6 +1648,13 @@ mod tests {
                 self.display.dispatch_clients(&mut self.host).unwrap();
                 self.display.flush_clients().unwrap();
             }
+        }
+
+        fn fire_frame_callbacks(&mut self) {
+            for cb in self.host.pending_frame_callbacks.drain(..) {
+                cb.done(0);
+            }
+            self.sync();
         }
 
         fn create_remote_surface(&mut self, cid: u64, sid: u64) -> ServerWlSurface {
@@ -1944,6 +2094,7 @@ mod tests {
             id,
             buffer: None,
             role,
+            buffer_delta: None,
             buffer_scale: 1,
             buffer_transform: None,
             opaque_region: None,
@@ -2263,6 +2414,315 @@ mod tests {
                 x: 120,
                 y: 45,
             }]
+        );
+    }
+
+    #[test]
+    #[cfg_attr(miri, ignore)]
+    fn test_wprsc_buffer_delta_v5_offset_and_v4_attach_wire() {
+        use std::num::NonZeroUsize;
+
+        use crate::buffer_pointer::BufferPointer;
+        use crate::serialization::geometry::Point;
+        use crate::serialization::wayland::BufferFormat;
+        use crate::serialization::wayland::BufferMetadata;
+        use crate::sharding_compression::ShardingCompressor;
+
+        let send_full_buffer = |h: &mut ClientDndHarness,
+                                client_id: ClientId,
+                                surface_id: WlSurfaceId,
+                                fill: u8,
+                                delta: Option<Point<i32>>| {
+            let meta = BufferMetadata {
+                width: 4,
+                height: 4,
+                stride: 16,
+                format: BufferFormat::Argb8888,
+            };
+            let pixels = [fill; 64];
+            let ptr = pixels.as_ptr();
+            // SAFETY: `pixels` stays alive for the duration of `filter_and_compress_full_streaming`.
+            let bp = unsafe { BufferPointer::new(&ptr, pixels.len()) };
+            let mut compressor = ShardingCompressor::new(NonZeroUsize::new(1).unwrap(), 1).unwrap();
+            let mut streams = Vec::new();
+            filtering::filter_and_compress_full_streaming(
+                bp,
+                client_id,
+                surface_id,
+                meta,
+                CompressionMode::Lossless,
+                None,
+                &mut compressor,
+                |stream| streams.push(stream),
+            );
+            for stream in streams {
+                let (tx, rx) = crossbeam_channel::unbounded();
+                for tile in stream.tiles {
+                    tx.send(Ok(tile)).unwrap();
+                }
+                drop(tx);
+                h.client
+                    .handle_request(RecvType::RawBuffer(CompressedTileStream {
+                        header: stream.header,
+                        tiles: rx,
+                    }));
+            }
+            let mut st = make_client_surface_state(client_id, surface_id, None);
+            st.buffer = Some(BufferAssignment::New(meta));
+            st.buffer_delta = delta;
+            h.client
+                .handle_request(RecvType::Object(Request::Surface(SurfaceRequest {
+                    client: client_id,
+                    surface: surface_id,
+                    payload: SurfaceRequestPayload::Commit(st),
+                })));
+            h.sync();
+        };
+
+        // 1. Host with `wl_compositor` v5 uses `attach(buf, 0, 0)` + `wl_surface.offset(dx, dy)`
+        //    and does not replay the delta on subsequent delta-less commits.
+        let (mut h5, _) = ClientDndHarness::new_with_compositor_version(5);
+        let client_id = ClientId(1);
+        let sid = WlSurfaceId(400);
+        send_full_buffer(&mut h5, client_id, sid, 0x11, Some((-12, 7).into()));
+        let proto_v5 = h5
+            .client
+            .remote_display
+            .client(&client_id)
+            .surfaces
+            .get(&sid)
+            .unwrap()
+            .wl_surface()
+            .id()
+            .protocol_id();
+        assert_eq!(
+            h5.host.xdg_reqs,
+            vec![
+                HostXdgReq::SurfaceAttach {
+                    surface_id: proto_v5,
+                    has_buffer: true,
+                    x: 0,
+                    y: 0,
+                },
+                HostXdgReq::SurfaceOffset {
+                    surface_id: proto_v5,
+                    x: -12,
+                    y: 7,
+                },
+                HostXdgReq::SurfaceCommit {
+                    surface_id: proto_v5,
+                },
+            ]
+        );
+
+        // Delta-less next commit emits no `SurfaceOffset`.
+        h5.fire_frame_callbacks();
+        h5.host.xdg_reqs.clear();
+        send_full_buffer(&mut h5, client_id, sid, 0x22, None);
+        assert_eq!(
+            h5.host.xdg_reqs,
+            vec![
+                HostXdgReq::SurfaceAttach {
+                    surface_id: proto_v5,
+                    has_buffer: true,
+                    x: 0,
+                    y: 0,
+                },
+                HostXdgReq::SurfaceCommit {
+                    surface_id: proto_v5,
+                },
+            ]
+        );
+
+        // Commits arriving while throttled accumulate relative deltas and apply
+        // them once on the next frame callback commit.
+        h5.host.xdg_reqs.clear();
+        for delta in [(-3, 2), (-5, 4)] {
+            let mut throttled = make_client_surface_state(client_id, sid, None);
+            throttled.buffer_delta = Some(delta.into());
+            h5.client
+                .handle_request(RecvType::Object(Request::Surface(SurfaceRequest {
+                    client: client_id,
+                    surface: sid,
+                    payload: SurfaceRequestPayload::Commit(throttled),
+                })));
+        }
+        h5.sync();
+        assert!(h5.host.xdg_reqs.is_empty());
+
+        h5.fire_frame_callbacks();
+        assert_eq!(
+            h5.host.xdg_reqs,
+            vec![
+                HostXdgReq::SurfaceOffset {
+                    surface_id: proto_v5,
+                    x: -8,
+                    y: 6,
+                },
+                HostXdgReq::SurfaceCommit {
+                    surface_id: proto_v5,
+                },
+            ]
+        );
+
+        // Bufferless offset-only commit on v5 still emits `wl_surface.offset`.
+        h5.host.xdg_reqs.clear();
+        let mut offset_only = make_client_surface_state(client_id, sid, None);
+        offset_only.buffer_delta = Some((5, -2).into());
+        h5.client
+            .handle_request(RecvType::Object(Request::Surface(SurfaceRequest {
+                client: client_id,
+                surface: sid,
+                payload: SurfaceRequestPayload::Commit(offset_only),
+            })));
+        h5.sync();
+        assert_eq!(
+            h5.host.xdg_reqs,
+            vec![
+                HostXdgReq::SurfaceOffset {
+                    surface_id: proto_v5,
+                    x: 5,
+                    y: -2,
+                },
+                HostXdgReq::SurfaceCommit {
+                    surface_id: proto_v5,
+                },
+            ]
+        );
+
+        // 2. Host with `wl_compositor` v4 passes `(dx, dy)` via `wl_surface.attach`
+        //    and never sends `wl_surface.offset`.
+        let (mut h4, _) = ClientDndHarness::new_with_compositor_version(4);
+        send_full_buffer(&mut h4, client_id, sid, 0x33, Some((-8, 3).into()));
+        let proto_v4 = h4
+            .client
+            .remote_display
+            .client(&client_id)
+            .surfaces
+            .get(&sid)
+            .unwrap()
+            .wl_surface()
+            .id()
+            .protocol_id();
+        assert_eq!(
+            h4.host.xdg_reqs,
+            vec![
+                HostXdgReq::SurfaceAttach {
+                    surface_id: proto_v4,
+                    has_buffer: true,
+                    x: -8,
+                    y: 3,
+                },
+                HostXdgReq::SurfaceCommit {
+                    surface_id: proto_v4,
+                },
+            ]
+        );
+
+        h4.fire_frame_callbacks();
+        h4.host.xdg_reqs.clear();
+        send_full_buffer(&mut h4, client_id, sid, 0x44, None);
+        assert_eq!(
+            h4.host.xdg_reqs,
+            vec![
+                HostXdgReq::SurfaceAttach {
+                    surface_id: proto_v4,
+                    has_buffer: true,
+                    x: 0,
+                    y: 0,
+                },
+                HostXdgReq::SurfaceCommit {
+                    surface_id: proto_v4,
+                },
+            ]
+        );
+    }
+
+    #[test]
+    #[cfg_attr(miri, ignore)]
+    fn test_wprsc_toplevel_set_fullscreen_output_and_unset_wire() {
+        let (mut h, outputs_by_name) = ClientDndHarness::new_with_compositor_version(5);
+        let out1_id = outputs_by_name["OUT-1"];
+        let out2_id = outputs_by_name["OUT-2"];
+        let client_id = ClientId(1);
+        let tl_id = WlSurfaceId(500);
+
+        // 1. Pre-commit fullscreen on OUT-2 resolves to host output tag 2 in `set_role`.
+        let init_tl = xdg_shell::XdgToplevelState {
+            fullscreen: Some(xdg_shell::FullscreenState::Set(Some(out2_id))),
+            ..Default::default()
+        };
+        h.client
+            .handle_request(RecvType::Object(Request::Surface(SurfaceRequest {
+                client: client_id,
+                surface: tl_id,
+                payload: SurfaceRequestPayload::Commit(make_client_surface_state(
+                    client_id,
+                    tl_id,
+                    Some(wayland::Role::XdgToplevel(init_tl)),
+                )),
+            })));
+        h.sync();
+
+        let tl_proto = h
+            .client
+            .remote_display
+            .client(&client_id)
+            .surfaces
+            .get(&tl_id)
+            .unwrap()
+            .wl_surface()
+            .id()
+            .protocol_id();
+        assert_eq!(
+            h.host.xdg_reqs,
+            vec![
+                HostXdgReq::ToplevelSetFullscreen {
+                    surface_id: tl_proto,
+                    output_tag: Some(2),
+                },
+                HostXdgReq::SurfaceCommit {
+                    surface_id: tl_proto,
+                },
+            ]
+        );
+
+        // 2. Post-commit `SetFullscreen(Some(out1_id))`, `SetFullscreen(None)`,
+        //    unknown output fallback, and `UnsetFullscreen`.
+        h.host.xdg_reqs.clear();
+        for payload in [
+            ToplevelRequestPayload::SetFullscreen(Some(out1_id)),
+            ToplevelRequestPayload::SetFullscreen(None),
+            ToplevelRequestPayload::SetFullscreen(Some(999_999)),
+            ToplevelRequestPayload::UnsetFullscreen,
+        ] {
+            h.client
+                .handle_request(RecvType::Object(Request::Toplevel(ToplevelRequest {
+                    client: client_id,
+                    surface: tl_id,
+                    payload,
+                })));
+        }
+        h.sync();
+        assert_eq!(
+            h.host.xdg_reqs,
+            vec![
+                HostXdgReq::ToplevelSetFullscreen {
+                    surface_id: tl_proto,
+                    output_tag: Some(1),
+                },
+                HostXdgReq::ToplevelSetFullscreen {
+                    surface_id: tl_proto,
+                    output_tag: None,
+                },
+                HostXdgReq::ToplevelSetFullscreen {
+                    surface_id: tl_proto,
+                    output_tag: None,
+                },
+                HostXdgReq::ToplevelUnsetFullscreen {
+                    surface_id: tl_proto,
+                },
+            ]
         );
     }
 }

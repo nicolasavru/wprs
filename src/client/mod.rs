@@ -33,6 +33,7 @@ use smithay_client_toolkit::data_device_manager::data_offer::DragOffer;
 use smithay_client_toolkit::data_device_manager::data_offer::SelectionOffer;
 use smithay_client_toolkit::data_device_manager::data_source::CopyPasteSource;
 use smithay_client_toolkit::data_device_manager::data_source::DragSource;
+use smithay_client_toolkit::output::OutputData;
 use smithay_client_toolkit::output::OutputState;
 use smithay_client_toolkit::primary_selection::PrimarySelectionManagerState;
 use smithay_client_toolkit::primary_selection::offer::PrimarySelectionOffer;
@@ -43,6 +44,7 @@ use smithay_client_toolkit::reexports::client::QueueHandle;
 use smithay_client_toolkit::reexports::client::backend::ObjectId as SctkObjectId;
 use smithay_client_toolkit::reexports::client::globals::GlobalList;
 use smithay_client_toolkit::reexports::client::protocol::wl_output::Transform;
+use smithay_client_toolkit::reexports::client::protocol::wl_output::WlOutput;
 use smithay_client_toolkit::reexports::client::protocol::wl_seat::WlSeat;
 use smithay_client_toolkit::reexports::client::protocol::wl_subcompositor::WlSubcompositor;
 use smithay_client_toolkit::reexports::client::protocol::wl_surface::WlSurface;
@@ -76,6 +78,7 @@ use crate::serialization::SendType;
 use crate::serialization::Serializer;
 use crate::serialization::framing::TILE_PIXELS;
 use crate::serialization::framing::TileRect;
+use crate::serialization::geometry::Point;
 use crate::serialization::wayland::BufferAssignment;
 use crate::serialization::wayland::BufferMetadata;
 use crate::serialization::wayland::CursorImage;
@@ -127,6 +130,14 @@ impl CapabilitiesLatch {
             .unwrap();
         guard.clone()
     }
+}
+
+pub(crate) fn find_output(output_state: &OutputState, output_id: u32) -> Option<WlOutput> {
+    output_state.outputs().find(|output| {
+        output
+            .data::<OutputData>()
+            .is_some_and(|data| data.with_output_info(|info| info.id == output_id))
+    })
 }
 
 pub struct WprsClientState {
@@ -698,6 +709,7 @@ pub struct RemoteSurface {
     pub z_ordered_children: Vec<SubsurfacePosition>,
     pub frame_callback_completed: bool,
     pub frame_damage: FrameDamage,
+    pub pending_buffer_delta: Option<Point<i32>>,
     pub viewport: Option<WpViewport>,
     pub current_viewport_state: Option<ViewportState>,
 }
@@ -731,6 +743,7 @@ impl RemoteSurface {
             }],
             frame_callback_completed: true,
             frame_damage: FrameDamage::Empty,
+            pending_buffer_delta: None,
             viewport: None,
             current_viewport_state: None,
         })
@@ -779,6 +792,25 @@ impl RemoteSurface {
     pub(crate) fn drop_buffer(&mut self) {
         self.buffer = None;
         self.frame_damage = FrameDamage::Empty;
+        self.pending_buffer_delta = None;
+    }
+
+    pub(crate) fn add_buffer_delta(&mut self, delta: Option<Point<i32>>) {
+        let Some(delta) = delta else {
+            return;
+        };
+        if delta.x == 0 && delta.y == 0 {
+            return;
+        }
+        match &mut self.pending_buffer_delta {
+            Some(pending) => {
+                pending.x = pending.x.saturating_add(delta.x);
+                pending.y = pending.y.saturating_add(delta.y);
+            },
+            None => {
+                self.pending_buffer_delta = Some(delta);
+            },
+        }
     }
 
     #[instrument(skip(self), level = "debug")]
@@ -834,19 +866,42 @@ impl RemoteSurface {
             return Ok(());
         }
         let wl_surface = &self.wl_surface().clone();
+        let buffer_delta = self
+            .pending_buffer_delta
+            .take()
+            .filter(|delta| delta.x != 0 || delta.y != 0);
+        let use_surface_offset = wl_surface.version() >= 5;
         let attached = if let Some(buffer) = &mut self.buffer
             && buffer.state == RemoteBufferState::Dirty
         {
-            buffer.active_buffer.attach_to(wl_surface).context(
-                loc!(),
-                "attaching a buffer failed, this probably means we're leaking buffers",
-            )?;
+            if let Some(delta) = (!use_surface_offset).then_some(buffer_delta).flatten() {
+                buffer.active_buffer.activate().context(
+                    loc!(),
+                    "attaching a buffer failed, this probably means we're leaking buffers",
+                )?;
+                wl_surface.attach(Some(buffer.active_buffer.wl_buffer()), delta.x, delta.y);
+            } else {
+                buffer.active_buffer.attach_to(wl_surface).context(
+                    loc!(),
+                    "attaching a buffer failed, this probably means we're leaking buffers",
+                )?;
+            }
             self.frame_damage.apply_and_clear(wl_surface);
             buffer.state = RemoteBufferState::Clean;
             true
         } else {
             false
         };
+        if let Some(delta) = buffer_delta {
+            if use_surface_offset {
+                wl_surface.offset(delta.x, delta.y);
+            } else if !attached
+                && let Some(buffer) = &self.buffer
+                && buffer.active_buffer.activate().is_ok()
+            {
+                wl_surface.attach(Some(buffer.active_buffer.wl_buffer()), delta.x, delta.y);
+            }
+        }
         if attached && let Some(qh) = frame_qh {
             self.frame(qh);
             self.frame_callback_completed = false;

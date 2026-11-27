@@ -130,6 +130,12 @@ impl TryFrom<KdeDecorationMode> for DecorationMode {
     }
 }
 
+#[derive(Debug, Copy, Clone, Eq, PartialEq, Archive, Deserialize, Serialize)]
+pub enum FullscreenState {
+    Unset,
+    Set(Option<u32>),
+}
+
 #[derive(Debug, Default, Clone, Eq, PartialEq, Archive, Deserialize, Serialize)]
 pub struct XdgToplevelState {
     pub parent: Option<WlSurfaceId>,
@@ -137,7 +143,7 @@ pub struct XdgToplevelState {
     pub app_id: Option<String>,
     pub decoration_mode: Option<DecorationMode>,
     pub maximized: Option<bool>,
-    pub fullscreen: Option<bool>,
+    pub fullscreen: Option<FullscreenState>,
 }
 
 #[derive(Debug, Copy, Clone, Eq, PartialEq, Archive, Deserialize, Serialize)]
@@ -284,7 +290,7 @@ pub enum ToplevelRequestPayload {
     // the request, so they state could get out of sync.
     SetMaximized,
     UnsetMaximized,
-    SetFullscreen, // TODO: specify output?
+    SetFullscreen(Option<u32>),
     UnsetFullscreen,
     // "There is no way to know if the surface is currently minimized, nor is
     // there any way to unset minimization on this surface."
