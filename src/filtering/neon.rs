@@ -28,10 +28,12 @@
 //! annotation — the compilation target's default features alone do not suffice.
 
 use std::arch::aarch64::uint8x8x3_t;
+use std::arch::aarch64::uint8x8x4_t;
 use std::arch::aarch64::uint8x16_t;
 use std::arch::aarch64::uint8x16x3_t;
 use std::arch::aarch64::uint8x16x4_t;
 use std::arch::aarch64::vabsq_s8;
+use std::arch::aarch64::vadd_u8;
 use std::arch::aarch64::vaddq_u8;
 use std::arch::aarch64::vaddv_u8;
 use std::arch::aarch64::vaddvq_u32;
@@ -52,6 +54,7 @@ use std::arch::aarch64::vld1_u8;
 use std::arch::aarch64::vld1q_u8;
 use std::arch::aarch64::vld1q_u32;
 use std::arch::aarch64::vld2q_u8;
+use std::arch::aarch64::vld3_u8;
 use std::arch::aarch64::vld3q_u8;
 use std::arch::aarch64::vld4_u8;
 use std::arch::aarch64::vld4q_u8;
@@ -74,6 +77,7 @@ use std::arch::aarch64::vst1_u8;
 use std::arch::aarch64::vst1q_u8;
 use std::arch::aarch64::vst3_u8;
 use std::arch::aarch64::vst3q_u8;
+use std::arch::aarch64::vst4_u8;
 use std::arch::aarch64::vst4q_u8;
 use std::arch::aarch64::vsub_u8;
 use std::arch::aarch64::vsubq_u8;
@@ -453,8 +457,8 @@ impl RowKernel for Kernel {
 
         let lim = (tw / 16) * 16;
         let mut x = 0usize;
-        // SAFETY: `x + 16 <= tw`, so `vld3q_u8` reads 48 bytes in bounds,
-        // `vld1q_u8` reads 16 bytes in bounds, and `vst4q_u8` writes 64 bytes in bounds.
+        // SAFETY: `x + 16 <= tw` in the main loop and `x + 8 <= tw` in the
+        // 8-pixel tail, so all structure loads/stores stay strictly in bounds.
         unsafe {
             let const_a = vdupq_n_u8(const_alpha);
             let dst_base = dst.as_mut_ptr().cast::<u8>();
@@ -471,9 +475,22 @@ impl RowKernel for Kernel {
                 vst4q_u8(dst_base.add(x * 4), uint8x16x4_t(b, g, r, a));
                 x += 16;
             }
+            if x + 8 <= tw {
+                let bgr = vld3_u8(src_bgr.as_ptr().add(x * 3));
+                let g = bgr.1;
+                let b = vadd_u8(bgr.0, g);
+                let r = vadd_u8(bgr.2, g);
+                let a = if CONST_ALPHA {
+                    vdup_n_u8(const_alpha)
+                } else {
+                    vld1_u8(alpha_row.as_ptr().add(x))
+                };
+                vst4_u8(dst_base.add(x * 4), uint8x8x4_t(b, g, r, a));
+                x += 8;
+            }
         }
-        for (off, out) in dst[lim..].iter_mut().enumerate() {
-            let i = lim + off;
+        for (off, out) in dst[x..].iter_mut().enumerate() {
+            let i = x + off;
             let s = i * 3;
             let g = src_bgr[s + 1];
             let a = if CONST_ALPHA {
@@ -487,6 +504,97 @@ impl RowKernel for Kernel {
                 src_bgr[s + 2].wrapping_add(g),
                 a,
             ));
+        }
+    }
+
+    #[inline(always)]
+    unsafe fn row_up_subgreen_bgr3_to_bgra<
+        const STREAM: bool,
+        const CONST_ALPHA: bool,
+        const WRITE_DEC: bool,
+    >(
+        self,
+        filt_bgr: &[u8],
+        prev_bgr: &[u8],
+        cur_dec: &mut [u8],
+        alpha_row: &[u8],
+        const_alpha: u8,
+        dst: &mut [MaybeUninit<Vec4u8>],
+    ) {
+        let tw = dst.len();
+        let row_b = tw * 3;
+        debug_assert_eq!(filt_bgr.len(), row_b);
+        debug_assert_eq!(prev_bgr.len(), row_b);
+        debug_assert!(!WRITE_DEC || cur_dec.len() == row_b);
+        debug_assert!(CONST_ALPHA || alpha_row.len() == tw);
+
+        let lim = (tw / 16) * 16;
+        let mut x = 0usize;
+        // SAFETY: `x + 16 <= tw` in the main loop and `x + 8 <= tw` in the
+        // 8-pixel tail, so all structure loads/stores stay strictly in bounds.
+        unsafe {
+            let const_a = vdupq_n_u8(const_alpha);
+            let filt_p = filt_bgr.as_ptr();
+            let prev_p = prev_bgr.as_ptr();
+            let dec_p = cur_dec.as_mut_ptr();
+            let alpha_p = alpha_row.as_ptr();
+            let dst_base = dst.as_mut_ptr().cast::<u8>();
+            while x < lim {
+                let f = vld3q_u8(filt_p.add(x * 3));
+                let u = vld3q_u8(prev_p.add(x * 3));
+                let db = vaddq_u8(f.0, u.0);
+                let dg = vaddq_u8(f.1, u.1);
+                let dr = vaddq_u8(f.2, u.2);
+                if WRITE_DEC {
+                    vst3q_u8(dec_p.add(x * 3), uint8x16x3_t(db, dg, dr));
+                }
+                let b = vaddq_u8(db, dg);
+                let r = vaddq_u8(dr, dg);
+                let a = if CONST_ALPHA {
+                    const_a
+                } else {
+                    vld1q_u8(alpha_p.add(x))
+                };
+                vst4q_u8(dst_base.add(x * 4), uint8x16x4_t(b, dg, r, a));
+                x += 16;
+            }
+            if x + 8 <= tw {
+                let f = vld3_u8(filt_p.add(x * 3));
+                let u = vld3_u8(prev_p.add(x * 3));
+                let db = vadd_u8(f.0, u.0);
+                let dg = vadd_u8(f.1, u.1);
+                let dr = vadd_u8(f.2, u.2);
+                if WRITE_DEC {
+                    vst3_u8(dec_p.add(x * 3), uint8x8x3_t(db, dg, dr));
+                }
+                let b = vadd_u8(db, dg);
+                let r = vadd_u8(dr, dg);
+                let a = if CONST_ALPHA {
+                    vdup_n_u8(const_alpha)
+                } else {
+                    vld1_u8(alpha_p.add(x))
+                };
+                vst4_u8(dst_base.add(x * 4), uint8x8x4_t(b, dg, r, a));
+                x += 8;
+            }
+        }
+        for (off, out) in dst[x..].iter_mut().enumerate() {
+            let i = x + off;
+            let s = i * 3;
+            let db = filt_bgr[s].wrapping_add(prev_bgr[s]);
+            let dg = filt_bgr[s + 1].wrapping_add(prev_bgr[s + 1]);
+            let dr = filt_bgr[s + 2].wrapping_add(prev_bgr[s + 2]);
+            if WRITE_DEC {
+                cur_dec[s] = db;
+                cur_dec[s + 1] = dg;
+                cur_dec[s + 2] = dr;
+            }
+            let a = if CONST_ALPHA {
+                const_alpha
+            } else {
+                alpha_row[i]
+            };
+            out.write(Vec4u8(db.wrapping_add(dg), dg, dr.wrapping_add(dg), a));
         }
     }
 
@@ -1137,6 +1245,52 @@ impl Tier {
         // SAFETY: Caller upholds validated-hit and disjoint-tile invariants.
         unsafe {
             super::blit_hits_worker_with(Kernel, cache, hits, tile_rects, frame, next_hit);
+        }
+    }
+
+    #[inline(always)]
+    pub(super) const fn stream_align(self) -> usize {
+        1
+    }
+
+    /// # Safety
+    /// Caller must uphold [`super::unfilter_aos_zstd_rows_with`] invariants.
+    #[inline(never)]
+    pub(super) unsafe fn unfilter_aos_zstd_rows<const STREAM: bool, const CONST_ALPHA: bool>(
+        self,
+        predictors: &[u8],
+        filt_bgr: &[u8],
+        alpha_filt: &[u8],
+        const_alpha: u8,
+        frame: &FrameRows,
+        x0: usize,
+        y0: usize,
+        tw: usize,
+        th: usize,
+        dec_row_a: &mut [u8],
+        dec_row_b: &mut [u8],
+        alpha_row_a: &mut [u8],
+        alpha_row_b: &mut [u8],
+    ) {
+        // SAFETY: Caller upholds validated-frame and disjoint-rect invariants;
+        // `Kernel::STREAM_ALIGN == 1` never issues streaming stores.
+        unsafe {
+            super::unfilter_aos_zstd_rows_with::<Kernel, false, CONST_ALPHA>(
+                Kernel,
+                predictors,
+                filt_bgr,
+                alpha_filt,
+                const_alpha,
+                frame,
+                x0,
+                y0,
+                tw,
+                th,
+                dec_row_a,
+                dec_row_b,
+                alpha_row_a,
+                alpha_row_b,
+            );
         }
     }
 

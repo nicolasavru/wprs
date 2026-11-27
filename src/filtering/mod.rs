@@ -92,6 +92,11 @@ mod arch {
         }
 
         #[inline(always)]
+        pub(super) const fn stream_align(self) -> usize {
+            1
+        }
+
+        #[inline(always)]
         pub(super) fn filter_aos_zstd_leaf<const HAS_ALPHA: bool>(
             self,
             aos: BufferPointer<Vec4u8>,
@@ -197,6 +202,47 @@ mod arch {
                     tile_rects,
                     frame,
                     next_hit,
+                );
+            }
+        }
+
+        /// # Safety
+        /// Caller must uphold [`super::unfilter_aos_zstd_rows_with`] invariants.
+        #[inline(never)]
+        pub(super) unsafe fn unfilter_aos_zstd_rows<const STREAM: bool, const CONST_ALPHA: bool>(
+            self,
+            predictors: &[u8],
+            filt_bgr: &[u8],
+            alpha_filt: &[u8],
+            const_alpha: u8,
+            frame: &FrameRows,
+            x0: usize,
+            y0: usize,
+            tw: usize,
+            th: usize,
+            dec_row_a: &mut [u8],
+            dec_row_b: &mut [u8],
+            alpha_row_a: &mut [u8],
+            alpha_row_b: &mut [u8],
+        ) {
+            // SAFETY: Caller upholds validated-frame and disjoint-rect invariants;
+            // `ScalarKernel::STREAM_ALIGN == 1` never issues streaming stores.
+            unsafe {
+                super::unfilter_aos_zstd_rows_with::<ScalarKernel, false, CONST_ALPHA>(
+                    ScalarKernel,
+                    predictors,
+                    filt_bgr,
+                    alpha_filt,
+                    const_alpha,
+                    frame,
+                    x0,
+                    y0,
+                    tw,
+                    th,
+                    dec_row_a,
+                    dec_row_b,
+                    alpha_row_a,
+                    alpha_row_b,
                 );
             }
         }
@@ -607,6 +653,27 @@ pub(crate) trait RowKernel: Copy {
         dst: &mut [MaybeUninit<Vec4u8>],
     );
 
+    /// Fuses `Up` inverse prediction (`dec = filt_bgr + prev_bgr`) with
+    /// `SubGreen` BGR3 -> BGRA unpacking in a single register pass. When
+    /// `WRITE_DEC` is `true`, stores `dec` into `cur_dec` for subsequent rows;
+    /// when `false`, skips writing `cur_dec` completely.
+    ///
+    /// # Safety
+    /// When `STREAM` is `true`, `dst.as_mut_ptr()` must be aligned to `Self::STREAM_ALIGN`.
+    unsafe fn row_up_subgreen_bgr3_to_bgra<
+        const STREAM: bool,
+        const CONST_ALPHA: bool,
+        const WRITE_DEC: bool,
+    >(
+        self,
+        filt_bgr: &[u8],
+        prev_bgr: &[u8],
+        cur_dec: &mut [u8],
+        alpha_row: &[u8],
+        const_alpha: u8,
+        dst: &mut [MaybeUninit<Vec4u8>],
+    );
+
     /// # Safety
     /// When `STREAM` is `true`, `dst.as_mut_ptr()` must be aligned to `Self::STREAM_ALIGN`.
     unsafe fn splat_row<const STREAM: bool>(self, dst: &mut [MaybeUninit<Vec4u8>], pixel: Vec4u8);
@@ -901,6 +968,45 @@ impl RowKernel for ScalarKernel {
                 src_bgr[s + 2].wrapping_add(g),
                 a,
             ));
+        }
+    }
+
+    #[inline(always)]
+    unsafe fn row_up_subgreen_bgr3_to_bgra<
+        const STREAM: bool,
+        const CONST_ALPHA: bool,
+        const WRITE_DEC: bool,
+    >(
+        self,
+        filt_bgr: &[u8],
+        prev_bgr: &[u8],
+        cur_dec: &mut [u8],
+        alpha_row: &[u8],
+        const_alpha: u8,
+        dst: &mut [MaybeUninit<Vec4u8>],
+    ) {
+        let tw = dst.len();
+        let row_b = tw * 3;
+        debug_assert_eq!(filt_bgr.len(), row_b);
+        debug_assert_eq!(prev_bgr.len(), row_b);
+        debug_assert!(!WRITE_DEC || cur_dec.len() == row_b);
+        debug_assert!(CONST_ALPHA || alpha_row.len() == tw);
+        for (i, out) in dst.iter_mut().enumerate() {
+            let s = i * 3;
+            let db = filt_bgr[s].wrapping_add(prev_bgr[s]);
+            let dg = filt_bgr[s + 1].wrapping_add(prev_bgr[s + 1]);
+            let dr = filt_bgr[s + 2].wrapping_add(prev_bgr[s + 2]);
+            if WRITE_DEC {
+                cur_dec[s] = db;
+                cur_dec[s + 1] = dg;
+                cur_dec[s + 2] = dr;
+            }
+            let a = if CONST_ALPHA {
+                const_alpha
+            } else {
+                alpha_row[i]
+            };
+            out.write(Vec4u8(db.wrapping_add(dg), dg, dr.wrapping_add(dg), a));
         }
     }
 
@@ -1852,6 +1958,272 @@ unsafe fn unfilter_jpeg_leaf<const HAS_ALPHA: bool>(
 }
 
 /// # Safety
+/// `(x0, y0, tw, th)` must be validated in-bounds within `frame` and disjoint
+/// from all other tiles being decoded concurrently; when `STREAM` is `true`,
+/// every row pointer `frame.row_ptr(y0 + ry, x0)` must be aligned to
+/// `K::STREAM_ALIGN` and `tw.is_multiple_of(16)` must hold.
+#[inline(always)]
+unsafe fn unfilter_aos_zstd_rows_with<K: RowKernel, const STREAM: bool, const CONST_ALPHA: bool>(
+    kernel: K,
+    predictors: &[u8],
+    filt_bgr: &[u8],
+    alpha_filt: &[u8],
+    const_alpha: u8,
+    frame: &FrameRows,
+    x0: usize,
+    y0: usize,
+    tw: usize,
+    th: usize,
+    dec_row_a: &mut [u8],
+    dec_row_b: &mut [u8],
+    alpha_row_a: &mut [u8],
+    alpha_row_b: &mut [u8],
+) {
+    let row_b = tw * 3;
+    let mut use_a = true;
+    for ry in 0..th {
+        let c = ry * row_b;
+        let filt_row = &filt_bgr[c..c + row_b];
+        let p_mode = predictor_at(predictors, ry);
+        let next_needs_prev = ry + 1 < th && predictor_at(predictors, ry + 1) >= 2;
+
+        let (cur_dec, prev_dec): (&mut [u8], &[u8]) = if use_a {
+            (dec_row_a, if ry > 0 { dec_row_b } else { &[] })
+        } else {
+            (dec_row_b, dec_row_a)
+        };
+
+        // SAFETY: Caller guarantees `(x0, y0, tw, th)` is in-bounds and disjoint.
+        let dst_row = unsafe { slice::from_raw_parts_mut(frame.row_ptr(y0 + ry, x0), tw) };
+
+        let alpha_row: &[u8] = if CONST_ALPHA {
+            &[]
+        } else {
+            let (a_cur, a_prev): (&mut [u8], &[u8]) = if use_a {
+                (alpha_row_a, if ry > 0 { alpha_row_b } else { &[] })
+            } else {
+                (alpha_row_b, alpha_row_a)
+            };
+            if ry == 0 {
+                kernel.row_sub1_inverse(&alpha_filt[..tw], a_cur);
+            } else {
+                kernel.row_up_inverse(&alpha_filt[ry * tw..(ry + 1) * tw], a_prev, a_cur);
+            }
+            a_cur
+        };
+
+        // SAFETY: Caller verified `dst_row` alignment matches `K::STREAM_ALIGN`
+        // when `STREAM` is `true`, and row 0 rejects `p_mode >= 2` so
+        // `prev_dec.len() == row_b` whenever `p_mode >= 2`.
+        if p_mode == 2 {
+            unsafe {
+                if next_needs_prev {
+                    kernel.row_up_subgreen_bgr3_to_bgra::<STREAM, CONST_ALPHA, true>(
+                        filt_row,
+                        prev_dec,
+                        cur_dec,
+                        alpha_row,
+                        const_alpha,
+                        dst_row,
+                    );
+                } else {
+                    kernel.row_up_subgreen_bgr3_to_bgra::<STREAM, CONST_ALPHA, false>(
+                        filt_row,
+                        prev_dec,
+                        &mut [],
+                        alpha_row,
+                        const_alpha,
+                        dst_row,
+                    );
+                }
+            }
+        } else {
+            let decoded_bgr: &[u8] = match p_mode {
+                0 => {
+                    if next_needs_prev {
+                        cur_dec.copy_from_slice(filt_row);
+                    }
+                    filt_row
+                },
+                1 => {
+                    kernel.row_sub3_inverse(filt_row, cur_dec);
+                    cur_dec
+                },
+                _ => {
+                    kernel.row_subup3_inverse(filt_row, prev_dec, cur_dec);
+                    cur_dec
+                },
+            };
+            // SAFETY: Caller verified `dst_row` alignment matches `K::STREAM_ALIGN`
+            // when `STREAM` is `true`.
+            unsafe {
+                kernel.subgreen_bgr3_to_bgra::<STREAM, CONST_ALPHA>(
+                    decoded_bgr,
+                    alpha_row,
+                    const_alpha,
+                    dst_row,
+                );
+            }
+        }
+        use_a = !use_a;
+    }
+}
+
+/// # Safety
+/// `rect` shifted by `dst_origin` must already be validated in-bounds within
+/// `frame` and disjoint from all other tiles being decoded concurrently.
+#[inline(never)]
+unsafe fn unfilter_aos_zstd_leaf<const HAS_ALPHA: bool>(
+    tier: arch::Tier,
+    rect: TileRect,
+    dst_origin: (usize, usize),
+    allow_stream: bool,
+    predictors: &[u8],
+    color: &EncodedBytes,
+    alpha: &AlphaChannel,
+    frame: &FrameRows,
+    state: &mut DecompressorWorkerState,
+) -> Result<bool> {
+    let x0 = rect.x as usize - dst_origin.0;
+    let y0 = rect.y as usize - dst_origin.1;
+    let tw = rect.w as usize;
+    let th = rect.h as usize;
+    let n_px = tw * th;
+
+    let expected_pred_len = th.div_ceil(4);
+    if predictors.len() != expected_pred_len {
+        bail!(
+            "predictors len {} != expected {expected_pred_len}",
+            predictors.len()
+        );
+    }
+    let rem_bits = th & 3;
+    if rem_bits != 0 && (predictors[th >> 2] >> (rem_bits * 2)) != 0 {
+        bail!("non-zero padding bits in row predictors");
+    }
+    if predictor_at(predictors, 0) >= 2 {
+        bail!("invalid row-0 predictor {}", predictor_at(predictors, 0));
+    }
+
+    let row_b = tw * 3;
+    let total_b = row_b * th;
+    let filt_bgr =
+        decode_encoded_bytes(color, total_b, &mut state.filt_bgr, &mut state.decompressor)
+            .location(loc!())?;
+
+    let (const_alpha, alpha_filt_slice) = prepare_alpha_decode::<HAS_ALPHA>(
+        alpha,
+        n_px,
+        &mut state.alpha_filt,
+        &mut state.decompressor,
+    )
+    .location(loc!())?;
+
+    ensure_len(&mut state.dec_row_a, row_b);
+    if th > 1 {
+        ensure_len(&mut state.dec_row_b, row_b);
+    }
+    if alpha_filt_slice.is_some() {
+        ensure_len(&mut state.alpha_row_a, tw);
+        if th > 1 {
+            ensure_len(&mut state.alpha_row_b, tw);
+        }
+    }
+
+    let dec_row_a = &mut state.dec_row_a[..row_b];
+    let dec_row_b = &mut state.dec_row_b[..if th > 1 { row_b } else { 0 }];
+
+    let stream_align = tier.stream_align();
+    let stream_rows = allow_stream
+        && stream_align > 1
+        && tw.is_multiple_of(16)
+        // SAFETY: Caller guarantees `(x0, y0)` is in-bounds within `frame`.
+        && (unsafe { frame.row_ptr(y0, x0) } as usize).is_multiple_of(stream_align)
+        && (frame.stride_px * 4).is_multiple_of(stream_align);
+
+    // SAFETY: Caller guarantees `rect` is in-bounds and disjoint within `frame`,
+    // and `stream_rows` verified alignment of every row and `tw % 16 == 0`.
+    unsafe {
+        if let Some(a) = const_alpha {
+            if stream_rows {
+                tier.unfilter_aos_zstd_rows::<true, true>(
+                    predictors,
+                    filt_bgr,
+                    &[],
+                    a,
+                    frame,
+                    x0,
+                    y0,
+                    tw,
+                    th,
+                    dec_row_a,
+                    dec_row_b,
+                    &mut [],
+                    &mut [],
+                );
+            } else {
+                tier.unfilter_aos_zstd_rows::<false, true>(
+                    predictors,
+                    filt_bgr,
+                    &[],
+                    a,
+                    frame,
+                    x0,
+                    y0,
+                    tw,
+                    th,
+                    dec_row_a,
+                    dec_row_b,
+                    &mut [],
+                    &mut [],
+                );
+            }
+        } else if HAS_ALPHA {
+            let a_filt = alpha_filt_slice.unwrap();
+            let alpha_row_a = &mut state.alpha_row_a[..tw];
+            let alpha_row_b = &mut state.alpha_row_b[..if th > 1 { tw } else { 0 }];
+            if stream_rows {
+                tier.unfilter_aos_zstd_rows::<true, false>(
+                    predictors,
+                    filt_bgr,
+                    a_filt,
+                    0,
+                    frame,
+                    x0,
+                    y0,
+                    tw,
+                    th,
+                    dec_row_a,
+                    dec_row_b,
+                    alpha_row_a,
+                    alpha_row_b,
+                );
+            } else {
+                tier.unfilter_aos_zstd_rows::<false, false>(
+                    predictors,
+                    filt_bgr,
+                    a_filt,
+                    0,
+                    frame,
+                    x0,
+                    y0,
+                    tw,
+                    th,
+                    dec_row_a,
+                    dec_row_b,
+                    alpha_row_a,
+                    alpha_row_b,
+                );
+            }
+        } else {
+            unreachable!("prepare_alpha_decode::<false> always returns Some(0xFF)");
+        }
+    }
+
+    Ok(stream_rows)
+}
+
+/// # Safety
 /// `rect` shifted by `dst_origin` must already be validated in-bounds within
 /// `frame` and disjoint from all other tiles being decoded concurrently.
 #[inline(always)]
@@ -1939,151 +2311,20 @@ unsafe fn unfilter_leaf<K: RowKernel, const HAS_ALPHA: bool>(
             color,
             alpha,
         } => {
-            let expected_pred_len = th.div_ceil(4);
-            if predictors.len() != expected_pred_len {
-                bail!(
-                    "predictors len {} != expected {expected_pred_len}",
-                    predictors.len()
-                );
+            // SAFETY: Caller guarantees `rect` shifted by `dst_origin` is in-bounds and disjoint.
+            unsafe {
+                unfilter_aos_zstd_leaf::<HAS_ALPHA>(
+                    tier,
+                    rect,
+                    dst_origin,
+                    allow_stream,
+                    predictors,
+                    color,
+                    alpha,
+                    frame,
+                    state,
+                )
             }
-            let rem_bits = th & 3;
-            if rem_bits != 0 && (predictors[th >> 2] >> (rem_bits * 2)) != 0 {
-                bail!("non-zero padding bits in row predictors");
-            }
-            if predictor_at(predictors, 0) >= 2 {
-                bail!("invalid row-0 predictor {}", predictor_at(predictors, 0));
-            }
-
-            let row_b = tw * 3;
-            let total_b = row_b * th;
-            let filt_bgr =
-                decode_encoded_bytes(color, total_b, &mut state.filt_bgr, &mut state.decompressor)
-                    .location(loc!())?;
-
-            let (const_alpha, alpha_filt_slice) = prepare_alpha_decode::<HAS_ALPHA>(
-                alpha,
-                n_px,
-                &mut state.alpha_filt,
-                &mut state.decompressor,
-            )
-            .location(loc!())?;
-
-            ensure_len(&mut state.dec_row_a, row_b);
-            if th > 1 {
-                ensure_len(&mut state.dec_row_b, row_b);
-            }
-            if alpha_filt_slice.is_some() {
-                ensure_len(&mut state.alpha_row_a, tw);
-                if th > 1 {
-                    ensure_len(&mut state.alpha_row_b, tw);
-                }
-            }
-
-            let mut streamed = false;
-            let mut use_a = true;
-            for ry in 0..th {
-                let c = ry * row_b;
-                let filt_row = &filt_bgr[c..c + row_b];
-                let p_mode = predictor_at(predictors, ry);
-
-                let (cur_dec, prev_dec): (&mut [u8], &[u8]) = if use_a {
-                    (
-                        &mut state.dec_row_a[..row_b],
-                        &state.dec_row_b[..if ry > 0 { row_b } else { 0 }],
-                    )
-                } else {
-                    (&mut state.dec_row_b[..row_b], &state.dec_row_a[..row_b])
-                };
-
-                let decoded_bgr: &[u8] = match p_mode {
-                    0 => {
-                        let next_needs_prev = ry + 1 < th && predictor_at(predictors, ry + 1) >= 2;
-                        if next_needs_prev {
-                            cur_dec.copy_from_slice(filt_row);
-                        }
-                        filt_row
-                    },
-                    1 => {
-                        kernel.row_sub3_inverse(filt_row, cur_dec);
-                        cur_dec
-                    },
-                    2 => {
-                        kernel.row_up_inverse(filt_row, prev_dec, cur_dec);
-                        cur_dec
-                    },
-                    _ => {
-                        kernel.row_subup3_inverse(filt_row, prev_dec, cur_dec);
-                        cur_dec
-                    },
-                };
-
-                // SAFETY: Caller guarantees `rect` is in-bounds and disjoint.
-                let dst_row = unsafe { slice::from_raw_parts_mut(frame.row_ptr(y0 + ry, x0), tw) };
-                let use_stream = allow_stream
-                    && K::STREAM_ALIGN > 1
-                    && tw.is_multiple_of(16)
-                    && (dst_row.as_mut_ptr() as usize).is_multiple_of(K::STREAM_ALIGN);
-
-                if let Some(a) = const_alpha {
-                    if use_stream {
-                        // SAFETY: Verified `dst_row` alignment matches `K::STREAM_ALIGN`.
-                        unsafe {
-                            kernel.subgreen_bgr3_to_bgra::<true, true>(decoded_bgr, &[], a, dst_row)
-                        };
-                        streamed = true;
-                    } else {
-                        // SAFETY: `STREAM = false` imposes no extra alignment requirement.
-                        unsafe {
-                            kernel.subgreen_bgr3_to_bgra::<false, true>(
-                                decoded_bgr,
-                                &[],
-                                a,
-                                dst_row,
-                            );
-                        }
-                    }
-                } else {
-                    let a_filt = alpha_filt_slice.unwrap();
-                    let (a_cur, a_prev): (&mut [u8], &[u8]) = if use_a {
-                        (
-                            &mut state.alpha_row_a[..tw],
-                            &state.alpha_row_b[..if ry > 0 { tw } else { 0 }],
-                        )
-                    } else {
-                        (&mut state.alpha_row_b[..tw], &state.alpha_row_a[..tw])
-                    };
-                    if ry == 0 {
-                        kernel.row_sub1_inverse(&a_filt[..tw], a_cur);
-                    } else {
-                        kernel.row_up_inverse(&a_filt[ry * tw..(ry + 1) * tw], a_prev, a_cur);
-                    }
-                    if use_stream {
-                        // SAFETY: Verified `dst_row` alignment matches `K::STREAM_ALIGN`.
-                        unsafe {
-                            kernel.subgreen_bgr3_to_bgra::<true, false>(
-                                decoded_bgr,
-                                a_cur,
-                                0,
-                                dst_row,
-                            );
-                        }
-                        streamed = true;
-                    } else {
-                        // SAFETY: `STREAM = false` imposes no extra alignment requirement.
-                        unsafe {
-                            kernel.subgreen_bgr3_to_bgra::<false, false>(
-                                decoded_bgr,
-                                a_cur,
-                                0,
-                                dst_row,
-                            );
-                        }
-                    }
-                }
-                use_a = !use_a;
-            }
-
-            Ok(streamed)
         },
         LeafPayload::Jpeg { data, alpha } => {
             // SAFETY: Caller guarantees `rect` shifted by `dst_origin` is in-bounds and disjoint.
@@ -5747,11 +5988,15 @@ mod tests {
             );
             assert_eq!(dst_k, row_tr);
         }
-        // Exhaustive width sweep (`0..=256`, covering every SIMD main-loop,
-        // 16B/8px/4px tail, and scalar-tail boundary) for `bgra_to_subgreen_bgr3`
-        // and the fused 4-predictor selector/filter, plus `i8::MIN` (`0x80`) and
-        // exact tie-breaking parity checks.
-        for tw in 0..=256usize {
+        // Exhaustive width sweep (`0..=256` and `300`, covering every SIMD
+        // main-loop, 48B/24B/12B/8px/4px tail, and scalar-tail boundary) for
+        // `bgra_to_subgreen_bgr3`, the fused 4-predictor selector/filter,
+        // `row_sub3_inverse`, `row_subup3_inverse`, `subgreen_bgr3_to_bgra`,
+        // and fused `row_up_subgreen_bgr3_to_bgra` (all `STREAM`/`CONST_ALPHA`/
+        // `WRITE_DEC` combinations + aligned/unaligned `dst`).
+        let mut sweep_dst_bytes = vec![0xAAu8; (300 + 17) * 4];
+        let sweep_aligned_off = (64 - (sweep_dst_bytes.as_ptr() as usize & 63)) & 63;
+        for tw in (0..=256usize).chain([300]) {
             let row_b = tw * 3;
             let raw0: Vec<Vec4u8> = (0..tw)
                 .map(|i| {
@@ -5783,6 +6028,7 @@ mod tests {
             let (mut bgr0_s, mut bgr0_a) = (vec![0xCCu8; row_b], vec![0xCCu8; row_b]);
             let (mut bgr1_s, mut bgr1_a) = (vec![0xCCu8; row_b], vec![0xCCu8; row_b]);
             let (mut alp0_s, mut alp0_a) = (vec![0xCCu8; tw], vec![0xCCu8; tw]);
+            let (mut alp1_s, mut alp1_a) = (vec![0xCCu8; tw], vec![0xCCu8; tw]);
             ScalarKernel.bgra_to_subgreen_bgr3::<true>(bp0, &mut bgr0_s, &mut alp0_s);
             kernel.bgra_to_subgreen_bgr3::<true>(bp0, &mut bgr0_a, &mut alp0_a);
             assert_eq!(bgr0_a, bgr0_s, "[{tier_name}] sweep subgreen<true> tw={tw}");
@@ -5795,9 +6041,10 @@ mod tests {
                 "[{tier_name}] sweep subgreen<false> tw={tw}"
             );
 
-            ScalarKernel.bgra_to_subgreen_bgr3::<false>(bp1, &mut bgr1_s, &mut []);
-            kernel.bgra_to_subgreen_bgr3::<false>(bp1, &mut bgr1_a, &mut []);
+            ScalarKernel.bgra_to_subgreen_bgr3::<true>(bp1, &mut bgr1_s, &mut alp1_s);
+            kernel.bgra_to_subgreen_bgr3::<true>(bp1, &mut bgr1_a, &mut alp1_a);
             assert_eq!(bgr1_a, bgr1_s, "[{tier_name}] sweep subgreen row1 tw={tw}");
+            assert_eq!(alp1_a, alp1_s, "[{tier_name}] sweep alpha row1 tw={tw}");
 
             let (mut up_s, mut up_a) = (vec![0xBBu8; row_b], vec![0xBBu8; row_b]);
             assert_eq!(
@@ -5807,6 +6054,15 @@ mod tests {
             );
             assert_eq!(up_a, up_s, "[{tier_name}] sweep up_out tw={tw}");
 
+            // Inverse `Sub3` and `SubUp3` parity across every width `0..=256, 300`.
+            let (mut sub_f, mut inv_a) = (vec![0xAAu8; row_b], vec![0x55u8; row_b]);
+            ScalarKernel.row_sub3_forward(&bgr0_s, &mut sub_f);
+            kernel.row_sub3_inverse(&sub_f, &mut inv_a);
+            assert_eq!(
+                inv_a, bgr0_s,
+                "[{tier_name}] sweep row_sub3_inverse tw={tw}"
+            );
+
             let (mut ip_s, mut ip_a) = (up_s.clone(), up_a.clone());
             kernel.row_sub3_forward_in_place(&mut ip_a);
             ScalarKernel.row_sub3_forward_in_place(&mut ip_s);
@@ -5814,6 +6070,181 @@ mod tests {
                 ip_a, ip_s,
                 "[{tier_name}] sweep row_sub3_forward_in_place tw={tw}"
             );
+            inv_a.fill(0x55);
+            kernel.row_subup3_inverse(&ip_a, &bgr0_s, &mut inv_a);
+            assert_eq!(
+                inv_a, bgr1_s,
+                "[{tier_name}] sweep row_subup3_inverse tw={tw}"
+            );
+
+            // `subgreen_bgr3_to_bgra` and fused `row_up_subgreen_bgr3_to_bgra`
+            // across all `STREAM`/`CONST_ALPHA`/`WRITE_DEC` combinations and
+            // both aligned and unaligned destinations.
+            let mut dec_buf = vec![0x77u8; row_b];
+            for (stream, byte_off) in [(true, sweep_aligned_off), (false, sweep_aligned_off + 4)] {
+                let dst: &mut [Vec4u8] =
+                    bytemuck::cast_slice_mut(&mut sweep_dst_bytes[byte_off..byte_off + tw * 4]);
+                let do_stream = stream && K::STREAM_ALIGN > 1;
+
+                // 1. `subgreen_bgr3_to_bgra` varying alpha & const alpha
+                dst.fill(Vec4u8(0, 0, 0, 0));
+                let dst_u: &mut [MaybeUninit<Vec4u8>] =
+                    unsafe { slice::from_raw_parts_mut(dst.as_mut_ptr().cast(), tw) };
+                unsafe {
+                    if do_stream {
+                        kernel.subgreen_bgr3_to_bgra::<true, false>(&bgr1_s, &alp1_s, 0, dst_u);
+                    } else {
+                        kernel.subgreen_bgr3_to_bgra::<false, false>(&bgr1_s, &alp1_s, 0, dst_u);
+                    }
+                }
+                assert_eq!(
+                    dst,
+                    &raw1[..],
+                    "[{tier_name}] sweep subgreen_bgr3_to_bgra var tw={tw} stream={stream}"
+                );
+
+                dst.fill(Vec4u8(0, 0, 0, 0));
+                let dst_u: &mut [MaybeUninit<Vec4u8>] =
+                    unsafe { slice::from_raw_parts_mut(dst.as_mut_ptr().cast(), tw) };
+                unsafe {
+                    if do_stream {
+                        kernel.subgreen_bgr3_to_bgra::<true, true>(&bgr1_s, &[], 0xC3, dst_u);
+                    } else {
+                        kernel.subgreen_bgr3_to_bgra::<false, true>(&bgr1_s, &[], 0xC3, dst_u);
+                    }
+                }
+                for (got, exp) in dst.iter().zip(&raw1) {
+                    assert_eq!(
+                        *got,
+                        Vec4u8(exp.0, exp.1, exp.2, 0xC3),
+                        "[{tier_name}] sweep subgreen_bgr3_to_bgra const tw={tw} stream={stream}"
+                    );
+                }
+
+                // 2. Fused `row_up_subgreen_bgr3_to_bgra` (`WRITE_DEC = true/false`,
+                //    `CONST_ALPHA = true/false`, `STREAM = true/false`).
+                for write_dec in [true, false] {
+                    dec_buf.fill(0x77);
+                    dst.fill(Vec4u8(0, 0, 0, 0));
+                    let dst_u: &mut [MaybeUninit<Vec4u8>] =
+                        unsafe { slice::from_raw_parts_mut(dst.as_mut_ptr().cast(), tw) };
+                    unsafe {
+                        match (do_stream, write_dec) {
+                            (true, true) => kernel
+                                .row_up_subgreen_bgr3_to_bgra::<true, false, true>(
+                                    &up_s,
+                                    &bgr0_s,
+                                    &mut dec_buf,
+                                    &alp1_s,
+                                    0,
+                                    dst_u,
+                                ),
+                            (true, false) => kernel
+                                .row_up_subgreen_bgr3_to_bgra::<true, false, false>(
+                                    &up_s,
+                                    &bgr0_s,
+                                    &mut [],
+                                    &alp1_s,
+                                    0,
+                                    dst_u,
+                                ),
+                            (false, true) => kernel
+                                .row_up_subgreen_bgr3_to_bgra::<false, false, true>(
+                                    &up_s,
+                                    &bgr0_s,
+                                    &mut dec_buf,
+                                    &alp1_s,
+                                    0,
+                                    dst_u,
+                                ),
+                            (false, false) => kernel
+                                .row_up_subgreen_bgr3_to_bgra::<false, false, false>(
+                                    &up_s,
+                                    &bgr0_s,
+                                    &mut [],
+                                    &alp1_s,
+                                    0,
+                                    dst_u,
+                                ),
+                        }
+                    }
+                    assert_eq!(
+                        dst,
+                        &raw1[..],
+                        "[{tier_name}] sweep fused up var tw={tw} stream={stream} wd={write_dec}"
+                    );
+                    if write_dec {
+                        assert_eq!(
+                            dec_buf, bgr1_s,
+                            "[{tier_name}] sweep fused up var cur_dec tw={tw} stream={stream}"
+                        );
+                    } else {
+                        assert!(
+                            dec_buf.iter().all(|&b| b == 0x77),
+                            "[{tier_name}] sweep fused up var touched cur_dec when wd=false tw={tw}"
+                        );
+                    }
+
+                    dec_buf.fill(0x77);
+                    dst.fill(Vec4u8(0, 0, 0, 0));
+                    let dst_u: &mut [MaybeUninit<Vec4u8>] =
+                        unsafe { slice::from_raw_parts_mut(dst.as_mut_ptr().cast(), tw) };
+                    unsafe {
+                        match (do_stream, write_dec) {
+                            (true, true) => kernel
+                                .row_up_subgreen_bgr3_to_bgra::<true, true, true>(
+                                    &up_s,
+                                    &bgr0_s,
+                                    &mut dec_buf,
+                                    &[],
+                                    0x9D,
+                                    dst_u,
+                                ),
+                            (true, false) => kernel
+                                .row_up_subgreen_bgr3_to_bgra::<true, true, false>(
+                                    &up_s,
+                                    &bgr0_s,
+                                    &mut [],
+                                    &[],
+                                    0x9D,
+                                    dst_u,
+                                ),
+                            (false, true) => kernel
+                                .row_up_subgreen_bgr3_to_bgra::<false, true, true>(
+                                    &up_s,
+                                    &bgr0_s,
+                                    &mut dec_buf,
+                                    &[],
+                                    0x9D,
+                                    dst_u,
+                                ),
+                            (false, false) => kernel
+                                .row_up_subgreen_bgr3_to_bgra::<false, true, false>(
+                                    &up_s,
+                                    &bgr0_s,
+                                    &mut [],
+                                    &[],
+                                    0x9D,
+                                    dst_u,
+                                ),
+                        }
+                    }
+                    for (got, exp) in dst.iter().zip(&raw1) {
+                        assert_eq!(
+                            *got,
+                            Vec4u8(exp.0, exp.1, exp.2, 0x9D),
+                            "[{tier_name}] sweep fused up const tw={tw} stream={stream} wd={write_dec}"
+                        );
+                    }
+                    if write_dec {
+                        assert_eq!(
+                            dec_buf, bgr1_s,
+                            "[{tier_name}] sweep fused up const cur_dec tw={tw} stream={stream}"
+                        );
+                    }
+                }
+            }
+            kernel.fence_stream();
 
             let (mut o_s, mut o_a) = (vec![0xAAu8; row_b], vec![0xAAu8; row_b]);
             let m0_s = select_and_filter_row(ScalarKernel, 0, &bgr0_s, &[], &mut o_s);
@@ -5860,6 +6291,21 @@ mod tests {
             let p_sua = select_and_filter_row(kernel, 1, &ramp_cur, &ramp_prev, &mut z_a);
             assert_eq!(p_sua, p_sus, "[{tier_name}] SubUp winner tw={tw}");
             assert_eq!(z_a, z_s, "[{tier_name}] SubUp winner out tw={tw}");
+        }
+
+        // Verify `row_sub3_inverse` on arbitrary (including non-multiple-of-3) byte lengths `0..=65`.
+        for len in 0..=65usize {
+            let src: Vec<u8> = (0..len)
+                .map(|j| ((j * 37 + len * 13 + 7) & 0xFF) as u8)
+                .collect();
+            let mut dst_s = vec![0xAAu8; len];
+            let mut dst_k = vec![0x55u8; len];
+            ScalarKernel.row_sub3_inverse(&src, &mut dst_s);
+            kernel.row_sub3_inverse(&src, &mut dst_k);
+            assert_eq!(
+                dst_k, dst_s,
+                "[{tier_name}] row_sub3_inverse arbitrary len={len}"
+            );
         }
 
         // `i8::MIN` (`0x80` = `-128`) unsigned abs must equal `128` across all backends
@@ -14312,6 +14758,161 @@ mod tests {
                     canvas.iter().all(|&b| b == 0xA5),
                     "tier={tier:?} partially corrupted canvas on malformed case {name}"
                 );
+            }
+        }
+    }
+
+    #[test]
+    #[cfg_attr(miri, ignore)]
+    fn test_aos_mixed_predictor_transitions_across_tiers() {
+        // Explicit sequence exercising every `(prev_mode -> cur_mode)` transition
+        // among `{0=None, 1=Sub, 2=Up, 3=SubUp}`, including `Up -> None/Sub`
+        // (where fused `Up` skips writing `cur_dec`), `Up -> Up/SubUp` (where
+        // fused `Up` must populate `cur_dec` for the next row), and ending on
+        // `Up` as the final row (`next_needs_prev == false`).
+        let pred_seq: [u8; 20] = [0, 2, 0, 1, 2, 1, 2, 2, 3, 2, 3, 3, 0, 3, 1, 3, 2, 0, 2, 2];
+        let th = pred_seq.len();
+        let mut predictors = vec![0u8; th.div_ceil(4)];
+        for (ry, &p) in pred_seq.iter().enumerate() {
+            predictors[ry >> 2] |= p << ((ry & 3) * 2);
+        }
+
+        let mut decomp = ShardingDecompressor::new(NonZeroUsize::new(1).unwrap()).unwrap();
+        let widths = [
+            1usize, 2, 3, 4, 5, 7, 8, 9, 10, 11, 12, 15, 16, 17, 23, 24, 25, 31, 32, 40, 48, 63,
+            64, 72, 120, 127, 128, 255, 256,
+        ];
+
+        for &tw in &widths {
+            let row_b = tw * 3;
+            for (format, alpha_kind) in [
+                (BufferFormat::Xrgb8888, 0u8),
+                (BufferFormat::Argb8888, 1),
+                (BufferFormat::Argb8888, 2),
+            ] {
+                let mut expected_px = Vec::with_capacity(tw * th);
+                let mut raw_bgr_rows = Vec::with_capacity(th);
+                let mut raw_alpha = Vec::with_capacity(tw * th);
+                for ry in 0..th {
+                    let mut row_px = Vec::with_capacity(tw);
+                    for x in 0..tw {
+                        let k = (ry * 131 + x * 37 + tw * 17 + usize::from(alpha_kind) * 53) as u32;
+                        let a = match alpha_kind {
+                            0 => 0xFF,
+                            1 => 0xA7,
+                            _ => ((k * 19 + 7) & 0xFF) as u8,
+                        };
+                        row_px.push(Vec4u8(
+                            ((k * 13 + 5) & 0xFF) as u8,
+                            ((k * 29 + 11) & 0xFF) as u8,
+                            ((k * 43 + 17) & 0xFF) as u8,
+                            a,
+                        ));
+                    }
+                    let mut bgr = vec![0u8; row_b];
+                    let mut alp = vec![0u8; tw];
+                    let p = row_px.as_ptr();
+                    let bp = unsafe { BufferPointer::new(&p, tw) };
+                    ScalarKernel.bgra_to_subgreen_bgr3::<true>(bp, &mut bgr, &mut alp);
+                    expected_px.extend_from_slice(&row_px);
+                    raw_bgr_rows.push(bgr);
+                    raw_alpha.extend_from_slice(&alp);
+                }
+
+                let mut filt_bgr = vec![0u8; row_b * th];
+                for ry in 0..th {
+                    let dst = &mut filt_bgr[ry * row_b..(ry + 1) * row_b];
+                    match pred_seq[ry] {
+                        0 => dst.copy_from_slice(&raw_bgr_rows[ry]),
+                        1 => ScalarKernel.row_sub3_forward(&raw_bgr_rows[ry], dst),
+                        2 => ScalarKernel.row_up_forward(
+                            &raw_bgr_rows[ry],
+                            &raw_bgr_rows[ry - 1],
+                            dst,
+                        ),
+                        _ => {
+                            ScalarKernel.row_up_forward(
+                                &raw_bgr_rows[ry],
+                                &raw_bgr_rows[ry - 1],
+                                dst,
+                            );
+                            ScalarKernel.row_sub3_forward_in_place(dst);
+                        },
+                    }
+                }
+
+                let alpha = match alpha_kind {
+                    0 => AlphaChannel::Omitted,
+                    1 => AlphaChannel::Constant(0xA7),
+                    _ => {
+                        let mut a_filt = vec![0u8; tw * th];
+                        ScalarKernel.row_sub1_forward(&raw_alpha[..tw], &mut a_filt[..tw]);
+                        for ry in 1..th {
+                            ScalarKernel.row_up_forward(
+                                &raw_alpha[ry * tw..(ry + 1) * tw],
+                                &raw_alpha[(ry - 1) * tw..ry * tw],
+                                &mut a_filt[ry * tw..(ry + 1) * tw],
+                            );
+                        }
+                        AlphaChannel::Uncompressed(a_filt)
+                    },
+                };
+
+                let payload = LeafPayload::AosZstd {
+                    predictors: predictors.clone(),
+                    color: EncodedBytes::Uncompressed(filt_bgr),
+                    alpha,
+                };
+                let meta = BufferMetadata {
+                    width: tw as i32,
+                    height: th as i32,
+                    stride: (tw * 4) as i32,
+                    format,
+                };
+                let tile_rects = [TileRect {
+                    x: 0,
+                    y: 0,
+                    w: tw as u32,
+                    h: th as u32,
+                }];
+                let expected_bytes: &[u8] = bytemuck::cast_slice(&expected_px);
+
+                for tier in arch::Tier::supported_tiers() {
+                    for use_cache in [false, true] {
+                        let mut cache = ClientTileCache::new();
+                        let mut canvas: AlignedVec<64> = AlignedVec::with_capacity(tw * th * 4);
+                        canvas.resize(tw * th * 4, 0x5A);
+                        let tile = CompressedTile {
+                            tile_idx: 0,
+                            cache_put: use_cache.then_some(0),
+                            payload: TilePayload::Leaf(payload.clone()),
+                        };
+                        let emitted = AtomicBool::new(false);
+                        unsafe {
+                            unfilter_tiles_parallel_with_tier(
+                                tier,
+                                &mut decomp,
+                                meta,
+                                canvas.len(),
+                                false,
+                                &[],
+                                &tile_rects,
+                                Some(&mut canvas),
+                                use_cache.then_some(&mut cache),
+                                || {
+                                    (!emitted.swap(true, Ordering::Relaxed))
+                                        .then(|| Ok(Cow::Borrowed(&tile)))
+                                },
+                            )
+                            .unwrap();
+                        }
+                        assert_eq!(
+                            canvas.as_slice(),
+                            expected_bytes,
+                            "tier={tier:?} tw={tw} alpha_kind={alpha_kind} use_cache={use_cache}"
+                        );
+                    }
+                }
             }
         }
     }
