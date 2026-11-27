@@ -17,6 +17,13 @@ use std::sync::Mutex;
 use std::time::Duration;
 
 use smithay::backend::input::Axis;
+use smithay::input::Seat;
+use smithay::input::SeatHandler;
+use smithay::input::keyboard::KeyboardTarget;
+use smithay::input::keyboard::Layout;
+use smithay::input::keyboard::ModifiersState;
+use smithay::input::keyboard::XkbContext;
+use smithay::input::keyboard::xkb;
 use smithay::input::pointer::AxisFrame;
 use smithay::output::Mode;
 use smithay::output::Output;
@@ -28,6 +35,7 @@ use smithay::utils::Buffer as BufferCoords;
 use smithay::utils::Logical;
 use smithay::utils::Physical;
 use smithay::utils::Rectangle;
+use smithay::utils::Serial;
 use smithay::utils::Size;
 use smithay::utils::Transform;
 use smithay::utils::user_data::UserDataMap;
@@ -45,6 +53,7 @@ use crate::serialization::geometry::Rectangle as SerRectangle;
 use crate::serialization::wayland::AxisScroll;
 use crate::serialization::wayland::AxisSource;
 use crate::serialization::wayland::OutputInfo;
+use crate::serialization::wayland::RawModifiers;
 use crate::serialization::wayland::ViewportState;
 
 pub fn with_buffer_contents<F, T>(buffer: &WlBuffer, f: F) -> Result<T, BufferAccessError>
@@ -391,6 +400,108 @@ pub fn build_axis_frame(
         }
     }
     axis_frame
+}
+
+/// Evdev keycodes for standard modifier keys (see `linux/input-event-codes.h`).
+const MODIFIER_KEYCODES: [u32; 8] = [
+    /* KEY_LEFTCTRL */ 29, /* KEY_RIGHTCTRL */ 97, /* KEY_LEFTALT */ 56,
+    /* KEY_RIGHTALT */ 100, /* KEY_LEFTMETA */ 125, /* KEY_RIGHTMETA */ 126,
+    /* KEY_LEFTSHIFT */ 42, /* KEY_RIGHTSHIFT */ 54,
+];
+
+/// Returns whether an evdev keycode is a standard modifier key that should be
+/// applied before non-modifier held keys during `wl_keyboard.enter`.
+pub fn is_modifier_keycode(keycode: u32) -> bool {
+    MODIFIER_KEYCODES.contains(&keycode)
+}
+
+fn mod_active_in_mask(keymap: &xkb::Keymap, mask: u32, name: &str) -> bool {
+    let index = keymap.mod_get_index(name);
+    index != xkb::MOD_INVALID && index < u32::BITS && (mask & (1u32 << index)) != 0
+}
+
+/// Synchronizes Smithay's keyboard modifier and layout state from host
+/// `wl_keyboard.modifiers` raw bitmasks without injecting synthetic
+/// `KEY_CAPSLOCK`/`KEY_NUMLOCK` keypresses.
+pub fn sync_keyboard_modifiers<D>(
+    seat: &Seat<D>,
+    data: &mut D,
+    raw: RawModifiers,
+    layout_index: u32,
+    serial: Serial,
+) where
+    D: SeatHandler + 'static,
+    D::KeyboardFocus: KeyboardTarget<D> + Clone,
+{
+    let Some(keyboard) = seat.get_keyboard() else {
+        return;
+    };
+
+    let effective = raw.depressed | raw.latched | raw.locked;
+    let (desired, num_layouts) = keyboard.with_xkb_state(data, |ctx: XkbContext<'_>| {
+        let xkb = ctx.xkb().lock().unwrap();
+        // SAFETY: `keymap` is borrowed only inside this lock guard and never cloned.
+        let keymap = unsafe { xkb.keymap() };
+        let desired = ModifiersState {
+            ctrl: mod_active_in_mask(keymap, effective, xkb::MOD_NAME_CTRL),
+            alt: mod_active_in_mask(keymap, effective, xkb::MOD_NAME_ALT),
+            shift: mod_active_in_mask(keymap, effective, xkb::MOD_NAME_SHIFT),
+            caps_lock: mod_active_in_mask(keymap, effective, xkb::MOD_NAME_CAPS),
+            logo: mod_active_in_mask(keymap, effective, xkb::MOD_NAME_LOGO),
+            num_lock: mod_active_in_mask(keymap, effective, xkb::MOD_NAME_NUM),
+            iso_level3_shift: mod_active_in_mask(keymap, effective, xkb::MOD_NAME_ISO_LEVEL3_SHIFT),
+            iso_level5_shift: mod_active_in_mask(keymap, effective, xkb::MOD_NAME_MOD3),
+            serialized: Default::default(),
+        };
+        (desired, keymap.num_layouts())
+    });
+
+    let current = keyboard.modifier_state();
+    let mods_differ = desired.ctrl != current.ctrl
+        || desired.alt != current.alt
+        || desired.shift != current.shift
+        || desired.caps_lock != current.caps_lock
+        || desired.logo != current.logo
+        || desired.num_lock != current.num_lock
+        || desired.iso_level3_shift != current.iso_level3_shift
+        || desired.iso_level5_shift != current.iso_level5_shift
+        || (current.serialized.latched != 0 && raw.latched == 0);
+
+    let mods_changed = if mods_differ {
+        keyboard.set_modifier_state(desired) != 0
+    } else {
+        false
+    };
+
+    // `KeyboardHandle::set_modifier_state` in Smithay 0.7 masks layout indices
+    // with `STATE_LAYOUT_*` flags, zeroing `xkb.state`'s layout while leaving
+    // `mods_state.serialized.layout_effective` stale when coming from a non-zero
+    // layout. Always restore `layout_index` via `XkbContext::set_layout`, and on
+    // multi-layout keymaps bounce `0 -> 1 -> 0` inside one `with_xkb_state` call
+    // when targeting layout 0 after `set_modifier_state` so `mods_state.serialized`
+    // refreshes cleanly and emits a single `wl_keyboard.modifiers` event.
+    let layout_broadcast = keyboard.with_xkb_state(data, |mut ctx: XkbContext<'_>| {
+        if mods_changed
+            && layout_index == 0
+            && num_layouts > 1
+            && ctx.xkb().lock().unwrap().active_layout() == Layout(0)
+        {
+            ctx.set_layout(Layout(1));
+        }
+        let prev_layout = ctx.xkb().lock().unwrap().active_layout();
+        ctx.set_layout(Layout(layout_index));
+        let new_layout = ctx.xkb().lock().unwrap().active_layout();
+        new_layout != prev_layout
+    });
+
+    // `set_modifier_state` does not notify the focused client; emit
+    // `wl_keyboard.modifiers` directly if `set_layout` did not already do so.
+    if mods_changed
+        && !layout_broadcast
+        && let Some(focus) = keyboard.current_focus()
+    {
+        focus.modifiers(seat, data, keyboard.modifier_state(), serial);
+    }
 }
 
 #[cfg(test)]

@@ -43,7 +43,7 @@ use smithay_client_toolkit::reexports::client::protocol::wl_output::Transform as
 use smithay_client_toolkit::reexports::client::protocol::wl_pointer::AxisRelativeDirection as SctkAxisRelativeDirection;
 use smithay_client_toolkit::reexports::client::protocol::wl_pointer::AxisSource as SctkAxisSource;
 use smithay_client_toolkit::reexports::client::protocol::wl_shm::Format as SctkBufferFormat;
-use smithay_client_toolkit::seat::keyboard::Modifiers as SmithayModifiers;
+use smithay_client_toolkit::seat::keyboard::RawModifiers as SctkRawModifiers;
 use smithay_client_toolkit::seat::keyboard::RepeatInfo as SctkRepeatInfo;
 use smithay_client_toolkit::seat::pointer::AxisScroll as SctkAxisScroll;
 use smithay_client_toolkit::seat::pointer::PointerEvent as SctkPointerEvent;
@@ -262,25 +262,19 @@ impl fmt::Debug for KeyInner {
     }
 }
 
-#[derive(Debug, Copy, Clone, Eq, PartialEq, Archive, Deserialize, Serialize)]
-pub struct ModifierState {
-    pub ctrl: bool,
-    pub alt: bool,
-    pub shift: bool,
-    pub caps_lock: bool,
-    pub logo: bool,
-    pub num_lock: bool,
+#[derive(Debug, Default, Copy, Clone, Eq, PartialEq, Archive, Deserialize, Serialize)]
+pub struct RawModifiers {
+    pub depressed: u32,
+    pub latched: u32,
+    pub locked: u32,
 }
 
-impl From<SmithayModifiers> for ModifierState {
-    fn from(modifiers: SmithayModifiers) -> Self {
+impl From<SctkRawModifiers> for RawModifiers {
+    fn from(modifiers: SctkRawModifiers) -> Self {
         Self {
-            ctrl: modifiers.ctrl,
-            alt: modifiers.alt,
-            shift: modifiers.shift,
-            caps_lock: modifiers.caps_lock,
-            logo: modifiers.logo,
-            num_lock: modifiers.num_lock,
+            depressed: modifiers.depressed,
+            latched: modifiers.latched,
+            locked: modifiers.locked,
         }
     }
 }
@@ -300,7 +294,8 @@ pub enum KeyboardEvent {
     RepeatInfo(RepeatInfo),
     Keymap(String),
     Modifiers {
-        modifier_state: ModifierState,
+        serial: u32,
+        raw_modifiers: RawModifiers,
         layout_index: u32,
     },
 }
@@ -1350,5 +1345,33 @@ mod tests {
         let bytes = rkyv::to_bytes::<rkyv::rancor::Error>(&events).unwrap();
         let decoded = rkyv::from_bytes::<Vec<OutputEvent>, rkyv::rancor::Error>(&bytes).unwrap();
         assert_eq!(decoded, events);
+    }
+
+    #[test]
+    fn test_keyboard_modifiers_wire_roundtrip() {
+        let raw = SctkRawModifiers {
+            depressed: 0x05,
+            latched: 0x02,
+            locked: 0x12,
+        };
+        let event = KeyboardEvent::Modifiers {
+            serial: 77,
+            raw_modifiers: raw.into(),
+            layout_index: 2,
+        };
+        let bytes = rkyv::to_bytes::<rkyv::rancor::Error>(&event).unwrap();
+        let decoded = rkyv::from_bytes::<KeyboardEvent, rkyv::rancor::Error>(&bytes).unwrap();
+        assert_eq!(
+            decoded,
+            KeyboardEvent::Modifiers {
+                serial: 77,
+                raw_modifiers: RawModifiers {
+                    depressed: 0x05,
+                    latched: 0x02,
+                    locked: 0x12,
+                },
+                layout_index: 2,
+            }
+        );
     }
 }

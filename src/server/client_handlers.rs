@@ -30,9 +30,7 @@ use smithay::backend::input::KeyState as SmithayKeyState;
 use smithay::backend::renderer::utils::RendererSurfaceStateUserData;
 use smithay::input::keyboard::FilterResult;
 use smithay::input::keyboard::KeysymHandle;
-use smithay::input::keyboard::Layout;
 use smithay::input::keyboard::ModifiersState;
-use smithay::input::keyboard::XkbContext;
 use smithay::input::pointer::ButtonEvent;
 use smithay::input::pointer::CursorImageStatus as SmithayCursorImageStatus;
 use smithay::input::pointer::CursorImageSurfaceData;
@@ -83,6 +81,7 @@ use crate::serialization::wayland::KeyboardEvent;
 use crate::serialization::wayland::OutputEvent;
 use crate::serialization::wayland::PointerEvent;
 use crate::serialization::wayland::PointerEventKind;
+use crate::serialization::wayland::RawModifiers;
 use crate::serialization::wayland::RepeatInfo;
 use crate::serialization::wayland::Role;
 use crate::serialization::wayland::SubsurfacePosition;
@@ -526,10 +525,51 @@ impl WprsServerState {
 
         // our keycode is getting offset by 8 for reasons
         // see https://github.com/Smithay/smithay/pull/1536
-        let x11_keycode = (keycode + 8).into();
+        let x11_keycode = keycode
+            .checked_add(8)
+            .context(loc!(), "keycode overflow")?
+            .into();
         let time = self.start_time.elapsed().as_millis() as u32;
         match state {
             KeyState::Pressed => {
+                if !self.pressed_keys.insert(keycode) {
+                    return Ok(());
+                }
+                keyboard.input::<(), _>(
+                    self,
+                    x11_keycode,
+                    SmithayKeyState::Pressed,
+                    serial,
+                    time,
+                    filter,
+                );
+            },
+            KeyState::Released => {
+                if !self.pressed_keys.remove(&keycode) {
+                    return Ok(());
+                }
+                keyboard.input::<(), _>(
+                    self,
+                    x11_keycode,
+                    SmithayKeyState::Released,
+                    serial,
+                    time,
+                    filter,
+                );
+            },
+            KeyState::Repeated => {
+                // Map repeated to released + pressed
+                // Smithay 0.7 keystates don't support repetition
+                if self.pressed_keys.contains(&keycode) {
+                    keyboard.input::<(), _>(
+                        self,
+                        x11_keycode,
+                        SmithayKeyState::Released,
+                        serial,
+                        time,
+                        filter,
+                    );
+                }
                 keyboard.input::<(), _>(
                     self,
                     x11_keycode,
@@ -540,40 +580,63 @@ impl WprsServerState {
                 );
                 self.pressed_keys.insert(keycode);
             },
-            KeyState::Released => {
-                keyboard.input::<(), _>(
-                    self,
-                    x11_keycode,
-                    SmithayKeyState::Released,
-                    serial,
-                    time,
-                    filter,
-                );
-                self.pressed_keys.remove(&keycode);
-            },
-            KeyState::Repeated => {
-                // Map repeated to released + pressed
-                // Smithay 0.7 keystates don't support repetition
-                keyboard.input::<(), _>(
-                    self,
-                    x11_keycode,
-                    SmithayKeyState::Released,
-                    serial,
-                    time,
-                    filter,
-                );
-                keyboard.input::<(), _>(
-                    self,
-                    x11_keycode,
-                    SmithayKeyState::Pressed,
-                    serial,
-                    time,
-                    filter,
-                );
-            },
         }
 
         Ok(())
+    }
+
+    fn release_all_pressed_keys(&mut self) -> Result<()> {
+        let pressed: Vec<u32> = self.pressed_keys.iter().copied().collect();
+        for keycode in pressed {
+            self.set_key_state(keycode, KeyState::Released, SERIAL_COUNTER.next_serial())
+                .location(loc!())?;
+        }
+        Ok(())
+    }
+
+    fn reset_input_state(&mut self) {
+        if let Some(keyboard) = self.seat.get_keyboard() {
+            keyboard.set_focus(self, None, SERIAL_COUNTER.next_serial());
+        }
+        self.data_device_state.set_clipboard_focus(&self.dh, None);
+        primary_selection::set_primary_focus(&self.dh, &self.seat, None);
+        self.release_all_pressed_keys().log_and_ignore(loc!());
+        let seat = self.seat.clone();
+        compositor_utils::sync_keyboard_modifiers(
+            &seat,
+            self,
+            RawModifiers::default(),
+            0,
+            SERIAL_COUNTER.next_serial(),
+        );
+
+        if let Some(pointer) = self.seat.get_pointer() {
+            let time = self.start_time.elapsed().as_millis() as u32;
+            let pressed_buttons: HashSet<u32> = mem::take(&mut self.pressed_buttons);
+            for button in pressed_buttons {
+                pointer.button(
+                    self,
+                    &ButtonEvent {
+                        time,
+                        button,
+                        serial: SERIAL_COUNTER.next_serial(),
+                        state: ButtonState::Released,
+                    },
+                );
+            }
+            pointer.motion(
+                self,
+                None,
+                &MotionEvent {
+                    location: (0.0, 0.0).into(),
+                    serial: SERIAL_COUNTER.next_serial(),
+                    time,
+                },
+            );
+            pointer.frame(self);
+        } else {
+            self.pressed_buttons.clear();
+        }
     }
 
     #[instrument(skip_all, level = "debug")]
@@ -586,19 +649,36 @@ impl WprsServerState {
                 keycodes,
                 keysyms: _,
             } => {
-                // see linux/input-event-codes.h for keycodes
-                let modifier_keycodes = HashSet::from([
-                    /* KEY_LEFTCTRL */ 29, /* KEY_RIGHTCTRL */ 97,
-                    /* KEY_LEFTALT */ 56, /* KEY_RIGHTALT */ 100,
-                    /* KEY_LEFTMETA	*/ 125, /* KEY_RIGHTMETA */ 126,
-                    /* KEY_LEFTSHIFT */ 42, /* KEY_RIGHTSHIFT */ 54,
-                ]);
+                // Validate the target surface before mutating focus or pressed keys so
+                // stale/unknown `Enter` events never leak stuck keys into Smithay.
+                let (_, client, surface) = self
+                    .object_client_surface_from_id(&surface_id)
+                    .map_err(|err| match err {
+                        UnknownSurfaceErr::ObjectId(surface_id) => {
+                            anyhow!("Ignoring keyboard event for unknown object {surface_id:?}")
+                        },
+                        UnknownSurfaceErr::Client(object_id) => {
+                            anyhow!("Ignoring keyboard event for unknown client {object_id:?}")
+                        },
+                        UnknownSurfaceErr::Surface(client) => {
+                            anyhow!("Ignoring keyboard event for unknown surface {client:?}")
+                        },
+                    })
+                    .warn(loc!())?;
+
+                // Clear any stale focus and pressed keys (e.g. if a previous focused
+                // surface was destroyed without a host `Leave`) before simulating the
+                // entered surface's held keys while unfocused.
+                if keyboard.is_focused() {
+                    keyboard.set_focus(self, None, SERIAL_COUNTER.next_serial());
+                }
+                self.release_all_pressed_keys().location(loc!())?;
 
                 // We simulate keycodes before focusing since that is what a normal wayland application would see.
                 // Process modifier keys first so that they apply to other held keys.
                 let mut delayed_keycodes = Vec::new();
                 for keycode in keycodes {
-                    if modifier_keycodes.contains(&keycode) {
+                    if compositor_utils::is_modifier_keycode(keycode) {
                         self.set_key_state(
                             keycode,
                             KeyState::Pressed,
@@ -615,22 +695,6 @@ impl WprsServerState {
                 }
 
                 let serial = self.serial_map.insert(serial);
-
-                let (_, client, surface) = self
-                    .object_client_surface_from_id(&surface_id)
-                    .map_err(|err| match err {
-                        UnknownSurfaceErr::ObjectId(surface_id) => {
-                            anyhow!("Ignoring keyboard event for unknown object {surface_id:?}")
-                        },
-                        UnknownSurfaceErr::Client(object_id) => {
-                            anyhow!("Ignoring keyboard event for unknown client {object_id:?}")
-                        },
-                        UnknownSurfaceErr::Surface(client) => {
-                            anyhow!("Ignoring keyboard event for unknown surface {client:?}")
-                        },
-                    })
-                    .warn(loc!())?;
-
                 debug!("setting keyboard focus to surface {surface:?}");
                 keyboard.set_focus(self, Some(surface), serial);
                 self.data_device_state
@@ -642,11 +706,7 @@ impl WprsServerState {
                 keyboard.set_focus(self, None, serial);
                 self.data_device_state.set_clipboard_focus(&self.dh, None);
                 primary_selection::set_primary_focus(&self.dh, &self.seat, None);
-
-                for keycode in self.pressed_keys.clone() {
-                    self.set_key_state(keycode, KeyState::Released, SERIAL_COUNTER.next_serial())
-                        .location(loc!())?;
-                }
+                self.release_all_pressed_keys().location(loc!())?;
             },
             KeyboardEvent::Key(KeyInner {
                 serial,
@@ -665,48 +725,27 @@ impl WprsServerState {
                         i32::try_from(delay).location(loc!())?,
                     );
                 },
-                RepeatInfo::Disable => {},
+                RepeatInfo::Disable => {
+                    keyboard.change_repeat_info(0, 0);
+                },
             },
             KeyboardEvent::Keymap(keymap) => keyboard
                 .set_keymap_from_string(self, keymap)
                 .location(loc!())?,
             KeyboardEvent::Modifiers {
-                modifier_state,
+                serial,
+                raw_modifiers,
                 layout_index,
             } => {
-                keyboard.with_xkb_state(self, |mut context: XkbContext| {
-                    context.set_layout(Layout(layout_index));
-                });
-
-                // see linux/input-event-codes.h for keycodes
-                let mod_state = keyboard.modifier_state();
-                for (new_modifier, current_modifier, keycode) in [
-                    (
-                        modifier_state.caps_lock,
-                        mod_state.caps_lock,
-                        /* KEY_CAPSLOCK */ 58,
-                    ),
-                    (
-                        modifier_state.num_lock,
-                        mod_state.num_lock,
-                        /* KEY_NUMLOCK */ 69,
-                    ),
-                ] {
-                    if new_modifier != current_modifier {
-                        self.set_key_state(
-                            keycode,
-                            KeyState::Pressed,
-                            SERIAL_COUNTER.next_serial(),
-                        )
-                        .location(loc!())?;
-                        self.set_key_state(
-                            keycode,
-                            KeyState::Released,
-                            SERIAL_COUNTER.next_serial(),
-                        )
-                        .location(loc!())?;
-                    }
-                }
+                let serial = self.serial_map.insert(serial);
+                let seat = self.seat.clone();
+                compositor_utils::sync_keyboard_modifiers(
+                    &seat,
+                    self,
+                    raw_modifiers,
+                    layout_index,
+                    serial,
+                );
             },
         }
 
@@ -925,6 +964,7 @@ impl WprsServerState {
     #[instrument(skip_all, level = "debug")]
     fn handle_connect(&mut self) -> Result<()> {
         self.reset_dnd_state();
+        self.reset_input_state();
         let old_outputs: Vec<_> = self.outputs.drain().collect();
         // Clear all previous-session `output_ids` unconditionally (including IDs
         // recorded by `OutputsChanged` before `OutputEvent::New` arrived).
@@ -1246,14 +1286,727 @@ impl WprsServerState {
 #[cfg(test)]
 mod tests {
     use std::assert_matches;
+    use std::num::NonZeroU32;
     use std::os::unix::net::UnixStream;
+    use std::sync::Arc;
+    use std::sync::atomic::AtomicBool;
+    use std::sync::atomic::Ordering;
     use std::time::Duration;
 
+    use smithay::input::keyboard::xkb;
     use smithay::reexports::calloop::EventLoop;
     use smithay::reexports::wayland_server::Display;
+    use smithay_client_toolkit::reexports::client::Connection;
+    use smithay_client_toolkit::reexports::client::Dispatch as ClientDispatch;
+    use smithay_client_toolkit::reexports::client::EventQueue;
+    use smithay_client_toolkit::reexports::client::Proxy;
+    use smithay_client_toolkit::reexports::client::QueueHandle;
+    use smithay_client_toolkit::reexports::client::WEnum as ClientWEnum;
+    use smithay_client_toolkit::reexports::client::protocol::wl_callback::WlCallback;
+    use smithay_client_toolkit::reexports::client::protocol::wl_compositor::WlCompositor;
+    use smithay_client_toolkit::reexports::client::protocol::wl_keyboard;
+    use smithay_client_toolkit::reexports::client::protocol::wl_keyboard::WlKeyboard as ClientWlKeyboard;
+    use smithay_client_toolkit::reexports::client::protocol::wl_pointer;
+    use smithay_client_toolkit::reexports::client::protocol::wl_pointer::WlPointer as ClientWlPointer;
+    use smithay_client_toolkit::reexports::client::protocol::wl_registry;
+    use smithay_client_toolkit::reexports::client::protocol::wl_registry::WlRegistry;
+    use smithay_client_toolkit::reexports::client::protocol::wl_seat;
+    use smithay_client_toolkit::reexports::client::protocol::wl_seat::WlSeat as ClientWlSeat;
+    use smithay_client_toolkit::reexports::client::protocol::wl_surface::WlSurface as ClientWlSurface;
 
     use super::*;
     use crate::serialization::JpegSubsamp;
+    use crate::server::smithay_handlers::ClientState;
+
+    #[derive(Debug, Clone, Eq, PartialEq)]
+    enum KbdWireEvent {
+        Enter {
+            surface_id: u32,
+            keys: Vec<u32>,
+        },
+        Leave {
+            surface_id: u32,
+        },
+        Key {
+            key: u32,
+            pressed: bool,
+        },
+        Modifiers {
+            depressed: u32,
+            latched: u32,
+            locked: u32,
+            group: u32,
+        },
+        RepeatInfo {
+            rate: i32,
+            delay: i32,
+        },
+    }
+
+    #[derive(Default)]
+    struct TestWaylandApp {
+        compositor: Option<WlCompositor>,
+        seat: Option<ClientWlSeat>,
+        keyboard: Option<ClientWlKeyboard>,
+        pointer: Option<ClientWlPointer>,
+        kbd_events: Vec<KbdWireEvent>,
+        pointer_leaves: Vec<u32>,
+        pointer_button_releases: Vec<u32>,
+    }
+
+    impl ClientDispatch<WlRegistry, ()> for TestWaylandApp {
+        fn event(
+            state: &mut Self,
+            registry: &WlRegistry,
+            event: wl_registry::Event,
+            _data: &(),
+            _conn: &Connection,
+            qh: &QueueHandle<Self>,
+        ) {
+            if let wl_registry::Event::Global {
+                name,
+                interface,
+                version,
+            } = event
+            {
+                match interface.as_str() {
+                    "wl_compositor" => {
+                        state.compositor =
+                            Some(registry.bind::<WlCompositor, _, _>(name, version.min(6), qh, ()));
+                    },
+                    "wl_seat" => {
+                        state.seat =
+                            Some(registry.bind::<ClientWlSeat, _, _>(name, version.min(9), qh, ()));
+                    },
+                    _ => {},
+                }
+            }
+        }
+    }
+
+    impl ClientDispatch<WlCompositor, ()> for TestWaylandApp {
+        fn event(
+            _state: &mut Self,
+            _proxy: &WlCompositor,
+            _event: <WlCompositor as Proxy>::Event,
+            _data: &(),
+            _conn: &Connection,
+            _qh: &QueueHandle<Self>,
+        ) {
+        }
+    }
+
+    impl ClientDispatch<ClientWlSurface, ()> for TestWaylandApp {
+        fn event(
+            _state: &mut Self,
+            _proxy: &ClientWlSurface,
+            _event: <ClientWlSurface as Proxy>::Event,
+            _data: &(),
+            _conn: &Connection,
+            _qh: &QueueHandle<Self>,
+        ) {
+        }
+    }
+
+    impl ClientDispatch<ClientWlSeat, ()> for TestWaylandApp {
+        fn event(
+            state: &mut Self,
+            seat: &ClientWlSeat,
+            event: wl_seat::Event,
+            _data: &(),
+            _conn: &Connection,
+            qh: &QueueHandle<Self>,
+        ) {
+            if let wl_seat::Event::Capabilities {
+                capabilities: ClientWEnum::Value(caps),
+            } = event
+            {
+                if caps.contains(wl_seat::Capability::Keyboard) && state.keyboard.is_none() {
+                    state.keyboard = Some(seat.get_keyboard(qh, ()));
+                }
+                if caps.contains(wl_seat::Capability::Pointer) && state.pointer.is_none() {
+                    state.pointer = Some(seat.get_pointer(qh, ()));
+                }
+            }
+        }
+    }
+
+    impl ClientDispatch<ClientWlKeyboard, ()> for TestWaylandApp {
+        fn event(
+            state: &mut Self,
+            _kbd: &ClientWlKeyboard,
+            event: wl_keyboard::Event,
+            _data: &(),
+            _conn: &Connection,
+            _qh: &QueueHandle<Self>,
+        ) {
+            match event {
+                wl_keyboard::Event::Enter { surface, keys, .. } => {
+                    let keys = keys
+                        .as_chunks::<4>()
+                        .0
+                        .iter()
+                        .copied()
+                        .map(u32::from_ne_bytes)
+                        .collect();
+                    state.kbd_events.push(KbdWireEvent::Enter {
+                        surface_id: surface.id().protocol_id(),
+                        keys,
+                    });
+                },
+                wl_keyboard::Event::Leave { surface, .. } => {
+                    state.kbd_events.push(KbdWireEvent::Leave {
+                        surface_id: surface.id().protocol_id(),
+                    });
+                },
+                wl_keyboard::Event::Key {
+                    key,
+                    state: ClientWEnum::Value(key_state),
+                    ..
+                } => {
+                    let pressed = match key_state {
+                        wl_keyboard::KeyState::Pressed => true,
+                        wl_keyboard::KeyState::Released => false,
+                        _ => return,
+                    };
+                    state.kbd_events.push(KbdWireEvent::Key { key, pressed });
+                },
+                wl_keyboard::Event::Modifiers {
+                    mods_depressed,
+                    mods_latched,
+                    mods_locked,
+                    group,
+                    ..
+                } => {
+                    state.kbd_events.push(KbdWireEvent::Modifiers {
+                        depressed: mods_depressed,
+                        latched: mods_latched,
+                        locked: mods_locked,
+                        group,
+                    });
+                },
+                wl_keyboard::Event::RepeatInfo { rate, delay } => {
+                    state
+                        .kbd_events
+                        .push(KbdWireEvent::RepeatInfo { rate, delay });
+                },
+                _ => {},
+            }
+        }
+    }
+
+    impl ClientDispatch<ClientWlPointer, ()> for TestWaylandApp {
+        fn event(
+            state: &mut Self,
+            _ptr: &ClientWlPointer,
+            event: wl_pointer::Event,
+            _data: &(),
+            _conn: &Connection,
+            _qh: &QueueHandle<Self>,
+        ) {
+            match event {
+                wl_pointer::Event::Leave { surface, .. } => {
+                    state.pointer_leaves.push(surface.id().protocol_id());
+                },
+                wl_pointer::Event::Button {
+                    button,
+                    state: ClientWEnum::Value(wl_pointer::ButtonState::Released),
+                    ..
+                } => {
+                    state.pointer_button_releases.push(button);
+                },
+                _ => {},
+            }
+        }
+    }
+
+    impl ClientDispatch<WlCallback, Arc<AtomicBool>> for TestWaylandApp {
+        fn event(
+            _state: &mut Self,
+            _proxy: &WlCallback,
+            _event: <WlCallback as Proxy>::Event,
+            done: &Arc<AtomicBool>,
+            _conn: &Connection,
+            _qh: &QueueHandle<Self>,
+        ) {
+            done.store(true, Ordering::Release);
+        }
+    }
+
+    fn roundtrip_app(
+        display: &mut Display<WprsServerState>,
+        server: &mut WprsServerState,
+        conn: &Connection,
+        queue: &mut EventQueue<TestWaylandApp>,
+        app: &mut TestWaylandApp,
+    ) {
+        let done = Arc::new(AtomicBool::new(false));
+        let _cb = conn.display().sync(&queue.handle(), done.clone());
+        for _ in 0..32 {
+            conn.flush().unwrap();
+            display.dispatch_clients(server).unwrap();
+            display.flush_clients().unwrap();
+            if let Some(guard) = queue.prepare_read() {
+                _ = guard.read();
+            }
+            queue.dispatch_pending(app).unwrap();
+            if done.load(Ordering::Acquire) {
+                return;
+            }
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        panic!("roundtrip_app timed out");
+    }
+
+    fn server_surface_id(state: &WprsServerState, surface: &ClientWlSurface) -> WlSurfaceId {
+        let proto_id = surface.id().protocol_id();
+        state
+            .object_map
+            .iter()
+            .find_map(|(&wid, oid)| (oid.protocol_id() == proto_id).then_some(wid))
+            .expect("committed surface present in object_map")
+    }
+
+    #[test]
+    #[cfg_attr(miri, ignore)]
+    fn test_keyboard_reconnect_enter_modifiers_repeat_and_dedup_wire() {
+        let sock_path = std::env::temp_dir().join(format!(
+            "wprs_kbd_wire_test_{}_{}.sock",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let mut serializer: Serializer<Request, Event> =
+            Serializer::new_server(&sock_path).unwrap();
+        let reader = serializer.reader().unwrap();
+        let mut display: Display<WprsServerState> = Display::new().unwrap();
+        let event_loop: EventLoop<WprsServerState> = EventLoop::try_new().unwrap();
+        let mut state = WprsServerState::new(
+            display.handle(),
+            event_loop.handle(),
+            serializer,
+            false,
+            Duration::from_millis(16),
+            false,
+        );
+        state
+            .seat
+            .add_keyboard(Default::default(), 200, 200)
+            .unwrap();
+        state.seat.add_pointer();
+
+        // Connect a real Wayland app client to `wprsd`.
+        let (server_sock, client_sock) = UnixStream::pair().unwrap();
+        display
+            .handle()
+            .insert_client(
+                server_sock,
+                Arc::new(ClientState::new(state.serializer.writer())),
+            )
+            .unwrap();
+        let conn = Connection::from_socket(client_sock).unwrap();
+        let mut queue: EventQueue<TestWaylandApp> = conn.new_event_queue();
+        let qh = queue.handle();
+        let mut app = TestWaylandApp::default();
+        let _reg = conn.display().get_registry(&qh, ());
+        roundtrip_app(&mut display, &mut state, &conn, &mut queue, &mut app);
+        roundtrip_app(&mut display, &mut state, &conn, &mut queue, &mut app);
+        assert!(app.keyboard.is_some());
+        assert!(app.pointer.is_some());
+
+        let compositor = app.compositor.as_ref().unwrap();
+        let surf_a = compositor.create_surface(&qh, ());
+        surf_a.commit();
+        let surf_b = compositor.create_surface(&qh, ());
+        surf_b.commit();
+        roundtrip_app(&mut display, &mut state, &conn, &mut queue, &mut app);
+
+        let wid_a = server_surface_id(&state, &surf_a);
+        let wid_b = server_surface_id(&state, &surf_b);
+        let pid_a = surf_a.id().protocol_id();
+        let pid_b = surf_b.id().protocol_id();
+
+        // Activate `wprsc` session 1.
+        let wprsc1 = UnixStream::connect(&sock_path).unwrap();
+        let (conn1, msg1) = reader.recv().unwrap();
+        assert_matches!(msg1, RecvType::Connected);
+        state.handle_event(conn1, msg1);
+
+        // Compile a 2-layout keymap where evdev keycode 58 (CapsLock) is remapped
+        // to BackSpace so any synthetic keycode-58 injection would immediately show up.
+        let xkb_ctx = xkb::Context::new(xkb::CONTEXT_NO_FLAGS);
+        let keymap = xkb::Keymap::new_from_names(
+            &xkb_ctx,
+            "",
+            "",
+            "us,de",
+            "",
+            Some("caps:backspace".to_string()),
+            xkb::KEYMAP_COMPILE_NO_FLAGS,
+        )
+        .expect("compile us,de caps:backspace keymap");
+        let keymap_str = keymap.get_as_string(xkb::KEYMAP_FORMAT_TEXT_V1);
+        let caps_bit = 1u32 << keymap.mod_get_index(xkb::MOD_NAME_CAPS);
+        let num_bit = 1u32 << keymap.mod_get_index(xkb::MOD_NAME_NUM);
+        let ctrl_bit = 1u32 << keymap.mod_get_index(xkb::MOD_NAME_CTRL);
+        let alt_bit = 1u32 << keymap.mod_get_index(xkb::MOD_NAME_ALT);
+
+        state.handle_event(
+            conn1,
+            RecvType::Object(Event::KeyboardEvent(KeyboardEvent::Keymap(
+                keymap_str.clone(),
+            ))),
+        );
+        roundtrip_app(&mut display, &mut state, &conn, &mut queue, &mut app);
+        app.kbd_events.clear();
+
+        // 1. Unknown-surface Enter must NOT leak keys into `pressed_keys` or Smithay.
+        state.handle_event(
+            conn1,
+            RecvType::Object(Event::KeyboardEvent(KeyboardEvent::Enter {
+                serial: 1,
+                surface_id: WlSurfaceId(999_999),
+                keycodes: vec![59, 14],
+                keysyms: Vec::new(),
+            })),
+        );
+        assert!(state.pressed_keys.is_empty());
+        assert!(state.seat.get_keyboard().unwrap().pressed_keys().is_empty());
+
+        // 2. Enter surf_a, verify RepeatInfo::Repeat and RepeatInfo::Disable.
+        state.handle_event(
+            conn1,
+            RecvType::Object(Event::KeyboardEvent(KeyboardEvent::Enter {
+                serial: 2,
+                surface_id: wid_a,
+                keycodes: Vec::new(),
+                keysyms: Vec::new(),
+            })),
+        );
+        state.handle_event(
+            conn1,
+            RecvType::Object(Event::KeyboardEvent(KeyboardEvent::RepeatInfo(
+                RepeatInfo::Repeat {
+                    rate: NonZeroU32::new(25).unwrap(),
+                    delay: 400,
+                },
+            ))),
+        );
+        state.handle_event(
+            conn1,
+            RecvType::Object(Event::KeyboardEvent(KeyboardEvent::RepeatInfo(
+                RepeatInfo::Disable,
+            ))),
+        );
+        roundtrip_app(&mut display, &mut state, &conn, &mut queue, &mut app);
+        assert!(app.kbd_events.contains(&KbdWireEvent::RepeatInfo {
+            rate: 25,
+            delay: 400,
+        }));
+        assert!(
+            app.kbd_events
+                .contains(&KbdWireEvent::RepeatInfo { rate: 0, delay: 0 })
+        );
+        app.kbd_events.clear();
+
+        // 3. Modifiers sync updates depressed/locked + layout 1 with ZERO fake
+        //    KEY_CAPSLOCK (58) / KEY_NUMLOCK (69) keypresses.
+        state.handle_event(
+            conn1,
+            RecvType::Object(Event::KeyboardEvent(KeyboardEvent::Modifiers {
+                serial: 3,
+                raw_modifiers: RawModifiers {
+                    depressed: ctrl_bit | alt_bit,
+                    latched: 0,
+                    locked: caps_bit | num_bit,
+                },
+                layout_index: 1,
+            })),
+        );
+        roundtrip_app(&mut display, &mut state, &conn, &mut queue, &mut app);
+        assert!(
+            !app.kbd_events
+                .iter()
+                .any(|e| matches!(e, KbdWireEvent::Key { .. })),
+            "Modifiers sync must never emit synthetic key events: {:?}",
+            app.kbd_events
+        );
+        assert_eq!(
+            app.kbd_events.last(),
+            Some(&KbdWireEvent::Modifiers {
+                depressed: ctrl_bit | alt_bit,
+                latched: 0,
+                locked: caps_bit | num_bit,
+                group: 1,
+            })
+        );
+        app.kbd_events.clear();
+
+        // Clearing back to layout 0 and zero modifiers notifies focused client cleanly.
+        state.handle_event(
+            conn1,
+            RecvType::Object(Event::KeyboardEvent(KeyboardEvent::Modifiers {
+                serial: 4,
+                raw_modifiers: RawModifiers::default(),
+                layout_index: 0,
+            })),
+        );
+        roundtrip_app(&mut display, &mut state, &conn, &mut queue, &mut app);
+        assert!(
+            !app.kbd_events
+                .iter()
+                .any(|e| matches!(e, KbdWireEvent::Key { .. }))
+        );
+        assert_eq!(
+            app.kbd_events.last(),
+            Some(&KbdWireEvent::Modifiers {
+                depressed: 0,
+                latched: 0,
+                locked: 0,
+                group: 0,
+            })
+        );
+        app.kbd_events.clear();
+
+        // 4. Duplicate Pressed/Released deduplication + Repeated handling for Backspace (14).
+        for (serial, key_state) in [
+            (5, KeyState::Pressed),
+            (6, KeyState::Pressed),
+            (7, KeyState::Repeated),
+            (8, KeyState::Released),
+            (9, KeyState::Released),
+        ] {
+            state.handle_event(
+                conn1,
+                RecvType::Object(Event::KeyboardEvent(KeyboardEvent::Key(KeyInner {
+                    serial,
+                    raw_code: 14,
+                    state: key_state,
+                }))),
+            );
+        }
+        roundtrip_app(&mut display, &mut state, &conn, &mut queue, &mut app);
+        let key_events: Vec<_> = app
+            .kbd_events
+            .iter()
+            .filter(|e| matches!(e, KbdWireEvent::Key { .. }))
+            .cloned()
+            .collect();
+        assert_eq!(
+            key_events,
+            vec![
+                KbdWireEvent::Key {
+                    key: 14,
+                    pressed: true,
+                },
+                KbdWireEvent::Key {
+                    key: 14,
+                    pressed: false,
+                },
+                KbdWireEvent::Key {
+                    key: 14,
+                    pressed: true,
+                },
+                KbdWireEvent::Key {
+                    key: 14,
+                    pressed: false,
+                },
+            ]
+        );
+        assert!(state.pressed_keys.is_empty());
+        app.kbd_events.clear();
+
+        // 5. Enter surf_b while surf_a is still focused (missed Leave) with key 59 held:
+        //    surf_a must receive Leave (NOT a spurious Key(14, Pressed)), and surf_b
+        //    must receive Enter with ONLY `[14]`, not stale `59`.
+        state.handle_event(
+            conn1,
+            RecvType::Object(Event::KeyboardEvent(KeyboardEvent::Key(KeyInner {
+                serial: 10,
+                raw_code: 59, // KEY_F1
+                state: KeyState::Pressed,
+            }))),
+        );
+        roundtrip_app(&mut display, &mut state, &conn, &mut queue, &mut app);
+        app.kbd_events.clear();
+
+        state.handle_event(
+            conn1,
+            RecvType::Object(Event::KeyboardEvent(KeyboardEvent::Enter {
+                serial: 11,
+                surface_id: wid_b,
+                keycodes: vec![14],
+                keysyms: Vec::new(),
+            })),
+        );
+        roundtrip_app(&mut display, &mut state, &conn, &mut queue, &mut app);
+        assert!(
+            !app.kbd_events
+                .iter()
+                .any(|e| matches!(e, KbdWireEvent::Key { .. })),
+            "switching focus via Enter must not emit Key events to the old surface: {:?}",
+            app.kbd_events
+        );
+        assert!(
+            app.kbd_events
+                .contains(&KbdWireEvent::Leave { surface_id: pid_a })
+        );
+        assert!(app.kbd_events.contains(&KbdWireEvent::Enter {
+            surface_id: pid_b,
+            keys: vec![14],
+        }));
+        app.kbd_events.clear();
+
+        // 6. Disconnect while surf_b is focused with F1 (59), Backspace (14),
+        //    LeftShift (42), CapsLock + layout 1, and a pointer button pressed;
+        //    reconnecting `wprsc2` must reset all input state and allow clean
+        //    re-entry onto the SAME surf_b with working F1 & Backspace.
+        state.handle_event(
+            conn1,
+            RecvType::Object(Event::KeyboardEvent(KeyboardEvent::Key(KeyInner {
+                serial: 12,
+                raw_code: 59,
+                state: KeyState::Pressed,
+            }))),
+        );
+        state.handle_event(
+            conn1,
+            RecvType::Object(Event::KeyboardEvent(KeyboardEvent::Key(KeyInner {
+                serial: 13,
+                raw_code: 42,
+                state: KeyState::Pressed,
+            }))),
+        );
+        state.handle_event(
+            conn1,
+            RecvType::Object(Event::KeyboardEvent(KeyboardEvent::Modifiers {
+                serial: 14,
+                raw_modifiers: RawModifiers {
+                    depressed: 0,
+                    latched: 0,
+                    locked: caps_bit,
+                },
+                layout_index: 1,
+            })),
+        );
+        state.handle_event(
+            conn1,
+            RecvType::Object(Event::PointerFrame(vec![
+                PointerEvent {
+                    surface_id: wid_b,
+                    position: (10.0, 20.0).into(),
+                    kind: PointerEventKind::Enter { serial: 15 },
+                },
+                PointerEvent {
+                    surface_id: wid_b,
+                    position: (10.0, 20.0).into(),
+                    kind: PointerEventKind::Press {
+                        button: 0x110,
+                        serial: 16,
+                    },
+                },
+            ])),
+        );
+        roundtrip_app(&mut display, &mut state, &conn, &mut queue, &mut app);
+        app.kbd_events.clear();
+        app.pointer_leaves.clear();
+        app.pointer_button_releases.clear();
+
+        // Sudden disconnect (no Leave / Release) + reconnect.
+        drop(wprsc1);
+        let wprsc2 = UnixStream::connect(&sock_path).unwrap();
+        let (conn2, msg2) = reader.recv().unwrap();
+        assert_matches!(msg2, RecvType::Connected);
+        state.handle_event(conn2, msg2);
+        roundtrip_app(&mut display, &mut state, &conn, &mut queue, &mut app);
+
+        assert!(
+            app.kbd_events
+                .contains(&KbdWireEvent::Leave { surface_id: pid_b }),
+            "reconnect must leave previously focused keyboard surface: {:?}",
+            app.kbd_events
+        );
+        assert_eq!(app.pointer_button_releases, vec![0x110]);
+        assert_eq!(app.pointer_leaves, vec![pid_b]);
+        assert!(state.pressed_keys.is_empty());
+        assert!(state.pressed_buttons.is_empty());
+        let kbd = state.seat.get_keyboard().unwrap();
+        assert!(kbd.pressed_keys().is_empty());
+        assert!(kbd.current_focus().is_none());
+        assert_eq!(kbd.modifier_state().serialized.depressed, 0);
+        assert_eq!(kbd.modifier_state().serialized.locked, 0);
+        assert_eq!(kbd.modifier_state().serialized.layout_effective, 0);
+        app.kbd_events.clear();
+
+        // New session sends Keymap + Enter on the SAME surf_b -> must deliver fresh
+        // Enter with empty keys and exact F1 (59) & Backspace (14) keycodes.
+        state.handle_event(
+            conn2,
+            RecvType::Object(Event::KeyboardEvent(KeyboardEvent::Keymap(keymap_str))),
+        );
+        state.handle_event(
+            conn2,
+            RecvType::Object(Event::KeyboardEvent(KeyboardEvent::Enter {
+                serial: 20,
+                surface_id: wid_b,
+                keycodes: Vec::new(),
+                keysyms: Vec::new(),
+            })),
+        );
+        for (serial, code, key_state) in [
+            (21, 59, KeyState::Pressed),
+            (22, 59, KeyState::Released),
+            (23, 14, KeyState::Pressed),
+            (24, 14, KeyState::Released),
+        ] {
+            state.handle_event(
+                conn2,
+                RecvType::Object(Event::KeyboardEvent(KeyboardEvent::Key(KeyInner {
+                    serial,
+                    raw_code: code,
+                    state: key_state,
+                }))),
+            );
+        }
+        roundtrip_app(&mut display, &mut state, &conn, &mut queue, &mut app);
+
+        assert!(app.kbd_events.contains(&KbdWireEvent::Enter {
+            surface_id: pid_b,
+            keys: Vec::new(),
+        }));
+        let post_reconnect_keys: Vec<_> = app
+            .kbd_events
+            .iter()
+            .filter(|e| matches!(e, KbdWireEvent::Key { .. }))
+            .cloned()
+            .collect();
+        assert_eq!(
+            post_reconnect_keys,
+            vec![
+                KbdWireEvent::Key {
+                    key: 59,
+                    pressed: true,
+                },
+                KbdWireEvent::Key {
+                    key: 59,
+                    pressed: false,
+                },
+                KbdWireEvent::Key {
+                    key: 14,
+                    pressed: true,
+                },
+                KbdWireEvent::Key {
+                    key: 14,
+                    pressed: false,
+                },
+            ]
+        );
+
+        drop(wprsc2);
+        _ = std::fs::remove_file(&sock_path);
+    }
 
     #[test]
     #[cfg_attr(miri, ignore)]

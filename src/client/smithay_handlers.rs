@@ -595,25 +595,23 @@ impl KeyboardHandler for WprsClientState {
             )));
     }
 
-    #[instrument(
-        skip(self, _conn, _qh, _keyboard, _serial, _raw_modifiers),
-        level = "debug"
-    )]
+    #[instrument(skip(self, _conn, _qh, _keyboard, _modifiers), level = "debug")]
     fn update_modifiers(
         &mut self,
         _conn: &Connection,
         _qh: &QueueHandle<Self>,
         _keyboard: &WlKeyboard,
-        _serial: u32,
-        modifiers: Modifiers,
-        _raw_modifiers: RawModifiers,
+        serial: u32,
+        _modifiers: Modifiers,
+        raw_modifiers: RawModifiers,
         variant: u32,
     ) {
         self.serializer
             .writer()
             .send(SendType::Object(Event::KeyboardEvent(
                 KeyboardEvent::Modifiers {
-                    modifier_state: modifiers.into(),
+                    serial,
+                    raw_modifiers: raw_modifiers.into(),
                     layout_index: variant,
                 },
             )));

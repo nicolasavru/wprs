@@ -12,14 +12,11 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use std::collections::HashSet;
 use std::num::NonZeroU32;
 use std::sync::Arc;
 
 use enum_as_inner::EnumAsInner;
 use smithay::backend::input::ButtonState;
-use smithay::input::keyboard::Layout;
-use smithay::input::keyboard::XkbContext;
 use smithay::input::pointer::ButtonEvent;
 use smithay::input::pointer::MotionEvent;
 use smithay::input::pointer::PointerTarget;
@@ -815,13 +812,6 @@ impl KeyboardHandler for WprsState {
         raw: &[u32],
         _keysyms: &[Keysym],
     ) {
-        // see linux/input-event-codes.h for keycodes
-        let modifier_keycodes = HashSet::from([
-            /* KEY_LEFTCTRL */ 29, /* KEY_RIGHTCTRL */ 97, /* KEY_LEFTALT */ 56,
-            /* KEY_RIGHTALT */ 100, /* KEY_LEFTMETA	*/ 125, /* KEY_RIGHTMETA */ 126,
-            /* KEY_LEFTSHIFT */ 42, /* KEY_RIGHTSHIFT */ 54,
-        ]);
-
         let keyboard = log_and_return!(
             self.compositor_state
                 .seat
@@ -829,13 +819,34 @@ impl KeyboardHandler for WprsState {
                 .ok_or("seat has no keyboard")
         );
 
+        let Some(compositor_surface_id) = self.surface_bimap.get_by_right(&surface.id()).cloned()
+        else {
+            // surface was already destroyed
+            return;
+        };
+        let Some(xwayland_surface) = self.surfaces.get(&compositor_surface_id) else {
+            return;
+        };
+        let x11_surface = log_and_return!(xwayland_surface.get_x11_surface()).clone();
+        let Some(client) = x11_surface.wl_surface().and_then(|s| s.client()) else {
+            return;
+        };
+        self.client_state.last_keyboard_surface = Some(compositor_surface_id);
+
+        // Clear any stale focus and pressed keys before simulating held keys for
+        // the newly entered surface while unfocused.
+        if keyboard.is_focused() {
+            keyboard.set_focus(self, None, SERIAL_COUNTER.next_serial());
+        }
+        log_and_return!(self.release_all_pressed_keys());
+
         // We simulate keycodes before focusing since that is what a normal wayland application would see.
         // Process modifier keys first so that they apply to other held keys.
         let mut delayed_keycodes = Vec::new();
-        for keycode in raw {
-            if modifier_keycodes.contains(keycode) {
+        for &keycode in raw {
+            if compositor_utils::is_modifier_keycode(keycode) {
                 log_and_return!(self.set_key_state(
-                    *keycode,
+                    keycode,
                     KeyState::Pressed,
                     SERIAL_COUNTER.next_serial(),
                 ));
@@ -845,34 +856,24 @@ impl KeyboardHandler for WprsState {
         }
         for keycode in delayed_keycodes {
             log_and_return!(self.set_key_state(
-                *keycode,
+                keycode,
                 KeyState::Pressed,
                 SERIAL_COUNTER.next_serial()
             ));
         }
-        let Some(compositor_surface_id) = self.surface_bimap.get_by_right(&surface.id()).cloned()
-        else {
-            // surface was already destroyed
-            return;
-        };
-        self.client_state.last_keyboard_surface = Some(compositor_surface_id.clone());
-        let Some(xwayland_surface) = self.surfaces.get(&compositor_surface_id) else {
-            return;
-        };
-        let x11_surface = log_and_return!(xwayland_surface.get_x11_surface()).clone();
-        let client = x11_surface.wl_surface().unwrap().client();
+
         x11_surface.set_activated(true).unwrap();
         let serial = self.compositor_state.serial_map.insert(serial);
         keyboard.set_focus(self, Some(x11_surface), serial);
         data_device::set_data_device_focus(
             &self.compositor_state.dh,
             &self.compositor_state.seat,
-            client.clone(),
+            Some(client.clone()),
         );
         primary_selection::set_primary_focus(
             &self.compositor_state.dh,
             &self.compositor_state.seat,
-            client,
+            Some(client),
         );
     }
 
@@ -884,14 +885,12 @@ impl KeyboardHandler for WprsState {
         surface: &WlSurface,
         serial: u32,
     ) {
-        let Some(xwayland_surface) =
+        if let Some(xwayland_surface) =
             xsurface_from_client_surface(&self.surface_bimap, &mut self.surfaces, surface)
-        else {
-            // surface was already destroyed
-            return;
-        };
-        let x11_surface = log_and_return!(xwayland_surface.get_x11_surface()).clone();
-        x11_surface.set_activated(false).unwrap();
+            && let Ok(x11_surface) = xwayland_surface.get_x11_surface()
+        {
+            x11_surface.set_activated(false).log_and_ignore(loc!());
+        }
         let keyboard = log_and_return!(
             self.compositor_state
                 .seat
@@ -911,10 +910,7 @@ impl KeyboardHandler for WprsState {
             &self.compositor_state.seat,
             None,
         );
-
-        for keycode in self.compositor_state.pressed_keys.clone() {
-            log_and_return!(self.set_key_state(keycode, KeyState::Released, serial));
-        }
+        log_and_return!(self.release_all_pressed_keys());
     }
 
     // INTENTIONALLY NOT LOGGING KEY EVENTS
@@ -1040,48 +1036,20 @@ impl KeyboardHandler for WprsState {
         _conn: &Connection,
         _qh: &QueueHandle<Self>,
         _keyboard: &WlKeyboard,
-        _serial: u32,
-        modifiers: Modifiers,
-        _raw_modifiers: RawModifiers,
+        serial: u32,
+        _modifiers: Modifiers,
+        raw_modifiers: RawModifiers,
         variant: u32,
     ) {
-        let keyboard = log_and_return!(
-            self.compositor_state
-                .seat
-                .get_keyboard()
-                .ok_or("seat has no keyboard")
+        let serial = self.compositor_state.serial_map.insert(serial);
+        let seat = self.compositor_state.seat.clone();
+        compositor_utils::sync_keyboard_modifiers(
+            &seat,
+            self,
+            raw_modifiers.into(),
+            variant,
+            serial,
         );
-        keyboard.with_xkb_state(self, |mut context: XkbContext| {
-            context.set_layout(Layout(variant));
-        });
-
-        // see linux/input-event-codes.h for keycodes
-        let mod_state = keyboard.modifier_state();
-        for (new_modifier, current_modifier, keycode) in [
-            (
-                modifiers.caps_lock,
-                mod_state.caps_lock,
-                /* KEY_CAPSLOCK */ 58,
-            ),
-            (
-                modifiers.num_lock,
-                mod_state.num_lock,
-                /* KEY_NUMLOCK */ 69,
-            ),
-        ] {
-            if new_modifier != current_modifier {
-                log_and_return!(self.set_key_state(
-                    keycode,
-                    KeyState::Pressed,
-                    SERIAL_COUNTER.next_serial(),
-                ));
-                log_and_return!(self.set_key_state(
-                    keycode,
-                    KeyState::Released,
-                    SERIAL_COUNTER.next_serial(),
-                ));
-            }
-        }
     }
 }
 

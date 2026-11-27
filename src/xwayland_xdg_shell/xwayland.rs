@@ -95,6 +95,7 @@ impl XwmHandler for WprsState {
         {
             let serial = SERIAL_COUNTER.next_serial();
             keyboard.set_focus(self, None, serial);
+            self.release_all_pressed_keys().log_and_ignore(loc!());
         }
 
         if !window.is_override_redirect() && window.alive() {

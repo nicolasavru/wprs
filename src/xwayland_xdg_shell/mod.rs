@@ -30,6 +30,7 @@ use smithay::reexports::wayland_server::Resource;
 use smithay::reexports::wayland_server::backend::ObjectId as CompositorObjectId;
 use smithay::reexports::wayland_server::protocol::wl_surface::WlSurface as CompositorWlSurface;
 use smithay::utils::Rectangle;
+use smithay::utils::SERIAL_COUNTER;
 use smithay::utils::Serial;
 use smithay::xwayland::X11Surface;
 use smithay::xwayland::xwm::WmWindowType;
@@ -509,10 +510,51 @@ impl WprsState {
 
         // our keycode is getting offset by 8 for reasons
         // see https://github.com/Smithay/smithay/pull/1536
-        let x11_keycode = (keycode + 8).into();
+        let x11_keycode = keycode
+            .checked_add(8)
+            .context(loc!(), "keycode overflow")?
+            .into();
         let time = self.compositor_state.start_time.elapsed().as_millis() as u32;
         match state {
             KeyState::Pressed => {
+                if !self.compositor_state.pressed_keys.insert(keycode) {
+                    return Ok(());
+                }
+                keyboard.input::<(), _>(
+                    self,
+                    x11_keycode,
+                    SmithayKeyState::Pressed,
+                    serial,
+                    time,
+                    filter,
+                );
+            },
+            KeyState::Released => {
+                if !self.compositor_state.pressed_keys.remove(&keycode) {
+                    return Ok(());
+                }
+                keyboard.input::<(), _>(
+                    self,
+                    x11_keycode,
+                    SmithayKeyState::Released,
+                    serial,
+                    time,
+                    filter,
+                );
+            },
+            KeyState::Repeated => {
+                // Map repeated to released + pressed
+                // Smithay 0.7 keystates don't support repetition
+                if self.compositor_state.pressed_keys.contains(&keycode) {
+                    keyboard.input::<(), _>(
+                        self,
+                        x11_keycode,
+                        SmithayKeyState::Released,
+                        serial,
+                        time,
+                        filter,
+                    );
+                }
                 keyboard.input::<(), _>(
                     self,
                     x11_keycode,
@@ -523,39 +565,17 @@ impl WprsState {
                 );
                 self.compositor_state.pressed_keys.insert(keycode);
             },
-            KeyState::Released => {
-                keyboard.input::<(), _>(
-                    self,
-                    x11_keycode,
-                    SmithayKeyState::Released,
-                    serial,
-                    time,
-                    filter,
-                );
-                self.compositor_state.pressed_keys.remove(&keycode);
-            },
-            KeyState::Repeated => {
-                // Map repeated to released + pressed
-                // Smithay 0.7 keystates don't support repetition
-                keyboard.input::<(), _>(
-                    self,
-                    x11_keycode,
-                    SmithayKeyState::Released,
-                    serial,
-                    time,
-                    filter,
-                );
-                keyboard.input::<(), _>(
-                    self,
-                    x11_keycode,
-                    SmithayKeyState::Pressed,
-                    serial,
-                    time,
-                    filter,
-                );
-            },
         }
 
+        Ok(())
+    }
+
+    pub(crate) fn release_all_pressed_keys(&mut self) -> Result<()> {
+        let pressed: Vec<u32> = self.compositor_state.pressed_keys.iter().copied().collect();
+        for keycode in pressed {
+            self.set_key_state(keycode, KeyState::Released, SERIAL_COUNTER.next_serial())
+                .location(loc!())?;
+        }
         Ok(())
     }
 
