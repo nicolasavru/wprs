@@ -144,7 +144,7 @@ pub struct XdgToplevelState {
 pub struct XdgPopupState {
     pub parent_surface_id: WlSurfaceId,
     pub positioner: XdgPositioner,
-    pub grab_requested: bool,
+    pub grab_serial: Option<u32>,
     pub reposition_token: Option<u32>,
 }
 
@@ -153,7 +153,7 @@ impl XdgPopupState {
         Ok(Self {
             parent_surface_id: WlSurfaceId::new(&popup.get_parent_surface().location(loc!())?),
             positioner: XdgPositioner::new(positioner),
-            grab_requested: false,
+            grab_serial: None,
             reposition_token: None,
         })
     }

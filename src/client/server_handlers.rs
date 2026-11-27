@@ -147,6 +147,9 @@ impl WprsClientState {
             remote_surface.frame_callback_completed
         };
 
+        let primary_seat = matches!(surface_state.role, Some(wayland::Role::XdgPopup(_)))
+            .then(|| self.primary_seat())
+            .flatten();
         let client = self.remote_display.client(&client_id);
         let surfaces = &mut client.surfaces;
 
@@ -190,6 +193,7 @@ impl WprsClientState {
                 surface_id,
                 surfaces,
                 &self.xdg_shell_state,
+                primary_seat.as_ref(),
                 &self.qh,
             )
             .location(loc!())?,
@@ -749,6 +753,7 @@ impl WprsClientState {
 
 #[cfg(test)]
 mod tests {
+    use std::collections::HashMap;
     use std::io::Read;
     use std::os::fd::AsFd;
     use std::os::unix::net::UnixStream;
@@ -760,7 +765,12 @@ mod tests {
     use crossbeam_channel::Receiver;
     use nix::fcntl::OFlag;
     use nix::unistd;
+    use smithay::reexports::wayland_protocols::xdg::shell::server::xdg_popup as server_xdg_popup;
+    use smithay::reexports::wayland_protocols::xdg::shell::server::xdg_popup::XdgPopup as ServerXdgPopup;
+    use smithay::reexports::wayland_protocols::xdg::shell::server::xdg_positioner::XdgPositioner as ServerXdgPositioner;
+    use smithay::reexports::wayland_protocols::xdg::shell::server::xdg_surface as server_xdg_surface;
     use smithay::reexports::wayland_protocols::xdg::shell::server::xdg_surface::XdgSurface as ServerXdgSurface;
+    use smithay::reexports::wayland_protocols::xdg::shell::server::xdg_toplevel::XdgToplevel as ServerXdgToplevel;
     use smithay::reexports::wayland_protocols::xdg::shell::server::xdg_wm_base;
     use smithay::reexports::wayland_protocols::xdg::shell::server::xdg_wm_base::XdgWmBase as ServerXdgWmBase;
     use smithay::reexports::wayland_server::Client as ServerClient;
@@ -799,6 +809,7 @@ mod tests {
     use smithay::reexports::wayland_server::protocol::wl_subcompositor;
     use smithay::reexports::wayland_server::protocol::wl_subcompositor::WlSubcompositor as ServerWlSubcompositor;
     use smithay::reexports::wayland_server::protocol::wl_subsurface::WlSubsurface as ServerWlSubsurface;
+    use smithay::reexports::wayland_server::protocol::wl_surface as server_surface;
     use smithay::reexports::wayland_server::protocol::wl_surface::WlSurface as ServerWlSurface;
     use smithay_client_toolkit::reexports::client::Connection;
     use smithay_client_toolkit::reexports::client::EventQueue;
@@ -848,15 +859,23 @@ mod tests {
         OfferDestroy,
     }
 
+    #[derive(Debug, Eq, PartialEq)]
+    enum HostXdgReq {
+        SurfaceCommit { surface_id: u32 },
+        PopupGrab { surface_id: u32, serial: u32 },
+    }
+
     #[derive(Default)]
     struct MockHostState {
         client: Option<ServerClient>,
         pointer: Option<ServerWlPointer>,
         data_device: Option<ServerWlDataDevice>,
         surfaces: Vec<ServerWlSurface>,
+        xdg_popups: HashMap<u32, ServerXdgPopup>,
         last_source: Option<ServerWlDataSource>,
         receive_fds: Vec<(String, OwnedFd)>,
         reqs: Vec<HostRecordedReq>,
+        xdg_reqs: Vec<HostXdgReq>,
     }
 
     impl GlobalDispatch<ServerWlShm, ()> for MockHostState {
@@ -957,14 +976,19 @@ mod tests {
 
     impl ServerDispatch<ServerWlSurface, ()> for MockHostState {
         fn request(
-            _state: &mut Self,
+            state: &mut Self,
             _client: &ServerClient,
-            _resource: &ServerWlSurface,
-            _request: <ServerWlSurface as Resource>::Request,
+            resource: &ServerWlSurface,
+            request: server_surface::Request,
             _data: &(),
             _dh: &DisplayHandle,
             _data_init: &mut DataInit<'_, Self>,
         ) {
+            if matches!(request, server_surface::Request::Commit) {
+                state.xdg_reqs.push(HostXdgReq::SurfaceCommit {
+                    surface_id: resource.id().protocol_id(),
+                });
+            }
         }
     }
 
@@ -1046,22 +1070,82 @@ mod tests {
             _dh: &DisplayHandle,
             data_init: &mut DataInit<'_, Self>,
         ) {
-            if let xdg_wm_base::Request::GetXdgSurface { id, .. } = request {
-                data_init.init(id, ());
+            match request {
+                xdg_wm_base::Request::CreatePositioner { id } => {
+                    data_init.init(id, ());
+                },
+                xdg_wm_base::Request::GetXdgSurface { id, surface } => {
+                    data_init.init(id, surface.id().protocol_id());
+                },
+                _ => {},
             }
         }
     }
 
-    impl ServerDispatch<ServerXdgSurface, ()> for MockHostState {
+    impl ServerDispatch<ServerXdgPositioner, ()> for MockHostState {
         fn request(
             _state: &mut Self,
             _client: &ServerClient,
-            _resource: &ServerXdgSurface,
-            _request: <ServerXdgSurface as Resource>::Request,
+            _resource: &ServerXdgPositioner,
+            _request: <ServerXdgPositioner as Resource>::Request,
             _data: &(),
             _dh: &DisplayHandle,
             _data_init: &mut DataInit<'_, Self>,
         ) {
+        }
+    }
+
+    impl ServerDispatch<ServerXdgSurface, u32> for MockHostState {
+        fn request(
+            state: &mut Self,
+            _client: &ServerClient,
+            _resource: &ServerXdgSurface,
+            request: server_xdg_surface::Request,
+            &surface_id: &u32,
+            _dh: &DisplayHandle,
+            data_init: &mut DataInit<'_, Self>,
+        ) {
+            match request {
+                server_xdg_surface::Request::GetToplevel { id } => {
+                    data_init.init(id, surface_id);
+                },
+                server_xdg_surface::Request::GetPopup { id, .. } => {
+                    let popup = data_init.init(id, surface_id);
+                    state.xdg_popups.insert(surface_id, popup);
+                },
+                _ => {},
+            }
+        }
+    }
+
+    impl ServerDispatch<ServerXdgToplevel, u32> for MockHostState {
+        fn request(
+            _state: &mut Self,
+            _client: &ServerClient,
+            _resource: &ServerXdgToplevel,
+            _request: <ServerXdgToplevel as Resource>::Request,
+            _data: &u32,
+            _dh: &DisplayHandle,
+            _data_init: &mut DataInit<'_, Self>,
+        ) {
+        }
+    }
+
+    impl ServerDispatch<ServerXdgPopup, u32> for MockHostState {
+        fn request(
+            state: &mut Self,
+            _client: &ServerClient,
+            _resource: &ServerXdgPopup,
+            request: server_xdg_popup::Request,
+            &surface_id: &u32,
+            _dh: &DisplayHandle,
+            _data_init: &mut DataInit<'_, Self>,
+        ) {
+            if let server_xdg_popup::Request::Grab { serial, .. } = request {
+                state
+                    .xdg_reqs
+                    .push(HostXdgReq::PopupGrab { surface_id, serial });
+            }
         }
     }
 
@@ -1255,7 +1339,7 @@ mod tests {
             dh.create_global::<MockHostState, ServerWlShm, _>(1, ());
             dh.create_global::<MockHostState, ServerWlCompositor, _>(4, ());
             dh.create_global::<MockHostState, ServerWlSubcompositor, _>(1, ());
-            dh.create_global::<MockHostState, ServerXdgWmBase, _>(2, ());
+            dh.create_global::<MockHostState, ServerXdgWmBase, _>(5, ());
             dh.create_global::<MockHostState, ServerWlDataDeviceManager, _>(3, ());
             dh.create_global::<MockHostState, ServerWlSeat, _>(7, ());
 
@@ -1755,5 +1839,154 @@ mod tests {
         let mut received = Vec::new();
         File::from(r_fd).read_to_end(&mut received).unwrap();
         assert_eq!(received, b"remote-src-bytes");
+    }
+
+    fn make_client_surface_state(
+        client: ClientId,
+        id: WlSurfaceId,
+        role: Option<wayland::Role>,
+    ) -> SurfaceState {
+        SurfaceState {
+            client,
+            id,
+            buffer: None,
+            role,
+            buffer_scale: 1,
+            buffer_transform: None,
+            opaque_region: None,
+            input_region: None,
+            z_ordered_children: vec![wayland::SubsurfacePosition {
+                id,
+                position: (0, 0).into(),
+            }],
+            damage: None,
+            output_ids: Vec::new(),
+            viewport_state: None,
+            xdg_surface_state: None,
+        }
+    }
+
+    #[test]
+    #[cfg_attr(miri, ignore)]
+    fn test_wprsc_popup_grab_ordering_skip_without_serial_and_done_wire() {
+        let mut h = ClientDndHarness::new();
+        let client_id = ClientId(1);
+        let parent_id = WlSurfaceId(100);
+        let popup_grab_id = WlSurfaceId(101);
+        let popup_nograb_id = WlSurfaceId(102);
+
+        // Create parent toplevel first.
+        h.client
+            .handle_request(RecvType::Object(Request::Surface(SurfaceRequest {
+                client: client_id,
+                surface: parent_id,
+                payload: SurfaceRequestPayload::Commit(make_client_surface_state(
+                    client_id,
+                    parent_id,
+                    Some(wayland::Role::XdgToplevel(Default::default())),
+                )),
+            })));
+        h.sync();
+        h.host.xdg_reqs.clear();
+        h.drain_events();
+
+        let positioner = xdg_shell::XdgPositioner {
+            width: 120,
+            height: 80,
+            anchor_rect: crate::serialization::geometry::Rectangle::new(10, 10, 1, 1),
+            anchor_edges: 5, // TopLeft
+            gravity: 8,      // BottomRight
+            constraint_adjustment: 0,
+            offset: (0, 0).into(),
+            reactive: false,
+            parent_size: None,
+            parent_configure: None,
+        };
+
+        // 1. Popup with `grab_serial: Some(4242)` must issue `xdg_popup.grab`
+        //    BEFORE its initial `wl_surface.commit()`.
+        h.client
+            .handle_request(RecvType::Object(Request::Surface(SurfaceRequest {
+                client: client_id,
+                surface: popup_grab_id,
+                payload: SurfaceRequestPayload::Commit(make_client_surface_state(
+                    client_id,
+                    popup_grab_id,
+                    Some(wayland::Role::XdgPopup(xdg_shell::XdgPopupState {
+                        parent_surface_id: parent_id,
+                        positioner,
+                        grab_serial: Some(4242),
+                        reposition_token: None,
+                    })),
+                )),
+            })));
+        h.sync();
+
+        let grab_proto_id = h
+            .client
+            .remote_display
+            .client(&client_id)
+            .surfaces
+            .get(&popup_grab_id)
+            .unwrap()
+            .wl_surface()
+            .id()
+            .protocol_id();
+        assert_eq!(
+            h.host.xdg_reqs,
+            vec![
+                HostXdgReq::PopupGrab {
+                    surface_id: grab_proto_id,
+                    serial: 4242,
+                },
+                HostXdgReq::SurfaceCommit {
+                    surface_id: grab_proto_id,
+                },
+            ]
+        );
+
+        // Host rejects or dismisses the grab -> `wprsc` emits `PopupEvent::Done`.
+        h.host.xdg_popups[&grab_proto_id].popup_done();
+        h.sync();
+        assert_eq!(
+            h.drain_events(),
+            vec![Event::Popup(xdg_shell::PopupEvent::Done(popup_grab_id))]
+        );
+
+        // 2. Popup with `grab_serial: None` commits without calling `grab`.
+        h.host.xdg_reqs.clear();
+        h.client
+            .handle_request(RecvType::Object(Request::Surface(SurfaceRequest {
+                client: client_id,
+                surface: popup_nograb_id,
+                payload: SurfaceRequestPayload::Commit(make_client_surface_state(
+                    client_id,
+                    popup_nograb_id,
+                    Some(wayland::Role::XdgPopup(xdg_shell::XdgPopupState {
+                        parent_surface_id: parent_id,
+                        positioner,
+                        grab_serial: None,
+                        reposition_token: None,
+                    })),
+                )),
+            })));
+        h.sync();
+
+        let nograb_proto_id = h
+            .client
+            .remote_display
+            .client(&client_id)
+            .surfaces
+            .get(&popup_nograb_id)
+            .unwrap()
+            .wl_surface()
+            .id()
+            .protocol_id();
+        assert_eq!(
+            h.host.xdg_reqs,
+            vec![HostXdgReq::SurfaceCommit {
+                surface_id: nograb_proto_id,
+            }]
+        );
     }
 }

@@ -15,6 +15,7 @@
 use std::collections::HashMap;
 
 use smithay_client_toolkit::reexports::client::QueueHandle;
+use smithay_client_toolkit::reexports::client::protocol::wl_seat::WlSeat;
 use smithay_client_toolkit::reexports::protocols::xdg::shell::client::xdg_positioner;
 use smithay_client_toolkit::shell::xdg;
 use smithay_client_toolkit::shell::xdg::XdgShell;
@@ -314,6 +315,7 @@ impl RemoteXdgPopup {
         surface_id: WlSurfaceId,
         surfaces: &mut HashMap<WlSurfaceId, RemoteSurface>,
         xdg_shell_state: &XdgShell,
+        seat: Option<&WlSeat>,
         qh: &QueueHandle<WprsClientState>,
     ) -> Result<()> {
         {
@@ -351,11 +353,9 @@ impl RemoteXdgPopup {
         )
         .location(loc!())?;
 
-        // if popup_state.grab_requested {
-        //     local_popup
-        //         .xdg_popup()
-        //         .grab(&seat_state.seats().next().location(loc!())?, 0); // TODO: serial
-        // }
+        if let (Some(grab_serial), Some(seat)) = (popup_state.grab_serial, seat) {
+            local_popup.xdg_popup().grab(seat, grab_serial);
+        }
 
         let new_popup = Self {
             local_popup,
@@ -409,10 +409,18 @@ impl RemoteXdgPopup {
         surface_id: WlSurfaceId,
         surfaces: &mut HashMap<WlSurfaceId, RemoteSurface>,
         xdg_shell_state: &XdgShell,
+        seat: Option<&WlSeat>,
         qh: &QueueHandle<WprsClientState>,
     ) -> Result<()> {
-        Self::set_role(&surface_state, surface_id, surfaces, xdg_shell_state, qh)
-            .location(loc!())?;
+        Self::set_role(
+            &surface_state,
+            surface_id,
+            surfaces,
+            xdg_shell_state,
+            seat,
+            qh,
+        )
+        .location(loc!())?;
         let surface = surfaces.get_mut(&surface_id).location(loc!())?;
         Self::update(surface_state, surface, xdg_shell_state)
     }

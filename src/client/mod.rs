@@ -43,6 +43,7 @@ use smithay_client_toolkit::reexports::client::QueueHandle;
 use smithay_client_toolkit::reexports::client::backend::ObjectId as SctkObjectId;
 use smithay_client_toolkit::reexports::client::globals::GlobalList;
 use smithay_client_toolkit::reexports::client::protocol::wl_output::Transform;
+use smithay_client_toolkit::reexports::client::protocol::wl_seat::WlSeat;
 use smithay_client_toolkit::reexports::client::protocol::wl_subcompositor::WlSubcompositor;
 use smithay_client_toolkit::reexports::client::protocol::wl_surface::WlSurface;
 use smithay_client_toolkit::reexports::protocols::xdg::shell::client::xdg_surface;
@@ -256,6 +257,13 @@ impl WprsClientState {
                 options.compression_mode,
             )));
         Ok(state)
+    }
+
+    pub(crate) fn primary_seat(&self) -> Option<WlSeat> {
+        self.seat_objects
+            .last()
+            .map(|seat_obj| seat_obj.seat.clone())
+            .or_else(|| self.seat_state.seats().next())
     }
 
     pub(crate) fn allocate_transfer_id(&mut self) -> u64 {

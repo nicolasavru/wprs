@@ -166,6 +166,10 @@ fn sync_surface_data(
             .location
             .into();
     }
+    if let Some(Role::XdgPopup(popup_state)) = &mut surface_state_to_send.role {
+        // Never replay an explicit grab serial from a prior connection on sync.
+        popup_state.grab_serial = None;
+    }
     surface_state_to_send.z_ordered_children = z_ordered_children;
     // `wprsc` treats `damage: None` + `BufferAssignment::New` as full damage
     // (`FrameDamage::merge_commit`).
@@ -965,14 +969,19 @@ impl WprsServerState {
     fn handle_connect(&mut self) -> Result<()> {
         self.reset_dnd_state();
         self.reset_input_state();
+        self.serial_map.clear();
         let old_outputs: Vec<_> = self.outputs.drain().collect();
         // Clear all previous-session `output_ids` unconditionally (including IDs
-        // recorded by `OutputsChanged` before `OutputEvent::New` arrived).
+        // recorded by `OutputsChanged` before `OutputEvent::New` arrived), and
+        // clear any pending popup grab serials captured in a previous session.
         self.for_each_mapped_surface(|surface, surface_state| {
             for (_, (local_output, _)) in &old_outputs {
                 local_output.leave(surface);
             }
             surface_state.output_ids.clear();
+            if let Some(Role::XdgPopup(popup_state)) = &mut surface_state.role {
+                popup_state.grab_serial = None;
+            }
         });
         for (_, (_, global_id)) in old_outputs {
             self.dh.remove_global::<Self>(global_id);

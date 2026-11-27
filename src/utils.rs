@@ -126,6 +126,10 @@ impl SerialMap {
     pub fn remove(&mut self, server_serial: Serial) -> Option<u32> {
         self.map.remove(&server_serial.into())
     }
+
+    pub fn clear(&mut self) {
+        self.map.clear();
+    }
 }
 
 impl Default for SerialMap {
@@ -175,5 +179,7 @@ mod tests {
         assert_eq!(map.remove(s1), Some(42));
         assert_eq!(map.get(s1), None);
         assert_eq!(map.get(s2), Some(99));
+        map.clear();
+        assert_eq!(map.get(s2), None);
     }
 }

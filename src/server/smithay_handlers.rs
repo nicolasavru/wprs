@@ -332,16 +332,30 @@ impl XdgShellHandler for WprsServerState {
         };
     }
 
-    fn grab(&mut self, _surface: PopupSurface, _seat: wl_seat::WlSeat, _serial: Serial) {
-        // TODO: this works in sway but breaks popups in mutter
-        // "This means it requests to be sent a popup_done event when the pointer leaves the grab area.", do we need to do something here?
-        // maybe mutter is denying the grab? maybe because we're passing 0 as the serial?
+    fn grab(&mut self, surface: PopupSurface, _seat: wl_seat::WlSeat, serial: Serial) {
+        if !self.serializer.other_end_connected() {
+            return;
+        }
+        let surface_id = WlSurfaceId::new(surface.wl_surface());
+        if self.committed_surfaces.contains(&surface_id) {
+            warn!("Ignoring popup grab request for already-committed surface {surface_id:?}.");
+            return;
+        }
+        let Some(host_serial) = self.serial_map.get(serial) else {
+            warn!("Received popup grab request with unknown serial {serial:?}.");
+            return;
+        };
 
-        // let mut surface_state = self
-        //     .surfaces
-        //     .get_mut(&serialization::wayland::WlSurfaceId::new(surface.wl_surface()))
-        //     .unwrap();
-        // surface_state.xdg_popup().unwrap().grab_requested = true;
+        compositor::with_states(surface.wl_surface(), |surface_data| {
+            let Some(locked_state) = surface_data.data_map.get::<LockedSurfaceState>() else {
+                return;
+            };
+            let mut tracked = locked_state.0.lock().unwrap();
+            if let Some(Role::XdgPopup(popup_state)) = &mut tracked.state.role {
+                popup_state.grab_serial = Some(host_serial);
+                tracked.dirty = true;
+            }
+        });
     }
 
     fn ack_configure(&mut self, _surface: wl_surface::WlSurface, _configure: Configure) {}
@@ -1071,6 +1085,9 @@ pub fn commit_impl(
     tracked.has_committed = true;
 
     let Some(prev_without_buffer) = prev_without_buffer else {
+        if let Some(Role::XdgPopup(popup_state)) = &mut tracked.state.role {
+            popup_state.grab_serial = None;
+        }
         if unmapped_xdg_surface {
             tracked.dirty = true;
         }
@@ -1101,6 +1118,9 @@ pub fn commit_impl(
             payload: SurfaceRequestPayload::Commit(surface_state_to_send),
         })));
     state.committed_surfaces.insert(surface);
+    if let Some(Role::XdgPopup(popup_state)) = &mut tracked.state.role {
+        popup_state.grab_serial = None;
+    }
     // Keep `dirty = true` after an `xdg_shell` unmap (`attach(NULL)`) so the
     // subsequent bufferless remap commit is not deduplicated away.
     tracked.dirty = unmapped_xdg_surface;
@@ -1311,7 +1331,9 @@ mod tests {
     use smithay_client_toolkit::reexports::client::protocol::wl_callback;
     use smithay_client_toolkit::reexports::client::protocol::wl_compositor::WlCompositor;
     use smithay_client_toolkit::reexports::client::protocol::wl_output;
+    use smithay_client_toolkit::reexports::client::protocol::wl_pointer;
     use smithay_client_toolkit::reexports::client::protocol::wl_registry;
+    use smithay_client_toolkit::reexports::client::protocol::wl_seat as client_seat;
     use smithay_client_toolkit::reexports::client::protocol::wl_shm;
     use smithay_client_toolkit::reexports::client::protocol::wl_shm_pool::WlShmPool;
     use smithay_client_toolkit::reexports::client::protocol::wl_subcompositor::WlSubcompositor;
@@ -1371,6 +1393,9 @@ mod tests {
         compositor: Option<WlCompositor>,
         subcompositor: Option<WlSubcompositor>,
         shm: Option<wl_shm::WlShm>,
+        seat: Option<client_seat::WlSeat>,
+        pointer: Option<wl_pointer::WlPointer>,
+        last_button_serial: Option<u32>,
         xdg_wm_base: Option<XdgWmBase>,
         xdg_decoration_manager: Option<ZxdgDecorationManagerV1>,
         xdg_output_manager: Option<ZxdgOutputManagerV1>,
@@ -1412,6 +1437,14 @@ mod tests {
                         state.shm = Some(registry.bind::<wl_shm::WlShm, _, _>(
                             name,
                             version.min(1),
+                            qh,
+                            (),
+                        ));
+                    },
+                    "wl_seat" => {
+                        state.seat = Some(registry.bind::<client_seat::WlSeat, _, _>(
+                            name,
+                            version.min(7),
                             qh,
                             (),
                         ));
@@ -1660,6 +1693,41 @@ mod tests {
         }
     }
 
+    impl Dispatch<client_seat::WlSeat, ()> for WireClientData {
+        fn event(
+            state: &mut Self,
+            seat: &client_seat::WlSeat,
+            event: client_seat::Event,
+            _data: &(),
+            _conn: &Connection,
+            qh: &QueueHandle<Self>,
+        ) {
+            if let client_seat::Event::Capabilities {
+                capabilities: smithay_client_toolkit::reexports::client::WEnum::Value(caps),
+            } = event
+                && caps.contains(client_seat::Capability::Pointer)
+                && state.pointer.is_none()
+            {
+                state.pointer = Some(seat.get_pointer(qh, ()));
+            }
+        }
+    }
+
+    impl Dispatch<wl_pointer::WlPointer, ()> for WireClientData {
+        fn event(
+            state: &mut Self,
+            _proxy: &wl_pointer::WlPointer,
+            event: wl_pointer::Event,
+            _data: &(),
+            _conn: &Connection,
+            _qh: &QueueHandle<Self>,
+        ) {
+            if let wl_pointer::Event::Button { serial, .. } = event {
+                state.last_button_serial = Some(serial);
+            }
+        }
+    }
+
     impl Dispatch<WlShmPool, ()> for WireClientData {
         fn event(
             _state: &mut Self,
@@ -1810,7 +1878,7 @@ mod tests {
             let serializer: Serializer<Request, Event> = Serializer::new_test_server();
             let display: Display<WprsServerState> = Display::new().unwrap();
             let event_loop: EventLoop<WprsServerState> = EventLoop::try_new().unwrap();
-            let state = WprsServerState::new(
+            let mut state = WprsServerState::new(
                 display.handle(),
                 event_loop.handle(),
                 serializer,
@@ -1818,6 +1886,7 @@ mod tests {
                 Duration::from_millis(16),
                 false,
             );
+            state.seat.add_pointer();
 
             let (server_sock, client_sock) = UnixStream::pair().unwrap();
             display
@@ -1844,6 +1913,7 @@ mod tests {
                 rx: None,
                 conn_id: None,
             };
+            harness.roundtrip();
             harness.roundtrip();
             if connected {
                 harness.connect_wprsc();
@@ -2982,6 +3052,191 @@ mod tests {
                 },
                 ClientConfigureEvent::SurfaceConfigure,
             ]
+        );
+    }
+
+    #[test]
+    #[cfg_attr(miri, ignore)]
+    fn test_popup_grab_forwards_mapped_serial_and_skips_unmapped_or_stale_wire() {
+        use crate::serialization::wayland::PointerEvent;
+        use crate::serialization::wayland::PointerEventKind;
+        use crate::serialization::xdg_shell::PopupEvent;
+
+        let mut h = WaylandTestHarness::new(true);
+        let conn_id = h.conn_id.unwrap();
+        let compositor = h.client_data.compositor.clone().unwrap();
+        let wm_base = h.client_data.xdg_wm_base.clone().unwrap();
+        let seat = h.client_data.seat.clone().unwrap();
+
+        let parent_surface = compositor.create_surface(&h.qh, ());
+        let parent_xdg = wm_base.get_xdg_surface(&parent_surface, &h.qh, ());
+        let _parent_toplevel = parent_xdg.get_toplevel(&h.qh, ());
+        parent_surface.commit();
+        h.roundtrip();
+        let parent_sid = h.server_surface_id(&parent_surface);
+        h.drain_requests();
+
+        // Deliver a pointer button press carrying host serial 4242 so `wprsd`
+        // records a `server_serial -> 4242` mapping in `serial_map`.
+        h.state.handle_event(
+            conn_id,
+            RecvType::Object(Event::PointerFrame(vec![
+                PointerEvent {
+                    surface_id: parent_sid,
+                    position: (20.0, 20.0).into(),
+                    kind: PointerEventKind::Enter { serial: 4241 },
+                },
+                PointerEvent {
+                    surface_id: parent_sid,
+                    position: (20.0, 20.0).into(),
+                    kind: PointerEventKind::Press {
+                        button: 0x110,
+                        serial: 4242,
+                    },
+                },
+            ])),
+        );
+        h.roundtrip();
+        let server_button_serial = h
+            .client_data
+            .last_button_serial
+            .expect("client must receive wl_pointer.button serial");
+
+        let make_positioner = |wm_base: &XdgWmBase, qh: &QueueHandle<WireClientData>| {
+            let pos = wm_base.create_positioner(qh, ());
+            pos.set_size(120, 80);
+            pos.set_anchor_rect(10, 10, 1, 1);
+            pos.set_anchor(xdg_positioner::Anchor::TopLeft);
+            pos.set_gravity(xdg_positioner::Gravity::BottomRight);
+            pos
+        };
+
+        // 1. Grabbing popup before initial commit forwards mapped host serial 4242.
+        let popup1_surface = compositor.create_surface(&h.qh, ());
+        let popup1_xdg = wm_base.get_xdg_surface(&popup1_surface, &h.qh, ());
+        let pos1 = make_positioner(&wm_base, &h.qh);
+        let popup1 = popup1_xdg.get_popup(Some(&parent_xdg), &pos1, &h.qh, ());
+        popup1.grab(&seat, server_button_serial);
+        popup1_surface.commit();
+        h.roundtrip();
+
+        let popup1_sid = h.server_surface_id(&popup1_surface);
+        let reqs = h.drain_requests();
+        let popup1_state = reqs
+            .iter()
+            .find_map(|req| match req {
+                Request::Surface(SurfaceRequest {
+                    surface,
+                    payload: SurfaceRequestPayload::Commit(state),
+                    ..
+                }) if *surface == popup1_sid => state.xdg_popup().ok().copied(),
+                _ => None,
+            })
+            .expect("popup1 commit must be forwarded");
+        assert_eq!(popup1_state.grab_serial, Some(4242));
+
+        // 2. Nested grabbing popup reusing the SAME serial still resolves to
+        //    4242 (non-destructive `SerialMap::get`).
+        let popup2_surface = compositor.create_surface(&h.qh, ());
+        let popup2_xdg = wm_base.get_xdg_surface(&popup2_surface, &h.qh, ());
+        let pos2 = make_positioner(&wm_base, &h.qh);
+        let popup2 = popup2_xdg.get_popup(Some(&popup1_xdg), &pos2, &h.qh, ());
+        popup2.grab(&seat, server_button_serial);
+        popup2_surface.commit();
+        h.roundtrip();
+
+        let popup2_sid = h.server_surface_id(&popup2_surface);
+        let reqs = h.drain_requests();
+        let popup2_state = reqs
+            .iter()
+            .find_map(|req| match req {
+                Request::Surface(SurfaceRequest {
+                    surface,
+                    payload: SurfaceRequestPayload::Commit(state),
+                    ..
+                }) if *surface == popup2_sid => state.xdg_popup().ok().copied(),
+                _ => None,
+            })
+            .expect("popup2 commit must be forwarded");
+        assert_eq!(popup2_state.grab_serial, Some(4242));
+
+        // 3. Popup with an unmapped serial skips the grab (`grab_serial: None`).
+        let popup3_surface = compositor.create_surface(&h.qh, ());
+        let popup3_xdg = wm_base.get_xdg_surface(&popup3_surface, &h.qh, ());
+        let pos3 = make_positioner(&wm_base, &h.qh);
+        let popup3 = popup3_xdg.get_popup(Some(&parent_xdg), &pos3, &h.qh, ());
+        popup3.grab(&seat, 999_999);
+        popup3_surface.commit();
+        h.roundtrip();
+
+        let popup3_sid = h.server_surface_id(&popup3_surface);
+        let reqs = h.drain_requests();
+        let popup3_state = reqs
+            .iter()
+            .find_map(|req| match req {
+                Request::Surface(SurfaceRequest {
+                    surface,
+                    payload: SurfaceRequestPayload::Commit(state),
+                    ..
+                }) if *surface == popup3_sid => state.xdg_popup().ok().copied(),
+                _ => None,
+            })
+            .expect("popup3 commit must be forwarded");
+        assert_eq!(popup3_state.grab_serial, None);
+
+        // 4. Reconnect clears `serial_map` and never replays stale `grab_serial`
+        //    on synced popups OR new popups using a pre-reconnect serial.
+        h.connect_wprsc();
+        let sync_reqs = h.drain_requests();
+        for sid in [popup1_sid, popup2_sid] {
+            let synced = sync_reqs
+                .iter()
+                .find_map(|req| match req {
+                    Request::Surface(SurfaceRequest {
+                        surface,
+                        payload: SurfaceRequestPayload::Commit(state),
+                        ..
+                    }) if *surface == sid => state.xdg_popup().ok().copied(),
+                    _ => None,
+                })
+                .expect("existing popup must be synced on reconnect");
+            assert_eq!(synced.grab_serial, None);
+        }
+
+        let popup4_surface = compositor.create_surface(&h.qh, ());
+        let popup4_xdg = wm_base.get_xdg_surface(&popup4_surface, &h.qh, ());
+        let pos4 = make_positioner(&wm_base, &h.qh);
+        let popup4 = popup4_xdg.get_popup(Some(&parent_xdg), &pos4, &h.qh, ());
+        popup4.grab(&seat, server_button_serial);
+        popup4_surface.commit();
+        h.roundtrip();
+
+        let popup4_sid = h.server_surface_id(&popup4_surface);
+        let reqs = h.drain_requests();
+        let popup4_state = reqs
+            .iter()
+            .find_map(|req| match req {
+                Request::Surface(SurfaceRequest {
+                    surface,
+                    payload: SurfaceRequestPayload::Commit(state),
+                    ..
+                }) if *surface == popup4_sid => state.xdg_popup().ok().copied(),
+                _ => None,
+            })
+            .expect("popup4 commit must be forwarded");
+        assert_eq!(popup4_state.grab_serial, None);
+
+        // 5. Host grab dismissal delivers `xdg_popup.popup_done`.
+        h.client_data.configures.clear();
+        let conn_id2 = h.conn_id.unwrap();
+        h.state.handle_event(
+            conn_id2,
+            RecvType::Object(Event::Popup(PopupEvent::Done(popup1_sid))),
+        );
+        h.roundtrip();
+        assert_eq!(
+            h.client_data.configures,
+            vec![ClientConfigureEvent::PopupDone]
         );
     }
 }
