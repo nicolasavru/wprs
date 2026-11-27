@@ -16,20 +16,21 @@
 use std::collections::HashSet;
 use std::mem;
 use std::os::fd::OwnedFd;
-use std::time::Duration;
+use std::time::Instant;
 
 use smithay::backend::renderer::utils::on_commit_buffer_handler;
-use smithay::input::pointer::CursorImageStatus as SmithayCursorImageStatus;
 use smithay::input::Seat;
 use smithay::input::SeatHandler;
 use smithay::input::SeatState;
+use smithay::input::pointer::CursorImageStatus as SmithayCursorImageStatus;
 use smithay::output::Output;
-use smithay::reexports::calloop::timer::TimeoutAction;
-use smithay::reexports::calloop::timer::Timer;
 use smithay::reexports::wayland_protocols::xdg::decoration::zv1::server::zxdg_toplevel_decoration_v1::Mode as XdgDecorationMode;
+use smithay::reexports::wayland_protocols::xdg::shell::server::xdg_toplevel;
 use smithay::reexports::wayland_protocols_misc::server_decoration::server::org_kde_kwin_server_decoration::Mode as KdeDecorationMode;
 use smithay::reexports::wayland_protocols_misc::server_decoration::server::org_kde_kwin_server_decoration::OrgKdeKwinServerDecoration;
-use smithay::reexports::wayland_protocols::xdg::shell::server::xdg_toplevel;
+use smithay::reexports::wayland_server::Client;
+use smithay::reexports::wayland_server::Resource;
+use smithay::reexports::wayland_server::WEnum;
 use smithay::reexports::wayland_server::backend::ClientData;
 use smithay::reexports::wayland_server::backend::ClientId;
 use smithay::reexports::wayland_server::backend::DisconnectReason;
@@ -38,9 +39,6 @@ use smithay::reexports::wayland_server::protocol::wl_output;
 use smithay::reexports::wayland_server::protocol::wl_seat;
 use smithay::reexports::wayland_server::protocol::wl_surface;
 use smithay::reexports::wayland_server::protocol::wl_surface::WlSurface;
-use smithay::reexports::wayland_server::Client;
-use smithay::reexports::wayland_server::Resource;
-use smithay::reexports::wayland_server::WEnum;
 use smithay::utils::Logical;
 use smithay::utils::Point;
 use smithay::utils::Serial;
@@ -50,6 +48,7 @@ use smithay::wayland::compositor::BufferAssignment as SmithayBufferAssignment;
 use smithay::wayland::compositor::CompositorClientState;
 use smithay::wayland::compositor::CompositorHandler;
 use smithay::wayland::compositor::CompositorState;
+use smithay::wayland::compositor::Damage;
 use smithay::wayland::compositor::SubsurfaceCachedState;
 use smithay::wayland::compositor::SurfaceAttributes;
 use smithay::wayland::compositor::SurfaceData;
@@ -111,9 +110,191 @@ use crate::serialization::xdg_shell::XdgPopupState;
 use crate::serialization::xdg_shell::XdgPositioner;
 use crate::serialization::xdg_shell::XdgSurfaceState;
 use crate::serialization::xdg_shell::XdgToplevelState;
+use crate::server::FrameBackpressure;
 use crate::server::LockedSurfaceState;
+use crate::server::PendingDamage;
 use crate::server::SyncedSurfaceBuffer;
 use crate::server::WprsServerState;
+
+pub(crate) enum ScanDamage<'a> {
+    Full,
+    Raw(&'a [Damage]),
+    BufferRects(&'a [Rectangle<i32>]),
+}
+
+pub(crate) enum EncodeBufferOutcome {
+    Sent {
+        metadata: BufferMetadata,
+        damage: Option<Vec<Rectangle<i32>>>,
+    },
+    Unchanged,
+    FaultedAfterSend,
+    Failed(anyhow::Error),
+}
+
+impl WprsServerState {
+    pub(crate) fn encode_and_send_buffer(
+        &mut self,
+        wl_buffer: &wl_buffer::WlBuffer,
+        surface_state: &mut SurfaceState,
+        scan_damage: ScanDamage<'_>,
+    ) -> EncodeBufferOutcome {
+        enum InnerOutcome {
+            Unchanged {
+                synced: SyncedSurfaceBuffer,
+            },
+            Sent {
+                synced: SyncedSurfaceBuffer,
+                metadata: BufferMetadata,
+                damage: Option<Vec<Rectangle<i32>>>,
+            },
+        }
+
+        // Remove the existing shadow buffer before reading `wl_shm` so a
+        // `BadMap` or validation failure never leaves a half-updated shadow
+        // in `synced_buffers`.
+        let prev_synced = self.synced_buffers.remove(&surface_state.id);
+        let mut raw_buffer_sent = false;
+        let writer = self.serializer.writer();
+        let frame_backpressure = &mut self.frame_backpressure;
+        let compressor = &mut self.compressor;
+        let compression_mode = self.compression_mode;
+
+        let commit_buf_res =
+            compositor_utils::with_buffer_contents(wl_buffer, |data, spec| -> Result<_> {
+                let metadata = surface_state.set_buffer(&spec).location(loc!())?;
+                match prev_synced {
+                    Some(mut synced) if synced.metadata == metadata => {
+                        // Use partial row-bands when `< 75%` of height is
+                        // damaged to avoid scanning undamaged rows, while
+                        // still running full-frame incremental diffing on
+                        // `>= 75%` or undamaged commits to skip unchanged
+                        // `128x128` quadrants.
+                        let scan_bands = match scan_damage {
+                            ScanDamage::Full
+                            | ScanDamage::Raw([])
+                            | ScanDamage::BufferRects([]) => None,
+                            ScanDamage::Raw(raw) => {
+                                let damage = compositor_utils::damage_to_buffer_rects(
+                                    raw,
+                                    surface_state.buffer_scale,
+                                    surface_state
+                                        .buffer_transform
+                                        .unwrap_or(Transform::Normal)
+                                        .into(),
+                                    surface_state.viewport_state.as_ref(),
+                                    (metadata.width, metadata.height),
+                                );
+                                filtering::compute_partial_row_bands(
+                                    &damage,
+                                    metadata.width,
+                                    metadata.height,
+                                )
+                            },
+                            ScanDamage::BufferRects(rects) => filtering::compute_partial_row_bands(
+                                rects,
+                                metadata.width,
+                                metadata.height,
+                            ),
+                        };
+                        compositor_utils::fault_probe_buffer(
+                            data,
+                            metadata.stride as usize,
+                            scan_bands.as_deref(),
+                        );
+                        let dirty_tiles = filtering::filter_and_compress_incremental_streaming(
+                            data,
+                            surface_state.client,
+                            surface_state.id,
+                            metadata,
+                            compression_mode,
+                            scan_bands.as_deref(),
+                            &mut synced.pixels,
+                            compressor,
+                            |mut raw_buffer_to_send| {
+                                raw_buffer_to_send.header.frame_seq =
+                                    frame_backpressure.allocate_seq();
+                                raw_buffer_sent = true;
+                                writer.send(SendType::RawBuffer(raw_buffer_to_send));
+                            },
+                        );
+                        if dirty_tiles.is_empty() {
+                            return Ok(InnerOutcome::Unchanged { synced });
+                        }
+                        let damage =
+                            (dirty_tiles.len() < constants::SENT_DAMAGE_LIMIT).then(|| {
+                                dirty_tiles
+                                    .into_iter()
+                                    .map(|r| {
+                                        Rectangle::new(
+                                            r.x as i32, r.y as i32, r.w as i32, r.h as i32,
+                                        )
+                                    })
+                                    .collect()
+                            });
+                        Ok(InnerOutcome::Sent {
+                            synced,
+                            metadata,
+                            damage,
+                        })
+                    },
+                    other => {
+                        let mut pixels = other.map_or_else(Vec::new, |old| old.pixels);
+                        compositor_utils::fault_probe_buffer(data, metadata.stride as usize, None);
+                        filtering::filter_and_compress_full_streaming(
+                            data,
+                            surface_state.client,
+                            surface_state.id,
+                            metadata,
+                            compression_mode,
+                            Some(&mut pixels),
+                            compressor,
+                            |mut raw_buffer_to_send| {
+                                raw_buffer_to_send.header.frame_seq =
+                                    frame_backpressure.allocate_seq();
+                                raw_buffer_sent = true;
+                                writer.send(SendType::RawBuffer(raw_buffer_to_send));
+                            },
+                        );
+                        Ok(InnerOutcome::Sent {
+                            synced: SyncedSurfaceBuffer { metadata, pixels },
+                            metadata,
+                            damage: None,
+                        })
+                    },
+                }
+            });
+
+        match commit_buf_res {
+            Ok(Ok(InnerOutcome::Sent {
+                synced,
+                metadata,
+                damage,
+            })) => {
+                self.synced_buffers.insert(surface_state.id, synced);
+                EncodeBufferOutcome::Sent { metadata, damage }
+            },
+            Ok(Ok(InnerOutcome::Unchanged { synced })) => {
+                self.synced_buffers.insert(surface_state.id, synced);
+                EncodeBufferOutcome::Unchanged
+            },
+            Ok(Err(err)) => EncodeBufferOutcome::Failed(err),
+            Err(err) => {
+                // Smithay reports SIGBUS as `Err(BadMap)` after the closure
+                // returns, so `raw_buffer_sent` may already be `true`.
+                if raw_buffer_sent {
+                    warn!(
+                        "shm buffer faulted during commit ({err:?}); detaching remote surface buffer"
+                    );
+                    surface_state.buffer = None;
+                    EncodeBufferOutcome::FaultedAfterSend
+                } else {
+                    EncodeBufferOutcome::Failed(anyhow!(err))
+                }
+            },
+        }
+    }
+}
 
 impl BufferHandler for WprsServerState {
     #[instrument(skip(self), level = "debug")]
@@ -286,6 +467,8 @@ impl XdgShellHandler for WprsServerState {
             let surface_id = WlSurfaceId::new(toplevel.wl_surface());
             self.synced_buffers.remove(&surface_id);
             self.dirty_sync_surfaces.remove(&surface_id);
+            self.frame_backpressure.remove_deferred(surface_id);
+            self.deferred_sync_ancestors.remove(&surface_id);
             compositor::with_states(toplevel.wl_surface(), |surface_data| {
                 let mut tracked = surface_data
                     .data_map
@@ -297,10 +480,13 @@ impl XdgShellHandler for WprsServerState {
                 tracked.state.role = None;
                 tracked.has_committed = false;
                 tracked.dirty = true;
+                tracked.pending_buffer_delta = None;
+                tracked.pending_damage = PendingDamage::None;
             });
 
             self.send_toplevel_request(&toplevel, ToplevelRequestPayload::Destroyed);
             self.committed_surfaces.remove(&surface_id);
+            self.release_held_frame_callbacks(surface_id);
         }
     }
 
@@ -335,6 +521,8 @@ impl XdgShellHandler for WprsServerState {
             let surface_id = WlSurfaceId::new(popup.wl_surface());
             self.synced_buffers.remove(&surface_id);
             self.dirty_sync_surfaces.remove(&surface_id);
+            self.frame_backpressure.remove_deferred(surface_id);
+            self.deferred_sync_ancestors.remove(&surface_id);
             let was_committed = self.committed_surfaces.remove(&surface_id);
             // Uses with_states internally and with_states is not reentrant.
             compositor::with_states(popup.wl_surface(), |surface_data| {
@@ -348,6 +536,8 @@ impl XdgShellHandler for WprsServerState {
                 tracked.state.role = None;
                 tracked.has_committed = false;
                 tracked.dirty = true;
+                tracked.pending_buffer_delta = None;
+                tracked.pending_damage = PendingDamage::None;
             });
 
             if was_committed {
@@ -359,6 +549,7 @@ impl XdgShellHandler for WprsServerState {
                         payload: PopupRequestPayload::Destroyed,
                     })));
             }
+            self.release_held_frame_callbacks(surface_id);
         };
     }
 
@@ -508,7 +699,9 @@ impl XdgShellHandler for WprsServerState {
                         surface,
                         payload: SurfaceRequestPayload::Commit(surface_state_to_send),
                     })));
-                if tracked.state.buffer.is_some() {
+                if tracked.state.buffer.is_some()
+                    && !self.frame_backpressure.is_deferred(surface_id)
+                {
                     tracked.dirty = false;
                 }
             } else {
@@ -606,7 +799,7 @@ impl CompositorHandler for WprsServerState {
     }
 }
 
-fn take_dirty_sync_descendants<N>(
+pub(crate) fn take_dirty_sync_descendants<N>(
     dirty: &mut HashSet<WlSurfaceId>,
     surface: &N,
     children: &impl Fn(&N) -> Vec<N>,
@@ -628,6 +821,23 @@ fn take_dirty_sync_descendants<N>(
         }
     }
     taken
+}
+
+pub(crate) fn has_deferred_sync_descendant(
+    surface: &WlSurface,
+    frame_backpressure: &FrameBackpressure,
+) -> bool {
+    for child in compositor::get_children(surface) {
+        if !compositor::is_sync_subsurface(&child) {
+            continue;
+        }
+        if frame_backpressure.is_deferred(WlSurfaceId::new(&child))
+            || has_deferred_sync_descendant(&child, frame_backpressure)
+        {
+            return true;
+        }
+    }
+    false
 }
 
 #[instrument(ret, level = "debug")]
@@ -728,6 +938,7 @@ pub fn commit(surface: &WlSurface, state: &mut WprsServerState) -> Result<()> {
     };
     let children_dirty = !taken_dirty.is_empty();
 
+    let was_deferred_before = state.frame_backpressure.is_deferred(surface_id);
     let res = state
         .insert_surface(surface)
         .location(loc!())
@@ -760,8 +971,18 @@ pub fn commit(surface: &WlSurface, state: &mut WprsServerState) -> Result<()> {
         }
     } else {
         state.dirty_sync_surfaces.remove(&surface_id);
+        if state.serializer.other_end_connected()
+            && has_deferred_sync_descendant(surface, &state.frame_backpressure)
+        {
+            state.deferred_sync_ancestors.insert(surface_id);
+        } else {
+            state.deferred_sync_ancestors.remove(&surface_id);
+        }
     }
     on_commit_buffer_handler::<WprsServerState>(surface);
+    if was_deferred_before && !state.frame_backpressure.is_deferred(surface_id) {
+        state.flush_ready_deferred_sync_ancestors();
+    }
     // When no `wprsc` is connected to supply a host configure, answer the
     // initial (or post-unmap remap) xdg-shell commit directly so applications
     // receive their initial configure instead of blocking indefinitely.
@@ -860,7 +1081,6 @@ pub fn set_xdg_toplevel_attributes(
     Ok(())
 }
 
-#[allow(clippy::iter_with_drain)]
 #[instrument(skip(state), level = "debug")]
 pub fn commit_impl(
     surface: &WlSurface,
@@ -883,15 +1103,14 @@ pub fn commit_impl(
     let was_committed = state.committed_surfaces.contains(&surface_id);
     let was_dirty = tracked.dirty;
     let prev_without_buffer = connected.then(|| tracked.state.clone_without_buffer());
-    let surface_state = &mut tracked.state;
 
     sync_subsurface_role(
-        surface_state,
+        &mut tracked.state,
         matches!(surface_data.role, Some("subsurface")),
         parent.as_ref().map(WlSurfaceId::new),
     );
 
-    surface_state.z_ordered_children = surface_order;
+    tracked.state.z_ordered_children = surface_order;
 
     let mut guard = surface_data.cached_state.get::<ViewportCachedState>();
     let viewport_state = guard.current();
@@ -899,58 +1118,26 @@ pub fn commit_impl(
     let mut guard = surface_data.cached_state.get::<SurfaceAttributes>();
     let surface_attributes = guard.current();
     compositor_utils::cap_surface_damage(&mut surface_attributes.damage);
-    let mut frame_callbacks = mem::take(&mut surface_attributes.frame_callbacks);
+    let frame_callbacks = mem::take(&mut surface_attributes.frame_callbacks);
+    let frame_ready_at = state.frame_callback_ready_at(Instant::now());
     let buffer_delta = surface_attributes
         .buffer_delta
         .take()
         .filter(|delta| delta.x != 0 || delta.y != 0)
         .map(Into::into);
-
-    if !frame_callbacks.is_empty() {
-        let surface = surface.clone();
-        state
-            .lh
-            .insert_source(
-                Timer::from_duration(
-                    state
-                        .frame_interval
-                        // "The server should give some time for the client to
-                        // draw and commit after sending the frame callback
-                        // events to let it hit the next output refresh."
-                        .saturating_sub(Duration::from_millis(2)),
-                ),
-                move |_, _, state| {
-                    if !surface.is_alive() {
-                        return TimeoutAction::Drop;
-                    }
-
-                    if state.serializer.other_end_connected() {
-                        // We can't use into_iter() because we can't move
-                        // frame_callbacks because this is a FnMut. However, this
-                        // works because this branch will only ever be taken once.
-                        for callback in frame_callbacks.drain(..) {
-                            debug!(
-                                "Sending callback for surface {:?}: {:?}",
-                                surface.id(),
-                                callback.id()
-                            );
-                            callback.done(state.start_time.elapsed().as_millis() as u32);
-                        }
-                        TimeoutAction::Drop
-                    } else {
-                        TimeoutAction::ToDuration(state.frame_interval)
-                    }
-                },
-            )
-            .expect("timer registration should never fail");
+    if connected {
+        tracked.add_buffer_delta(buffer_delta);
+    } else {
+        tracked.pending_buffer_delta = None;
+        tracked.pending_damage = PendingDamage::None;
     }
 
-    set_regions(surface_attributes, surface_state);
-    set_transformation(surface_attributes, surface_state);
-    set_viewport_state(viewport_state, surface_state);
-    set_xdg_surface_attributes(surface_data, surface_state);
+    set_regions(surface_attributes, &mut tracked.state);
+    set_transformation(surface_attributes, &mut tracked.state);
+    set_viewport_state(viewport_state, &mut tracked.state);
+    set_xdg_surface_attributes(surface_data, &mut tracked.state);
 
-    match &mut surface_state.role {
+    match &mut tracked.state.role {
         Some(Role::Cursor(_)) => {},
         Some(Role::SubSurface(subsurface_state)) => {
             subsurface_state.sync = sync;
@@ -974,177 +1161,165 @@ pub fn commit_impl(
 
     match &surface_attributes.buffer {
         Some(SmithayBufferAssignment::NewBuffer(buffer)) => {
-            enum CommitBufferOutcome {
-                Disconnected,
-                Unchanged {
-                    synced: SyncedSurfaceBuffer,
-                },
-                Sent {
-                    synced: SyncedSurfaceBuffer,
-                    metadata: BufferMetadata,
-                    damage: Option<Vec<Rectangle<i32>>>,
-                },
-            }
-
-            // Remove the existing shadow buffer before reading `wl_shm` so a
-            // `BadMap` or validation failure never leaves a half-updated shadow
-            // in `synced_buffers`.
-            let prev_synced = state.synced_buffers.remove(&surface_state.id);
-            let mut raw_buffer_sent = false;
-            let writer = state.serializer.writer();
-            let commit_buf_res =
-                compositor_utils::with_buffer_contents(buffer, |data, spec| -> Result<_> {
-                    let metadata = surface_state.set_buffer(&spec).location(loc!())?;
-                    if !connected {
-                        return Ok(CommitBufferOutcome::Disconnected);
-                    }
-
-                    match prev_synced {
-                        Some(mut synced) if synced.metadata == metadata => {
-                            // Use partial row-bands when `< 75%` of height is
-                            // damaged to avoid scanning undamaged rows, while
-                            // still running full-frame incremental diffing on
-                            // `>= 75%` or undamaged commits to skip unchanged
-                            // `128x128` quadrants.
-                            let scan_bands = (!surface_attributes.damage.is_empty()).then(|| {
-                                let damage = compositor_utils::damage_to_buffer_rects(
-                                    &surface_attributes.damage,
-                                    surface_state.buffer_scale,
-                                    surface_state
-                                        .buffer_transform
-                                        .unwrap_or(Transform::Normal)
-                                        .into(),
-                                    surface_state.viewport_state.as_ref(),
-                                    (metadata.width, metadata.height),
-                                );
-                                filtering::compute_partial_row_bands(
-                                    &damage,
-                                    metadata.width,
-                                    metadata.height,
-                                )
-                            });
-                            let scan_bands = scan_bands.flatten();
-                            compositor_utils::fault_probe_buffer(
-                                data,
-                                metadata.stride as usize,
-                                scan_bands.as_deref(),
-                            );
-                            let dirty_tiles = filtering::filter_and_compress_incremental_streaming(
-                                data,
-                                surface_state.client,
-                                surface_state.id,
-                                metadata,
-                                state.compression_mode,
-                                scan_bands.as_deref(),
-                                &mut synced.pixels,
-                                &mut state.compressor,
-                                |raw_buffer_to_send| {
-                                    raw_buffer_sent = true;
-                                    writer.send(SendType::RawBuffer(raw_buffer_to_send));
-                                },
-                            );
-                            if dirty_tiles.is_empty() {
-                                return Ok(CommitBufferOutcome::Unchanged { synced });
-                            }
-                            let damage =
-                                (dirty_tiles.len() < constants::SENT_DAMAGE_LIMIT).then(|| {
-                                    dirty_tiles
-                                        .into_iter()
-                                        .map(|r| {
-                                            Rectangle::new(
-                                                r.x as i32, r.y as i32, r.w as i32, r.h as i32,
-                                            )
-                                        })
-                                        .collect()
-                                });
-                            Ok(CommitBufferOutcome::Sent {
-                                synced,
-                                metadata,
-                                damage,
-                            })
-                        },
-                        other => {
-                            let mut pixels = other.map_or_else(Vec::new, |old| old.pixels);
-                            compositor_utils::fault_probe_buffer(
-                                data,
-                                metadata.stride as usize,
-                                None,
-                            );
-                            filtering::filter_and_compress_full_streaming(
-                                data,
-                                surface_state.client,
-                                surface_state.id,
-                                metadata,
-                                state.compression_mode,
-                                Some(&mut pixels),
-                                &mut state.compressor,
-                                |raw_buffer_to_send| {
-                                    raw_buffer_sent = true;
-                                    writer.send(SendType::RawBuffer(raw_buffer_to_send));
-                                },
-                            );
-                            Ok(CommitBufferOutcome::Sent {
-                                synced: SyncedSurfaceBuffer { metadata, pixels },
-                                metadata,
-                                damage: None,
-                            })
-                        },
-                    }
+            if !connected {
+                let res = compositor_utils::with_buffer_contents(buffer, |_, spec| {
+                    tracked.state.set_buffer(&spec)
                 });
-
-            match commit_buf_res {
-                Ok(Ok(CommitBufferOutcome::Sent {
-                    synced,
-                    metadata,
-                    damage,
-                })) => {
-                    surface_attributes.damage.clear();
-                    state.synced_buffers.insert(surface_state.id, synced);
-                    damage_to_send = damage;
-                    buffer_to_send = Some(BufferAssignment::New(metadata));
-                },
-                Ok(Ok(CommitBufferOutcome::Unchanged { synced })) => {
-                    surface_attributes.damage.clear();
-                    state.synced_buffers.insert(surface_state.id, synced);
-                },
-                Ok(Ok(CommitBufferOutcome::Disconnected)) => {
-                    surface_attributes.damage.clear();
-                },
-                Ok(Err(err)) => {
-                    return Err(err).location(loc!());
-                },
-                Err(err) => {
-                    // Smithay reports SIGBUS as `Err(BadMap)` after the
-                    // closure returns, so `raw_buffer_sent` may already be
-                    // `true`.
-                    if raw_buffer_sent {
-                        warn!(
-                            "shm buffer faulted during commit ({err:?}); detaching remote surface buffer"
-                        );
+                state.schedule_or_fire_frame_callbacks(
+                    surface.clone(),
+                    surface_id,
+                    frame_callbacks,
+                    frame_ready_at,
+                );
+                match res {
+                    Ok(Ok(_)) => {
                         surface_attributes.damage.clear();
-                        surface_state.buffer = None;
-                        buffer_to_send = Some(BufferAssignment::Removed);
-                    } else {
+                    },
+                    Ok(Err(err)) => return Err(err).location(loc!()),
+                    Err(err) => return Err(err).location(loc!()),
+                }
+            } else if !state.frame_backpressure.has_credit()
+                || state.frame_backpressure.is_deferred(surface_id)
+            {
+                let prev_meta = match tracked.state.buffer {
+                    Some(BufferAssignment::New(meta)) => Some(meta),
+                    _ => None,
+                };
+                let meta_res = compositor_utils::with_buffer_contents(buffer, |_, spec| {
+                    tracked.state.set_buffer(&spec)
+                });
+                let metadata = match meta_res {
+                    Ok(Ok(metadata)) => metadata,
+                    Ok(Err(err)) => {
+                        state.schedule_or_fire_frame_callbacks(
+                            surface.clone(),
+                            surface_id,
+                            frame_callbacks,
+                            frame_ready_at,
+                        );
                         return Err(err).location(loc!());
-                    }
-                },
+                    },
+                    Err(err) => {
+                        state.schedule_or_fire_frame_callbacks(
+                            surface.clone(),
+                            surface_id,
+                            frame_callbacks,
+                            frame_ready_at,
+                        );
+                        return Err(err).location(loc!());
+                    },
+                };
+                if prev_meta != Some(metadata) || surface_attributes.damage.is_empty() {
+                    tracked.pending_damage.mark_full();
+                } else {
+                    let rects = compositor_utils::damage_to_buffer_rects(
+                        &surface_attributes.damage,
+                        tracked.state.buffer_scale,
+                        tracked
+                            .state
+                            .buffer_transform
+                            .unwrap_or(Transform::Normal)
+                            .into(),
+                        tracked.state.viewport_state.as_ref(),
+                        (metadata.width, metadata.height),
+                    );
+                    tracked.pending_damage.merge(rects);
+                }
+                surface_attributes.damage.clear();
+                tracked.has_committed = true;
+                tracked.dirty = true;
+                state.frame_backpressure.defer(surface_id);
+                state.hold_frame_callbacks(surface, surface_id, frame_callbacks, frame_ready_at);
+                return Ok(false);
+            } else {
+                state.schedule_or_fire_frame_callbacks(
+                    surface.clone(),
+                    surface_id,
+                    frame_callbacks,
+                    frame_ready_at,
+                );
+                let outcome = state.encode_and_send_buffer(
+                    buffer,
+                    &mut tracked.state,
+                    ScanDamage::Raw(&surface_attributes.damage),
+                );
+                match outcome {
+                    EncodeBufferOutcome::Sent { metadata, damage } => {
+                        surface_attributes.damage.clear();
+                        damage_to_send = damage;
+                        buffer_to_send = Some(BufferAssignment::New(metadata));
+                    },
+                    EncodeBufferOutcome::Unchanged => {
+                        surface_attributes.damage.clear();
+                    },
+                    EncodeBufferOutcome::FaultedAfterSend => {
+                        surface_attributes.damage.clear();
+                        buffer_to_send = Some(BufferAssignment::Removed);
+                    },
+                    EncodeBufferOutcome::Failed(err) => {
+                        return Err(err).location(loc!());
+                    },
+                }
             }
         },
         Some(SmithayBufferAssignment::Removed) => {
             surface_attributes.damage.clear();
-            surface_state.buffer = None;
-            state.synced_buffers.remove(&surface_state.id);
+            tracked.pending_damage = PendingDamage::None;
+            tracked.pending_buffer_delta = None;
+            tracked.state.buffer = None;
+            state.synced_buffers.remove(&surface_id);
+            if state.frame_backpressure.remove_deferred(surface_id) {
+                state.release_held_frame_callbacks(surface_id);
+            }
+            state.schedule_or_fire_frame_callbacks(
+                surface.clone(),
+                surface_id,
+                frame_callbacks,
+                frame_ready_at,
+            );
             buffer_to_send = Some(BufferAssignment::Removed);
         },
         // Retain `surface_attributes.damage` across bufferless commits (bounded
         // by `cap_surface_damage`) so damage posted before a subsequent
         // same-size `NewBuffer` commit is included in its incremental row-bands.
-        None => {},
+        None => {
+            if connected && state.frame_backpressure.is_deferred(surface_id) {
+                if !surface_attributes.damage.is_empty() {
+                    if let Some(BufferAssignment::New(metadata)) = tracked.state.buffer {
+                        let rects = compositor_utils::damage_to_buffer_rects(
+                            &surface_attributes.damage,
+                            tracked.state.buffer_scale,
+                            tracked
+                                .state
+                                .buffer_transform
+                                .unwrap_or(Transform::Normal)
+                                .into(),
+                            tracked.state.viewport_state.as_ref(),
+                            (metadata.width, metadata.height),
+                        );
+                        tracked.pending_damage.merge(rects);
+                    } else {
+                        tracked.pending_damage.mark_full();
+                    }
+                    surface_attributes.damage.clear();
+                }
+                tracked.has_committed = true;
+                tracked.dirty = true;
+                state.hold_frame_callbacks(surface, surface_id, frame_callbacks, frame_ready_at);
+                return Ok(false);
+            }
+            state.schedule_or_fire_frame_callbacks(
+                surface.clone(),
+                surface_id,
+                frame_callbacks,
+                frame_ready_at,
+            );
+        },
     }
 
     let unmapped_xdg_surface = matches!(buffer_to_send, Some(BufferAssignment::Removed))
         && matches!(
-            surface_state.role,
+            tracked.state.role,
             Some(Role::XdgToplevel(_) | Role::XdgPopup(_))
         );
     tracked.has_committed = true;
@@ -1161,7 +1336,7 @@ pub fn commit_impl(
 
     let mut surface_state_to_send = tracked.state.clone_without_buffer();
     surface_state_to_send.buffer = buffer_to_send;
-    surface_state_to_send.buffer_delta = buffer_delta;
+    surface_state_to_send.buffer_delta = tracked.pending_buffer_delta.take();
     if was_committed
         && !was_dirty
         && surface_state_to_send.buffer.is_none()
@@ -1252,7 +1427,9 @@ impl WprsServerState {
                             surface,
                             payload: SurfaceRequestPayload::Commit(surface_state_to_send),
                         })));
-                    if tracked.state.buffer.is_some() {
+                    if tracked.state.buffer.is_some()
+                        && !self.frame_backpressure.is_deferred(surface_id)
+                    {
                         tracked.dirty = false;
                     }
                     return true;
@@ -1384,6 +1561,7 @@ mod tests {
     use std::sync::Arc;
     use std::sync::atomic::AtomicBool;
     use std::sync::atomic::Ordering;
+    use std::time::Duration;
 
     use crossbeam_channel::Receiver;
     use smithay::reexports::calloop::EventLoop;
@@ -1469,6 +1647,7 @@ mod tests {
         xdg_outputs: HashMap<u32, zxdg_output_v1::ZxdgOutputV1>,
         output_snapshots: HashMap<u32, WireOutputSnapshot>,
         configures: Vec<ClientConfigureEvent>,
+        frame_callbacks_done: Vec<u32>,
     }
 
     impl Dispatch<wl_registry::WlRegistry, ()> for WireClientData {
@@ -1927,9 +2106,24 @@ mod tests {
         }
     }
 
+    impl Dispatch<wl_callback::WlCallback, u32> for WireClientData {
+        fn event(
+            state: &mut Self,
+            _proxy: &wl_callback::WlCallback,
+            event: wl_callback::Event,
+            tag: &u32,
+            _conn: &Connection,
+            _qh: &QueueHandle<Self>,
+        ) {
+            if matches!(event, wl_callback::Event::Done { .. }) {
+                state.frame_callbacks_done.push(*tag);
+            }
+        }
+    }
+
     struct WaylandTestHarness {
         display: Display<WprsServerState>,
-        _event_loop: EventLoop<'static, WprsServerState>,
+        event_loop: EventLoop<'static, WprsServerState>,
         state: WprsServerState,
         conn: Connection,
         event_queue: EventQueue<WireClientData>,
@@ -1970,7 +2164,7 @@ mod tests {
 
             let mut harness = Self {
                 display,
-                _event_loop: event_loop,
+                event_loop,
                 state,
                 conn,
                 event_queue,
@@ -1991,11 +2185,41 @@ mod tests {
         fn connect_wprsc(&mut self) {
             if let Some(conn_id) = self.conn_id.take() {
                 self.state.serializer.disconnect_test_client(conn_id);
+                self.state.handle_event(conn_id, RecvType::Disconnected);
             }
             let (conn_id, rx) = self.state.serializer.connect_test_client();
             self.conn_id = Some(conn_id);
             self.rx = Some(rx);
             self.state.handle_event(conn_id, RecvType::Connected);
+        }
+
+        fn disconnect_wprsc(&mut self) {
+            if let Some(conn_id) = self.conn_id.take() {
+                self.state.serializer.disconnect_test_client(conn_id);
+                self.state.handle_event(conn_id, RecvType::Disconnected);
+            }
+            self.rx = None;
+        }
+
+        fn ack_frame(&mut self, seq: u64) {
+            let conn_id = self.conn_id.expect("wprsc must be connected");
+            self.state
+                .handle_event(conn_id, RecvType::Object(Event::FrameAck { seq }));
+        }
+
+        fn pump_timers(&mut self, duration: Duration) {
+            let deadline = Instant::now() + duration;
+            while Instant::now() < deadline {
+                let remaining = deadline.saturating_duration_since(Instant::now());
+                self.event_loop
+                    .dispatch(
+                        Some(remaining.min(Duration::from_millis(5))),
+                        &mut self.state,
+                    )
+                    .unwrap();
+                self.display.flush_clients().unwrap();
+            }
+            self.roundtrip();
         }
 
         fn roundtrip(&mut self) {
@@ -2011,17 +2235,25 @@ mod tests {
             }
         }
 
-        fn drain_requests(&self) -> Vec<Request> {
+        fn drain_messages(&self) -> Vec<SendType<Request>> {
             let Some(rx) = &self.rx else {
                 return Vec::new();
             };
             let mut out = Vec::new();
             while let Ok(msg) = rx.try_recv() {
-                if let SendType::Object(req) = msg {
-                    out.push(req);
-                }
+                out.push(msg);
             }
             out
+        }
+
+        fn drain_requests(&self) -> Vec<Request> {
+            self.drain_messages()
+                .into_iter()
+                .filter_map(|msg| match msg {
+                    SendType::Object(req) => Some(req),
+                    SendType::RawBuffer(_) => None,
+                })
+                .collect()
         }
 
         fn server_surface_id(&self, surface: &ClientWlSurface) -> WlSurfaceId {
@@ -3806,5 +4038,477 @@ mod tests {
                 ..
             }) if *surface == sid
         )));
+    }
+
+    #[test]
+    #[cfg_attr(miri, ignore)]
+    fn test_frame_backpressure_coalescing_fair_fifo_pixels_and_reconnect_wire() {
+        use std::io::Seek;
+        use std::io::Write;
+        use std::num::NonZeroUsize;
+
+        use crate::filtering::ValidatedTileStream;
+        use crate::serialization::framing::CompressedTileStream;
+        use crate::sharding_compression::ShardingDecompressor;
+
+        let mut h = WaylandTestHarness::new(true);
+        let compositor = h.client_data.compositor.clone().unwrap();
+        let subcompositor = h.client_data.subcompositor.clone().unwrap();
+        let shm = h.client_data.shm.clone().unwrap();
+        let wm_base = h.client_data.xdg_wm_base.clone().unwrap();
+
+        let width = 16usize;
+        let height = 16usize;
+        let stride = width * 4;
+        let byte_len = height * stride;
+
+        let make_shm_surface = |tag: &str, h: &mut WaylandTestHarness| {
+            let path = std::env::temp_dir().join(format!(
+                "wprs_bp_test_{tag}_{}_{}.bin",
+                std::process::id(),
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap()
+                    .as_nanos()
+            ));
+            let mut file = std::fs::OpenOptions::new()
+                .read(true)
+                .write(true)
+                .create_new(true)
+                .open(&path)
+                .unwrap();
+            let pixels = vec![0x10u8; byte_len];
+            file.write_all(&pixels).unwrap();
+            _ = std::fs::remove_file(&path);
+            let pool = shm.create_pool(file.as_fd(), byte_len as i32, &h.qh, ());
+            let buf = pool.create_buffer(
+                0,
+                width as i32,
+                height as i32,
+                stride as i32,
+                wl_shm::Format::Argb8888,
+                &h.qh,
+                (),
+            );
+            let surf = compositor.create_surface(&h.qh, ());
+            (surf, pool, buf, file, pixels)
+        };
+
+        let paint_rect =
+            |pixels: &mut [u8], x: usize, y: usize, w: usize, hh: usize, px: [u8; 4]| {
+                for row in y..(y + hh) {
+                    for col in x..(x + w) {
+                        let off = row * stride + col * 4;
+                        pixels[off..off + 4].copy_from_slice(&px);
+                    }
+                }
+            };
+
+        let mut decompressor = ShardingDecompressor::new(NonZeroUsize::new(2).unwrap()).unwrap();
+        let mut s1_canvas = vec![0u8; byte_len];
+        let mut s2_canvas = vec![0u8; byte_len];
+        let decode_into = |streaming: crate::serialization::framing::StreamingCompressedTiles,
+                           canvas: &mut [u8],
+                           decompressor: &mut ShardingDecompressor|
+         -> u64 {
+            let mut wire = Vec::new();
+            streaming.framed_write(&mut wire).unwrap();
+            let (tx, rx) = crossbeam_channel::bounded(1);
+            let reader = std::thread::spawn(move || {
+                CompressedTileStream::read_from_stream(&mut wire.as_slice(), |stream| {
+                    tx.send(stream).unwrap();
+                    Ok(())
+                })
+                .unwrap();
+            });
+            let stream = rx.recv().unwrap();
+            let seq = stream.header.frame_seq;
+            let validated = ValidatedTileStream::new(stream).unwrap();
+            filtering::decompress_and_unfilter_streaming(validated, decompressor, canvas).unwrap();
+            reader.join().unwrap();
+            seq
+        };
+
+        let (s1, _p1, b1, mut f1, mut px1) = make_shm_surface("s1", &mut h);
+        let (s2, _p2, b2, mut f2, mut px2) = make_shm_surface("s2", &mut h);
+
+        // 1. First `MAX_IN_FLIGHT_FRAMES` commits consume all credits immediately.
+        let mut in_flight_seqs = Vec::new();
+        for step in 0..constants::MAX_IN_FLIGHT_FRAMES {
+            paint_rect(
+                &mut px1,
+                0,
+                0,
+                width,
+                height,
+                [0x20 + step as u8, 0x30, 0x40, 0xFF],
+            );
+            f1.rewind().unwrap();
+            f1.write_all(&px1).unwrap();
+            s1.attach(Some(&b1), 0, 0);
+            s1.commit();
+            h.roundtrip();
+        }
+        let sid1 = h.server_surface_id(&s1);
+        for msg in h.drain_messages() {
+            if let SendType::RawBuffer(rb) = msg {
+                let seq = decode_into(rb, &mut s1_canvas, &mut decompressor);
+                in_flight_seqs.push(seq);
+            }
+        }
+        assert_eq!(in_flight_seqs.len(), constants::MAX_IN_FLIGHT_FRAMES);
+        assert_eq!(
+            h.state.frame_backpressure.in_flight_count(),
+            constants::MAX_IN_FLIGHT_FRAMES
+        );
+        assert_eq!(h.state.frame_backpressure.deferred_len(), 0);
+        assert_eq!(s1_canvas, px1);
+
+        // 2. Rapidly commit 12 more frames on S1 (with disjoint partial damage rects
+        //    and accumulated buffer_delta) interleaved with commits on S2 without
+        //    any FrameAck -> zero extra RawBuffers sent, both coalesced in FIFO order!
+        for i in 0..6u8 {
+            paint_rect(&mut px1, 0, 0, 8, 8, [0xA0 + i, 0x11, 0x22, 0xFF]);
+            f1.rewind().unwrap();
+            f1.write_all(&px1).unwrap();
+            s1.attach(Some(&b1), 0, 0);
+            s1.damage_buffer(0, 0, 8, 8);
+            if i == 0 {
+                s1.offset(3, -1);
+            }
+            s1.commit();
+
+            paint_rect(&mut px2, 0, 0, width, height, [0x50 + i, 0x60, 0x70, 0xFF]);
+            f2.rewind().unwrap();
+            f2.write_all(&px2).unwrap();
+            s2.attach(Some(&b2), 0, 0);
+            s2.commit();
+
+            paint_rect(&mut px1, 8, 8, 8, 8, [0xB0 + i, 0x33, 0x44, 0xFF]);
+            f1.rewind().unwrap();
+            f1.write_all(&px1).unwrap();
+            s1.attach(Some(&b1), 0, 0);
+            s1.damage_buffer(8, 8, 8, 8);
+            if i == 5 {
+                s1.offset(-1, 5);
+            }
+            s1.commit();
+            h.roundtrip();
+        }
+        let sid2 = h.server_surface_id(&s2);
+        assert!(
+            h.drain_messages().is_empty(),
+            "no frames or commits should be emitted while credits are exhausted"
+        );
+        assert_eq!(
+            h.state.frame_backpressure.in_flight_count(),
+            constants::MAX_IN_FLIGHT_FRAMES
+        );
+        assert_eq!(h.state.frame_backpressure.deferred_len(), 2);
+
+        // 3. Stale/unknown FrameAck is ignored and does not flush anything.
+        h.ack_frame(99_999);
+        assert!(h.drain_messages().is_empty());
+        assert_eq!(
+            h.state.frame_backpressure.in_flight_count(),
+            constants::MAX_IN_FLIGHT_FRAMES
+        );
+
+        // 4. Ack 1st credit -> S1 flushes FIRST (FIFO) with exact coalesced pixels
+        //    from BOTH partial damage rects and summed `buffer_delta == (2, 4)`.
+        h.ack_frame(in_flight_seqs.remove(0));
+        let msgs = h.drain_messages();
+        let mut s1_flushed_seq = None;
+        let mut s1_flushed_delta = None;
+        for msg in msgs {
+            match msg {
+                SendType::RawBuffer(rb) => {
+                    assert_eq!(rb.header.surface, sid1);
+                    s1_flushed_seq = Some(decode_into(rb, &mut s1_canvas, &mut decompressor));
+                },
+                SendType::Object(Request::Surface(SurfaceRequest {
+                    surface,
+                    payload: SurfaceRequestPayload::Commit(st),
+                    ..
+                })) => {
+                    assert_eq!(surface, sid1);
+                    s1_flushed_delta = st.buffer_delta;
+                },
+                other => panic!("unexpected message on S1 flush: {other:?}"),
+            }
+        }
+        in_flight_seqs.push(s1_flushed_seq.expect("S1 must flush RawBuffer"));
+        assert_eq!(s1_flushed_delta, Some((2, 4).into()));
+        assert_eq!(
+            s1_canvas, px1,
+            "coalesced S1 pixels must match final frame bit-for-bit"
+        );
+        assert_eq!(h.state.frame_backpressure.deferred_len(), 1);
+
+        // 5. Ack 2nd credit -> S2 flushes NEXT (fair FIFO!) with exact final pixels.
+        h.ack_frame(in_flight_seqs.remove(0));
+        let msgs = h.drain_messages();
+        let mut s2_flushed_seq = None;
+        for msg in msgs {
+            if let SendType::RawBuffer(rb) = msg {
+                assert_eq!(rb.header.surface, sid2);
+                s2_flushed_seq = Some(decode_into(rb, &mut s2_canvas, &mut decompressor));
+            }
+        }
+        in_flight_seqs.push(s2_flushed_seq.expect("S2 must flush RawBuffer"));
+        assert_eq!(
+            s2_canvas, px2,
+            "coalesced S2 pixels must match final frame bit-for-bit"
+        );
+        assert_eq!(h.state.frame_backpressure.deferred_len(), 0);
+
+        // 6. Unmap (`attach(None)`) on a deferred surface removes it from deferred
+        //    queue and immediately forwards `BufferAssignment::Removed`.
+        paint_rect(&mut px1, 0, 0, width, height, [0xCC, 0xCC, 0xCC, 0xFF]);
+        f1.rewind().unwrap();
+        f1.write_all(&px1).unwrap();
+        s1.attach(Some(&b1), 0, 0);
+        s1.commit();
+        h.roundtrip();
+        assert!(h.state.frame_backpressure.is_deferred(sid1));
+        assert!(h.drain_messages().is_empty());
+
+        s1.attach(None, 0, 0);
+        s1.commit();
+        h.roundtrip();
+        assert!(!h.state.frame_backpressure.is_deferred(sid1));
+        let reqs = h.drain_requests();
+        assert!(reqs.iter().any(|r| matches!(
+            r,
+            Request::Surface(SurfaceRequest {
+                surface,
+                payload: SurfaceRequestPayload::Commit(st),
+                ..
+            }) if *surface == sid1 && matches!(st.buffer, Some(BufferAssignment::Removed))
+        )));
+
+        // 7. Destroying a deferred surface removes it cleanly from deferred queue.
+        paint_rect(&mut px2, 0, 0, width, height, [0xDD, 0xDD, 0xDD, 0xFF]);
+        f2.rewind().unwrap();
+        f2.write_all(&px2).unwrap();
+        s2.attach(Some(&b2), 0, 0);
+        s2.commit();
+        h.roundtrip();
+        assert!(h.state.frame_backpressure.is_deferred(sid2));
+        s2.destroy();
+        h.roundtrip();
+        assert!(!h.state.frame_backpressure.is_deferred(sid2));
+        let reqs = h.drain_requests();
+        assert!(reqs.iter().any(|r| matches!(
+            r,
+            Request::Surface(SurfaceRequest {
+                surface,
+                payload: SurfaceRequestPayload::Destroyed,
+                ..
+            }) if *surface == sid2
+        )));
+
+        // 8. Deferred sync subsurface: parent commits while sync child is deferred,
+        //    then acking a credit flushes child AND emits a bufferless parent Commit
+        //    so `wprsc` applies the sync child.
+        let parent = compositor.create_surface(&h.qh, ());
+        let (child, _pc, bc, mut fc, mut pxc) = make_shm_surface("sync_child", &mut h);
+        let _sub = subcompositor.get_subsurface(&child, &parent, &h.qh, ());
+        paint_rect(&mut pxc, 0, 0, width, height, [0x77, 0x88, 0x99, 0xFF]);
+        fc.rewind().unwrap();
+        fc.write_all(&pxc).unwrap();
+        child.attach(Some(&bc), 0, 0);
+        child.commit();
+        parent.commit();
+        h.roundtrip();
+        let pid = h.server_surface_id(&parent);
+        let cid = h.server_surface_id(&child);
+        assert!(h.state.frame_backpressure.is_deferred(cid));
+        assert!(h.state.deferred_sync_ancestors.contains(&pid));
+        h.drain_messages();
+
+        h.ack_frame(in_flight_seqs.remove(0));
+        let msgs = h.drain_messages();
+        let mut saw_child_buf = false;
+        let mut saw_child_commit = false;
+        let mut saw_parent_flush_commit = false;
+        for msg in msgs {
+            match msg {
+                SendType::RawBuffer(rb) if rb.header.surface == cid => {
+                    saw_child_buf = true;
+                    in_flight_seqs.push(rb.header.frame_seq);
+                },
+                SendType::Object(Request::Surface(SurfaceRequest {
+                    surface,
+                    payload: SurfaceRequestPayload::Commit(_),
+                    ..
+                })) if surface == cid => {
+                    saw_child_commit = true;
+                },
+                SendType::Object(Request::Surface(SurfaceRequest {
+                    surface,
+                    payload: SurfaceRequestPayload::Commit(st),
+                    ..
+                })) if surface == pid && st.buffer.is_none() => {
+                    saw_parent_flush_commit = true;
+                },
+                _ => {},
+            }
+        }
+        assert!(saw_child_buf && saw_child_commit && saw_parent_flush_commit);
+        assert!(!h.state.deferred_sync_ancestors.contains(&pid));
+
+        // 9. Reconnect resets credits and caps initial `sync_surface_tree` across
+        //    `MAX_IN_FLIGHT_FRAMES + 2` buffered toplevels.
+        h.disconnect_wprsc();
+        let mut toplevels = Vec::new();
+        for idx in 0..(constants::MAX_IN_FLIGHT_FRAMES + 2) {
+            let (surf, pool, buf, mut file, mut px) =
+                make_shm_surface(&format!("tl_{idx}"), &mut h);
+            let xdg_surf = wm_base.get_xdg_surface(&surf, &h.qh, ());
+            let tl = xdg_surf.get_toplevel(&h.qh, ());
+            surf.commit();
+            h.roundtrip();
+            paint_rect(
+                &mut px,
+                0,
+                0,
+                width,
+                height,
+                [0x10 + idx as u8, 0x20, 0x30, 0xFF],
+            );
+            file.rewind().unwrap();
+            file.write_all(&px).unwrap();
+            surf.attach(Some(&buf), 0, 0);
+            surf.commit();
+            toplevels.push((surf, xdg_surf, tl, pool, buf, file));
+        }
+        h.roundtrip();
+
+        h.connect_wprsc();
+        let sync_msgs = h.drain_messages();
+        let mut sync_seqs: Vec<u64> = sync_msgs
+            .iter()
+            .filter_map(|m| match m {
+                SendType::RawBuffer(rb) => Some(rb.header.frame_seq),
+                SendType::Object(_) => None,
+            })
+            .collect();
+        assert_eq!(sync_seqs.len(), constants::MAX_IN_FLIGHT_FRAMES);
+        assert_eq!(
+            h.state.frame_backpressure.in_flight_count(),
+            constants::MAX_IN_FLIGHT_FRAMES
+        );
+        assert_eq!(h.state.frame_backpressure.deferred_len(), 2);
+
+        // Acking two synced frames flushes the remaining 2 deferred toplevels.
+        for _ in 0..2 {
+            h.ack_frame(sync_seqs.remove(0));
+            let flushed_rbs: Vec<u64> = h
+                .drain_messages()
+                .into_iter()
+                .filter_map(|m| match m {
+                    SendType::RawBuffer(rb) => Some(rb.header.frame_seq),
+                    SendType::Object(_) => None,
+                })
+                .collect();
+            assert_eq!(flushed_rbs.len(), 1);
+            sync_seqs.extend(flushed_rbs);
+        }
+        assert_eq!(h.state.frame_backpressure.deferred_len(), 0);
+    }
+
+    #[test]
+    #[cfg_attr(miri, ignore)]
+    fn test_wl_surface_frame_pacing_deferred_detached_and_disconnect_wire() {
+        use std::io::Seek;
+        use std::io::Write;
+
+        let mut h = WaylandTestHarness::new(true);
+        // Use a short frame interval so timer tests finish in milliseconds.
+        h.state.frame_interval = Duration::from_millis(5);
+        let compositor = h.client_data.compositor.clone().unwrap();
+        let shm = h.client_data.shm.clone().unwrap();
+
+        let path = std::env::temp_dir().join(format!(
+            "wprs_frame_pace_test_{}_{}.bin",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let mut file = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create_new(true)
+            .open(&path)
+            .unwrap();
+        file.write_all(&[0x11; 16]).unwrap();
+        _ = std::fs::remove_file(&path);
+        let pool = shm.create_pool(file.as_fd(), 16, &h.qh, ());
+        let buf = pool.create_buffer(0, 2, 2, 8, wl_shm::Format::Argb8888, &h.qh, ());
+        let surface = compositor.create_surface(&h.qh, ());
+
+        let mut in_flight_seqs = Vec::new();
+        let commit_frame =
+            |h: &mut WaylandTestHarness, file: &mut std::fs::File, fill: u8, cb_tag: u32| {
+                file.rewind().unwrap();
+                file.write_all(&[fill; 16]).unwrap();
+                surface.attach(Some(&buf), 0, 0);
+                let _cb = surface.frame(&h.qh, cb_tag);
+                surface.commit();
+                h.roundtrip();
+            };
+
+        // 1. Unthrottled commits consume credits and fire `wl_surface.frame` callbacks.
+        for i in 0..constants::MAX_IN_FLIGHT_FRAMES {
+            commit_frame(&mut h, &mut file, 0x20 + i as u8, 100 + i as u32);
+        }
+        for msg in h.drain_messages() {
+            if let SendType::RawBuffer(rb) = msg {
+                in_flight_seqs.push(rb.header.frame_seq);
+            }
+        }
+        assert_eq!(in_flight_seqs.len(), constants::MAX_IN_FLIGHT_FRAMES);
+        h.pump_timers(Duration::from_millis(20));
+        assert_eq!(h.client_data.frame_callbacks_done, vec![100, 101, 102]);
+        h.client_data.frame_callbacks_done.clear();
+
+        // 2. Backpressured commit is deferred and HOLDS its `wl_surface.frame` callback.
+        commit_frame(&mut h, &mut file, 0x40, 200);
+        assert!(h.drain_messages().is_empty());
+        h.pump_timers(Duration::from_millis(25));
+        assert!(
+            h.client_data.frame_callbacks_done.is_empty(),
+            "frame callback must remain held while surface is deferred"
+        );
+
+        // 3. Acking a credit flushes the surface and releases its held frame callback.
+        h.ack_frame(in_flight_seqs.remove(0));
+        for msg in h.drain_messages() {
+            if let SendType::RawBuffer(rb) = msg {
+                in_flight_seqs.push(rb.header.frame_seq);
+            }
+        }
+        h.pump_timers(Duration::from_millis(20));
+        assert_eq!(h.client_data.frame_callbacks_done, vec![200]);
+        h.client_data.frame_callbacks_done.clear();
+
+        // 4. Disconnecting while a surface is deferred releases its held callback
+        //    so apps never freeze on detach.
+        commit_frame(&mut h, &mut file, 0x50, 300);
+        h.pump_timers(Duration::from_millis(20));
+        assert!(h.client_data.frame_callbacks_done.is_empty());
+
+        h.disconnect_wprsc();
+        h.pump_timers(Duration::from_millis(20));
+        assert_eq!(h.client_data.frame_callbacks_done, vec![300]);
+        h.client_data.frame_callbacks_done.clear();
+
+        // 5. Detached commits fire `wl_surface.frame` normally.
+        commit_frame(&mut h, &mut file, 0x60, 400);
+        h.pump_timers(Duration::from_millis(20));
+        assert_eq!(h.client_data.frame_callbacks_done, vec![400]);
     }
 }

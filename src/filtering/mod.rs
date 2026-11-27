@@ -2234,6 +2234,7 @@ fn filter_and_compress_full_streaming_with_tier(
 
     let (tiles_tx, tiles_rx) = crossbeam_channel::unbounded();
     let header = RawBufferHeader {
+        frame_seq: 0,
         client,
         surface,
         metadata,
@@ -2434,6 +2435,7 @@ fn filter_and_compress_incremental_streaming_with_tier(
     let n_tiles = dirty_tiles.len();
     let (tiles_tx, tiles_rx) = crossbeam_channel::unbounded();
     let header = RawBufferHeader {
+        frame_seq: 0,
         client,
         surface,
         metadata,
@@ -4682,6 +4684,7 @@ mod tests {
             drop(tx_short);
             let validated_short = ValidatedTileStream::new(CompressedTileStream {
                 header: RawBufferHeader {
+                    frame_seq: 0,
                     client: ClientId(1),
                     surface: WlSurfaceId(1),
                     metadata: meta_2,
@@ -4705,6 +4708,7 @@ mod tests {
             let bad_headers = [
                 // Non-incremental with empty rects.
                 RawBufferHeader {
+                    frame_seq: 0,
                     client: ClientId(1),
                     surface: WlSurfaceId(1),
                     metadata: meta,
@@ -4713,6 +4717,7 @@ mod tests {
                 },
                 // Non-incremental covering only half the frame.
                 RawBufferHeader {
+                    frame_seq: 0,
                     client: ClientId(1),
                     surface: WlSurfaceId(1),
                     metadata: meta,
@@ -4726,6 +4731,7 @@ mod tests {
                 },
                 // Incremental overlapping rects.
                 RawBufferHeader {
+                    frame_seq: 0,
                     client: ClientId(1),
                     surface: WlSurfaceId(1),
                     metadata: meta,
@@ -4747,6 +4753,7 @@ mod tests {
                 },
                 // Out-of-bounds rect.
                 RawBufferHeader {
+                    frame_seq: 0,
                     client: ClientId(1),
                     surface: WlSurfaceId(1),
                     metadata: meta,
@@ -4760,6 +4767,7 @@ mod tests {
                 },
                 // Zero-dim rect.
                 RawBufferHeader {
+                    frame_seq: 0,
                     client: ClientId(1),
                     surface: WlSurfaceId(1),
                     metadata: meta,
@@ -4773,6 +4781,7 @@ mod tests {
                 },
                 // Excessive tile count (`5 > 2 * 2`).
                 RawBufferHeader {
+                    frame_seq: 0,
                     client: ClientId(1),
                     surface: WlSurfaceId(1),
                     metadata: BufferMetadata {

@@ -13,6 +13,8 @@
 // limitations under the License.
 
 /// Handlers for events from smithay client toolkit.
+use std::time::Instant;
+
 use smithay::reexports::wayland_protocols::wp::primary_selection::zv1::client::zwp_primary_selection_device_v1::ZwpPrimarySelectionDeviceV1;
 use smithay::reexports::wayland_protocols::wp::primary_selection::zv1::client::zwp_primary_selection_source_v1::ZwpPrimarySelectionSourceV1;
 use smithay::reexports::wayland_protocols::wp::viewporter::client::wp_viewport;
@@ -452,14 +454,22 @@ impl KeyboardHandler for WprsClientState {
             return;
         };
 
+        let (keycodes, keysyms) = if self.is_input_stalled(Instant::now()) {
+            self.sent_pressed_keys.clear();
+            (Vec::new(), Vec::new())
+        } else {
+            self.sent_pressed_keys = raw.iter().copied().collect();
+            (raw.into(), keysyms.iter().map(|k| k.raw()).collect())
+        };
+
         self.serializer
             .writer()
             .send(SendType::Object(Event::KeyboardEvent(
                 KeyboardEvent::Enter {
                     serial,
                     surface_id,
-                    keycodes: raw.into(),
-                    keysyms: keysyms.iter().map(|k| k.raw()).collect(),
+                    keycodes,
+                    keysyms,
                 },
             )));
     }
@@ -473,6 +483,7 @@ impl KeyboardHandler for WprsClientState {
         surface: &WlSurface,
         serial: u32,
     ) {
+        self.sent_pressed_keys.clear();
         self.serializer
             .writer()
             .send(SendType::Object(Event::KeyboardEvent(
@@ -494,7 +505,11 @@ impl KeyboardHandler for WprsClientState {
         serial: u32,
         event: KeyEvent,
     ) {
+        if self.is_input_stalled(Instant::now()) {
+            return;
+        }
         self.last_implicit_grab_serial = Some(serial);
+        self.sent_pressed_keys.insert(event.raw_code);
         if args::get_log_priv_data() {
             Span::current().record("event", field::debug(&event));
         }
@@ -523,6 +538,9 @@ impl KeyboardHandler for WprsClientState {
         serial: u32,
         event: KeyEvent,
     ) {
+        if self.is_input_stalled(Instant::now()) {
+            return;
+        }
         if args::get_log_priv_data() {
             Span::current().record("event", field::debug(&event));
         }
@@ -551,6 +569,10 @@ impl KeyboardHandler for WprsClientState {
         serial: u32,
         event: KeyEvent,
     ) {
+        let was_sent = self.sent_pressed_keys.remove(&event.raw_code);
+        if self.is_input_stalled(Instant::now()) && !was_sent {
+            return;
+        }
         if args::get_log_priv_data() {
             Span::current().record("event", field::debug(&event));
         }
@@ -627,6 +649,7 @@ impl PointerHandler for WprsClientState {
         _pointer: &WlPointer,
         events: &[PointerEvent],
     ) {
+        let stalled = self.is_input_stalled(Instant::now());
         let has_enter = events
             .iter()
             .any(|event| matches!(event.kind, PointerEventKind::Enter { .. }));
@@ -636,19 +659,31 @@ impl PointerHandler for WprsClientState {
                 continue;
             };
 
-            match event.kind {
+            let forward = match event.kind {
                 PointerEventKind::Enter { serial } => {
                     self.last_enter_serial = serial;
                     self.apply_current_cursor_image().log_and_ignore(loc!());
+                    !stalled
                 },
                 PointerEventKind::Leave { .. } => {
                     if self.dnd_source.is_none() && !has_enter {
                         self.pressed_buttons.clear();
                     }
+                    let had_sent_buttons = !self.sent_pressed_buttons.is_empty();
+                    if !has_enter {
+                        self.sent_pressed_buttons.clear();
+                    }
+                    !stalled || had_sent_buttons
                 },
                 PointerEventKind::Press { button, serial, .. } => {
-                    self.last_mouse_down_serial = Some(serial);
                     self.pressed_buttons.insert(button);
+                    if stalled {
+                        false
+                    } else {
+                        self.last_mouse_down_serial = Some(serial);
+                        self.sent_pressed_buttons.insert(button);
+                        true
+                    }
                 },
                 PointerEventKind::Release { button, .. } => {
                     self.pressed_buttons.remove(&button);
@@ -665,10 +700,14 @@ impl PointerHandler for WprsClientState {
                             DataEvent::SourceEvent(DataSourceEvent::DnDCancelled { source_id }),
                         )));
                     }
+                    let was_sent = self.sent_pressed_buttons.remove(&button);
+                    !stalled || was_sent
                 },
-                _ => {},
+                _ => !stalled,
+            };
+            if forward {
+                serialized_events.push(wayland::PointerEvent::from_smithay(&surface_id, event));
             }
-            serialized_events.push(wayland::PointerEvent::from_smithay(&surface_id, event));
         }
 
         if !serialized_events.is_empty() {

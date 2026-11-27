@@ -490,6 +490,7 @@ impl TileRect {
 
 #[derive(Debug, Clone, Eq, PartialEq)]
 pub struct RawBufferHeader {
+    pub frame_seq: u64,
     pub client: ClientId,
     pub surface: WlSurfaceId,
     pub metadata: BufferMetadata,
@@ -497,24 +498,25 @@ pub struct RawBufferHeader {
     pub tile_rects: Vec<TileRect>,
 }
 
-const RAW_BUFFER_HEADER_LEN: usize = 34;
+const RAW_BUFFER_HEADER_LEN: usize = 42;
 
 impl Framed for RawBufferHeader {
     fn framed_write<W: Write>(&self, stream: &mut W) -> Result<()> {
         let n_tiles = u32::try_from(self.tile_rects.len())
             .context(loc!(), "tile_rects length exceeds u32::MAX")?;
         let mut buf = [0u8; RAW_BUFFER_HEADER_LEN];
-        buf[0..8].copy_from_slice(&self.client.0.to_be_bytes());
-        buf[8..16].copy_from_slice(&self.surface.0.to_be_bytes());
-        buf[16..20].copy_from_slice(&self.metadata.width.to_be_bytes());
-        buf[20..24].copy_from_slice(&self.metadata.height.to_be_bytes());
-        buf[24..28].copy_from_slice(&self.metadata.stride.to_be_bytes());
-        buf[28] = match self.metadata.format {
+        buf[0..8].copy_from_slice(&self.frame_seq.to_be_bytes());
+        buf[8..16].copy_from_slice(&self.client.0.to_be_bytes());
+        buf[16..24].copy_from_slice(&self.surface.0.to_be_bytes());
+        buf[24..28].copy_from_slice(&self.metadata.width.to_be_bytes());
+        buf[28..32].copy_from_slice(&self.metadata.height.to_be_bytes());
+        buf[32..36].copy_from_slice(&self.metadata.stride.to_be_bytes());
+        buf[36] = match self.metadata.format {
             BufferFormat::Argb8888 => 0,
             BufferFormat::Xrgb8888 => 1,
         };
-        buf[29] = u8::from(self.incremental);
-        buf[30..34].copy_from_slice(&n_tiles.to_be_bytes());
+        buf[37] = u8::from(self.incremental);
+        buf[38..42].copy_from_slice(&n_tiles.to_be_bytes());
         stream.write_all(&buf).location(loc!())?;
         for &rect in &self.tile_rects {
             rect.write_framed(stream).location(loc!())?;
@@ -525,22 +527,23 @@ impl Framed for RawBufferHeader {
     fn framed_read<R: Read>(stream: &mut R) -> Result<Self> {
         let mut buf = [0u8; RAW_BUFFER_HEADER_LEN];
         stream.read_exact(&mut buf).location(loc!())?;
-        let client = ClientId(u64::from_be_bytes(buf[0..8].try_into().unwrap()));
-        let surface = WlSurfaceId(u64::from_be_bytes(buf[8..16].try_into().unwrap()));
-        let width = i32::from_be_bytes(buf[16..20].try_into().unwrap());
-        let height = i32::from_be_bytes(buf[20..24].try_into().unwrap());
-        let stride = i32::from_be_bytes(buf[24..28].try_into().unwrap());
-        let format = match buf[28] {
+        let frame_seq = u64::from_be_bytes(buf[0..8].try_into().unwrap());
+        let client = ClientId(u64::from_be_bytes(buf[8..16].try_into().unwrap()));
+        let surface = WlSurfaceId(u64::from_be_bytes(buf[16..24].try_into().unwrap()));
+        let width = i32::from_be_bytes(buf[24..28].try_into().unwrap());
+        let height = i32::from_be_bytes(buf[28..32].try_into().unwrap());
+        let stride = i32::from_be_bytes(buf[32..36].try_into().unwrap());
+        let format = match buf[36] {
             0 => BufferFormat::Argb8888,
             1 => BufferFormat::Xrgb8888,
             tag => bail!("invalid BufferFormat tag: {tag}"),
         };
-        let incremental = match buf[29] {
+        let incremental = match buf[37] {
             0 => false,
             1 => true,
             tag => bail!("invalid incremental tag: {tag}"),
         };
-        let n_tiles = u32::from_be_bytes(buf[30..34].try_into().unwrap()) as usize;
+        let n_tiles = u32::from_be_bytes(buf[38..42].try_into().unwrap()) as usize;
         let metadata = BufferMetadata {
             width,
             height,
@@ -562,6 +565,7 @@ impl Framed for RawBufferHeader {
             tile_rects.push(rect);
         }
         Ok(Self {
+            frame_seq,
             client,
             surface,
             metadata,
@@ -1503,6 +1507,7 @@ mod tests {
                 ),
             ] {
                 let hdr = RawBufferHeader {
+                    frame_seq: 123_456_789,
                     client: ClientId(42),
                     surface: WlSurfaceId(99),
                     metadata: BufferMetadata {
@@ -1525,12 +1530,12 @@ mod tests {
         // Valid fixed prefix helper for negative header tests (`640x480` Xrgb).
         let make_header_prefix = |w: i32, h: i32, stride: i32, fmt: u8, inc: u8, n_tiles: u32| {
             let mut buf = [0u8; RAW_BUFFER_HEADER_LEN];
-            buf[16..20].copy_from_slice(&w.to_be_bytes());
-            buf[20..24].copy_from_slice(&h.to_be_bytes());
-            buf[24..28].copy_from_slice(&stride.to_be_bytes());
-            buf[28] = fmt;
-            buf[29] = inc;
-            buf[30..34].copy_from_slice(&n_tiles.to_be_bytes());
+            buf[24..28].copy_from_slice(&w.to_be_bytes());
+            buf[28..32].copy_from_slice(&h.to_be_bytes());
+            buf[32..36].copy_from_slice(&stride.to_be_bytes());
+            buf[36] = fmt;
+            buf[37] = inc;
+            buf[38..42].copy_from_slice(&n_tiles.to_be_bytes());
             buf
         };
 
@@ -1812,6 +1817,7 @@ mod tests {
             h: 6,
         };
         let header = RawBufferHeader {
+            frame_seq: 1,
             client: ClientId(7),
             surface: WlSurfaceId(11),
             metadata: BufferMetadata {
@@ -1991,6 +1997,7 @@ mod tests {
         );
 
         let batch_header = RawBufferHeader {
+            frame_seq: 2,
             client: ClientId(7),
             surface: WlSurfaceId(11),
             metadata: BufferMetadata {

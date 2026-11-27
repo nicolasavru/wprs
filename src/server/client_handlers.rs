@@ -13,7 +13,6 @@
 // limitations under the License.
 
 /// Handlers for events from the wprs client.
-use std::collections::HashMap;
 use std::collections::HashSet;
 use std::collections::hash_map::Entry;
 use std::fs::File;
@@ -22,6 +21,7 @@ use std::io::Write;
 use std::mem;
 use std::os::fd::OwnedFd;
 use std::thread;
+use std::time::Instant;
 
 use nix::fcntl::OFlag;
 use nix::unistd;
@@ -39,6 +39,7 @@ use smithay::output::Output;
 use smithay::output::PhysicalProperties;
 use smithay::reexports::wayland_protocols::xdg::shell::server::xdg_toplevel;
 use smithay::reexports::wayland_server::Client;
+use smithay::reexports::wayland_server::Resource;
 use smithay::reexports::wayland_server::backend::ObjectId;
 use smithay::reexports::wayland_server::protocol::wl_buffer::WlBuffer;
 use smithay::reexports::wayland_server::protocol::wl_surface::WlSurface;
@@ -56,7 +57,6 @@ use smithay::wayland::shell::xdg::ToplevelStateSet;
 
 use crate::args;
 use crate::compositor_utils;
-use crate::filtering;
 use crate::prelude::*;
 use crate::serialization::Capabilities;
 use crate::serialization::CompressionMode;
@@ -64,7 +64,6 @@ use crate::serialization::Event;
 use crate::serialization::RecvType;
 use crate::serialization::Request;
 use crate::serialization::SendType;
-use crate::serialization::Serializer;
 use crate::serialization::wayland::BufferAssignment;
 use crate::serialization::wayland::ClientSurface;
 use crate::serialization::wayland::CursorImage;
@@ -91,7 +90,6 @@ use crate::serialization::wayland::SurfaceEvent;
 use crate::serialization::wayland::SurfaceEventPayload;
 use crate::serialization::wayland::SurfaceRequest;
 use crate::serialization::wayland::SurfaceRequestPayload;
-use crate::serialization::wayland::SurfaceState;
 use crate::serialization::wayland::WlSurfaceId;
 use crate::serialization::xdg_shell::FullscreenState;
 use crate::serialization::xdg_shell::PopupConfigure;
@@ -100,11 +98,15 @@ use crate::serialization::xdg_shell::PopupEvent;
 use crate::serialization::xdg_shell::ToplevelConfigure;
 use crate::serialization::xdg_shell::ToplevelEvent;
 use crate::server::LockedSurfaceState;
-use crate::server::SyncedSurfaceBuffer;
+use crate::server::PendingDamage;
+use crate::server::TrackedSurfaceState;
 use crate::server::WprsServerState;
+use crate::server::smithay_handlers::EncodeBufferOutcome;
+use crate::server::smithay_handlers::ScanDamage;
 use crate::server::smithay_handlers::get_surface_z_order;
+use crate::server::smithay_handlers::has_deferred_sync_descendant;
 use crate::server::smithay_handlers::sync_subsurface_role;
-use crate::sharding_compression::ShardingCompressor;
+use crate::server::smithay_handlers::take_dirty_sync_descendants;
 
 enum UnknownSurfaceErr {
     ObjectId(WlSurfaceId),
@@ -134,128 +136,102 @@ fn committed_wl_buffer(surface_data: &SurfaceData) -> Option<WlBuffer> {
         })
 }
 
-fn sync_surface_data(
-    serializer: &Serializer<Request, Event>,
-    compressor: &mut ShardingCompressor,
-    compression_mode: CompressionMode,
-    synced_buffers: &mut HashMap<WlSurfaceId, SyncedSurfaceBuffer>,
-    committed_surfaces: &mut HashSet<WlSurfaceId>,
-    surface_data: &SurfaceData,
-    parent_id: Option<WlSurfaceId>,
-    sync: bool,
-    z_ordered_children: Vec<SubsurfacePosition>,
-) {
-    // Uncommitted child subsurfaces visited by `with_surface_tree_downward` do
-    // not have `LockedSurfaceState` yet and will sync on their first commit.
-    let Some(locked_state) = surface_data.data_map.get::<LockedSurfaceState>() else {
-        return;
-    };
-    let mut tracked = locked_state.0.lock().unwrap();
-    if !tracked.has_committed {
-        return;
-    }
-    let mut surface_state_to_send = tracked.state.clone();
-    sync_subsurface_role(
-        &mut surface_state_to_send,
-        matches!(surface_data.role, Some("subsurface")),
-        parent_id,
-    );
-    if let Some(Role::SubSurface(subsurface_state)) = &mut surface_state_to_send.role {
-        subsurface_state.sync = sync;
-        subsurface_state.location = surface_data
-            .cached_state
-            .get::<SubsurfaceCachedState>()
-            .pending()
-            .location
-            .into();
-    }
-    if let Some(Role::XdgPopup(popup_state)) = &mut surface_state_to_send.role {
-        // Never replay an explicit grab serial from a prior connection on sync.
-        popup_state.grab_serial = None;
-    }
-    surface_state_to_send.z_ordered_children = z_ordered_children;
-    // `wprsc` treats `damage: None` + `BufferAssignment::New` as full damage
-    // (`FrameDamage::merge_commit`).
-    surface_state_to_send.damage = None;
+impl WprsServerState {
+    fn sync_surface_data(
+        &mut self,
+        surface_data: &SurfaceData,
+        parent_id: Option<WlSurfaceId>,
+        sync: bool,
+        z_ordered_children: Vec<SubsurfacePosition>,
+    ) {
+        // Uncommitted child subsurfaces visited by `with_surface_tree_downward`
+        // do not have `LockedSurfaceState` yet and will sync on their first
+        // commit.
+        let Some(locked_state) = surface_data.data_map.get::<LockedSurfaceState>() else {
+            return;
+        };
+        let mut tracked = locked_state.0.lock().unwrap();
+        if !tracked.has_committed {
+            return;
+        }
+        let mut surface_state_to_send = tracked.state.clone();
+        sync_subsurface_role(
+            &mut surface_state_to_send,
+            matches!(surface_data.role, Some("subsurface")),
+            parent_id,
+        );
+        if let Some(Role::SubSurface(subsurface_state)) = &mut surface_state_to_send.role {
+            subsurface_state.sync = sync;
+            subsurface_state.location = surface_data
+                .cached_state
+                .get::<SubsurfaceCachedState>()
+                .pending()
+                .location
+                .into();
+        }
+        if let Some(Role::XdgPopup(popup_state)) = &mut surface_state_to_send.role {
+            // Never replay an explicit grab serial from a prior connection on sync.
+            popup_state.grab_serial = None;
+        }
+        surface_state_to_send.z_ordered_children = z_ordered_children;
+        // `wprsc` treats `damage: None` + `BufferAssignment::New` as full damage
+        // (`FrameDamage::merge_commit`).
+        surface_state_to_send.damage = None;
 
-    if matches!(surface_state_to_send.buffer, Some(BufferAssignment::New(_))) {
-        // Remove any prior shadow buffer before reading `wl_shm` so a `BadMap`
-        // or invalid-metadata error cannot leave a stale shadow behind.
-        let mut shadow_pixels = synced_buffers
-            .remove(&surface_state_to_send.id)
-            .map_or_else(Vec::new, |old| old.pixels);
-        match committed_wl_buffer(surface_data) {
-            Some(wl_buffer) => {
-                let mut raw_buffer_sent = false;
-                let writer = serializer.writer();
-                let sync_res = compositor_utils::with_buffer_contents(
-                    &wl_buffer,
-                    |data, spec| -> Result<SyncedSurfaceBuffer> {
-                        let metadata = surface_state_to_send.set_buffer(&spec).location(loc!())?;
-                        compositor_utils::fault_probe_buffer(data, metadata.stride as usize, None);
-                        filtering::filter_and_compress_full_streaming(
-                            data,
-                            surface_state_to_send.client,
-                            surface_state_to_send.id,
-                            metadata,
-                            compression_mode,
-                            Some(&mut shadow_pixels),
-                            compressor,
-                            |raw_buffer_to_send| {
-                                raw_buffer_sent = true;
-                                writer.send(SendType::RawBuffer(raw_buffer_to_send));
-                            },
-                        );
-                        Ok(SyncedSurfaceBuffer {
-                            metadata,
-                            pixels: shadow_pixels,
-                        })
-                    },
-                );
-                match sync_res {
-                    Ok(Ok(synced)) => {
-                        synced_buffers.insert(surface_state_to_send.id, synced);
-                    },
-                    Ok(Err(err)) => {
-                        warn!("skipping invalid buffer during surface sync: {err:?}");
-                        surface_state_to_send.buffer = None;
-                    },
-                    Err(err) => {
-                        // Smithay reports SIGBUS as `Err(BadMap)` after the
-                        // closure returns, so `raw_buffer_sent` may already be
-                        // `true`.
-                        warn!("skipping unreadable shm buffer during surface sync: {err:?}");
-                        surface_state_to_send.buffer =
-                            raw_buffer_sent.then_some(BufferAssignment::Removed);
-                    },
-                }
-            },
-            None => {
-                warn!(
-                    "surface {:?} had BufferAssignment::New without committed WlBuffer; clearing buffer for sync",
-                    surface_state_to_send.id
-                );
-                surface_state_to_send.buffer = None;
-            },
+        let surface = surface_state_to_send.id;
+        if matches!(surface_state_to_send.buffer, Some(BufferAssignment::New(_))) {
+            match committed_wl_buffer(surface_data) {
+                Some(wl_buffer) => {
+                    if !self.frame_backpressure.has_credit() {
+                        tracked.pending_damage.mark_full();
+                        tracked.dirty = true;
+                        self.frame_backpressure.defer(surface);
+                        return;
+                    }
+                    match self.encode_and_send_buffer(
+                        &wl_buffer,
+                        &mut surface_state_to_send,
+                        ScanDamage::Full,
+                    ) {
+                        EncodeBufferOutcome::Sent { metadata, .. } => {
+                            surface_state_to_send.buffer = Some(BufferAssignment::New(metadata));
+                        },
+                        EncodeBufferOutcome::Unchanged => {
+                            surface_state_to_send.buffer = None;
+                        },
+                        EncodeBufferOutcome::FaultedAfterSend => {
+                            surface_state_to_send.buffer = Some(BufferAssignment::Removed);
+                        },
+                        EncodeBufferOutcome::Failed(err) => {
+                            warn!("skipping unreadable shm buffer during surface sync: {err:?}");
+                            surface_state_to_send.buffer = None;
+                        },
+                    }
+                },
+                None => {
+                    warn!(
+                        "surface {:?} had BufferAssignment::New without committed WlBuffer; clearing buffer for sync",
+                        surface_state_to_send.id
+                    );
+                    surface_state_to_send.buffer = None;
+                },
+            }
+        }
+
+        let client = surface_state_to_send.client;
+        self.serializer
+            .writer()
+            .send(SendType::Object(Request::Surface(SurfaceRequest {
+                client,
+                surface,
+                payload: SurfaceRequestPayload::Commit(surface_state_to_send),
+            })));
+        self.committed_surfaces.insert(surface);
+        if tracked.state.buffer.is_some() {
+            tracked.dirty = false;
         }
     }
 
-    let client = surface_state_to_send.client;
-    let surface = surface_state_to_send.id;
-    serializer
-        .writer()
-        .send(SendType::Object(Request::Surface(SurfaceRequest {
-            client,
-            surface,
-            payload: SurfaceRequestPayload::Commit(surface_state_to_send),
-        })));
-    committed_surfaces.insert(surface);
-    if tracked.state.buffer.is_some() {
-        tracked.dirty = false;
-    }
-}
-
-impl WprsServerState {
     fn sync_surface_tree(&mut self, root: &WlSurface) {
         // Collect the tree first so `get_parent` and `get_surface_z_order`
         // never re-lock `PrivateSurfaceData` while `with_surface_tree_downward`
@@ -275,27 +251,273 @@ impl WprsServerState {
             let sync = parent_id.is_some() && compositor::is_sync_subsurface(surface);
             let z_ordered_children = get_surface_z_order(surface);
             compositor::with_states(surface, |surface_data| {
-                sync_surface_data(
-                    &self.serializer,
-                    &mut self.compressor,
-                    self.compression_mode,
-                    &mut self.synced_buffers,
-                    &mut self.committed_surfaces,
-                    surface_data,
-                    parent_id,
-                    sync,
-                    z_ordered_children,
-                );
+                self.sync_surface_data(surface_data, parent_id, sync, z_ordered_children);
             });
+        }
+        if !compositor::is_sync_subsurface(root)
+            && has_deferred_sync_descendant(root, &self.frame_backpressure)
+        {
+            self.deferred_sync_ancestors.insert(WlSurfaceId::new(root));
         }
     }
 
     pub(crate) fn sync_surface_if_unsynced(&mut self, surface: &WlSurface) {
+        let surface_id = WlSurfaceId::new(surface);
         if self.serializer.other_end_connected()
-            && !self.synced_buffers.contains_key(&WlSurfaceId::new(surface))
+            && !self.synced_buffers.contains_key(&surface_id)
+            && !self.frame_backpressure.is_deferred(surface_id)
         {
             self.sync_surface_tree(surface);
         }
+    }
+
+    fn flush_deferred_surface(&mut self, surface_id: WlSurfaceId) {
+        let Ok((_, _, surface)) = self.object_client_surface_from_id(&surface_id) else {
+            self.held_frame_callbacks.remove(&surface_id);
+            return;
+        };
+        if !surface.is_alive() {
+            self.held_frame_callbacks.remove(&surface_id);
+            return;
+        }
+
+        let surface_order = get_surface_z_order(&surface);
+        let parent = compositor::get_parent(&surface);
+        let sync = parent.is_some() && compositor::is_sync_subsurface(&surface);
+        let taken_dirty = if sync {
+            Vec::new()
+        } else {
+            take_dirty_sync_descendants(
+                &mut self.dirty_sync_surfaces,
+                &surface,
+                &compositor::get_children,
+                &compositor::is_sync_subsurface,
+                &WlSurfaceId::new,
+            )
+        };
+        let children_dirty = !taken_dirty.is_empty();
+
+        let res = compositor::with_states(&surface, |surface_data| -> Result<bool> {
+            let Some(locked_state) = surface_data.data_map.get::<LockedSurfaceState>() else {
+                return Ok(false);
+            };
+            let mut tracked = locked_state.0.lock().unwrap();
+            if !tracked.has_committed {
+                return Ok(false);
+            }
+
+            sync_subsurface_role(
+                &mut tracked.state,
+                matches!(surface_data.role, Some("subsurface")),
+                parent.as_ref().map(WlSurfaceId::new),
+            );
+            if let Some(Role::SubSurface(subsurface_state)) = &mut tracked.state.role {
+                subsurface_state.sync = sync;
+                subsurface_state.location = surface_data
+                    .cached_state
+                    .get::<SubsurfaceCachedState>()
+                    .pending()
+                    .location
+                    .into();
+            }
+            tracked.state.z_ordered_children = surface_order;
+
+            let pending_damage_rects = tracked.pending_damage.take_rects();
+            let pending_buffer_delta = tracked.pending_buffer_delta.take();
+            let was_committed = self.committed_surfaces.contains(&surface_id);
+
+            let mut buffer_to_send = None;
+            let mut damage_to_send = None;
+
+            if matches!(tracked.state.buffer, Some(BufferAssignment::New(_))) {
+                if let Some(wl_buffer) = committed_wl_buffer(surface_data) {
+                    let scan_damage = match &pending_damage_rects {
+                        Some(rects) => ScanDamage::BufferRects(rects),
+                        None => ScanDamage::Full,
+                    };
+                    match self.encode_and_send_buffer(&wl_buffer, &mut tracked.state, scan_damage) {
+                        EncodeBufferOutcome::Sent { metadata, damage } => {
+                            buffer_to_send = Some(BufferAssignment::New(metadata));
+                            damage_to_send = damage;
+                        },
+                        EncodeBufferOutcome::Unchanged => {},
+                        EncodeBufferOutcome::FaultedAfterSend => {
+                            buffer_to_send = Some(BufferAssignment::Removed);
+                        },
+                        EncodeBufferOutcome::Failed(err) => {
+                            warn!("skipping unreadable shm buffer during deferred flush: {err:?}");
+                            return Err(err);
+                        },
+                    }
+                } else {
+                    tracked.state.buffer = None;
+                }
+            }
+
+            if was_committed
+                && !tracked.dirty
+                && buffer_to_send.is_none()
+                && pending_buffer_delta.is_none()
+                && !children_dirty
+            {
+                return Ok(false);
+            }
+
+            let unmapped_xdg_surface = matches!(buffer_to_send, Some(BufferAssignment::Removed))
+                && matches!(
+                    tracked.state.role,
+                    Some(Role::XdgToplevel(_) | Role::XdgPopup(_))
+                );
+
+            let mut surface_state_to_send = tracked.state.clone_without_buffer();
+            surface_state_to_send.buffer = buffer_to_send;
+            surface_state_to_send.buffer_delta = pending_buffer_delta;
+            surface_state_to_send.damage = damage_to_send;
+
+            let client = surface_state_to_send.client;
+            self.serializer
+                .writer()
+                .send(SendType::Object(Request::Surface(SurfaceRequest {
+                    client,
+                    surface: surface_id,
+                    payload: SurfaceRequestPayload::Commit(surface_state_to_send),
+                })));
+            self.committed_surfaces.insert(surface_id);
+            if let Some(Role::XdgPopup(popup_state)) = &mut tracked.state.role {
+                popup_state.grab_serial = None;
+            }
+            tracked.dirty = unmapped_xdg_surface;
+            Ok(true)
+        });
+
+        match res {
+            Ok(sent) => {
+                if sync {
+                    if sent {
+                        self.dirty_sync_surfaces.insert(surface_id);
+                    }
+                } else {
+                    self.dirty_sync_surfaces.remove(&surface_id);
+                    if !has_deferred_sync_descendant(&surface, &self.frame_backpressure) {
+                        self.deferred_sync_ancestors.remove(&surface_id);
+                    }
+                }
+            },
+            Err(err) => {
+                self.dirty_sync_surfaces.extend(taken_dirty);
+                Err::<(), _>(err).log_and_ignore(loc!());
+            },
+        }
+        self.release_held_frame_callbacks(surface_id);
+    }
+
+    pub(crate) fn flush_ready_deferred_sync_ancestors(&mut self) {
+        if self.deferred_sync_ancestors.is_empty() || !self.serializer.other_end_connected() {
+            return;
+        }
+        let candidates: Vec<WlSurfaceId> = self.deferred_sync_ancestors.iter().copied().collect();
+        for ancestor_id in candidates {
+            if self.frame_backpressure.is_deferred(ancestor_id) {
+                continue;
+            }
+            let Ok((_, _, ancestor)) = self.object_client_surface_from_id(&ancestor_id) else {
+                self.deferred_sync_ancestors.remove(&ancestor_id);
+                continue;
+            };
+            if !ancestor.is_alive() {
+                self.deferred_sync_ancestors.remove(&ancestor_id);
+                continue;
+            }
+            if has_deferred_sync_descendant(&ancestor, &self.frame_backpressure) {
+                continue;
+            }
+            self.deferred_sync_ancestors.remove(&ancestor_id);
+            let taken = take_dirty_sync_descendants(
+                &mut self.dirty_sync_surfaces,
+                &ancestor,
+                &compositor::get_children,
+                &compositor::is_sync_subsurface,
+                &WlSurfaceId::new,
+            );
+            if taken.is_empty() {
+                continue;
+            }
+            let surface_order = get_surface_z_order(&ancestor);
+            compositor::with_states(&ancestor, |surface_data| {
+                let Some(locked_state) = surface_data.data_map.get::<LockedSurfaceState>() else {
+                    return;
+                };
+                let mut tracked = locked_state.0.lock().unwrap();
+                if !tracked.has_committed {
+                    return;
+                }
+                tracked.state.z_ordered_children = surface_order;
+                let surface_state_to_send = tracked.state.clone_without_buffer();
+                let client = surface_state_to_send.client;
+                self.serializer
+                    .writer()
+                    .send(SendType::Object(Request::Surface(SurfaceRequest {
+                        client,
+                        surface: ancestor_id,
+                        payload: SurfaceRequestPayload::Commit(surface_state_to_send),
+                    })));
+                self.committed_surfaces.insert(ancestor_id);
+            });
+        }
+    }
+
+    fn flush_deferred_surfaces(&mut self) {
+        while self.serializer.other_end_connected() && self.frame_backpressure.has_credit() {
+            let Some(surface_id) = self.frame_backpressure.pop_deferred() else {
+                break;
+            };
+            self.flush_deferred_surface(surface_id);
+        }
+        self.flush_ready_deferred_sync_ancestors();
+    }
+
+    fn handle_frame_ack(&mut self, seq: u64) -> Result<()> {
+        if !self.frame_backpressure.ack(seq) {
+            debug!("ignoring stale or duplicate FrameAck({seq})");
+            return Ok(());
+        }
+        self.flush_deferred_surfaces();
+        Ok(())
+    }
+
+    fn handle_heartbeat(&self, seq: u64) -> Result<()> {
+        self.serializer
+            .writer()
+            .send(SendType::Object(Request::HeartbeatAck { seq }));
+        Ok(())
+    }
+
+    fn cleanup_disconnected_session(&mut self) {
+        self.active_conn_id = None;
+        self.heartbeat.on_disconnected();
+        self.reset_dnd_state();
+        self.reset_input_state();
+        self.serial_map.clear();
+        self.frame_backpressure.reset();
+        self.deferred_sync_ancestors.clear();
+        self.for_each_mapped_surface(|_, tracked| {
+            tracked.pending_buffer_delta = None;
+            tracked.pending_damage = PendingDamage::None;
+        });
+        self.release_unthrottled_held_frame_callbacks();
+    }
+
+    pub(crate) fn check_client_stall(&mut self, now: Instant) -> bool {
+        if !self.serializer.other_end_connected() || !self.heartbeat.is_stalled(now) {
+            return false;
+        }
+        warn!(
+            "wprsc connection stalled for >= {:?} without client activity; disconnecting.",
+            self.heartbeat.stall_timeout()
+        );
+        self.serializer.disconnect_active_connection();
+        self.cleanup_disconnected_session();
+        true
     }
 
     pub(crate) fn send_cursor_status(&mut self, image: &SmithayCursorImageStatus) {
@@ -892,7 +1114,7 @@ impl WprsServerState {
         Ok(())
     }
 
-    fn for_each_mapped_surface(&self, mut f: impl FnMut(&WlSurface, &mut SurfaceState)) {
+    fn for_each_mapped_surface(&self, mut f: impl FnMut(&WlSurface, &mut TrackedSurfaceState)) {
         for surface_id in self.object_map.keys() {
             let Ok((_, _, surface)) = self.object_client_surface_from_id(surface_id) else {
                 continue;
@@ -905,13 +1127,14 @@ impl WprsServerState {
                     .0
                     .lock()
                     .unwrap();
-                f(&surface, &mut tracked.state);
+                f(&surface, &mut tracked);
             });
         }
     }
 
     fn remove_output_from_surfaces(&self, output_id: u32, output: Option<&Output>) {
-        self.for_each_mapped_surface(|surface, surface_state| {
+        self.for_each_mapped_surface(|surface, tracked| {
+            let surface_state = &mut tracked.state;
             if let Some(output) = output {
                 output.leave(surface);
             }
@@ -925,8 +1148,8 @@ impl WprsServerState {
     }
 
     fn enter_surfaces_on_output(&self, output_id: u32, output: &Output) {
-        self.for_each_mapped_surface(|surface, surface_state| {
-            if surface_state.output_ids.contains(&output_id) {
+        self.for_each_mapped_surface(|surface, tracked| {
+            if tracked.state.output_ids.contains(&output_id) {
                 output.enter(surface);
             }
         });
@@ -992,15 +1215,23 @@ impl WprsServerState {
     }
 
     #[instrument(skip_all, level = "debug")]
-    fn handle_connect(&mut self) -> Result<()> {
+    fn handle_connect(&mut self, conn_id: u64) -> Result<()> {
+        self.active_conn_id = Some(conn_id);
+        self.heartbeat.on_connected(Instant::now());
         self.reset_dnd_state();
         self.reset_input_state();
         self.serial_map.clear();
+        self.frame_backpressure.reset();
+        self.deferred_sync_ancestors.clear();
         let old_outputs: Vec<_> = self.outputs.drain().collect();
         // Clear all previous-session `output_ids` unconditionally (including IDs
         // recorded by `OutputsChanged` before `OutputEvent::New` arrived), and
-        // clear any pending popup grab serials captured in a previous session.
-        self.for_each_mapped_surface(|surface, surface_state| {
+        // clear any pending popup grab serials or deferred commit state from a
+        // previous session.
+        self.for_each_mapped_surface(|surface, tracked| {
+            tracked.pending_buffer_delta = None;
+            tracked.pending_damage = PendingDamage::None;
+            let surface_state = &mut tracked.state;
             for (_, (local_output, _)) in &old_outputs {
                 local_output.leave(surface);
             }
@@ -1052,6 +1283,8 @@ impl WprsServerState {
         if let Some(cursor_status) = self.cursor_status.clone() {
             self.send_cursor_status(&cursor_status);
         }
+
+        self.release_unthrottled_held_frame_callbacks();
 
         Ok(())
     }
@@ -1295,18 +1528,33 @@ impl WprsServerState {
 
     #[instrument(skip(self), level = "debug")]
     pub fn handle_event(&mut self, conn_id: u64, event: RecvType<Event>) {
-        if matches!(event, RecvType::Connected) {
-            if !self.serializer.activate_connection(conn_id) {
-                debug!("ignoring Connected from already-disconnected session {conn_id}");
+        match event {
+            RecvType::Connected => {
+                if !self.serializer.activate_connection(conn_id) {
+                    debug!("ignoring Connected from already-disconnected session {conn_id}");
+                    return;
+                }
+            },
+            RecvType::Disconnected => {
+                if self.active_conn_id == Some(conn_id) {
+                    self.cleanup_disconnected_session();
+                } else {
+                    debug!("ignoring Disconnected for non-active session {conn_id}");
+                }
                 return;
-            }
-        } else if !self.serializer.is_active_connection(conn_id) {
-            debug!("ignoring stale event from session {conn_id}");
-            return;
+            },
+            _ => {
+                if !self.serializer.is_active_connection(conn_id) {
+                    debug!("ignoring stale event from session {conn_id}");
+                    return;
+                }
+                self.heartbeat.on_activity(Instant::now());
+            },
         }
 
         match event {
-            RecvType::Connected => self.handle_connect(),
+            RecvType::Connected => self.handle_connect(conn_id),
+            RecvType::Disconnected => unreachable!(),
             RecvType::Object(Event::Toplevel(toplevel)) => self.handle_toplevel(toplevel),
             RecvType::Object(Event::Popup(popup)) => self.handle_popup(popup),
             RecvType::Object(Event::KeyboardEvent(event)) => self.handle_keyboard_event(event),
@@ -1319,6 +1567,8 @@ impl WprsServerState {
             RecvType::Object(Event::SetCompressionMode(mode)) => {
                 self.handle_set_compression_mode(mode)
             },
+            RecvType::Object(Event::FrameAck { seq }) => self.handle_frame_ack(seq),
+            RecvType::Object(Event::Heartbeat { seq }) => self.handle_heartbeat(seq),
             RecvType::RawBuffer(_) => unreachable!(),
         }
         .log_and_ignore(loc!());
@@ -1359,6 +1609,7 @@ mod tests {
 
     use super::*;
     use crate::serialization::JpegSubsamp;
+    use crate::serialization::Serializer;
     use crate::server::smithay_handlers::ClientState;
 
     #[derive(Debug, Clone, Eq, PartialEq)]
@@ -1959,6 +2210,10 @@ mod tests {
 
         // Sudden disconnect (no Leave / Release) + reconnect.
         drop(wprsc1);
+        let (disc1, disc_msg1) = reader.recv().unwrap();
+        assert_eq!(disc1, conn1);
+        assert_matches!(disc_msg1, RecvType::Disconnected);
+        state.handle_event(disc1, disc_msg1);
         let wprsc2 = UnixStream::connect(&sock_path).unwrap();
         let (conn2, msg2) = reader.recv().unwrap();
         assert_matches!(msg2, RecvType::Connected);
@@ -2104,6 +2359,10 @@ mod tests {
 
         // Client 1 disconnects and Client 2 connects -> `handle_connect` resets to Lossless.
         drop(client1);
+        let (disc1, disc_msg1) = reader.recv().unwrap();
+        assert_eq!(disc1, conn1);
+        assert_matches!(disc_msg1, RecvType::Disconnected);
+        state.handle_event(disc1, disc_msg1);
         let client2 = UnixStream::connect(&sock_path).unwrap();
         let (conn2, msg2) = reader.recv().unwrap();
         assert_matches!(msg2, RecvType::Connected);
@@ -2115,6 +2374,180 @@ mod tests {
         assert_eq!(state.compression_mode, CompressionMode::Lossless);
 
         drop(client2);
+        _ = std::fs::remove_file(&sock_path);
+    }
+
+    #[test]
+    #[cfg_attr(miri, ignore)]
+    fn test_server_heartbeat_ack_and_stalled_client_disconnect() {
+        let sock_path = std::env::temp_dir().join(format!(
+            "wprs_heartbeat_stall_test_{}_{}.sock",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let mut serializer: Serializer<Request, Event> =
+            Serializer::new_server(&sock_path).unwrap();
+        let reader = serializer.reader().unwrap();
+
+        let mut display: Display<WprsServerState> = Display::new().unwrap();
+        let event_loop: EventLoop<WprsServerState> = EventLoop::try_new().unwrap();
+        let mut state = WprsServerState::new(
+            display.handle(),
+            event_loop.handle(),
+            serializer,
+            false,
+            Duration::from_millis(16),
+            false,
+        );
+        state
+            .seat
+            .add_keyboard(Default::default(), 200, 25)
+            .unwrap();
+        state.seat.add_pointer();
+
+        let (server_sock, client_sock) = UnixStream::pair().unwrap();
+        display
+            .handle()
+            .insert_client(
+                server_sock,
+                Arc::new(ClientState::new(state.serializer.writer())),
+            )
+            .unwrap();
+        let conn = Connection::from_socket(client_sock).unwrap();
+        let mut queue: EventQueue<TestWaylandApp> = conn.new_event_queue();
+        let qh = queue.handle();
+        let _reg = conn.display().get_registry(&qh, ());
+        let mut app = TestWaylandApp::default();
+        roundtrip_app(&mut display, &mut state, &conn, &mut queue, &mut app);
+        roundtrip_app(&mut display, &mut state, &conn, &mut queue, &mut app);
+
+        let surf = app.compositor.as_ref().unwrap().create_surface(&qh, ());
+        surf.commit();
+        roundtrip_app(&mut display, &mut state, &conn, &mut queue, &mut app);
+        let pid = surf.id().protocol_id();
+        let wid = *state
+            .object_map
+            .iter()
+            .find_map(|(sid, oid)| (oid.protocol_id() == pid).then_some(sid))
+            .unwrap();
+
+        // 1. Test Heartbeat -> HeartbeatAck on test serializer.
+        let mut test_ser: Serializer<Request, Event> = Serializer::new_test_server();
+        let (test_conn_id, test_rx) = test_ser.connect_test_client();
+        let test_display: Display<WprsServerState> = Display::new().unwrap();
+        let test_loop: EventLoop<WprsServerState> = EventLoop::try_new().unwrap();
+        let mut test_state = WprsServerState::new(
+            test_display.handle(),
+            test_loop.handle(),
+            test_ser,
+            false,
+            Duration::from_millis(16),
+            false,
+        );
+        test_state.handle_event(test_conn_id, RecvType::Connected);
+        while test_rx.try_recv().is_ok() {}
+        test_state.handle_event(test_conn_id, RecvType::Object(Event::Heartbeat { seq: 42 }));
+        let ack = test_rx.try_recv().unwrap();
+        assert!(matches!(
+            ack,
+            SendType::Object(Request::HeartbeatAck { seq: 42 })
+        ));
+
+        // 2. Real UnixStream peer with held key and pointer button stalls past
+        //    `STALL_TIMEOUT` -> server resets input, closes the dead stream,
+        //    and accepts a new connection cleanly.
+        let wprsc1 = UnixStream::connect(&sock_path).unwrap();
+        let (conn1, msg1) = reader.recv().unwrap();
+        assert_matches!(msg1, RecvType::Connected);
+        state.handle_event(conn1, msg1);
+
+        state.handle_event(
+            conn1,
+            RecvType::Object(Event::KeyboardEvent(KeyboardEvent::Enter {
+                serial: 1,
+                surface_id: wid,
+                keycodes: Vec::new(),
+                keysyms: Vec::new(),
+            })),
+        );
+        state.handle_event(
+            conn1,
+            RecvType::Object(Event::KeyboardEvent(KeyboardEvent::Key(KeyInner {
+                serial: 2,
+                raw_code: 30,
+                state: KeyState::Pressed,
+            }))),
+        );
+        state.handle_event(
+            conn1,
+            RecvType::Object(Event::PointerFrame(vec![
+                PointerEvent {
+                    surface_id: wid,
+                    position: (5.0, 5.0).into(),
+                    kind: PointerEventKind::Enter { serial: 3 },
+                },
+                PointerEvent {
+                    surface_id: wid,
+                    position: (5.0, 5.0).into(),
+                    kind: PointerEventKind::Press {
+                        button: 0x110,
+                        serial: 4,
+                    },
+                },
+            ])),
+        );
+        roundtrip_app(&mut display, &mut state, &conn, &mut queue, &mut app);
+        app.kbd_events.clear();
+        app.pointer_leaves.clear();
+        app.pointer_button_releases.clear();
+
+        // Heartbeat refreshes activity timestamp; before timeout no disconnect.
+        state.handle_event(conn1, RecvType::Object(Event::Heartbeat { seq: 1 }));
+        let now = Instant::now();
+        assert!(
+            !state
+                .check_client_stall(now + crate::constants::STALL_TIMEOUT - Duration::from_secs(1))
+        );
+        assert!(state.serializer.other_end_connected());
+
+        // Past `STALL_TIMEOUT`, watchdog disconnects stalled peer and releases held input.
+        assert!(
+            state
+                .check_client_stall(now + crate::constants::STALL_TIMEOUT + Duration::from_secs(1))
+        );
+        assert!(!state.serializer.other_end_connected());
+        assert!(state.pressed_keys.is_empty());
+        assert!(state.pressed_buttons.is_empty());
+        roundtrip_app(&mut display, &mut state, &conn, &mut queue, &mut app);
+        assert!(
+            app.kbd_events
+                .contains(&KbdWireEvent::Leave { surface_id: pid }),
+            "stalled disconnect must release keyboard focus: {:?}",
+            app.kbd_events
+        );
+        assert_eq!(app.pointer_button_releases, vec![0x110]);
+        assert_eq!(app.pointer_leaves, vec![pid]);
+
+        // Even while the vanished peer (`wprsc1`) still holds its fd open,
+        // shutting down the server's stream allows accept_loop to emit
+        // Disconnected and accept a replacement peer immediately.
+        let (disc1, disc_msg1) = reader.recv().unwrap();
+        assert_eq!(disc1, conn1);
+        assert_matches!(disc_msg1, RecvType::Disconnected);
+        state.handle_event(disc1, disc_msg1);
+
+        let wprsc2 = UnixStream::connect(&sock_path).unwrap();
+        let (conn2, msg2) = reader.recv().unwrap();
+        assert_matches!(msg2, RecvType::Connected);
+        assert!(conn2 > conn1);
+        state.handle_event(conn2, msg2);
+        assert!(state.serializer.other_end_connected());
+
+        drop(wprsc1);
+        drop(wprsc2);
         _ = std::fs::remove_file(&sock_path);
     }
 }

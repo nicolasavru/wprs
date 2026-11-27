@@ -19,6 +19,7 @@ use std::sync::Arc;
 use std::sync::Condvar;
 use std::sync::Mutex;
 use std::time::Duration;
+use std::time::Instant;
 
 use bimap::BiMap;
 use enum_as_inner::EnumAsInner;
@@ -68,6 +69,7 @@ use crate::client_utils::advance_two_slot_swapchain;
 use crate::client_utils::combine_rect_history;
 use crate::client_utils::rect_covered_by;
 use crate::client_utils::snapshot_rect_history;
+use crate::constants;
 use crate::prelude::*;
 use crate::serialization::Capabilities;
 use crate::serialization::ClientId;
@@ -140,6 +142,73 @@ pub(crate) fn find_output(output_state: &OutputState, output_id: u32) -> Option<
     })
 }
 
+#[derive(Debug, Copy, Clone, Eq, PartialEq)]
+pub enum HeartbeatTickAction {
+    Continue,
+    TimedOut,
+}
+
+#[derive(Debug, Copy, Clone, Eq, PartialEq)]
+enum ClientHeartbeatTick {
+    SendHeartbeat(u64),
+    TimedOut,
+}
+
+#[derive(Debug)]
+pub(crate) struct ClientHeartbeatState {
+    stale_input_threshold: Duration,
+    stall_timeout: Duration,
+    next_seq: u64,
+    oldest_unacked_sent_at: Option<Instant>,
+    input_stalled_logged: bool,
+}
+
+impl ClientHeartbeatState {
+    pub(crate) fn new(stale_input_threshold: Duration, stall_timeout: Duration) -> Self {
+        Self {
+            stale_input_threshold,
+            stall_timeout,
+            next_seq: 1,
+            oldest_unacked_sent_at: None,
+            input_stalled_logged: false,
+        }
+    }
+
+    pub(crate) fn on_server_activity(&mut self) {
+        self.oldest_unacked_sent_at = None;
+        if self.input_stalled_logged {
+            info!("Link to wprsd recovered; resuming input forwarding.");
+            self.input_stalled_logged = false;
+        }
+    }
+
+    pub(crate) fn is_input_stalled(&mut self, now: Instant) -> bool {
+        let stalled = self.oldest_unacked_sent_at.is_some_and(|sent_at| {
+            now.saturating_duration_since(sent_at) >= self.stale_input_threshold
+        });
+        if stalled && !self.input_stalled_logged {
+            warn!(
+                unacked_for = ?self.oldest_unacked_sent_at.map(|t| now.saturating_duration_since(t)),
+                "Link to wprsd appears stalled; suppressing new keyboard and pointer input until server responds.",
+            );
+            self.input_stalled_logged = true;
+        }
+        stalled
+    }
+
+    fn on_tick(&mut self, now: Instant) -> ClientHeartbeatTick {
+        if let Some(sent_at) = self.oldest_unacked_sent_at
+            && now.saturating_duration_since(sent_at) >= self.stall_timeout
+        {
+            return ClientHeartbeatTick::TimedOut;
+        }
+        let seq = self.next_seq;
+        self.next_seq = self.next_seq.wrapping_add(1).max(1);
+        self.oldest_unacked_sent_at.get_or_insert(now);
+        ClientHeartbeatTick::SendHeartbeat(seq)
+    }
+}
+
 pub struct WprsClientState {
     qh: QueueHandle<Self>,
     conn: Connection,
@@ -181,7 +250,11 @@ pub struct WprsClientState {
     last_implicit_grab_serial: Option<u32>,
     last_mouse_down_serial: Option<u32>,
     pressed_buttons: HashSet<u32>,
+    sent_pressed_keys: HashSet<u32>,
+    sent_pressed_buttons: HashSet<u32>,
     current_cursor_image: Option<CursorImage>,
+    pub(crate) heartbeat: ClientHeartbeatState,
+    timed_out: bool,
 
     title_prefix: String,
 
@@ -256,7 +329,14 @@ impl WprsClientState {
             last_implicit_grab_serial: None,
             last_mouse_down_serial: None,
             pressed_buttons: HashSet::new(),
+            sent_pressed_keys: HashSet::new(),
+            sent_pressed_buttons: HashSet::new(),
             current_cursor_image: None,
+            heartbeat: ClientHeartbeatState::new(
+                constants::STALE_INPUT_THRESHOLD,
+                constants::STALL_TIMEOUT,
+            ),
+            timed_out: false,
             title_prefix: options.title_prefix,
             decompressor,
             slot_copy_scratch: Vec::new(),
@@ -268,6 +348,38 @@ impl WprsClientState {
                 options.compression_mode,
             )));
         Ok(state)
+    }
+
+    pub(crate) fn record_server_activity(&mut self) {
+        self.heartbeat.on_server_activity();
+    }
+
+    pub(crate) fn is_input_stalled(&mut self, now: Instant) -> bool {
+        self.heartbeat.is_input_stalled(now)
+    }
+
+    pub fn handle_heartbeat_tick(&mut self, now: Instant) -> HeartbeatTickAction {
+        match self.heartbeat.on_tick(now) {
+            ClientHeartbeatTick::SendHeartbeat(seq) => {
+                self.serializer
+                    .writer()
+                    .send(SendType::Object(Event::Heartbeat { seq }));
+                HeartbeatTickAction::Continue
+            },
+            ClientHeartbeatTick::TimedOut => {
+                warn!(
+                    timeout = ?self.heartbeat.stall_timeout,
+                    "Connection to wprsd timed out waiting for heartbeat ack; disconnecting.",
+                );
+                self.timed_out = true;
+                self.serializer.disconnect_active_connection();
+                HeartbeatTickAction::TimedOut
+            },
+        }
+    }
+
+    pub fn timed_out(&self) -> bool {
+        self.timed_out
     }
 
     pub(crate) fn primary_seat(&self) -> Option<WlSeat> {
@@ -1592,5 +1704,37 @@ mod tests {
             latch.get(Duration::ZERO),
             Some(Capabilities { xwayland: true })
         );
+    }
+
+    #[test]
+    fn test_client_heartbeat_state_thresholds_and_recovery() {
+        let stale = Duration::from_secs(5);
+        let timeout = Duration::from_secs(20);
+        let t0 = Instant::now();
+        let mut hb = ClientHeartbeatState::new(stale, timeout);
+
+        assert!(!hb.is_input_stalled(t0));
+        assert_eq!(hb.on_tick(t0), ClientHeartbeatTick::SendHeartbeat(1));
+        assert!(!hb.is_input_stalled(t0 + stale - Duration::from_millis(1)));
+        assert!(hb.is_input_stalled(t0 + stale));
+
+        // Additional ticks keep the oldest unacked timestamp intact.
+        assert_eq!(
+            hb.on_tick(t0 + Duration::from_secs(10)),
+            ClientHeartbeatTick::SendHeartbeat(2)
+        );
+        assert!(hb.is_input_stalled(t0 + Duration::from_secs(10)));
+
+        // Any server activity clears stall state and resets timeout tracking.
+        hb.on_server_activity();
+        assert!(!hb.is_input_stalled(t0 + Duration::from_secs(11)));
+
+        let t1 = t0 + Duration::from_secs(15);
+        assert_eq!(hb.on_tick(t1), ClientHeartbeatTick::SendHeartbeat(3));
+        assert_eq!(
+            hb.on_tick(t1 + timeout - Duration::from_millis(1)),
+            ClientHeartbeatTick::SendHeartbeat(4)
+        );
+        assert_eq!(hb.on_tick(t1 + timeout), ClientHeartbeatTick::TimedOut);
     }
 }

@@ -15,6 +15,7 @@
 use std::fs;
 use std::path::PathBuf;
 use std::time::Duration;
+use std::time::Instant;
 
 use bpaf::Parser;
 use optional_struct::optional_struct;
@@ -22,6 +23,8 @@ use serde_derive::Deserialize;
 use serde_derive::Serialize;
 use smithay::reexports::calloop::EventLoop;
 use smithay::reexports::calloop::channel::Event;
+use smithay::reexports::calloop::timer::TimeoutAction;
+use smithay::reexports::calloop::timer::Timer;
 use smithay_client_toolkit::reexports::calloop_wayland_source::WaylandSource;
 use smithay_client_toolkit::reexports::client::ConnectError;
 use smithay_client_toolkit::reexports::client::Connection;
@@ -34,7 +37,9 @@ use wprs::args::JpegQuality;
 use wprs::args::OptionalConfig;
 use wprs::args::SerializableLevel;
 use wprs::client::ClientOptions;
+use wprs::client::HeartbeatTickAction;
 use wprs::client::WprsClientState;
+use wprs::constants;
 use wprs::control_server;
 use wprs::prelude::*;
 use wprs::serialization::CompressionMode;
@@ -192,18 +197,39 @@ fn main() -> Result<()> {
     .location(loc!())?;
 
     let mut event_loop = EventLoop::try_new()?;
+    let reader_loop_signal = event_loop.get_signal();
 
-    event_loop.handle().insert_source(
-        reader,
-        |event, _metadata, state: &mut WprsClientState| {
-            match event {
+    event_loop
+        .handle()
+        .insert_source(
+            reader,
+            move |event, _metadata, state: &mut WprsClientState| match event {
                 Event::Msg((_, msg)) => state.handle_request(msg),
                 Event::Closed => {
-                    unreachable!("serialization::client_loop terminates the process when the server disconnects.");
+                    reader_loop_signal.stop();
                 },
-            }
-        },
-    ).unwrap();
+            },
+        )
+        .unwrap();
+
+    let heartbeat_loop_signal = event_loop.get_signal();
+    event_loop
+        .handle()
+        .insert_source(
+            Timer::from_duration(constants::HEARTBEAT_INTERVAL),
+            move |_deadline, _metadata, state: &mut WprsClientState| match state
+                .handle_heartbeat_tick(Instant::now())
+            {
+                HeartbeatTickAction::Continue => {
+                    TimeoutAction::ToDuration(constants::HEARTBEAT_INTERVAL)
+                },
+                HeartbeatTickAction::TimedOut => {
+                    heartbeat_loop_signal.stop();
+                    TimeoutAction::Drop
+                },
+            },
+        )
+        .unwrap();
 
     {
         let capabilities = state.capabilities.clone();
@@ -225,6 +251,10 @@ fn main() -> Result<()> {
         .location(loc!())?;
 
     event_loop.run(None, &mut state, |_| {}).location(loc!())?;
+
+    if state.timed_out() {
+        bail!("connection to wprsd timed out");
+    }
 
     Ok(())
 }

@@ -21,6 +21,7 @@ use std::io::BufReader;
 use std::io::BufWriter;
 use std::io::Read;
 use std::io::Write;
+use std::mem;
 use std::net::Shutdown;
 use std::os::fd::AsFd;
 use std::os::unix::net::UnixListener;
@@ -112,6 +113,7 @@ pub enum Request {
     Data(wayland::DataRequest),
     ClientDisconnected(ClientId),
     Capabilities(Capabilities),
+    HeartbeatAck { seq: u64 },
 }
 
 #[derive(Debug, Clone, PartialEq, Archive, Deserialize, Serialize)]
@@ -124,6 +126,8 @@ pub enum Event {
     Data(wayland::DataEvent),
     Surface(wayland::SurfaceEvent),
     SetCompressionMode(CompressionMode),
+    FrameAck { seq: u64 },
+    Heartbeat { seq: u64 },
 }
 
 // TODO: test that object ids with same value from different clients hash
@@ -241,6 +245,7 @@ where
         + for<'a> bytecheck::CheckBytes<HighValidator<'a, RancorError>>,
 {
     Connected,
+    Disconnected,
     Object(RT),
     RawBuffer(CompressedTileStream),
 }
@@ -254,6 +259,7 @@ where
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::Connected => write!(f, "Connected"),
+            Self::Disconnected => write!(f, "Disconnected"),
             Self::Object(obj) => write!(f, "Object({obj:?})"),
             Self::RawBuffer(stream) => write!(f, "RawBuffer([{:?}])", stream.header),
         }
@@ -280,8 +286,16 @@ impl Framed for MessageType {
 
 enum ConnectionSession<T> {
     Disconnected,
-    Pending { conn_id: u64, sender: Sender<T> },
-    Active { conn_id: u64, sender: Sender<T> },
+    Pending {
+        conn_id: u64,
+        sender: Sender<T>,
+        stream: Option<UnixStream>,
+    },
+    Active {
+        conn_id: u64,
+        sender: Sender<T>,
+        stream: Option<UnixStream>,
+    },
 }
 
 struct ConnectionState<T> {
@@ -303,36 +317,53 @@ impl<T> ConnectionSlot<T> {
         })
     }
 
-    fn new_client(sender: Sender<T>) -> Arc<Self> {
+    fn new_client(sender: Sender<T>, stream: Option<UnixStream>) -> Arc<Self> {
         Arc::new(Self {
             state: Mutex::new(ConnectionState {
                 next_conn_id: 1,
-                session: ConnectionSession::Active { conn_id: 1, sender },
+                session: ConnectionSession::Active {
+                    conn_id: 1,
+                    sender,
+                    stream,
+                },
             }),
         })
     }
 
-    fn begin_connection(&self, sender: Sender<T>) -> u64 {
+    fn begin_connection(&self, sender: Sender<T>, stream: Option<UnixStream>) -> u64 {
         let mut guard = self.state.lock().unwrap();
         guard.next_conn_id += 1;
         let conn_id = guard.next_conn_id;
-        guard.session = ConnectionSession::Pending { conn_id, sender };
+        guard.session = ConnectionSession::Pending {
+            conn_id,
+            sender,
+            stream,
+        };
         conn_id
     }
 
     fn activate_connection(&self, conn_id: u64) -> bool {
         let mut guard = self.state.lock().unwrap();
-        match &guard.session {
+        if !matches!(
+            guard.session,
             ConnectionSession::Pending {
                 conn_id: pending_id,
-                sender,
-            } if *pending_id == conn_id => {
-                let sender = sender.clone();
-                guard.session = ConnectionSession::Active { conn_id, sender };
-                true
-            },
-            _ => false,
+                ..
+            } if pending_id == conn_id
+        ) {
+            return false;
         }
+        let ConnectionSession::Pending { sender, stream, .. } =
+            mem::replace(&mut guard.session, ConnectionSession::Disconnected)
+        else {
+            unreachable!();
+        };
+        guard.session = ConnectionSession::Active {
+            conn_id,
+            sender,
+            stream,
+        };
+        true
     }
 
     fn is_connected(&self) -> bool {
@@ -359,6 +390,23 @@ impl<T> ConnectionSlot<T> {
         if matches_id {
             guard.session = ConnectionSession::Disconnected;
         }
+    }
+
+    fn disconnect_active(&self) -> bool {
+        let stream = {
+            let mut guard = self.state.lock().unwrap();
+            if !matches!(guard.session, ConnectionSession::Active { .. }) {
+                return false;
+            }
+            match mem::replace(&mut guard.session, ConnectionSession::Disconnected) {
+                ConnectionSession::Active { stream, .. } => stream,
+                _ => unreachable!(),
+            }
+        };
+        if let Some(stream) = stream {
+            _ = stream.shutdown(Shutdown::Both);
+        }
+        true
     }
 }
 
@@ -583,7 +631,8 @@ fn accept_loop<ST, RT>(
             let (stream, _) = listener.accept().unwrap();
             info!("wprs client connected");
             let (conn_tx, conn_rx) = crossbeam_channel::unbounded();
-            let conn_id = slot.begin_connection(conn_tx);
+            let slot_stream = stream.try_clone().ok();
+            let conn_id = slot.begin_connection(conn_tx, slot_stream);
             // Notify the server event loop immediately on `accept()` rather than
             // waiting for a client-initiated packet: over `ssh -L`, OpenSSH holds
             // client writes until remote `sshd` connects and confirms the channel,
@@ -613,6 +662,12 @@ fn accept_loop<ST, RT>(
             _ = stream.shutdown(Shutdown::Both);
             let write_thread_result = utils::join_unwrap(write_thread);
             debug!("write thread joined: {write_thread_result:?}");
+            if read_channel_tx
+                .send((conn_id, RecvType::Disconnected))
+                .is_err()
+            {
+                break;
+            }
         }
     });
 }
@@ -621,6 +676,7 @@ fn client_loop<ST, RT>(
     stream: UnixStream,
     read_channel_tx: channel::SyncSender<(u64, RecvType<RT>)>,
     write_channel_rx: Receiver<SendType<ST>>,
+    slot: Arc<ConnectionSlot<SendType<ST>>>,
 ) -> Result<()>
 where
     ST: Serializable,
@@ -631,13 +687,22 @@ where
         + for<'a> bytecheck::CheckBytes<HighValidator<'a, RancorError>>,
 {
     thread::scope(|scope| {
-        let (read_thread, _) =
+        let shutdown_stream = stream.try_clone().location(loc!())?;
+        let (read_thread, write_thread) =
             spawn_rw_loops(scope, 1, stream, read_channel_tx, write_channel_rx).location(loc!())?;
 
         // TODO: consider actually look at the error and not printing the reason
         // if was actually just a disconnection and not some other error.
         let result = utils::join_unwrap(read_thread);
         debug!("read thread joined: {:?}", result);
+        let local_disconnect = !slot.is_connected();
+        slot.end_connection(1);
+        _ = shutdown_stream.shutdown(Shutdown::Both);
+        let write_result = utils::join_unwrap(write_thread);
+        debug!("write thread joined: {:?}", write_result);
+        if local_disconnect {
+            return Ok(());
+        }
         eprintln!("server disconnected: {result:?}");
         process::exit(1);
     })
@@ -700,9 +765,13 @@ where
         ) = channel::sync_channel(CHANNEL_SIZE);
         let (writer_tx, writer_rx): (Sender<SendType<ST>>, Receiver<SendType<ST>>) =
             crossbeam_channel::unbounded();
-        let slot = ConnectionSlot::new_client(writer_tx);
+        let slot_stream = stream.try_clone().location(loc!())?;
+        let slot = ConnectionSlot::new_client(writer_tx, Some(slot_stream));
 
-        thread::spawn(move || client_loop(stream, reader_tx, writer_rx));
+        {
+            let slot = slot.clone();
+            thread::spawn(move || client_loop(stream, reader_tx, writer_rx, slot));
+        }
 
         Ok(Self {
             read_handle: Some(reader_rx),
@@ -734,6 +803,10 @@ where
     pub fn is_active_connection(&self, conn_id: u64) -> bool {
         self.slot.is_active_connection(conn_id)
     }
+
+    pub fn disconnect_active_connection(&self) -> bool {
+        self.slot.disconnect_active()
+    }
 }
 
 #[cfg(test)]
@@ -758,7 +831,7 @@ where
         (
             Self {
                 read_handle: None,
-                slot: ConnectionSlot::new_client(tx),
+                slot: ConnectionSlot::new_client(tx, None),
             },
             rx,
         )
@@ -766,7 +839,7 @@ where
 
     pub(crate) fn connect_test_client(&mut self) -> (u64, Receiver<SendType<ST>>) {
         let (tx, rx) = crossbeam_channel::unbounded();
-        let conn_id = self.slot.begin_connection(tx);
+        let conn_id = self.slot.begin_connection(tx, None);
         (conn_id, rx)
     }
 
@@ -795,7 +868,7 @@ mod tests {
 
         // 2. Pending session keeps `is_connected() == false` and discards pre-activation sends.
         let (tx1, rx1) = crossbeam_channel::unbounded();
-        let c1 = slot.begin_connection(tx1);
+        let c1 = slot.begin_connection(tx1, None);
         assert_eq!(c1, 1);
         assert!(!slot.is_connected());
         assert!(!slot.is_active_connection(c1));
@@ -810,7 +883,7 @@ mod tests {
 
         // 4. Activating `c2` delivers messages once and rejects duplicate activation.
         let (tx2, rx2) = crossbeam_channel::unbounded();
-        let c2 = slot.begin_connection(tx2);
+        let c2 = slot.begin_connection(tx2, None);
         assert_eq!(c2, 2);
         assert!(slot.activate_connection(c2));
         assert!(!slot.activate_connection(c2));
@@ -822,7 +895,7 @@ mod tests {
         // 5. Rapid reconnect `c3` immediately closes `rx2`, ignores stale `c2`
         // calls, and buffers nothing until `c3` activates.
         let (tx3, rx3) = crossbeam_channel::unbounded();
-        let c3 = slot.begin_connection(tx3);
+        let c3 = slot.begin_connection(tx3, None);
         assert_eq!(c3, 3);
         assert!(!slot.is_connected());
         assert!(!slot.is_active_connection(c2));
@@ -846,15 +919,42 @@ mod tests {
         assert_matches!(rx3.try_recv(), Err(TryRecvError::Disconnected));
         writer.send(SendType::Object(60));
 
-        // 7. Client slot starts active immediately.
+        // 7. Client slot starts active immediately and supports `disconnect_active`.
         let (tx_client, rx_client) = crossbeam_channel::unbounded();
-        let client_slot: Arc<ConnectionSlot<SendType<u32>>> = ConnectionSlot::new_client(tx_client);
+        let client_slot: Arc<ConnectionSlot<SendType<u32>>> =
+            ConnectionSlot::new_client(tx_client, None);
         let client_writer = SerializerWriter(client_slot.clone());
         assert!(client_slot.is_connected());
         assert!(client_slot.is_active_connection(1));
         assert!(!client_slot.is_active_connection(2));
         client_writer.send(SendType::Object(70));
         assert_matches!(rx_client.try_recv(), Ok(SendType::Object(70)));
+        assert!(client_slot.disconnect_active());
+        assert!(!client_slot.disconnect_active());
+        assert!(!client_slot.is_connected());
+        assert_matches!(rx_client.try_recv(), Err(TryRecvError::Disconnected));
+    }
+
+    #[test]
+    fn test_frame_ack_and_heartbeat_wire_roundtrip() {
+        let requests = vec![
+            Request::HeartbeatAck { seq: 0 },
+            Request::HeartbeatAck { seq: 42 },
+            Request::HeartbeatAck { seq: u64::MAX },
+        ];
+        let req_bytes = rkyv::to_bytes::<RancorError>(&requests).unwrap();
+        let decoded_reqs = rkyv::from_bytes::<Vec<Request>, RancorError>(&req_bytes).unwrap();
+        assert_eq!(decoded_reqs, requests);
+
+        let events = vec![
+            Event::FrameAck { seq: 1 },
+            Event::FrameAck { seq: 999_999 },
+            Event::Heartbeat { seq: 1 },
+            Event::Heartbeat { seq: u64::MAX },
+        ];
+        let ev_bytes = rkyv::to_bytes::<RancorError>(&events).unwrap();
+        let decoded_evs = rkyv::from_bytes::<Vec<Event>, RancorError>(&ev_bytes).unwrap();
+        assert_eq!(decoded_evs, events);
     }
 
     #[test]
@@ -904,9 +1004,12 @@ mod tests {
 
         // Dropping `stream` ends `read_loop`, so `write_loop` (parked in
         // `recv()`) can only exit when `end_connection` drops the sender;
-        // `(2, Connected)` arriving below verifies `accept_loop` joined both
-        // threads and accepted the reconnect.
+        // `(1, Disconnected)` followed by `(2, Connected)` arriving below
+        // verifies `accept_loop` joined both threads and accepted the reconnect.
         drop(stream);
+        let (disc_id, disc_msg) = reader.recv().unwrap();
+        assert_eq!(disc_id, 1);
+        assert_matches!(disc_msg, RecvType::Disconnected);
 
         let mut stream2 = UnixStream::connect(&sock_path).unwrap();
         let (conn_id2, msg2) = reader.recv().unwrap();
@@ -932,7 +1035,22 @@ mod tests {
         assert_eq!(event_conn_id, 2);
         assert_matches!(event_msg, RecvType::Object(ev) if ev == expected_event);
 
+        // Force-disconnecting an active silent peer (`stream2` still open) via
+        // `disconnect_active_connection` shuts down the socket so `accept_loop`
+        // emits `(2, Disconnected)` and immediately accepts `stream3`.
+        assert!(server.disconnect_active_connection());
+        assert!(!server.other_end_connected());
+        let (disc2_id, disc2_msg) = reader.recv().unwrap();
+        assert_eq!(disc2_id, 2);
+        assert_matches!(disc2_msg, RecvType::Disconnected);
+
+        let stream3 = UnixStream::connect(&sock_path).unwrap();
+        let (conn_id3, msg3) = reader.recv().unwrap();
+        assert_eq!(conn_id3, 3);
+        assert_matches!(msg3, RecvType::Connected);
+
         drop(stream2);
+        drop(stream3);
         _ = std::fs::remove_file(&sock_path);
     }
 }

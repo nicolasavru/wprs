@@ -707,6 +707,7 @@ impl WprsClientState {
     fn handle_buffer(&mut self, buffer_stream: CompressedTileStream) -> Result<()> {
         let client_id = buffer_stream.header.client;
         let surface_id = buffer_stream.header.surface;
+        let frame_seq = buffer_stream.header.frame_seq;
 
         let decode_res = (|| -> Result<()> {
             let validated = ValidatedTileStream::new(buffer_stream).location(loc!())?;
@@ -740,16 +741,27 @@ impl WprsClientState {
         })();
 
         if let Err(err) = decode_res {
+            // Request resync before acknowledging the credit so any deferred
+            // flush triggered by `FrameAck` sends a full frame instead of an
+            // incremental delta against corrupt state.
             self.request_buffer_resync(client_id, surface_id);
+            self.serializer
+                .writer()
+                .send(SendType::Object(Event::FrameAck { seq: frame_seq }));
             return Err(err);
         }
+        self.serializer
+            .writer()
+            .send(SendType::Object(Event::FrameAck { seq: frame_seq }));
         Ok(())
     }
 
     #[instrument(skip(self), level = "debug")]
     pub fn handle_request(&mut self, request: RecvType<Request>) {
+        self.record_server_activity();
         match request {
             RecvType::Connected => unreachable!("client never receives RecvType::Connected"),
+            RecvType::Disconnected => unreachable!("client never receives RecvType::Disconnected"),
             RecvType::Object(Request::Surface(surface)) => self.handle_surface(surface),
             RecvType::Object(Request::Toplevel(toplevel)) => self.handle_toplevel(toplevel),
             RecvType::Object(Request::Popup(popup)) => self.handle_popup(popup),
@@ -761,6 +773,7 @@ impl WprsClientState {
                 self.handle_client_disconnected(client)
             },
             RecvType::Object(Request::Capabilities(caps)) => self.handle_capabilities(caps),
+            RecvType::Object(Request::HeartbeatAck { seq: _ }) => Ok(()),
             RecvType::RawBuffer(buffer) => self.handle_buffer(buffer),
         }
         .log_and_ignore(loc!())
@@ -816,6 +829,8 @@ mod tests {
     use smithay::reexports::wayland_server::protocol::wl_data_offer::WlDataOffer as ServerWlDataOffer;
     use smithay::reexports::wayland_server::protocol::wl_data_source as server_data_source;
     use smithay::reexports::wayland_server::protocol::wl_data_source::WlDataSource as ServerWlDataSource;
+    use smithay::reexports::wayland_server::protocol::wl_keyboard as server_keyboard;
+    use smithay::reexports::wayland_server::protocol::wl_keyboard::WlKeyboard as ServerWlKeyboard;
     use smithay::reexports::wayland_server::protocol::wl_output as server_output;
     use smithay::reexports::wayland_server::protocol::wl_output::WlOutput as ServerWlOutput;
     use smithay::reexports::wayland_server::protocol::wl_pointer as server_pointer;
@@ -927,6 +942,7 @@ mod tests {
     #[derive(Default)]
     struct MockHostState {
         client: Option<ServerClient>,
+        keyboard: Option<ServerWlKeyboard>,
         pointer: Option<ServerWlPointer>,
         data_device: Option<ServerWlDataDevice>,
         surfaces: Vec<ServerWlSurface>,
@@ -1382,7 +1398,7 @@ mod tests {
         ) {
             let seat = data_init.init(resource, ());
             seat.name("seat0".to_string());
-            seat.capabilities(server_seat::Capability::Pointer);
+            seat.capabilities(server_seat::Capability::Pointer | server_seat::Capability::Keyboard);
         }
     }
 
@@ -1396,9 +1412,28 @@ mod tests {
             _dh: &DisplayHandle,
             data_init: &mut DataInit<'_, Self>,
         ) {
-            if let server_seat::Request::GetPointer { id } = request {
-                state.pointer = Some(data_init.init(id, ()));
+            match request {
+                server_seat::Request::GetPointer { id } => {
+                    state.pointer = Some(data_init.init(id, ()));
+                },
+                server_seat::Request::GetKeyboard { id } => {
+                    state.keyboard = Some(data_init.init(id, ()));
+                },
+                _ => {},
             }
+        }
+    }
+
+    impl ServerDispatch<ServerWlKeyboard, ()> for MockHostState {
+        fn request(
+            _state: &mut Self,
+            _client: &ServerClient,
+            _resource: &ServerWlKeyboard,
+            _request: server_keyboard::Request,
+            _data: &(),
+            _dh: &DisplayHandle,
+            _data_init: &mut DataInit<'_, Self>,
+        ) {
         }
     }
 
@@ -2724,5 +2759,270 @@ mod tests {
                 },
             ]
         );
+    }
+
+    #[test]
+    #[cfg_attr(miri, ignore)]
+    fn test_wprsc_frame_ack_no_leak_on_valid_unknown_and_corrupt_buffer() {
+        use std::num::NonZeroUsize;
+
+        use crate::buffer_pointer::BufferPointer;
+        use crate::serialization::framing::CompressedTile;
+        use crate::serialization::framing::LeafPayload;
+        use crate::serialization::framing::RawBufferHeader;
+        use crate::serialization::framing::TilePayload;
+        use crate::serialization::framing::TileRect;
+        use crate::serialization::wayland::BufferFormat;
+        use crate::serialization::wayland::BufferMetadata;
+        use crate::sharding_compression::ShardingCompressor;
+
+        let mut h = ClientDndHarness::new();
+        let client_id = ClientId(7);
+        let sid_valid = WlSurfaceId(701);
+        let sid_corrupt = WlSurfaceId(702);
+
+        // 1. Valid RawBuffer for a previously unknown surface emits `Event::FrameAck { seq: 11 }`.
+        let meta = BufferMetadata {
+            width: 4,
+            height: 4,
+            stride: 16,
+            format: BufferFormat::Argb8888,
+        };
+        let pixels = [0x42u8; 64];
+        let ptr = pixels.as_ptr();
+        // SAFETY: `pixels` stays alive for the duration of `filter_and_compress_full_streaming`.
+        let bp = unsafe { BufferPointer::new(&ptr, pixels.len()) };
+        let mut compressor = ShardingCompressor::new(NonZeroUsize::new(1).unwrap(), 1).unwrap();
+        let mut streams = Vec::new();
+        filtering::filter_and_compress_full_streaming(
+            bp,
+            client_id,
+            sid_valid,
+            meta,
+            CompressionMode::Lossless,
+            None,
+            &mut compressor,
+            |mut stream| {
+                stream.header.frame_seq = 11;
+                streams.push(stream);
+            },
+        );
+        assert_eq!(streams.len(), 1);
+        let stream = streams.pop().unwrap();
+        let (tx, rx) = crossbeam_channel::unbounded();
+        for tile in stream.tiles {
+            tx.send(Ok(tile)).unwrap();
+        }
+        drop(tx);
+        h.client
+            .handle_request(RecvType::RawBuffer(CompressedTileStream {
+                header: stream.header,
+                tiles: rx,
+            }));
+        assert_eq!(h.drain_events(), vec![Event::FrameAck { seq: 11 }]);
+
+        // 2. Corrupted/invalid RawBuffer emits `BufferResyncRequested` BEFORE
+        //    `Event::FrameAck { seq: 12 }` so credits never leak and any deferred
+        //    flush on `wprsd` sends a full frame.
+        let (tx, rx) = crossbeam_channel::unbounded();
+        tx.send(Ok(CompressedTile {
+            tile_idx: 0,
+            payload: TilePayload::Leaf(LeafPayload::Solid([0xDE, 0xAD, 0xBE, 0xFF])),
+        }))
+        .unwrap();
+        drop(tx);
+        h.client
+            .handle_request(RecvType::RawBuffer(CompressedTileStream {
+                header: RawBufferHeader {
+                    frame_seq: 12,
+                    client: client_id,
+                    surface: sid_corrupt,
+                    metadata: meta,
+                    incremental: false,
+                    tile_rects: vec![TileRect {
+                        x: 0,
+                        y: 0,
+                        w: 99,
+                        h: 99,
+                    }],
+                },
+                tiles: rx,
+            }));
+        assert_eq!(
+            h.drain_events(),
+            vec![
+                Event::Surface(SurfaceEvent {
+                    surface_id: sid_corrupt,
+                    payload: SurfaceEventPayload::BufferResyncRequested,
+                }),
+                Event::FrameAck { seq: 12 },
+            ]
+        );
+    }
+
+    #[test]
+    #[cfg_attr(miri, ignore)]
+    fn test_wprsc_heartbeat_stale_input_suppression_and_timeout_wire() {
+        use std::time::Instant;
+
+        use smithay_client_toolkit::seat::keyboard::KeyEvent;
+        use smithay_client_toolkit::seat::keyboard::KeyboardHandler;
+        use smithay_client_toolkit::seat::keyboard::Keysym;
+
+        use crate::client::HeartbeatTickAction;
+        use crate::constants;
+        use crate::serialization::wayland::KeyInner;
+        use crate::serialization::wayland::KeyState;
+        use crate::serialization::wayland::KeyboardEvent;
+        use crate::serialization::wayland::PointerEventKind;
+
+        let mut h = ClientDndHarness::new();
+        let host_surf = h.create_remote_surface(1, 800);
+        let sid = WlSurfaceId(800);
+        let client_surf = h
+            .client
+            .remote_display
+            .client(&ClientId(1))
+            .surfaces
+            .get(&sid)
+            .unwrap()
+            .wl_surface()
+            .clone();
+        let client_kbd = h.client.seat_objects[0]
+            .keyboard
+            .as_ref()
+            .expect("seat must have keyboard")
+            .clone();
+        let host_ptr = h.host.pointer.clone().expect("host must have pointer");
+        let qh = h.event_queue.handle();
+
+        let make_key = |raw_code: u32| KeyEvent {
+            time: 1,
+            raw_code,
+            keysym: Keysym::new(raw_code),
+            utf8: None,
+        };
+
+        // 1. Pre-stall: enter, press key 30 and pointer button 0x110 -> forwarded.
+        h.client
+            .enter(&h.conn, &qh, &client_kbd, &client_surf, 1, &[], &[]);
+        h.client
+            .press_key(&h.conn, &qh, &client_kbd, 2, make_key(30));
+        host_ptr.enter(3, &host_surf, 10.0, 20.0);
+        host_ptr.button(4, 1, 0x110, server_pointer::ButtonState::Pressed);
+        host_ptr.frame();
+        h.sync();
+
+        let pre_events = h.drain_events();
+        assert!(pre_events.iter().any(|e| matches!(
+            e,
+            Event::KeyboardEvent(KeyboardEvent::Key(KeyInner {
+                raw_code: 30,
+                state: KeyState::Pressed,
+                ..
+            }))
+        )));
+        assert!(pre_events.iter().any(|e| matches!(
+            e,
+            Event::PointerFrame(frames) if frames.iter().any(|p| matches!(
+                p.kind,
+                PointerEventKind::Press { button: 0x110, .. }
+            ))
+        )));
+
+        // 2. Send a heartbeat stamped `STALE_INPUT_THRESHOLD + 1s` in the past so
+        //    input is immediately considered stalled without sleeping.
+        let stalled_sent_at =
+            Instant::now() - constants::STALE_INPUT_THRESHOLD - Duration::from_secs(1);
+        assert_eq!(
+            h.client.handle_heartbeat_tick(stalled_sent_at),
+            HeartbeatTickAction::Continue
+        );
+        assert_eq!(h.drain_events(), vec![Event::Heartbeat { seq: 1 }]);
+
+        // 3. While stalled: blind typing (key 31 press/repeat/release) and blind
+        //    pointer motion/click/scroll are suppressed, while releasing the
+        //    pre-stall held key 30 and button 0x110 STILL forwards.
+        h.client
+            .press_key(&h.conn, &qh, &client_kbd, 5, make_key(31));
+        h.client
+            .repeat_key(&h.conn, &qh, &client_kbd, 6, make_key(31));
+        h.client
+            .release_key(&h.conn, &qh, &client_kbd, 7, make_key(31));
+        h.client
+            .release_key(&h.conn, &qh, &client_kbd, 8, make_key(30));
+
+        host_ptr.motion(2, 50.0, 60.0);
+        host_ptr.button(9, 3, 0x111, server_pointer::ButtonState::Pressed);
+        host_ptr.button(10, 4, 0x111, server_pointer::ButtonState::Released);
+        host_ptr.axis(5, server_pointer::Axis::VerticalScroll, 15.0);
+        host_ptr.button(11, 6, 0x110, server_pointer::ButtonState::Released);
+        host_ptr.frame();
+        h.sync();
+
+        let stalled_events = h.drain_events();
+        assert_eq!(
+            stalled_events.len(),
+            2,
+            "only pre-stall key/button releases should forward while stalled: {stalled_events:?}"
+        );
+        assert!(matches!(
+            &stalled_events[0],
+            Event::KeyboardEvent(KeyboardEvent::Key(KeyInner {
+                raw_code: 30,
+                state: KeyState::Released,
+                ..
+            }))
+        ));
+        assert!(matches!(
+            &stalled_events[1],
+            Event::PointerFrame(frames) if frames.len() == 1 && matches!(
+                frames[0].kind,
+                PointerEventKind::Release { button: 0x110, .. }
+            )
+        ));
+
+        // 4. `Request::HeartbeatAck` clears stall -> new key + pointer motion forward again.
+        h.client
+            .handle_request(RecvType::Object(Request::HeartbeatAck { seq: 1 }));
+        h.client
+            .press_key(&h.conn, &qh, &client_kbd, 12, make_key(32));
+        host_ptr.motion(7, 80.0, 90.0);
+        host_ptr.frame();
+        h.sync();
+        let recovered_events = h.drain_events();
+        assert!(recovered_events.iter().any(|e| matches!(
+            e,
+            Event::KeyboardEvent(KeyboardEvent::Key(KeyInner {
+                raw_code: 32,
+                state: KeyState::Pressed,
+                ..
+            }))
+        )));
+        assert!(recovered_events.iter().any(|e| matches!(
+            e,
+            Event::PointerFrame(frames) if frames.iter().any(|p| matches!(
+                p.kind,
+                PointerEventKind::Motion
+            ))
+        )));
+
+        // 5. Unacked heartbeat past `STALL_TIMEOUT` returns `TimedOut`, sets
+        //    `timed_out()`, and disconnects the serializer cleanly.
+        let t_start = Instant::now();
+        assert_eq!(
+            h.client.handle_heartbeat_tick(t_start),
+            HeartbeatTickAction::Continue
+        );
+        assert_eq!(h.drain_events(), vec![Event::Heartbeat { seq: 2 }]);
+        assert!(!h.client.timed_out());
+
+        assert_eq!(
+            h.client
+                .handle_heartbeat_tick(t_start + constants::STALL_TIMEOUT),
+            HeartbeatTickAction::TimedOut
+        );
+        assert!(h.client.timed_out());
+        assert!(!h.client.serializer.other_end_connected());
     }
 }
