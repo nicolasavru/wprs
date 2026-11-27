@@ -34,12 +34,14 @@ use std::arch::aarch64::vabsq_s8;
 use std::arch::aarch64::vaddq_u8;
 use std::arch::aarch64::vaddvq_u32;
 use std::arch::aarch64::vandq_u8;
+use std::arch::aarch64::vandq_u32;
 use std::arch::aarch64::vdupq_laneq_u8;
 use std::arch::aarch64::vdupq_n_u8;
 use std::arch::aarch64::vdupq_n_u32;
 use std::arch::aarch64::veorq_u8;
 use std::arch::aarch64::vextq_u8;
 use std::arch::aarch64::vld1q_u8;
+use std::arch::aarch64::vld1q_u32;
 use std::arch::aarch64::vld3q_u8;
 use std::arch::aarch64::vld4q_u8;
 use std::arch::aarch64::vmaxvq_u8;
@@ -49,15 +51,18 @@ use std::arch::aarch64::vqtbl1q_u8;
 use std::arch::aarch64::vreinterpretq_s8_u8;
 use std::arch::aarch64::vreinterpretq_u8_s8;
 use std::arch::aarch64::vreinterpretq_u8_u32;
+use std::arch::aarch64::vreinterpretq_u32_u8;
 use std::arch::aarch64::vst1q_u8;
 use std::arch::aarch64::vst3q_u8;
 use std::arch::aarch64::vst4q_u8;
 use std::arch::aarch64::vsubq_u8;
+use std::arch::aarch64::vtstq_u32;
 use std::borrow::Cow;
 use std::mem::MaybeUninit;
 use std::ptr;
 use std::sync::Mutex;
 use std::sync::atomic::AtomicBool;
+use std::sync::atomic::AtomicU32;
 use std::sync::atomic::AtomicUsize;
 
 use crate::buffer_pointer::BufferPointer;
@@ -539,16 +544,20 @@ impl RowKernel for Kernel {
         self,
         src: BufferPointer<Vec4u8>,
         shadow: &mut [Vec4u8],
-    ) -> bool {
+    ) -> Option<(usize, usize)> {
+        const LANE_WEIGHTS: [u32; 4] = [1, 2, 4, 8];
         let n = src.len();
         debug_assert_eq!(shadow.len(), n);
         let src_p = src.ptr();
         let dst_p = shadow.as_mut_ptr();
         let lim = (n / 4) * 4;
+        let mut first = usize::MAX;
+        let mut last_end = 0usize;
         // SAFETY: NEON is mandatory on AArch64, `src_p` and `dst_p` are valid
         // for `n` `Vec4u8`s and non-overlapping, and `i + 4 <= n`.
         unsafe {
             let rgb_mask = vreinterpretq_u8_u32(vdupq_n_u32(0x00FF_FFFF));
+            let weights = vld1q_u32(LANE_WEIGHTS.as_ptr());
             let mut i = 0usize;
             while i < lim {
                 let s = vld1q_u8(src_p.add(i).cast::<u8>());
@@ -561,12 +570,13 @@ impl RowKernel for Kernel {
                 };
                 if vmaxvq_u8(masked) != 0 {
                     vst1q_u8(dst_p.add(i).cast::<u8>(), s);
-                    if i + 4 < n {
-                        src.split_at(i + 4)
-                            .1
-                            .copy_to_nonoverlapping(&mut shadow[i + 4..]);
+                    let m32 = vreinterpretq_u32_u8(masked);
+                    let lane_mask = vaddvq_u32(vandq_u32(vtstq_u32(m32, m32), weights));
+                    debug_assert_ne!(lane_mask, 0);
+                    if first == usize::MAX {
+                        first = i + lane_mask.trailing_zeros() as usize;
                     }
-                    return true;
+                    last_end = i + (32 - lane_mask.leading_zeros() as usize);
                 }
                 i += 4;
             }
@@ -580,16 +590,14 @@ impl RowKernel for Kernel {
                 };
                 if differs {
                     dst_p.add(j).write(s);
-                    if j + 1 < n {
-                        src.split_at(j + 1)
-                            .1
-                            .copy_to_nonoverlapping(&mut shadow[j + 1..]);
+                    if first == usize::MAX {
+                        first = j;
                     }
-                    return true;
+                    last_end = j + 1;
                 }
             }
         }
-        false
+        (first != usize::MAX).then_some((first, last_end))
     }
 
     #[inline(always)]
@@ -722,8 +730,9 @@ impl Tier {
         stride_px: usize,
         n_qx: usize,
         sub_bands: &[ScanSubBand],
-        dirty_flags: &[AtomicBool],
+        dirty_slots: &[AtomicU32],
         slot_hashes: Option<&SlotHashes>,
+        cache_non_empty: bool,
         next_sub: &AtomicUsize,
         hash_buf: &mut Vec<u8>,
     ) {
@@ -740,8 +749,9 @@ impl Tier {
                     stride_px,
                     n_qx,
                     sub_bands,
-                    dirty_flags,
+                    dirty_slots,
                     slot_hashes,
+                    cache_non_empty,
                     next_sub,
                     hash_buf,
                 );
@@ -756,8 +766,9 @@ impl Tier {
                     stride_px,
                     n_qx,
                     sub_bands,
-                    dirty_flags,
+                    dirty_slots,
                     slot_hashes,
+                    cache_non_empty,
                     next_sub,
                     hash_buf,
                 );
@@ -778,8 +789,9 @@ impl Tier {
         n_qx: usize,
         sub_bands: &[ScanSubBand],
         sr: ScrollRect,
-        dirty_flags: &[AtomicBool],
+        dirty_slots: &[AtomicU32],
         slot_hashes: Option<&SlotHashes>,
+        cache_non_empty: bool,
         next_sub: &AtomicUsize,
         hash_buf: &mut Vec<u8>,
     ) {
@@ -797,8 +809,9 @@ impl Tier {
                     n_qx,
                     sub_bands,
                     sr,
-                    dirty_flags,
+                    dirty_slots,
                     slot_hashes,
+                    cache_non_empty,
                     next_sub,
                     hash_buf,
                 );
@@ -814,8 +827,9 @@ impl Tier {
                     n_qx,
                     sub_bands,
                     sr,
-                    dirty_flags,
+                    dirty_slots,
                     slot_hashes,
+                    cache_non_empty,
                     next_sub,
                     hash_buf,
                 );
@@ -849,7 +863,7 @@ impl Tier {
         stride: usize,
         y0: usize,
         y1: usize,
-        dirty_slots: &[AtomicBool],
+        dirty_slots: &[AtomicU32],
     ) {
         // SAFETY: Caller upholds disjoint-row shadow invariants.
         unsafe {
@@ -866,6 +880,7 @@ impl Tier {
                 0,
                 dirty_slots,
                 None,
+                false,
                 &mut hash_buf,
             );
         }

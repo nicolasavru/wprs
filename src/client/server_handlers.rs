@@ -3797,4 +3797,319 @@ mod tests {
         assert_eq!(h.client.tile_cache.occupied_slots(), 0);
         assert_eq!(h.client.tile_cache.used_bytes(), 0);
     }
+
+    #[test]
+    #[cfg_attr(miri, ignore)]
+    fn test_wprsc_cropped_subtile_scroll_scrollbar_and_odd_edits_swapchain() {
+        use std::num::NonZeroUsize;
+
+        use crate::buffer_pointer::BufferPointer;
+        use crate::filtering;
+        use crate::filtering::ServerTileCache;
+        use crate::serialization::framing::CompressedTileStream;
+        use crate::serialization::framing::CompressionMode;
+        use crate::serialization::framing::TileRect;
+        use crate::serialization::geometry::Rectangle;
+        use crate::serialization::wayland::BufferFormat;
+        use crate::serialization::wayland::BufferMetadata;
+        use crate::sharding_compression::ShardingCompressor;
+
+        let mut h = ClientDndHarness::new();
+        h.host.hold_committed_buffers = true;
+
+        let client_id = ClientId(8);
+        let sid = WlSurfaceId(801);
+        let width = 512usize;
+        let height = 512usize;
+        let stride = width * 4;
+        let len = height * stride;
+        let sb_w = 12usize;
+        let meta = BufferMetadata {
+            width: width as i32,
+            height: height as i32,
+            stride: stride as i32,
+            format: BufferFormat::Xrgb8888,
+        };
+
+        let mut doc = vec![0u8; (height + 160) * stride];
+        for y in 0..(height + 160) {
+            for x in 0..width {
+                let off = y * stride + x * 4;
+                let line = y / 16;
+                let glyph = (3..=12).contains(&(y % 16))
+                    && x >= 12
+                    && x < width - 20
+                    && (((x * 19) ^ (y * 11) ^ (line * 71)) % 5) < 2;
+                let px = if glyph {
+                    [
+                        ((line * 29 + x) & 0x7F) as u8,
+                        ((line * 13 + y) & 0x7F) as u8,
+                        ((line * 43 + x * 3) & 0x7F) as u8,
+                        0xFF,
+                    ]
+                } else {
+                    [246, 248, 250, 0xFF]
+                };
+                doc[off..off + 4].copy_from_slice(&px);
+            }
+        }
+        let make_frame = |scroll_y: usize, thumb_y: usize| -> Vec<u8> {
+            let mut f = doc[scroll_y * stride..scroll_y * stride + len].to_vec();
+            for y in 0..height {
+                let in_thumb = y >= thumb_y && y < thumb_y + 84;
+                for x in (width - sb_w)..width {
+                    let off = y * stride + x * 4;
+                    f[off..off + 4].copy_from_slice(if in_thumb {
+                        &[115, 118, 125, 0xFF]
+                    } else {
+                        &[228, 230, 234, 0xFF]
+                    });
+                }
+            }
+            f
+        };
+
+        let mut compressor = ShardingCompressor::new(NonZeroUsize::new(4).unwrap(), 1).unwrap();
+        let mut srv_cache = ServerTileCache::new();
+        let mut shadow = Vec::new();
+        let mut next_seq = 1u64;
+
+        let send_wire_stream =
+            |h: &mut ClientDndHarness,
+             mut streaming: crate::serialization::framing::StreamingCompressedTiles,
+             seq: u64| {
+                streaming.header.frame_seq = seq;
+                let mut wire = Vec::new();
+                streaming.framed_write(&mut wire).unwrap();
+                let (tx, rx) = crossbeam_channel::bounded(1);
+                let reader = std::thread::spawn(move || {
+                    CompressedTileStream::read_from_stream(&mut wire.as_slice(), |stream| {
+                        tx.send(stream).unwrap();
+                        Ok(())
+                    })
+                    .unwrap();
+                });
+                let stream = rx.recv().unwrap();
+                h.client.handle_request(RecvType::RawBuffer(stream));
+                reader.join().unwrap();
+            };
+
+        let commit_surface = |h: &mut ClientDndHarness, damage: Option<Vec<Rectangle<i32>>>| {
+            let state = SurfaceState {
+                client: client_id,
+                id: sid,
+                buffer: Some(BufferAssignment::New(meta)),
+                role: None,
+                buffer_delta: None,
+                buffer_scale: 1,
+                buffer_transform: None,
+                opaque_region: None,
+                input_region: None,
+                z_ordered_children: vec![wayland::SubsurfacePosition {
+                    id: sid,
+                    position: (0, 0).into(),
+                }],
+                damage,
+                output_ids: Vec::new(),
+                viewport_state: None,
+                xdg_surface_state: None,
+            };
+            h.client
+                .handle_request(RecvType::Object(Request::Surface(SurfaceRequest {
+                    client: client_id,
+                    surface: sid,
+                    payload: SurfaceRequestPayload::Commit(state),
+                })));
+            h.sync();
+            h.fire_frame_callbacks();
+        };
+
+        let assert_active_slot_eq = |h: &mut ClientDndHarness, expected: &[u8], label: &str| {
+            let slot = h
+                .client
+                .remote_display
+                .client(&client_id)
+                .surfaces
+                .get(&sid)
+                .unwrap()
+                .buffer
+                .as_ref()
+                .unwrap()
+                .active_buffer
+                .slot();
+            let bytes = h.client.pool.raw_data_mut(&slot);
+            assert_eq!(&bytes[..len], expected, "SlotPool mismatch on {label}");
+        };
+
+        // Step 0: Initial full sync seeds both swapchain and tile cache.
+        let f0 = make_frame(40, 32);
+        {
+            let p = f0.as_ptr();
+            let bp = unsafe { BufferPointer::new(&p, len) };
+            let mut st = None;
+            filtering::filter_and_compress_full_streaming(
+                bp,
+                client_id,
+                sid,
+                meta,
+                CompressionMode::Lossless,
+                Some(&mut shadow),
+                Some(&mut srv_cache),
+                &mut compressor,
+                |s| st = Some(s),
+            );
+            let seq = next_seq;
+            next_seq += 1;
+            send_wire_stream(&mut h, st.unwrap(), seq);
+            assert_eq!(h.drain_events(), vec![Event::FrameAck { seq }]);
+            commit_surface(&mut h, None);
+            assert_active_slot_eq(&mut h, &f0, "initial full frame");
+        }
+        let host_surface_id = h
+            .client
+            .remote_display
+            .client(&client_id)
+            .surfaces
+            .get(&sid)
+            .unwrap()
+            .wl_surface()
+            .id()
+            .protocol_id();
+        let initial_cache_slots = h.client.tile_cache.occupied_slots();
+
+        // Steps 1..=3: Smooth scrolls (`dy = -12, -12, +12`) with moving 12px
+        // overlay scrollbar across 2-slot `SlotPool` ping-pong.
+        let scroll_steps = [(52usize, 44usize, -12i32), (64, 56, -12), (52, 44, 12)];
+        let mut last_frame = f0;
+        for (idx, (sy, ty, expected_dy)) in scroll_steps.into_iter().enumerate() {
+            h.host.damage_buffers.clear();
+            let frame = make_frame(sy, ty);
+            let p = frame.as_ptr();
+            let bp = unsafe { BufferPointer::new(&p, len) };
+            let mut st = None;
+            let diff = filtering::filter_and_compress_incremental_streaming(
+                bp,
+                client_id,
+                sid,
+                meta,
+                CompressionMode::Lossless,
+                None,
+                &mut shadow,
+                Some(&mut srv_cache),
+                &mut compressor,
+                |s| st = Some(s),
+            );
+            let sr = diff.scroll_rect.expect("expected ScrollRect");
+            assert_eq!(sr.dy, expected_dy, "scroll step {idx}");
+            assert!(
+                diff.dirty_tiles
+                    .iter()
+                    .any(|r| r.x == (width - sb_w) as u32 && r.w == sb_w as u32),
+                "step {idx}: expected tight 12px scrollbar rect in {:?}",
+                diff.dirty_tiles
+            );
+            let seq = next_seq;
+            next_seq += 1;
+            send_wire_stream(&mut h, st.unwrap(), seq);
+            assert_eq!(h.drain_events(), vec![Event::FrameAck { seq }]);
+            let mut damage = vec![sr.dst_damage_rect()];
+            damage.extend(
+                diff.dirty_tiles
+                    .iter()
+                    .map(|r| Rectangle::new(r.x as i32, r.y as i32, r.w as i32, r.h as i32)),
+            );
+            commit_surface(&mut h, Some(damage.clone()));
+
+            let got_damage: Vec<Rectangle<i32>> = h
+                .host
+                .damage_buffers
+                .iter()
+                .filter(|&&(id, ..)| id == host_surface_id)
+                .map(|&(_, x, y, w, hh)| Rectangle::new(x, y, w, hh))
+                .collect();
+            for rect in &damage {
+                assert!(
+                    got_damage.contains(rect),
+                    "step {idx}: missing damage_buffer {rect:?} in {got_damage:?}"
+                );
+            }
+            assert_eq!(h.client.tile_cache.occupied_slots(), initial_cache_slots);
+            assert_active_slot_eq(&mut h, &frame, &format!("scroll step {idx}"));
+            last_frame = frame;
+        }
+
+        // Steps 4..=5: Odd-aligned `1x1` and `13x17` cropped edits on alternating
+        // swapchain slots verify `stale_regions` synchronization with arbitrary
+        // odd-sized `TileRect`s.
+        let mut edit1 = last_frame;
+        edit1[73 * stride + 91 * 4] ^= 0x5A;
+        let mut edit2 = edit1.clone();
+        for y in 201..218 {
+            for x in 157..170 {
+                edit2[y * stride + x * 4 + 1] ^= 0x3C;
+            }
+        }
+        for (label, frame, expected_rect) in [
+            (
+                "odd 1x1",
+                &edit1,
+                TileRect {
+                    x: 91,
+                    y: 73,
+                    w: 1,
+                    h: 1,
+                },
+            ),
+            (
+                "odd 13x17",
+                &edit2,
+                TileRect {
+                    x: 157,
+                    y: 201,
+                    w: 13,
+                    h: 17,
+                },
+            ),
+        ] {
+            h.host.damage_buffers.clear();
+            let p = frame.as_ptr();
+            let bp = unsafe { BufferPointer::new(&p, len) };
+            let mut st = None;
+            let diff = filtering::filter_and_compress_incremental_streaming(
+                bp,
+                client_id,
+                sid,
+                meta,
+                CompressionMode::Lossless,
+                None,
+                &mut shadow,
+                Some(&mut srv_cache),
+                &mut compressor,
+                |s| st = Some(s),
+            );
+            assert_eq!(diff.scroll_rect, None);
+            assert_eq!(diff.dirty_tiles, vec![expected_rect], "{label}");
+            let seq = next_seq;
+            next_seq += 1;
+            send_wire_stream(&mut h, st.unwrap(), seq);
+            assert_eq!(h.drain_events(), vec![Event::FrameAck { seq }]);
+            let dmg_rect = Rectangle::new(
+                expected_rect.x as i32,
+                expected_rect.y as i32,
+                expected_rect.w as i32,
+                expected_rect.h as i32,
+            );
+            commit_surface(&mut h, Some(vec![dmg_rect]));
+            let got_damage: Vec<Rectangle<i32>> = h
+                .host
+                .damage_buffers
+                .iter()
+                .filter(|&&(id, ..)| id == host_surface_id)
+                .map(|&(_, x, y, w, hh)| Rectangle::new(x, y, w, hh))
+                .collect();
+            assert_eq!(got_damage, vec![dmg_rect], "{label} damage_buffer");
+            assert_eq!(h.client.tile_cache.occupied_slots(), initial_cache_slots);
+            assert_active_slot_eq(&mut h, frame, label);
+        }
+    }
 }

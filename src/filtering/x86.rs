@@ -38,6 +38,7 @@
 use std::borrow::Cow;
 use std::sync::Mutex;
 use std::sync::atomic::AtomicBool;
+use std::sync::atomic::AtomicU32;
 use std::sync::atomic::AtomicUsize;
 
 use crate::buffer_pointer::BufferPointer;
@@ -168,18 +169,6 @@ mod detect {
             _ => detect_uncached(),
         }
     }
-}
-
-/// Cold helper copying the remaining pixels of a dirty row from `wl_shm` into
-/// `shadow` after the first differing pixel/vector. Keeping this out-of-line
-/// prevents `BufferPointer` overlap checks from bloating the hot scan loop so
-/// LLVM inlines `diff_and_update_row_impl` cleanly into every worker wrapper.
-#[cold]
-#[inline(never)]
-fn copy_dirty_tail(src: BufferPointer<Vec4u8>, shadow: &mut [Vec4u8], start: usize) {
-    src.split_at(start)
-        .1
-        .copy_to_nonoverlapping(&mut shadow[start..]);
 }
 
 mod avx512 {
@@ -888,12 +877,14 @@ mod avx512 {
     unsafe fn diff_and_update_row_impl<const HAS_ALPHA: bool>(
         src: BufferPointer<Vec4u8>,
         shadow: &mut [Vec4u8],
-    ) -> bool {
+    ) -> Option<(usize, usize)> {
         let n = src.len();
         debug_assert_eq!(shadow.len(), n);
         let src_p = src.ptr();
         let dst_p = shadow.as_mut_ptr();
         let lim = (n / 16) * 16;
+        let mut first = usize::MAX;
+        let mut last_end = 0usize;
         // SAFETY: Caller guarantees AVX-512BW, `src_p` and `dst_p` are valid
         // for `n` `Vec4u8`s and non-overlapping (`src` is shm/caller, `shadow`
         // is exclusively borrowed), and `i + 16 <= n`.
@@ -909,10 +900,10 @@ mod avx512 {
                 };
                 if neq != 0 {
                     _mm512_storeu_si512(dst_p.add(i).cast(), s);
-                    if i + 16 < n {
-                        super::copy_dirty_tail(src, shadow, i + 16);
+                    if first == usize::MAX {
+                        first = i + (neq.trailing_zeros() as usize >> 2);
                     }
-                    return true;
+                    last_end = i + ((63 - neq.leading_zeros() as usize) >> 2) + 1;
                 }
                 i += 16;
             }
@@ -926,14 +917,14 @@ mod avx512 {
                 };
                 if differs {
                     dst_p.add(j).write(s);
-                    if j + 1 < n {
-                        super::copy_dirty_tail(src, shadow, j + 1);
+                    if first == usize::MAX {
+                        first = j;
                     }
-                    return true;
+                    last_end = j + 1;
                 }
             }
         }
-        false
+        (first != usize::MAX).then_some((first, last_end))
     }
 
     #[derive(Copy, Clone)]
@@ -1071,7 +1062,7 @@ mod avx512 {
             self,
             src: BufferPointer<Vec4u8>,
             shadow: &mut [Vec4u8],
-        ) -> bool {
+        ) -> Option<(usize, usize)> {
             // SAFETY: `self` witnesses `avx512bw + avx512vl + avx512vbmi` support.
             unsafe { diff_and_update_row_impl::<HAS_ALPHA>(src, shadow) }
         }
@@ -1110,8 +1101,10 @@ mod avx2 {
     use std::arch::x86_64::_mm256_alignr_epi8;
     use std::arch::x86_64::_mm256_and_si256;
     use std::arch::x86_64::_mm256_castsi256_si128;
+    use std::arch::x86_64::_mm256_cmpeq_epi32;
     use std::arch::x86_64::_mm256_extracti128_si256;
     use std::arch::x86_64::_mm256_loadu_si256;
+    use std::arch::x86_64::_mm256_movemask_epi8;
     use std::arch::x86_64::_mm256_or_si256;
     use std::arch::x86_64::_mm256_permute2x128_si256;
     use std::arch::x86_64::_mm256_sad_epu8;
@@ -1720,16 +1713,19 @@ mod avx2 {
     unsafe fn diff_and_update_row_impl<const HAS_ALPHA: bool>(
         src: BufferPointer<Vec4u8>,
         shadow: &mut [Vec4u8],
-    ) -> bool {
+    ) -> Option<(usize, usize)> {
         let n = src.len();
         debug_assert_eq!(shadow.len(), n);
         let src_p = src.ptr();
         let dst_p = shadow.as_mut_ptr();
         let lim = (n / 8) * 8;
+        let mut first = usize::MAX;
+        let mut last_end = 0usize;
         // SAFETY: Caller guarantees AVX2, `src_p` and `dst_p` are valid for `n`
         // `Vec4u8`s and non-overlapping (`src` is shm/caller, `shadow` is
         // exclusively borrowed), and `i + 8 <= n`.
         unsafe {
+            let zero = _mm256_setzero_si256();
             let rgb_mask = _mm256_set1_epi32(0x00FF_FFFFu32 as i32);
             let mut i = 0usize;
             while i < lim {
@@ -1743,10 +1739,13 @@ mod avx2 {
                 };
                 if _mm256_testz_si256(masked, masked) == 0 {
                     _mm256_storeu_si256(dst_p.add(i).cast::<__m256i>(), s);
-                    if i + 8 < n {
-                        super::copy_dirty_tail(src, shadow, i + 8);
+                    let eq = _mm256_movemask_epi8(_mm256_cmpeq_epi32(masked, zero)) as u32;
+                    let neq = !eq;
+                    debug_assert_ne!(neq, 0);
+                    if first == usize::MAX {
+                        first = i + (neq.trailing_zeros() as usize >> 2);
                     }
-                    return true;
+                    last_end = i + ((31 - neq.leading_zeros() as usize) >> 2) + 1;
                 }
                 i += 8;
             }
@@ -1760,14 +1759,14 @@ mod avx2 {
                 };
                 if differs {
                     dst_p.add(j).write(s);
-                    if j + 1 < n {
-                        super::copy_dirty_tail(src, shadow, j + 1);
+                    if first == usize::MAX {
+                        first = j;
                     }
-                    return true;
+                    last_end = j + 1;
                 }
             }
         }
-        false
+        (first != usize::MAX).then_some((first, last_end))
     }
 
     #[derive(Copy, Clone)]
@@ -1905,7 +1904,7 @@ mod avx2 {
             self,
             src: BufferPointer<Vec4u8>,
             shadow: &mut [Vec4u8],
-        ) -> bool {
+        ) -> Option<(usize, usize)> {
             // SAFETY: `self` witnesses `avx2` support.
             unsafe { diff_and_update_row_impl::<HAS_ALPHA>(src, shadow) }
         }
@@ -2495,12 +2494,14 @@ mod ssse3 {
     unsafe fn diff_and_update_row_impl<const HAS_ALPHA: bool>(
         src: BufferPointer<Vec4u8>,
         shadow: &mut [Vec4u8],
-    ) -> bool {
+    ) -> Option<(usize, usize)> {
         let n = src.len();
         debug_assert_eq!(shadow.len(), n);
         let src_p = src.ptr();
         let dst_p = shadow.as_mut_ptr();
         let lim = (n / 4) * 4;
+        let mut first = usize::MAX;
+        let mut last_end = 0usize;
         // SAFETY: Caller guarantees SSSE3, `src_p` and `dst_p` are valid for
         // `n` `Vec4u8`s and non-overlapping, and `i + 4 <= n`.
         unsafe {
@@ -2516,12 +2517,15 @@ mod ssse3 {
                 } else {
                     _mm_and_si128(diff, rgb_mask)
                 };
-                if _mm_movemask_epi8(_mm_cmpeq_epi8(masked, zero)) != 0xFFFF {
+                let eq_mask = _mm_movemask_epi8(_mm_cmpeq_epi8(masked, zero)) as u32;
+                if eq_mask != 0xFFFF {
                     _mm_storeu_si128(dst_p.add(i).cast::<__m128i>(), s);
-                    if i + 4 < n {
-                        super::copy_dirty_tail(src, shadow, i + 4);
+                    let neq = (!eq_mask) & 0xFFFF;
+                    debug_assert_ne!(neq, 0);
+                    if first == usize::MAX {
+                        first = i + (neq.trailing_zeros() as usize >> 2);
                     }
-                    return true;
+                    last_end = i + ((31 - neq.leading_zeros() as usize) >> 2) + 1;
                 }
                 i += 4;
             }
@@ -2535,14 +2539,14 @@ mod ssse3 {
                 };
                 if differs {
                     dst_p.add(j).write(s);
-                    if j + 1 < n {
-                        super::copy_dirty_tail(src, shadow, j + 1);
+                    if first == usize::MAX {
+                        first = j;
                     }
-                    return true;
+                    last_end = j + 1;
                 }
             }
         }
-        false
+        (first != usize::MAX).then_some((first, last_end))
     }
 
     #[derive(Copy, Clone)]
@@ -2680,7 +2684,7 @@ mod ssse3 {
             self,
             src: BufferPointer<Vec4u8>,
             shadow: &mut [Vec4u8],
-        ) -> bool {
+        ) -> Option<(usize, usize)> {
             // SAFETY: `self` witnesses `ssse3` support.
             unsafe { diff_and_update_row_impl::<HAS_ALPHA>(src, shadow) }
         }
@@ -2705,6 +2709,7 @@ macro_rules! define_tier_wrappers {
             use std::borrow::Cow;
             use std::sync::Mutex;
             use std::sync::atomic::AtomicBool;
+            use std::sync::atomic::AtomicU32;
             use std::sync::atomic::AtomicUsize;
 
             use super::X86Tier;
@@ -2852,8 +2857,9 @@ macro_rules! define_tier_wrappers {
                 stride_px: usize,
                 n_qx: usize,
                 sub_bands: &[ScanSubBand],
-                dirty_flags: &[AtomicBool],
+                dirty_slots: &[AtomicU32],
                 slot_hashes: Option<&SlotHashes>,
+                cache_non_empty: bool,
                 next_sub: &AtomicUsize,
                 hash_buf: &mut Vec<u8>,
             ) {
@@ -2874,8 +2880,9 @@ macro_rules! define_tier_wrappers {
                         stride_px,
                         n_qx,
                         sub_bands,
-                        dirty_flags,
+                        dirty_slots,
                         slot_hashes,
+                        cache_non_empty,
                         next_sub,
                         hash_buf,
                     );
@@ -2894,8 +2901,9 @@ macro_rules! define_tier_wrappers {
                 n_qx: usize,
                 sub_bands: &[ScanSubBand],
                 sr: ScrollRect,
-                dirty_flags: &[AtomicBool],
+                dirty_slots: &[AtomicU32],
                 slot_hashes: Option<&SlotHashes>,
+                cache_non_empty: bool,
                 next_sub: &AtomicUsize,
                 hash_buf: &mut Vec<u8>,
             ) {
@@ -2917,8 +2925,9 @@ macro_rules! define_tier_wrappers {
                         n_qx,
                         sub_bands,
                         sr,
-                        dirty_flags,
+                        dirty_slots,
                         slot_hashes,
+                        cache_non_empty,
                         next_sub,
                         hash_buf,
                     );
@@ -2953,7 +2962,7 @@ macro_rules! define_tier_wrappers {
                 stride: usize,
                 y0: usize,
                 y1: usize,
-                dirty_slots: &[AtomicBool],
+                dirty_slots: &[AtomicU32],
             ) {
                 // SAFETY: Caller verified CPU feature support and disjoint-row invariants.
                 unsafe {
@@ -2974,6 +2983,7 @@ macro_rules! define_tier_wrappers {
                         0,
                         dirty_slots,
                         None,
+                        false,
                         &mut hash_buf,
                     );
                 }
@@ -3415,8 +3425,9 @@ impl X86Tier {
         stride_px: usize,
         n_qx: usize,
         sub_bands: &[ScanSubBand],
-        dirty_flags: &[AtomicBool],
+        dirty_slots: &[AtomicU32],
         slot_hashes: Option<&SlotHashes>,
+        cache_non_empty: bool,
         next_sub: &AtomicUsize,
         hash_buf: &mut Vec<u8>,
     ) {
@@ -3445,8 +3456,9 @@ impl X86Tier {
                             stride_px,
                             n_qx,
                             sub_bands,
-                            dirty_flags,
+                            dirty_slots,
                             slot_hashes,
+                            cache_non_empty,
                             next_sub,
                             hash_buf,
                         );
@@ -3461,8 +3473,9 @@ impl X86Tier {
                             stride_px,
                             n_qx,
                             sub_bands,
-                            dirty_flags,
+                            dirty_slots,
                             slot_hashes,
+                            cache_non_empty,
                             next_sub,
                             hash_buf,
                         );
@@ -3487,8 +3500,9 @@ impl X86Tier {
                             stride_px,
                             n_qx,
                             sub_bands,
-                            dirty_flags,
+                            dirty_slots,
                             slot_hashes,
+                            cache_non_empty,
                             next_sub,
                             hash_buf,
                         );
@@ -3502,8 +3516,9 @@ impl X86Tier {
                             stride_px,
                             n_qx,
                             sub_bands,
-                            dirty_flags,
+                            dirty_slots,
                             slot_hashes,
+                            cache_non_empty,
                             next_sub,
                             hash_buf,
                         );
@@ -3525,8 +3540,9 @@ impl X86Tier {
                             stride_px,
                             n_qx,
                             sub_bands,
-                            dirty_flags,
+                            dirty_slots,
                             slot_hashes,
+                            cache_non_empty,
                             next_sub,
                             hash_buf,
                         );
@@ -3540,8 +3556,9 @@ impl X86Tier {
                             stride_px,
                             n_qx,
                             sub_bands,
-                            dirty_flags,
+                            dirty_slots,
                             slot_hashes,
+                            cache_non_empty,
                             next_sub,
                             hash_buf,
                         );
@@ -3558,8 +3575,9 @@ impl X86Tier {
                             stride_px,
                             n_qx,
                             sub_bands,
-                            dirty_flags,
+                            dirty_slots,
                             slot_hashes,
+                            cache_non_empty,
                             next_sub,
                             hash_buf,
                         );
@@ -3573,8 +3591,9 @@ impl X86Tier {
                             stride_px,
                             n_qx,
                             sub_bands,
-                            dirty_flags,
+                            dirty_slots,
                             slot_hashes,
+                            cache_non_empty,
                             next_sub,
                             hash_buf,
                         );
@@ -3599,8 +3618,9 @@ impl X86Tier {
         n_qx: usize,
         sub_bands: &[ScanSubBand],
         sr: ScrollRect,
-        dirty_flags: &[AtomicBool],
+        dirty_slots: &[AtomicU32],
         slot_hashes: Option<&SlotHashes>,
+        cache_non_empty: bool,
         next_sub: &AtomicUsize,
         hash_buf: &mut Vec<u8>,
     ) {
@@ -3630,8 +3650,9 @@ impl X86Tier {
                             n_qx,
                             sub_bands,
                             sr,
-                            dirty_flags,
+                            dirty_slots,
                             slot_hashes,
+                            cache_non_empty,
                             next_sub,
                             hash_buf,
                         );
@@ -3647,8 +3668,9 @@ impl X86Tier {
                             n_qx,
                             sub_bands,
                             sr,
-                            dirty_flags,
+                            dirty_slots,
                             slot_hashes,
+                            cache_non_empty,
                             next_sub,
                             hash_buf,
                         );
@@ -3674,8 +3696,9 @@ impl X86Tier {
                             n_qx,
                             sub_bands,
                             sr,
-                            dirty_flags,
+                            dirty_slots,
                             slot_hashes,
+                            cache_non_empty,
                             next_sub,
                             hash_buf,
                         );
@@ -3690,8 +3713,9 @@ impl X86Tier {
                             n_qx,
                             sub_bands,
                             sr,
-                            dirty_flags,
+                            dirty_slots,
                             slot_hashes,
+                            cache_non_empty,
                             next_sub,
                             hash_buf,
                         );
@@ -3714,8 +3738,9 @@ impl X86Tier {
                             n_qx,
                             sub_bands,
                             sr,
-                            dirty_flags,
+                            dirty_slots,
                             slot_hashes,
+                            cache_non_empty,
                             next_sub,
                             hash_buf,
                         );
@@ -3730,8 +3755,9 @@ impl X86Tier {
                             n_qx,
                             sub_bands,
                             sr,
-                            dirty_flags,
+                            dirty_slots,
                             slot_hashes,
+                            cache_non_empty,
                             next_sub,
                             hash_buf,
                         );
@@ -3749,8 +3775,9 @@ impl X86Tier {
                             n_qx,
                             sub_bands,
                             sr,
-                            dirty_flags,
+                            dirty_slots,
                             slot_hashes,
+                            cache_non_empty,
                             next_sub,
                             hash_buf,
                         );
@@ -3765,8 +3792,9 @@ impl X86Tier {
                             n_qx,
                             sub_bands,
                             sr,
-                            dirty_flags,
+                            dirty_slots,
                             slot_hashes,
+                            cache_non_empty,
                             next_sub,
                             hash_buf,
                         );
@@ -3839,7 +3867,7 @@ impl X86Tier {
         stride: usize,
         y0: usize,
         y1: usize,
-        dirty_slots: &[AtomicBool],
+        dirty_slots: &[AtomicU32],
     ) {
         // SAFETY: Caller verified `self` is host-supported and upheld disjoint-row invariants.
         unsafe {
@@ -3867,6 +3895,7 @@ impl X86Tier {
                         0,
                         dirty_slots,
                         None,
+                        false,
                         &mut hash_buf,
                     );
                 },

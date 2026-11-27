@@ -40,12 +40,16 @@ use std::slice;
 use std::sync::Mutex;
 use std::sync::atomic::AtomicBool;
 use std::sync::atomic::AtomicU8;
+use std::sync::atomic::AtomicU32;
 use std::sync::atomic::AtomicUsize;
 use std::sync::atomic::Ordering;
 
 use crate::buffer_pointer::BufferPointer;
 use crate::filtering::BaseScanEntry;
 use crate::filtering::FrameRows;
+use crate::filtering::SlotDirty;
+use crate::filtering::merge_cropped_quad_slots;
+use crate::filtering::quad_grid_slot;
 use crate::filtering::tile_quadrants;
 use crate::prelude::*;
 use crate::serialization::framing::CacheHitRef;
@@ -547,6 +551,14 @@ enum DirtyCandidate {
         quad_hashes: [TileHash; 4],
         n_quads: usize,
     },
+    PartialTile2D {
+        rect: TileRect,
+        parent_hash: Option<TileHash>,
+        quads: [TileRect; 4],
+        states: [SlotDirty; 4],
+        quad_hashes: [TileHash; 4],
+        n_quads: usize,
+    },
 }
 
 enum Pass1Item {
@@ -558,6 +570,9 @@ enum Pass1Item {
         rect: TileRect,
         hash: TileHash,
         sub_quads: Option<([TileRect; 4], [TileHash; 4], usize)>,
+    },
+    Uncached {
+        rect: TileRect,
     },
 }
 
@@ -1136,6 +1151,60 @@ impl ServerTileCache {
         self.free_slots.pop()
     }
 
+    /// Attempts to satisfy a `> 128`px tile from already-cached parent or
+    /// all-lossless quadrant entries (preferring lossless hits in Hybrid mode).
+    /// Returns `true` and appends `Pass1Item::Hit` entries when fully satisfied.
+    fn try_hit_splittable_parent(
+        &mut self,
+        rect: TileRect,
+        parent_hash: TileHash,
+        quads: &[TileRect; 4],
+        quad_hashes: &[TileHash; 4],
+        n_quads: usize,
+        has_alpha: bool,
+        mode: CompressionMode,
+        pass1: &mut Vec<Pass1Item>,
+    ) -> bool {
+        if let Some(hit_ref) = self.lookup_lossless(parent_hash, rect.w, rect.h, has_alpha) {
+            self.touch_and_pin(hit_ref.slot_id);
+            pass1.push(Pass1Item::Hit { rect, hit_ref });
+            return true;
+        }
+        // In Hybrid mode, if every quadrant already has a lossless cached entry
+        // (e.g. after a Lossless refresh that un-coalesced a mixed tile), prefer
+        // those bit-exact quadrants over a stale lossy parent slot.
+        let mut all_quads_lossless = [None; 4];
+        let all_lossless = matches!(mode, CompressionMode::Hybrid { .. })
+            && (0..n_quads).all(|q| {
+                let qrect = quads[q];
+                if let Some(qhit) =
+                    self.lookup_lossless(quad_hashes[q], qrect.w, qrect.h, has_alpha)
+                {
+                    all_quads_lossless[q] = Some(qhit);
+                    true
+                } else {
+                    false
+                }
+            });
+        if all_lossless {
+            for q in 0..n_quads {
+                let hit_ref = all_quads_lossless[q].unwrap();
+                self.touch_and_pin(hit_ref.slot_id);
+                pass1.push(Pass1Item::Hit {
+                    rect: quads[q],
+                    hit_ref,
+                });
+            }
+            return true;
+        }
+        if let Some(hit_ref) = self.lookup(parent_hash, rect.w, rect.h, has_alpha, mode) {
+            self.touch_and_pin(hit_ref.slot_id);
+            pass1.push(Pass1Item::Hit { rect, hit_ref });
+            return true;
+        }
+        false
+    }
+
     /// Runs two-pass lookup/pinning (Pass 1) and intra-frame dedup + unpinned
     /// LRU slot allocation (Pass 2) over all dirty entries in deterministic
     /// raster order.
@@ -1143,7 +1212,7 @@ impl ServerTileCache {
     pub(crate) fn plan_frame(
         &mut self,
         base_entries: &[BaseScanEntry],
-        dirty_flags: Option<&[AtomicBool]>,
+        dirty_slots: Option<&[AtomicU32]>,
         slot_hashes: &[TileHash],
         has_alpha: bool,
         mode: CompressionMode,
@@ -1154,8 +1223,9 @@ impl ServerTileCache {
         for entry in base_entries {
             match *entry {
                 BaseScanEntry::Strip1D { rect, slot_idx } => {
-                    let is_dirty =
-                        dirty_flags.is_none_or(|flags| flags[slot_idx].load(Ordering::Relaxed));
+                    let is_dirty = dirty_slots.is_none_or(|slots| {
+                        slots[slot_idx].load(Ordering::Relaxed) != SlotDirty::CLEAN_RAW
+                    });
                     if is_dirty {
                         candidates.push(DirtyCandidate::Single {
                             rect,
@@ -1168,26 +1238,37 @@ impl ServerTileCache {
                     quad_slots,
                     n_quads,
                 } => {
-                    let mut mask = 0u8;
+                    let mut states = [SlotDirty::Clean; 4];
+                    let mut full_count = 0usize;
+                    let mut dirty_count = 0usize;
                     for (q, &slot) in quad_slots[..n_quads].iter().enumerate() {
-                        let is_dirty =
-                            dirty_flags.is_none_or(|flags| flags[slot].load(Ordering::Relaxed));
-                        if is_dirty {
-                            mask |= 1u8 << q;
+                        let st = match dirty_slots {
+                            None => SlotDirty::Full,
+                            Some(slots) => SlotDirty::decode(slots[slot].load(Ordering::Relaxed)),
+                        };
+                        states[q] = st;
+                        match st {
+                            SlotDirty::Clean => {},
+                            SlotDirty::Full => {
+                                full_count += 1;
+                                dirty_count += 1;
+                            },
+                            SlotDirty::Cropped { .. } => {
+                                dirty_count += 1;
+                            },
                         }
                     }
-                    if mask == 0 {
+                    if dirty_count == 0 {
                         continue;
                     }
-                    if n_quads == 1 {
-                        candidates.push(DirtyCandidate::Single {
-                            rect,
-                            hash: slot_hashes[quad_slots[0]],
-                        });
-                    } else {
-                        let all_mask = (1u8 << n_quads) - 1;
-                        let (quads, _) = tile_quadrants(rect);
-                        if mask == all_mask {
+                    if full_count == n_quads {
+                        if n_quads == 1 {
+                            candidates.push(DirtyCandidate::Single {
+                                rect,
+                                hash: slot_hashes[quad_slots[0]],
+                            });
+                        } else {
+                            let (quads, _) = tile_quadrants(rect);
                             let mut quad_hashes = [[0u8; 16]; 4];
                             for (q, &slot) in quad_slots[..n_quads].iter().enumerate() {
                                 quad_hashes[q] = slot_hashes[slot];
@@ -1201,16 +1282,35 @@ impl ServerTileCache {
                                 quad_hashes,
                                 n_quads,
                             });
-                        } else {
-                            for q in 0..n_quads {
-                                if (mask & (1u8 << q)) != 0 {
-                                    candidates.push(DirtyCandidate::Single {
-                                        rect: quads[q],
-                                        hash: slot_hashes[quad_slots[q]],
-                                    });
-                                }
+                        }
+                    } else {
+                        let (quads, _) = tile_quadrants(rect);
+                        let mut quad_hashes = [[0u8; 16]; 4];
+                        let mut all_hashed = dirty_count == n_quads && n_quads > 1;
+                        for (q, &slot) in quad_slots[..n_quads].iter().enumerate() {
+                            if matches!(
+                                states[q],
+                                SlotDirty::Full
+                                    | SlotDirty::Cropped {
+                                        has_quad_hash: true,
+                                        ..
+                                    }
+                            ) {
+                                quad_hashes[q] = slot_hashes[slot];
+                            } else {
+                                all_hashed = false;
                             }
                         }
+                        let parent_hash = all_hashed
+                            .then(|| combine_quad_hashes(rect.w, rect.h, &quad_hashes[..n_quads]));
+                        candidates.push(DirtyCandidate::PartialTile2D {
+                            rect,
+                            parent_hash,
+                            quads,
+                            states,
+                            quad_hashes,
+                            n_quads,
+                        });
                     }
                 },
             }
@@ -1240,81 +1340,142 @@ impl ServerTileCache {
                     quad_hashes,
                     n_quads,
                 } => {
-                    if let Some(hit_ref) =
-                        self.lookup_lossless(parent_hash, rect.w, rect.h, has_alpha)
-                    {
-                        self.touch_and_pin(hit_ref.slot_id);
-                        pass1.push(Pass1Item::Hit { rect, hit_ref });
-                    } else {
-                        // In Hybrid mode, if every quadrant already has a
-                        // lossless cached entry (e.g. after a Lossless refresh
-                        // that un-coalesced a mixed tile), prefer those
-                        // bit-exact quadrants over a stale lossy parent slot.
-                        let mut all_quads_lossless = [None; 4];
-                        let all_lossless = matches!(mode, CompressionMode::Hybrid { .. })
-                            && (0..n_quads).all(|q| {
-                                let qrect = quads[q];
-                                if let Some(qhit) = self.lookup_lossless(
-                                    quad_hashes[q],
-                                    qrect.w,
-                                    qrect.h,
-                                    has_alpha,
-                                ) {
-                                    all_quads_lossless[q] = Some(qhit);
-                                    true
-                                } else {
-                                    false
-                                }
-                            });
-                        if all_lossless {
-                            for q in 0..n_quads {
-                                let hit_ref = all_quads_lossless[q].unwrap();
+                    if self.try_hit_splittable_parent(
+                        rect,
+                        parent_hash,
+                        &quads,
+                        &quad_hashes,
+                        n_quads,
+                        has_alpha,
+                        mode,
+                        &mut pass1,
+                    ) {
+                        continue;
+                    }
+                    let mut quad_hits = [None; 4];
+                    let mut any_quad_hit = false;
+                    for q in 0..n_quads {
+                        let qrect = quads[q];
+                        if let Some(qhit) =
+                            self.lookup(quad_hashes[q], qrect.w, qrect.h, has_alpha, mode)
+                        {
+                            quad_hits[q] = Some(qhit);
+                            any_quad_hit = true;
+                        }
+                    }
+                    if any_quad_hit {
+                        for q in 0..n_quads {
+                            if let Some(hit_ref) = quad_hits[q] {
                                 self.touch_and_pin(hit_ref.slot_id);
                                 pass1.push(Pass1Item::Hit {
                                     rect: quads[q],
                                     hit_ref,
                                 });
-                            }
-                        } else if let Some(hit_ref) =
-                            self.lookup(parent_hash, rect.w, rect.h, has_alpha, mode)
-                        {
-                            self.touch_and_pin(hit_ref.slot_id);
-                            pass1.push(Pass1Item::Hit { rect, hit_ref });
-                        } else {
-                            let mut quad_hits = [None; 4];
-                            let mut any_quad_hit = false;
-                            for q in 0..n_quads {
-                                let qrect = quads[q];
-                                if let Some(qhit) =
-                                    self.lookup(quad_hashes[q], qrect.w, qrect.h, has_alpha, mode)
-                                {
-                                    quad_hits[q] = Some(qhit);
-                                    any_quad_hit = true;
-                                }
-                            }
-                            if any_quad_hit {
-                                for q in 0..n_quads {
-                                    if let Some(hit_ref) = quad_hits[q] {
-                                        self.touch_and_pin(hit_ref.slot_id);
-                                        pass1.push(Pass1Item::Hit {
-                                            rect: quads[q],
-                                            hit_ref,
-                                        });
-                                    } else {
-                                        pass1.push(Pass1Item::Miss {
-                                            rect: quads[q],
-                                            hash: quad_hashes[q],
-                                            sub_quads: None,
-                                        });
-                                    }
-                                }
                             } else {
                                 pass1.push(Pass1Item::Miss {
-                                    rect,
-                                    hash: parent_hash,
-                                    sub_quads: Some((quads, quad_hashes, n_quads)),
+                                    rect: quads[q],
+                                    hash: quad_hashes[q],
+                                    sub_quads: None,
                                 });
                             }
+                        }
+                    } else {
+                        pass1.push(Pass1Item::Miss {
+                            rect,
+                            hash: parent_hash,
+                            sub_quads: Some((quads, quad_hashes, n_quads)),
+                        });
+                    }
+                },
+                DirtyCandidate::PartialTile2D {
+                    rect,
+                    parent_hash,
+                    quads,
+                    states,
+                    quad_hashes,
+                    n_quads,
+                } => {
+                    // When every quadrant of a `> 128`px tile is dirty and
+                    // carries a full-quadrant hash (mix of `Full` and lookup-
+                    // hashed `Cropped`), prefer a single coalesced parent
+                    // `CacheHit` if already cached (e.g. closing a popup whose
+                    // border partially overlapped an edge quadrant) without
+                    // ever polluting the cache on a miss.
+                    if let Some(ph) = parent_hash
+                        && self.try_hit_splittable_parent(
+                            rect,
+                            ph,
+                            &quads,
+                            &quad_hashes,
+                            n_quads,
+                            has_alpha,
+                            mode,
+                            &mut pass1,
+                        )
+                    {
+                        continue;
+                    }
+
+                    let mut resolved_grid: [Option<Pass1Item>; 4] = [None, None, None, None];
+                    let mut crop_miss_grid: [Option<TileRect>; 4] = [None; 4];
+                    for q in 0..n_quads {
+                        let qrect = quads[q];
+                        let grid_slot = quad_grid_slot(rect, qrect);
+                        match states[q] {
+                            SlotDirty::Clean => {},
+                            SlotDirty::Full => {
+                                let hash = quad_hashes[q];
+                                if let Some(hit_ref) =
+                                    self.lookup(hash, qrect.w, qrect.h, has_alpha, mode)
+                                {
+                                    self.touch_and_pin(hit_ref.slot_id);
+                                    resolved_grid[grid_slot] = Some(Pass1Item::Hit {
+                                        rect: qrect,
+                                        hit_ref,
+                                    });
+                                } else {
+                                    resolved_grid[grid_slot] = Some(Pass1Item::Miss {
+                                        rect: qrect,
+                                        hash,
+                                        sub_quads: None,
+                                    });
+                                }
+                            },
+                            SlotDirty::Cropped {
+                                min_x,
+                                max_x,
+                                min_y,
+                                max_y,
+                                has_quad_hash,
+                            } => {
+                                if has_quad_hash
+                                    && let Some(hit_ref) = self.lookup(
+                                        quad_hashes[q],
+                                        qrect.w,
+                                        qrect.h,
+                                        has_alpha,
+                                        mode,
+                                    )
+                                {
+                                    self.touch_and_pin(hit_ref.slot_id);
+                                    resolved_grid[grid_slot] = Some(Pass1Item::Hit {
+                                        rect: qrect,
+                                        hit_ref,
+                                    });
+                                } else {
+                                    crop_miss_grid[grid_slot] = Some(SlotDirty::cropped_rect(
+                                        qrect, min_x, max_x, min_y, max_y,
+                                    ));
+                                }
+                            },
+                        }
+                    }
+                    merge_cropped_quad_slots(&mut crop_miss_grid);
+                    for s in 0..4 {
+                        if let Some(item) = resolved_grid[s].take() {
+                            pass1.push(item);
+                        } else if let Some(crect) = crop_miss_grid[s] {
+                            pass1.push(Pass1Item::Uncached { rect: crect });
                         }
                     }
                 },
@@ -1338,6 +1499,10 @@ impl ServerTileCache {
                 Pass1Item::Hit { rect, hit_ref } => {
                     tile_rects.push(rect);
                     actions.push(TileCacheAction::Hit(hit_ref));
+                },
+                Pass1Item::Uncached { rect } => {
+                    tile_rects.push(rect);
+                    actions.push(TileCacheAction::Uncached);
                 },
                 Pass1Item::Miss {
                     rect,

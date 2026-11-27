@@ -19,8 +19,11 @@
 //! strip fallback for thin `< 8`-row partial bands so 1-row updates avoid
 //! tile-header fragmentation). On incremental commits against a per-surface
 //! shadow buffer, a parallel linear horizontal-band SIMD pass skips unchanged
-//! `128x128` quadrants (coalescing all-dirty quadrants back into a `256x256`
-//! tile and omitting empty commits completely). Each dirty tile is encoded on
+//! `128x128` quadrants, crops small dirty changes (`<= 45%` of quadrant area)
+//! to their tight pixel bounding box (with safe intra-tile seam merging and
+//! without polluting the tile cache), and coalesces all-full-dirty quadrants
+//! back into a `256x256` tile while omitting empty commits completely. Each
+//! dirty tile is encoded on
 //! a worker thread inside L1/L2 scratch memory as either a single
 //! [`TilePayload::Leaf`] or (in [`CompressionMode::Hybrid`] when a splittable
 //! tile mixes text and photographic quadrants) a non-recursive
@@ -55,6 +58,7 @@ mod arch {
     use std::borrow::Cow;
     use std::sync::Mutex;
     use std::sync::atomic::AtomicBool;
+    use std::sync::atomic::AtomicU32;
     use std::sync::atomic::AtomicUsize;
 
     use crate::buffer_pointer::BufferPointer;
@@ -231,8 +235,9 @@ mod arch {
             stride_px: usize,
             n_qx: usize,
             sub_bands: &[ScanSubBand],
-            dirty_flags: &[AtomicBool],
+            dirty_slots: &[AtomicU32],
             slot_hashes: Option<&SlotHashes>,
+            cache_non_empty: bool,
             next_sub: &AtomicUsize,
             hash_buf: &mut Vec<u8>,
         ) {
@@ -249,8 +254,9 @@ mod arch {
                         stride_px,
                         n_qx,
                         sub_bands,
-                        dirty_flags,
+                        dirty_slots,
                         slot_hashes,
+                        cache_non_empty,
                         next_sub,
                         hash_buf,
                     );
@@ -265,8 +271,9 @@ mod arch {
                         stride_px,
                         n_qx,
                         sub_bands,
-                        dirty_flags,
+                        dirty_slots,
                         slot_hashes,
+                        cache_non_empty,
                         next_sub,
                         hash_buf,
                     );
@@ -289,8 +296,9 @@ mod arch {
             n_qx: usize,
             sub_bands: &[ScanSubBand],
             sr: ScrollRect,
-            dirty_flags: &[AtomicBool],
+            dirty_slots: &[AtomicU32],
             slot_hashes: Option<&SlotHashes>,
+            cache_non_empty: bool,
             next_sub: &AtomicUsize,
             hash_buf: &mut Vec<u8>,
         ) {
@@ -308,8 +316,9 @@ mod arch {
                         n_qx,
                         sub_bands,
                         sr,
-                        dirty_flags,
+                        dirty_slots,
                         slot_hashes,
+                        cache_non_empty,
                         next_sub,
                         hash_buf,
                     );
@@ -325,8 +334,9 @@ mod arch {
                         n_qx,
                         sub_bands,
                         sr,
-                        dirty_flags,
+                        dirty_slots,
                         slot_hashes,
+                        cache_non_empty,
                         next_sub,
                         hash_buf,
                     );
@@ -364,7 +374,7 @@ mod arch {
             stride: usize,
             y0: usize,
             y1: usize,
-            dirty_slots: &[AtomicBool],
+            dirty_slots: &[AtomicU32],
         ) {
             // SAFETY: Caller upholds disjoint-row shadow invariants.
             unsafe {
@@ -381,6 +391,7 @@ mod arch {
                     0,
                     dirty_slots,
                     None,
+                    false,
                     &mut hash_buf,
                 );
             }
@@ -481,6 +492,30 @@ const MIN_2D_BAND_HEIGHT: u32 = 8;
 /// headers would bloat the payload.
 const MIN_JPEG_DIM: usize = 16;
 
+/// Maximum tight dirty bounding-box area share (`%` of a `<= 128x128`
+/// quadrant's pixel area) that emits a cropped [`TileRect`] instead of the
+/// full grid-aligned quadrant.
+///
+/// At `45%` (`7,372` px on `128x128`, ~57 full-width rows), two-line editor
+/// highlights (`128x40..52`), wheel-scroll exposed strips (`128x36..48`),
+/// smooth scrolls (`128x6..12`), overlay scrollbars (`12x128`), popup borders,
+/// and cursors (`20x20`) all crop tightly, while half/full-quadrant redraws,
+/// tab switches, and popup bodies stay grid-aligned `128x128` / coalesced
+/// `256x256` for the inter-frame tile cache.
+const CROP_MAX_AREA_PCT: usize = 45;
+
+/// Minimum cropped pixel area inside a quadrant before computing a lookup-only
+/// full-quadrant BLAKE3 hash against a non-empty [`ServerTileCache`]. Tiny
+/// transient edits (`< 1,024` px: cursors, status digits, single-character
+/// typing) skip hashing completely, while larger cropped strips (such as a
+/// popup border returning on close) still hit cached full quadrants without
+/// polluting the cache on misses.
+const CROP_CACHE_LOOKUP_MIN_PIXELS: usize = 1024;
+
+/// Maximum horizontal quadrants tracked on the stack inside a single
+/// `RowBand2D` (`64 * 128 = 8192` px 8K width without heap allocation).
+const STACK_QX_CAP: usize = 64;
+
 /// Architecture-specific row kernels operating on exact-length slices (no slack
 /// bytes required).
 ///
@@ -545,14 +580,15 @@ pub(crate) trait RowKernel: Copy {
 
     /// Compares `src` (via [`BufferPointer`], never creating `&[u8]` over
     /// `wl_shm`) against `shadow` pixel-by-pixel (`BGRA` when `HAS_ALPHA`, or
-    /// ignoring byte 3 when `!HAS_ALPHA`). Returns `false` without writing
-    /// `shadow` when all pixels match; otherwise updates the differing and
-    /// subsequent pixels in `shadow` from `src` and returns `true`.
+    /// ignoring byte 3 when `!HAS_ALPHA`). Returns `None` without writing
+    /// `shadow` when all pixels match; otherwise updates every differing pixel
+    /// in `shadow` from `src` and returns `Some((first_diff_x, last_diff_x_exclusive))`
+    /// spanning all differing pixel indices in `0..src.len()`.
     fn diff_and_update_row<const HAS_ALPHA: bool>(
         self,
         src: BufferPointer<Vec4u8>,
         shadow: &mut [Vec4u8],
-    ) -> bool;
+    ) -> Option<(usize, usize)>;
 
     fn fence_stream(self);
 }
@@ -780,30 +816,30 @@ impl RowKernel for ScalarKernel {
         self,
         src: BufferPointer<Vec4u8>,
         shadow: &mut [Vec4u8],
-    ) -> bool {
+    ) -> Option<(usize, usize)> {
         let n = src.len();
         debug_assert_eq!(shadow.len(), n);
         let src_p = src.ptr();
-        for j in 0..n {
-            // SAFETY: `j < n == src.len()`.
+        let mut first = usize::MAX;
+        let mut last_end = 0usize;
+        for (j, dst) in shadow.iter_mut().enumerate() {
+            // SAFETY: `j < shadow.len() == src.len()`.
             let s = unsafe { src_p.add(j).read() };
-            let d = shadow[j];
+            let d = *dst;
             let differs = if HAS_ALPHA {
                 s != d
             } else {
                 s.0 != d.0 || s.1 != d.1 || s.2 != d.2
             };
             if differs {
-                shadow[j] = s;
-                if j + 1 < n {
-                    src.split_at(j + 1)
-                        .1
-                        .copy_to_nonoverlapping(&mut shadow[j + 1..]);
+                *dst = s;
+                if first == usize::MAX {
+                    first = j;
                 }
-                return true;
+                last_end = j + 1;
             }
         }
-        false
+        (first != usize::MAX).then_some((first, last_end))
     }
 
     #[inline(always)]
@@ -2333,6 +2369,229 @@ fn plan_incremental_scan(
     Ok((sub_bands, base_entries, total_slots))
 }
 
+/// Packed per-quadrant / per-strip dirty state written by Phase A into
+/// `dirty_slots: &[AtomicU32]`.
+///
+/// Encoding:
+/// - `0`: clean ([`SlotDirty::Clean`])
+/// - `u32::MAX`: full quadrant or 1D strip dirty ([`SlotDirty::Full`])
+/// - Otherwise: cropped tight bounding box relative to the quadrant origin:
+///   - bits `0..7`: `min_x` (`0..128`)
+///   - bit `7`: `has_quad_hash` (lookup-only full-quadrant BLAKE3 hash written
+///     to [`SlotHashes`])
+///   - bits `8..16`: `max_x` (`1..=128`, exclusive)
+///   - bits `16..24`: `min_y` (`0..128`)
+///   - bits `24..32`: `max_y` (`1..=128`, exclusive)
+///
+/// Because `1 <= max_x <= 128` and `1 <= max_y <= 128`, a cropped value can
+/// never equal `0` or `u32::MAX`.
+#[derive(Debug, Copy, Clone, Eq, PartialEq)]
+pub(crate) enum SlotDirty {
+    Clean,
+    Full,
+    Cropped {
+        min_x: u8,
+        max_x: u8,
+        min_y: u8,
+        max_y: u8,
+        has_quad_hash: bool,
+    },
+}
+
+impl SlotDirty {
+    pub(crate) const CLEAN_RAW: u32 = 0;
+    pub(crate) const FULL_RAW: u32 = u32::MAX;
+
+    #[inline]
+    pub(crate) fn encode_cropped(
+        min_x: u8,
+        max_x: u8,
+        min_y: u8,
+        max_y: u8,
+        has_quad_hash: bool,
+    ) -> u32 {
+        debug_assert!(min_x < max_x && max_x as usize <= SUBTILE_W);
+        debug_assert!(min_y < max_y && max_y as usize <= SUBTILE_H);
+        let raw = u32::from(min_x)
+            | (u32::from(has_quad_hash) << 7)
+            | (u32::from(max_x) << 8)
+            | (u32::from(min_y) << 16)
+            | (u32::from(max_y) << 24);
+        debug_assert!(raw != Self::CLEAN_RAW && raw != Self::FULL_RAW);
+        raw
+    }
+
+    #[inline]
+    pub(crate) fn decode(raw: u32) -> Self {
+        match raw {
+            Self::CLEAN_RAW => Self::Clean,
+            Self::FULL_RAW => Self::Full,
+            v => Self::Cropped {
+                min_x: (v & 0x7F) as u8,
+                max_x: ((v >> 8) & 0xFF) as u8,
+                min_y: ((v >> 16) & 0xFF) as u8,
+                max_y: ((v >> 24) & 0xFF) as u8,
+                has_quad_hash: (v & 0x80) != 0,
+            },
+        }
+    }
+
+    #[inline]
+    pub(crate) fn cropped_rect(
+        quad: TileRect,
+        min_x: u8,
+        max_x: u8,
+        min_y: u8,
+        max_y: u8,
+    ) -> TileRect {
+        TileRect {
+            x: quad.x + u32::from(min_x),
+            y: quad.y + u32::from(min_y),
+            w: u32::from(max_x - min_x),
+            h: u32::from(max_y - min_y),
+        }
+    }
+}
+
+#[derive(Copy, Clone)]
+struct QuadBbox {
+    min_x: u8,
+    max_x: u8,
+    min_y: u8,
+    max_y: u8,
+    full: bool,
+}
+
+impl QuadBbox {
+    const CLEAN: Self = Self {
+        min_x: u8::MAX,
+        max_x: 0,
+        min_y: u8::MAX,
+        max_y: 0,
+        full: false,
+    };
+
+    #[inline(always)]
+    fn is_dirty(self) -> bool {
+        self.full || self.max_x != 0
+    }
+
+    /// Expands the tight bounding box with a dirty row span `[first_x, last_x_end)`
+    /// at quadrant-local row `ry`, escalating to `full = true` (and returning
+    /// `true`) if the expanded area exceeds `max_crop_area`.
+    #[inline(always)]
+    fn record_row(
+        &mut self,
+        ry: usize,
+        first_x: usize,
+        last_x_end: usize,
+        max_crop_area: usize,
+    ) -> bool {
+        let fx = first_x as u8;
+        let lx = last_x_end as u8;
+        let ry_u8 = ry as u8;
+        if self.max_x == 0 {
+            self.min_x = fx;
+            self.max_x = lx;
+            self.min_y = ry_u8;
+            self.max_y = ry_u8 + 1;
+        } else {
+            self.min_x = self.min_x.min(fx);
+            self.max_x = self.max_x.max(lx);
+            self.min_y = self.min_y.min(ry_u8);
+            self.max_y = self.max_y.max(ry_u8 + 1);
+        }
+        let area = usize::from(self.max_x - self.min_x) * usize::from(self.max_y - self.min_y);
+        if area > max_crop_area {
+            self.full = true;
+            return true;
+        }
+        false
+    }
+}
+
+/// Maps a quadrant `quad` inside `parent` (`<= 256x256`) to its 2x2 grid slot:
+/// `0 = TL, 1 = TR, 2 = BL, 3 = BR`.
+#[inline]
+pub(crate) fn quad_grid_slot(parent: TileRect, quad: TileRect) -> usize {
+    let col = usize::from(quad.x > parent.x);
+    let row = usize::from(quad.y > parent.y);
+    row * 2 + col
+}
+
+#[inline]
+fn try_merge_adjacent(a: TileRect, b: TileRect, horizontal: bool) -> Option<TileRect> {
+    let touches = if horizontal {
+        a.x + a.w == b.x && a.y < b.y + b.h && b.y < a.y + a.h
+    } else {
+        a.y + a.h == b.y && a.x < b.x + b.w && b.x < a.x + a.w
+    };
+    if !touches {
+        return None;
+    }
+    let x0 = a.x.min(b.x);
+    let y0 = a.y.min(b.y);
+    let x1 = (a.x + a.w).max(b.x + b.w);
+    let y1 = (a.y + a.h).max(b.y + b.h);
+    let merged = TileRect {
+        x: x0,
+        y: y0,
+        w: x1 - x0,
+        h: y1 - y0,
+    };
+    let merged_area = u64::from(merged.w) * u64::from(merged.h);
+    let sum_area = u64::from(a.w) * u64::from(a.h) + u64::from(b.w) * u64::from(b.h);
+    if merged_area <= TILE_PIXELS as u64
+        && (merged_area <= sum_area + 256 || merged_area * 8 <= sum_area * 9)
+    {
+        Some(merged)
+    } else {
+        None
+    }
+}
+
+/// Merges touching cropped-miss bounding boxes across internal quadrant seams
+/// of a single `<= 256x256` tile (`[TL, TR, BL, BR]`) without ever overlapping
+/// any `None` (clean, full, or cache-hit) sibling quadrant.
+#[inline]
+pub(crate) fn merge_cropped_quad_slots(grid: &mut [Option<TileRect>; 4]) {
+    let mut merged_top = false;
+    if let (Some(a), Some(b)) = (grid[0], grid[1])
+        && let Some(m) = try_merge_adjacent(a, b, true)
+    {
+        grid[0] = Some(m);
+        grid[1] = None;
+        merged_top = true;
+    }
+
+    let mut merged_bot = false;
+    if let (Some(a), Some(b)) = (grid[2], grid[3])
+        && let Some(m) = try_merge_adjacent(a, b, true)
+    {
+        grid[2] = Some(m);
+        grid[3] = None;
+        merged_bot = true;
+    }
+
+    // Only attempt vertical merges when both rows merged horizontally (all 4
+    // quadrants were cropped misses) or neither did (each rect remains inside
+    // its own column), preventing a wide `TL+TR` merge from overlapping `BR`.
+    if merged_top == merged_bot {
+        if let (Some(a), Some(b)) = (grid[0], grid[2])
+            && let Some(m) = try_merge_adjacent(a, b, false)
+        {
+            grid[0] = Some(m);
+            grid[2] = None;
+        }
+        if let (Some(a), Some(b)) = (grid[1], grid[3])
+            && let Some(m) = try_merge_adjacent(a, b, false)
+        {
+            grid[1] = Some(m);
+            grid[3] = None;
+        }
+    }
+}
+
 /// Scans a `< 8`-row 1D strip linearly against `shadow`, updating `shadow`
 /// from the first differing pixel onward.
 ///
@@ -2361,7 +2620,10 @@ unsafe fn diff_and_update_strip_with<K: RowKernel, const HAS_ALPHA: bool>(
         let dst_row = unsafe {
             slice::from_raw_parts_mut(shadow.row_ptr(y0 + ry, x_bytes).cast::<Vec4u8>(), w)
         };
-        if kernel.diff_and_update_row::<HAS_ALPHA>(src_row, dst_row) {
+        if kernel
+            .diff_and_update_row::<HAS_ALPHA>(src_row, dst_row)
+            .is_some()
+        {
             for rem_ry in (ry + 1)..h {
                 let (_, rem_after) = aos.split_at((y0 + rem_ry) * stride_px + x0);
                 let (rem_src, _) = rem_after.split_at(w);
@@ -2381,9 +2643,9 @@ unsafe fn diff_and_update_strip_with<K: RowKernel, const HAS_ALPHA: bool>(
 }
 
 /// Scans a horizontal `<= 128`-row 2D sub-band linearly row-by-row across all
-/// `n_qx` horizontal quadrants, updating `shadow` for dirty quadrants and
-/// falling back to bulk contiguous `memcpy` once all quadrants in the band are
-/// dirty.
+/// `n_qx` horizontal quadrants, tracking tight dirty bounding boxes per
+/// quadrant and falling back to bulk contiguous `memcpy` / fused copy+hash once
+/// all quadrants in the band exceed the crop area threshold.
 ///
 /// # Safety
 /// Rows `[y0, y1)` must be strictly in-bounds within `shadow` and disjoint from
@@ -2399,17 +2661,26 @@ unsafe fn diff_and_update_row_band_2d_with<K: RowKernel, const HAS_ALPHA: bool>(
     y0: usize,
     y1: usize,
     slot_base: usize,
-    dirty_slots: &[AtomicBool],
+    dirty_slots: &[AtomicU32],
     slot_hashes: Option<&SlotHashes>,
+    cache_non_empty: bool,
     hash_buf: &mut Vec<u8>,
 ) {
     let stride_px = stride / 4;
+    let ch = y1 - y0;
     let n_qx = dirty_slots.len();
-    let mut qx_dirty = vec![false; n_qx];
-    let mut dirty_count = 0usize;
+    let mut stack_bboxes = [QuadBbox::CLEAN; STACK_QX_CAP];
+    let mut heap_bboxes;
+    let qx_bboxes: &mut [QuadBbox] = if n_qx <= STACK_QX_CAP {
+        &mut stack_bboxes[..n_qx]
+    } else {
+        heap_bboxes = vec![QuadBbox::CLEAN; n_qx];
+        &mut heap_bboxes
+    };
+    let mut full_count = 0usize;
 
     for y in y0..y1 {
-        if dirty_count == n_qx {
+        if full_count == n_qx {
             if let Some(hashes) = slot_hashes {
                 // Fuse remaining row copy (`y..y1`) and BLAKE3 hashing per
                 // `<= 128x128` quadrant so each 64 KiB quadrant stays L1/L2-hot
@@ -2422,7 +2693,7 @@ unsafe fn diff_and_update_row_band_2d_with<K: RowKernel, const HAS_ALPHA: bool>(
                         x: x as u32,
                         y: y0 as u32,
                         w: cw as u32,
-                        h: (y1 - y0) as u32,
+                        h: ch as u32,
                     };
                     // SAFETY: `[y0, y1)` is strictly disjoint across workers.
                     let h = unsafe {
@@ -2437,7 +2708,7 @@ unsafe fn diff_and_update_row_band_2d_with<K: RowKernel, const HAS_ALPHA: bool>(
                     };
                     // SAFETY: `slot_base + qx` is exclusively owned by this worker.
                     unsafe { hashes.write(slot_base + qx, h) };
-                    slot.store(true, Ordering::Relaxed);
+                    slot.store(SlotDirty::FULL_RAW, Ordering::Relaxed);
                     x += cw;
                 }
                 return;
@@ -2465,6 +2736,7 @@ unsafe fn diff_and_update_row_band_2d_with<K: RowKernel, const HAS_ALPHA: bool>(
             break;
         }
 
+        let ry = y - y0;
         let (_, row_after) = aos.split_at(y * stride_px);
         let (row_aos, _) = row_after.split_at(width);
         // SAFETY: `[y0, y1)` is strictly disjoint across workers and `Vec4u8` has alignment 1.
@@ -2472,31 +2744,35 @@ unsafe fn diff_and_update_row_band_2d_with<K: RowKernel, const HAS_ALPHA: bool>(
             unsafe { slice::from_raw_parts_mut(shadow.row_ptr(y, 0).cast::<Vec4u8>(), width) };
 
         let mut x = 0usize;
-        for is_dirty in &mut qx_dirty {
+        for bbox in qx_bboxes.iter_mut() {
             let cw = (width - x).min(SUBTILE_W);
             let (_, after_x) = row_aos.split_at(x);
             let (src_chunk, _) = after_x.split_at(cw);
             let dst_chunk = &mut dst_row[x..x + cw];
-            if *is_dirty {
+            if bbox.full {
                 src_chunk.copy_to_nonoverlapping(dst_chunk);
-            } else if kernel.diff_and_update_row::<HAS_ALPHA>(src_chunk, dst_chunk) {
-                *is_dirty = true;
-                dirty_count += 1;
+            } else if let Some((fx, lx)) =
+                kernel.diff_and_update_row::<HAS_ALPHA>(src_chunk, dst_chunk)
+            {
+                let max_crop_area = (cw * ch * CROP_MAX_AREA_PCT) / 100;
+                if bbox.record_row(ry, fx, lx, max_crop_area) {
+                    full_count += 1;
+                }
             }
             x += cw;
         }
     }
 
     let mut x = 0usize;
-    for (qx, (slot, &dirty)) in dirty_slots.iter().zip(&qx_dirty).enumerate() {
+    for (qx, (slot, bbox)) in dirty_slots.iter().zip(qx_bboxes.iter()).enumerate() {
         let cw = (width - x).min(SUBTILE_W);
-        if dirty {
+        if bbox.full {
             if let Some(hashes) = slot_hashes {
                 let qrect = TileRect {
                     x: x as u32,
                     y: y0 as u32,
                     w: cw as u32,
-                    h: (y1 - y0) as u32,
+                    h: ch as u32,
                 };
                 // SAFETY: `[y0, y1)` is in-bounds, finalized, and exclusively owned by this worker.
                 let h = unsafe {
@@ -2510,7 +2786,42 @@ unsafe fn diff_and_update_row_band_2d_with<K: RowKernel, const HAS_ALPHA: bool>(
                 // SAFETY: `slot_base + qx` is exclusively owned by this worker.
                 unsafe { hashes.write(slot_base + qx, h) };
             }
-            slot.store(true, Ordering::Relaxed);
+            slot.store(SlotDirty::FULL_RAW, Ordering::Relaxed);
+        } else if bbox.is_dirty() {
+            let crop_area =
+                usize::from(bbox.max_x - bbox.min_x) * usize::from(bbox.max_y - bbox.min_y);
+            let has_quad_hash = cache_non_empty
+                && slot_hashes.is_some()
+                && crop_area >= CROP_CACHE_LOOKUP_MIN_PIXELS;
+            if has_quad_hash && let Some(hashes) = slot_hashes {
+                let qrect = TileRect {
+                    x: x as u32,
+                    y: y0 as u32,
+                    w: cw as u32,
+                    h: ch as u32,
+                };
+                // SAFETY: `[y0, y1)` is in-bounds, finalized, and exclusively owned by this worker.
+                let h = unsafe {
+                    tile_cache::hash_rect_from_shadow::<HAS_ALPHA>(
+                        shadow.base.cast_const(),
+                        stride,
+                        qrect,
+                        hash_buf,
+                    )
+                };
+                // SAFETY: `slot_base + qx` is exclusively owned by this worker.
+                unsafe { hashes.write(slot_base + qx, h) };
+            }
+            slot.store(
+                SlotDirty::encode_cropped(
+                    bbox.min_x,
+                    bbox.max_x,
+                    bbox.min_y,
+                    bbox.max_y,
+                    has_quad_hash,
+                ),
+                Ordering::Relaxed,
+            );
         }
         x += cw;
     }
@@ -2518,8 +2829,8 @@ unsafe fn diff_and_update_row_band_2d_with<K: RowKernel, const HAS_ALPHA: bool>(
 
 /// Scans a single `SUBTILE_W`-wide vertical column stripe `qx` across all
 /// `RowBand2D`s overlapping `scroll_rect`, fusing overlap-safe in-place shadow
-/// scrolling with SIMD sub-tile dirty detection and shadow update in a single
-/// parallel pass.
+/// scrolling with SIMD sub-tile tight dirty bounding-box tracking and shadow
+/// update in a single parallel pass.
 ///
 /// # Safety
 /// Every entry in `scroll_bands` must be [`ScanSubBand::RowBand2D`] in
@@ -2536,8 +2847,9 @@ unsafe fn diff_and_update_scroll_column_with<K: RowKernel, const HAS_ALPHA: bool
     scroll_bands: &[ScanSubBand],
     sr: ScrollRect,
     qx: usize,
-    dirty_flags: &[AtomicBool],
+    dirty_slots: &[AtomicU32],
     slot_hashes: Option<&SlotHashes>,
+    cache_non_empty: bool,
     hash_buf: &mut Vec<u8>,
 ) {
     let cx0 = qx * SUBTILE_W;
@@ -2566,13 +2878,15 @@ unsafe fn diff_and_update_scroll_column_with<K: RowKernel, const HAS_ALPHA: bool
         };
         let y0 = y0 as usize;
         let y1 = y1 as usize;
-        let mut is_dirty = false;
+        let ch = y1 - y0;
+        let max_crop_area = (cw * ch * CROP_MAX_AREA_PCT) / 100;
+        let mut bbox = QuadBbox::CLEAN;
         let band_overlaps_dst = ov_bytes > 0 && y1 > sr_dst_y0 && y0 < sr_dst_y1;
 
         let mut process_row = |y: usize| {
             let (_, row_after) = aos.split_at(y * stride_px + cx0);
             let (src_chunk, _) = row_after.split_at(cw);
-            if is_dirty {
+            if bbox.full {
                 // SAFETY: Column stripe `[cx0, cx1)` is exclusively owned by
                 // this worker across `scroll_bands`, and `Vec4u8` has align 1.
                 let dst_chunk = unsafe {
@@ -2599,8 +2913,10 @@ unsafe fn diff_and_update_scroll_column_with<K: RowKernel, const HAS_ALPHA: bool
                 let dst_chunk = unsafe {
                     slice::from_raw_parts_mut(shadow.row_ptr(y, cx0_bytes).cast::<Vec4u8>(), cw)
                 };
-                if kernel.diff_and_update_row::<HAS_ALPHA>(src_chunk, dst_chunk) {
-                    is_dirty = true;
+                if let Some((fx, lx)) =
+                    kernel.diff_and_update_row::<HAS_ALPHA>(src_chunk, dst_chunk)
+                {
+                    bbox.record_row(y - y0, fx, lx, max_crop_area);
                 }
             }
         };
@@ -2615,13 +2931,13 @@ unsafe fn diff_and_update_scroll_column_with<K: RowKernel, const HAS_ALPHA: bool
             }
         }
 
-        if is_dirty {
+        if bbox.full {
             if let Some(hashes) = slot_hashes {
                 let qrect = TileRect {
                     x: cx0 as u32,
                     y: y0 as u32,
                     w: cw as u32,
-                    h: (y1 - y0) as u32,
+                    h: ch as u32,
                 };
                 // SAFETY: Column stripe `[cx0, cx1)` over `[y0, y1)` is in-bounds,
                 // finalized, and exclusively owned by this worker.
@@ -2636,7 +2952,43 @@ unsafe fn diff_and_update_scroll_column_with<K: RowKernel, const HAS_ALPHA: bool
                 // SAFETY: `slot_base + qx` is exclusively owned by this worker.
                 unsafe { hashes.write(slot_base + qx, h) };
             }
-            dirty_flags[slot_base + qx].store(true, Ordering::Relaxed);
+            dirty_slots[slot_base + qx].store(SlotDirty::FULL_RAW, Ordering::Relaxed);
+        } else if bbox.is_dirty() {
+            let crop_area =
+                usize::from(bbox.max_x - bbox.min_x) * usize::from(bbox.max_y - bbox.min_y);
+            let has_quad_hash = cache_non_empty
+                && slot_hashes.is_some()
+                && crop_area >= CROP_CACHE_LOOKUP_MIN_PIXELS;
+            if has_quad_hash && let Some(hashes) = slot_hashes {
+                let qrect = TileRect {
+                    x: cx0 as u32,
+                    y: y0 as u32,
+                    w: cw as u32,
+                    h: ch as u32,
+                };
+                // SAFETY: Column stripe `[cx0, cx1)` over `[y0, y1)` is in-bounds,
+                // finalized, and exclusively owned by this worker.
+                let h = unsafe {
+                    tile_cache::hash_rect_from_shadow::<HAS_ALPHA>(
+                        shadow.base.cast_const(),
+                        stride,
+                        qrect,
+                        hash_buf,
+                    )
+                };
+                // SAFETY: `slot_base + qx` is exclusively owned by this worker.
+                unsafe { hashes.write(slot_base + qx, h) };
+            }
+            dirty_slots[slot_base + qx].store(
+                SlotDirty::encode_cropped(
+                    bbox.min_x,
+                    bbox.max_x,
+                    bbox.min_y,
+                    bbox.max_y,
+                    has_quad_hash,
+                ),
+                Ordering::Relaxed,
+            );
         }
     };
 
@@ -2688,8 +3040,9 @@ unsafe fn diff_and_update_worker_with<K: RowKernel, const HAS_ALPHA: bool>(
     stride_px: usize,
     n_qx: usize,
     sub_bands: &[ScanSubBand],
-    dirty_flags: &[AtomicBool],
+    dirty_slots: &[AtomicU32],
     slot_hashes: Option<&SlotHashes>,
+    cache_non_empty: bool,
     next_sub: &AtomicUsize,
     hash_buf: &mut Vec<u8>,
 ) {
@@ -2719,11 +3072,11 @@ unsafe fn diff_and_update_worker_with<K: RowKernel, const HAS_ALPHA: bool>(
                         // SAFETY: `slot_idx` is exclusively owned by this worker.
                         unsafe { hashes.write(slot_idx, h) };
                     }
-                    dirty_flags[slot_idx].store(true, Ordering::Relaxed);
+                    dirty_slots[slot_idx].store(SlotDirty::FULL_RAW, Ordering::Relaxed);
                 }
             },
             ScanSubBand::RowBand2D { y0, y1, slot_base } => {
-                let slots = &dirty_flags[slot_base..slot_base + n_qx];
+                let slots = &dirty_slots[slot_base..slot_base + n_qx];
                 // SAFETY: `sub_bands` cover disjoint row ranges in `shadow`.
                 unsafe {
                     diff_and_update_row_band_2d_with::<K, HAS_ALPHA>(
@@ -2738,6 +3091,7 @@ unsafe fn diff_and_update_worker_with<K: RowKernel, const HAS_ALPHA: bool>(
                         slot_base,
                         slots,
                         slot_hashes,
+                        cache_non_empty,
                         hash_buf,
                     );
                 }
@@ -2765,8 +3119,9 @@ unsafe fn diff_and_update_scroll_worker_with<K: RowKernel, const HAS_ALPHA: bool
     n_qx: usize,
     sub_bands: &[ScanSubBand],
     sr: ScrollRect,
-    dirty_flags: &[AtomicBool],
+    dirty_slots: &[AtomicU32],
     slot_hashes: Option<&SlotHashes>,
+    cache_non_empty: bool,
     next_sub: &AtomicUsize,
     hash_buf: &mut Vec<u8>,
 ) {
@@ -2796,8 +3151,9 @@ unsafe fn diff_and_update_scroll_worker_with<K: RowKernel, const HAS_ALPHA: bool
                     scroll_bands,
                     sr,
                     task,
-                    dirty_flags,
+                    dirty_slots,
                     slot_hashes,
+                    cache_non_empty,
                     hash_buf,
                 );
             }
@@ -2830,11 +3186,11 @@ unsafe fn diff_and_update_scroll_worker_with<K: RowKernel, const HAS_ALPHA: bool
                             // SAFETY: `slot_idx` is exclusively owned by this worker.
                             unsafe { hashes.write(slot_idx, h) };
                         }
-                        dirty_flags[slot_idx].store(true, Ordering::Relaxed);
+                        dirty_slots[slot_idx].store(SlotDirty::FULL_RAW, Ordering::Relaxed);
                     }
                 },
                 ScanSubBand::RowBand2D { y0, y1, slot_base } => {
-                    let slots = &dirty_flags[slot_base..slot_base + n_qx];
+                    let slots = &dirty_slots[slot_base..slot_base + n_qx];
                     // SAFETY: Outside `sb_start..sb_end`, disjoint from `sr`.
                     unsafe {
                         diff_and_update_row_band_2d_with::<K, HAS_ALPHA>(
@@ -2849,6 +3205,7 @@ unsafe fn diff_and_update_scroll_worker_with<K: RowKernel, const HAS_ALPHA: bool
                             slot_base,
                             slots,
                             slot_hashes,
+                            cache_non_empty,
                             hash_buf,
                         );
                     }
@@ -3619,8 +3976,13 @@ fn filter_and_compress_incremental_streaming_with_tier(
     let has_alpha = metadata.format == BufferFormat::Argb8888;
     let n_qx = width.div_ceil(SUBTILE_W);
     let n_sub = sub_bands.len();
-    let dirty_flags: Vec<AtomicBool> = (0..total_slots).map(|_| AtomicBool::new(false)).collect();
+    let dirty_slots: Vec<AtomicU32> = (0..total_slots)
+        .map(|_| AtomicU32::new(SlotDirty::CLEAN_RAW))
+        .collect();
     let slot_hashes = tile_cache.is_some().then(|| SlotHashes::new(total_slots));
+    let cache_non_empty = tile_cache
+        .as_deref()
+        .is_some_and(|c| c.occupied_slots() > 0);
     // SAFETY: Vec4u8 is a repr(C, packed) wrapper around [u8; 4].
     let aos = unsafe { data.cast::<Vec4u8>() };
 
@@ -3629,8 +3991,9 @@ fn filter_and_compress_incremental_streaming_with_tier(
     // A worker loop untouched for zero codegen overhead on non-scroll frames.
     let scroll_rect = scroll::detect_scroll_rect(data, shadow, metadata, bands);
 
-    // Phase A: parallel dirty scan + shadow update (+ dirty quadrant hashing
-    // when `tile_cache` is enabled, with optional fused scroll).
+    // Phase A: parallel dirty scan + tight bbox tracking + shadow update (+
+    // dirty quadrant hashing when `tile_cache` is enabled, with optional fused
+    // scroll).
     {
         let shadow_rows = ShadowRows {
             base: shadow.as_mut_ptr(),
@@ -3655,8 +4018,9 @@ fn filter_and_compress_incremental_streaming_with_tier(
                         n_qx,
                         &sub_bands,
                         sr,
-                        &dirty_flags,
+                        &dirty_slots,
                         slot_hashes.as_ref(),
+                        cache_non_empty,
                         &next_sub,
                         &mut state.hash_buf,
                     );
@@ -3676,8 +4040,9 @@ fn filter_and_compress_incremental_streaming_with_tier(
                         stride_px,
                         n_qx,
                         &sub_bands,
-                        &dirty_flags,
+                        &dirty_slots,
                         slot_hashes.as_ref(),
+                        cache_non_empty,
                         &next_sub,
                         &mut state.hash_buf,
                     );
@@ -3686,7 +4051,9 @@ fn filter_and_compress_incremental_streaming_with_tier(
         }
     }
 
-    let any_dirty = dirty_flags.iter().any(|f| f.load(Ordering::Relaxed));
+    let any_dirty = dirty_slots
+        .iter()
+        .any(|f| f.load(Ordering::Relaxed) != SlotDirty::CLEAN_RAW);
     if scroll_rect.is_none() && !any_dirty {
         return IncrementalFrameResult {
             scroll_rect: None,
@@ -3700,7 +4067,7 @@ fn filter_and_compress_incremental_streaming_with_tier(
         let hashes = slot_hashes
             .expect("slot_hashes allocated when tile_cache is Some")
             .into_vec();
-        let plan = cache.plan_frame(&base_entries, Some(&dirty_flags), &hashes, has_alpha, mode);
+        let plan = cache.plan_frame(&base_entries, Some(&dirty_slots), &hashes, has_alpha, mode);
         (
             plan.tile_rects,
             Some(plan.actions),
@@ -3712,7 +4079,7 @@ fn filter_and_compress_incremental_streaming_with_tier(
         for entry in &base_entries {
             match *entry {
                 BaseScanEntry::Strip1D { rect, slot_idx } => {
-                    if dirty_flags[slot_idx].load(Ordering::Relaxed) {
+                    if dirty_slots[slot_idx].load(Ordering::Relaxed) != SlotDirty::CLEAN_RAW {
                         dirty_tiles.push(rect);
                     }
                 },
@@ -3721,23 +4088,55 @@ fn filter_and_compress_incremental_streaming_with_tier(
                     quad_slots,
                     n_quads,
                 } => {
-                    let mut mask = 0u8;
+                    let mut states = [SlotDirty::Clean; 4];
+                    let mut full_count = 0usize;
+                    let mut dirty_count = 0usize;
                     for (q, &slot) in quad_slots[..n_quads].iter().enumerate() {
-                        if dirty_flags[slot].load(Ordering::Relaxed) {
-                            mask |= 1u8 << q;
+                        let st = SlotDirty::decode(dirty_slots[slot].load(Ordering::Relaxed));
+                        states[q] = st;
+                        match st {
+                            SlotDirty::Clean => {},
+                            SlotDirty::Full => {
+                                full_count += 1;
+                                dirty_count += 1;
+                            },
+                            SlotDirty::Cropped { .. } => {
+                                dirty_count += 1;
+                            },
                         }
                     }
-                    if mask == 0 {
+                    if dirty_count == 0 {
                         continue;
                     }
-                    let all_mask = (1u8 << n_quads) - 1;
-                    if mask == all_mask {
+                    if full_count == n_quads {
                         dirty_tiles.push(rect);
                     } else {
                         let (quads, _) = tile_quadrants(rect);
-                        for (q, &quad) in quads[..n_quads].iter().enumerate() {
-                            if (mask & (1u8 << q)) != 0 {
-                                dirty_tiles.push(quad);
+                        let mut full_grid = [None; 4];
+                        let mut crop_grid = [None; 4];
+                        for q in 0..n_quads {
+                            let qrect = quads[q];
+                            let slot = quad_grid_slot(rect, qrect);
+                            match states[q] {
+                                SlotDirty::Clean => {},
+                                SlotDirty::Full => full_grid[slot] = Some(qrect),
+                                SlotDirty::Cropped {
+                                    min_x,
+                                    max_x,
+                                    min_y,
+                                    max_y,
+                                    ..
+                                } => {
+                                    crop_grid[slot] = Some(SlotDirty::cropped_rect(
+                                        qrect, min_x, max_x, min_y, max_y,
+                                    ));
+                                },
+                            }
+                        }
+                        merge_cropped_quad_slots(&mut crop_grid);
+                        for s in 0..4 {
+                            if let Some(r) = full_grid[s].or(crop_grid[s]) {
+                                dirty_tiles.push(r);
                             }
                         }
                     }
@@ -4566,13 +4965,17 @@ mod tests {
                 assert_eq!(kernel.is_constant_plane(&plane), None);
             }
 
-            // `diff_and_update_row` matches `ScalarKernel` on identical, alpha-only,
-            // and RGB-perturbed pixels at start/mid/end.
+            // `diff_and_update_row` matches `ScalarKernel` (including exact
+            // tight pixel span) on identical, alpha-only, single-pixel, and
+            // multi-pixel RGB-perturbed inputs across SIMD lane boundaries.
             let mut sh_s = raw0.clone();
             let mut sh_a = raw0.clone();
-            assert!(!ScalarKernel.diff_and_update_row::<true>(bp0, &mut sh_s));
-            assert!(!kernel.diff_and_update_row::<true>(bp0, &mut sh_a));
-            assert!(!kernel.diff_and_update_row::<false>(bp0, &mut sh_a));
+            assert_eq!(
+                ScalarKernel.diff_and_update_row::<true>(bp0, &mut sh_s),
+                None
+            );
+            assert_eq!(kernel.diff_and_update_row::<true>(bp0, &mut sh_a), None);
+            assert_eq!(kernel.diff_and_update_row::<false>(bp0, &mut sh_a), None);
 
             for pos in [0, tw / 2, tw - 1] {
                 let mut alt_a = raw0.clone();
@@ -4581,14 +4984,24 @@ mod tests {
                 let bpa = unsafe { BufferPointer::new(&pa, tw) };
                 sh_s.clone_from(&raw0);
                 sh_a.clone_from(&raw0);
-                assert!(!ScalarKernel.diff_and_update_row::<false>(bpa, &mut sh_s));
-                assert!(!kernel.diff_and_update_row::<false>(bpa, &mut sh_a));
+                assert_eq!(
+                    ScalarKernel.diff_and_update_row::<false>(bpa, &mut sh_s),
+                    None
+                );
+                assert_eq!(kernel.diff_and_update_row::<false>(bpa, &mut sh_a), None);
                 assert_eq!(
                     sh_a, raw0,
                     "[{tier_name}] xrgb alpha-only must not write tw={tw} pos={pos}"
                 );
-                assert!(ScalarKernel.diff_and_update_row::<true>(bpa, &mut sh_s));
-                assert!(kernel.diff_and_update_row::<true>(bpa, &mut sh_a));
+                assert_eq!(
+                    ScalarKernel.diff_and_update_row::<true>(bpa, &mut sh_s),
+                    Some((pos, pos + 1))
+                );
+                assert_eq!(
+                    kernel.diff_and_update_row::<true>(bpa, &mut sh_a),
+                    Some((pos, pos + 1)),
+                    "[{tier_name}] argb alpha span tw={tw} pos={pos}"
+                );
                 assert_eq!(
                     sh_a, alt_a,
                     "[{tier_name}] argb alpha diff tw={tw} pos={pos}"
@@ -4602,13 +5015,39 @@ mod tests {
                 let bpr = unsafe { BufferPointer::new(&pr, tw) };
                 sh_s.clone_from(&raw0);
                 sh_a.clone_from(&raw0);
-                assert!(ScalarKernel.diff_and_update_row::<false>(bpr, &mut sh_s));
-                assert!(kernel.diff_and_update_row::<false>(bpr, &mut sh_a));
+                let exp_span = ScalarKernel.diff_and_update_row::<false>(bpr, &mut sh_s);
+                let got_span = kernel.diff_and_update_row::<false>(bpr, &mut sh_a);
+                assert_eq!(exp_span, Some((pos, tw)));
+                assert_eq!(
+                    got_span, exp_span,
+                    "[{tier_name}] xrgb rgb span tw={tw} pos={pos}"
+                );
                 assert_eq!(
                     sh_a, alt_rgb,
                     "[{tier_name}] xrgb rgb diff tw={tw} pos={pos}"
                 );
                 assert_eq!(sh_a, sh_s);
+            }
+            if tw >= 20 {
+                // Interior scattered diffs crossing 4-, 8-, and 16-pixel SIMD
+                // boundaries with unchanged prefix and suffix pixels.
+                for (p0, p1) in [(1, 1), (3, 17), (5, tw - 4), (15, 16)] {
+                    let mut alt = raw0.clone();
+                    alt[p0].0 ^= 0x21;
+                    alt[p1].2 ^= 0x42;
+                    let pr = alt.as_ptr();
+                    let bpr = unsafe { BufferPointer::new(&pr, tw) };
+                    sh_s.clone_from(&raw0);
+                    sh_a.clone_from(&raw0);
+                    let exp_span = ScalarKernel.diff_and_update_row::<false>(bpr, &mut sh_s);
+                    let got_span = kernel.diff_and_update_row::<false>(bpr, &mut sh_a);
+                    assert_eq!(exp_span, Some((p0, p1 + 1)));
+                    assert_eq!(
+                        got_span, exp_span,
+                        "[{tier_name}] interior span tw={tw} ({p0}..={p1})"
+                    );
+                    assert_eq!(sh_a, sh_s);
+                }
             }
         }
         // `i8::MIN` (`0x80` = `-128`) unsigned abs must equal `128` across all backends
@@ -5280,13 +5719,16 @@ mod tests {
                 }
 
                 // Flip only byte 3 (X/alpha) in quadrant 0 of `[0..12)` -> ignored
-                // on Xrgb, caught on Argb.
+                // on Xrgb, caught as tight `1x1` crop on Argb.
                 let a_off = 5 * stride + 10 * 4 + 3;
                 src[a_off] ^= 0xFF;
                 let src_ptr = src.as_ptr();
                 let bp = unsafe { BufferPointer::new(&src_ptr, len) };
                 let aos = unsafe { bp.cast::<Vec4u8>() };
-                let slots_xrgb = [AtomicBool::new(false), AtomicBool::new(false)];
+                let slots_xrgb = [
+                    AtomicU32::new(SlotDirty::CLEAN_RAW),
+                    AtomicU32::new(SlotDirty::CLEAN_RAW),
+                ];
                 unsafe {
                     tier.diff_and_update_row_band_2d::<false>(
                         bp,
@@ -5299,11 +5741,20 @@ mod tests {
                         &slots_xrgb,
                     );
                 }
-                assert!(!slots_xrgb[0].load(Ordering::Relaxed));
-                assert!(!slots_xrgb[1].load(Ordering::Relaxed));
+                assert_eq!(
+                    SlotDirty::decode(slots_xrgb[0].load(Ordering::Relaxed)),
+                    SlotDirty::Clean
+                );
+                assert_eq!(
+                    SlotDirty::decode(slots_xrgb[1].load(Ordering::Relaxed)),
+                    SlotDirty::Clean
+                );
                 assert_ne!(shadow[a_off], src[a_off]);
 
-                let slots_argb = [AtomicBool::new(false), AtomicBool::new(false)];
+                let slots_argb = [
+                    AtomicU32::new(SlotDirty::CLEAN_RAW),
+                    AtomicU32::new(SlotDirty::CLEAN_RAW),
+                ];
                 unsafe {
                     tier.diff_and_update_row_band_2d::<true>(
                         bp,
@@ -5316,22 +5767,42 @@ mod tests {
                         &slots_argb,
                     );
                 }
-                assert!(slots_argb[0].load(Ordering::Relaxed));
-                assert!(!slots_argb[1].load(Ordering::Relaxed));
+                assert_eq!(
+                    SlotDirty::decode(slots_argb[0].load(Ordering::Relaxed)),
+                    SlotDirty::Cropped {
+                        min_x: 10,
+                        max_x: 11,
+                        min_y: 5,
+                        max_y: 6,
+                        has_quad_hash: false,
+                    }
+                );
+                assert_eq!(
+                    SlotDirty::decode(slots_argb[1].load(Ordering::Relaxed)),
+                    SlotDirty::Clean
+                );
                 assert_eq!(shadow[a_off], src[a_off]);
 
-                // Flip RGB in BOTH quadrants on row 0 AND another pixel on row 11
-                // to exercise the all-quadrants-dirty bulk copy fast path.
+                // Flip RGB across wide spans in BOTH quadrants (`> 40%` of each
+                // quadrant's `12`-row height) to exercise the all-quadrants-full
+                // bulk copy fast path.
+                for y in 0..8usize {
+                    src[y * stride + 2 * 4] ^= 0x11;
+                    src[y * stride + 120 * 4] ^= 0x11;
+                    src[y * stride + 130 * 4] ^= 0x22;
+                    src[y * stride + 158 * 4] ^= 0x22;
+                }
                 let q0_off = 2 * 4;
-                let q1_off = 140 * 4;
+                let q1_off = 130 * 4;
                 let last_off = 11 * stride + 150 * 4;
-                src[q0_off] ^= 0x11;
-                src[q1_off] ^= 0x22;
                 src[last_off] ^= 0x33;
                 let src_ptr = src.as_ptr();
                 let bp = unsafe { BufferPointer::new(&src_ptr, len) };
                 let aos = unsafe { bp.cast::<Vec4u8>() };
-                let slots_all = [AtomicBool::new(false), AtomicBool::new(false)];
+                let slots_all = [
+                    AtomicU32::new(SlotDirty::CLEAN_RAW),
+                    AtomicU32::new(SlotDirty::CLEAN_RAW),
+                ];
                 unsafe {
                     tier.diff_and_update_row_band_2d::<false>(
                         bp,
@@ -5344,8 +5815,14 @@ mod tests {
                         &slots_all,
                     );
                 }
-                assert!(slots_all[0].load(Ordering::Relaxed));
-                assert!(slots_all[1].load(Ordering::Relaxed));
+                assert_eq!(
+                    SlotDirty::decode(slots_all[0].load(Ordering::Relaxed)),
+                    SlotDirty::Full
+                );
+                assert_eq!(
+                    SlotDirty::decode(slots_all[1].load(Ordering::Relaxed)),
+                    SlotDirty::Full
+                );
                 assert_eq!(shadow[q0_off], src[q0_off]);
                 assert_eq!(shadow[q1_off], src[q1_off]);
                 assert_eq!(shadow[last_off], src[last_off]);
@@ -5813,7 +6290,7 @@ mod tests {
                     }
 
                     // Step 2: Perturbing ONLY the alpha/X byte -> skipped on Xrgb8888,
-                    // caught on Argb8888!
+                    // caught as a tight `1x1` crop on Argb8888!
                     set_px(&mut frame, 10, 20, 0, 0x55);
                     {
                         let ptr = frame.as_ptr();
@@ -5836,18 +6313,18 @@ mod tests {
                             assert!(streaming.is_none());
                         } else {
                             assert_eq!(diff.scroll_rect, None);
-                            assert_eq!(diff.dirty_tiles, vec![tr(0, 0, 128, 128)]);
+                            assert_eq!(diff.dirty_tiles, vec![tr(10, 20, 1, 1)]);
                             apply_stream(streaming.unwrap(), decompressor, &mut client_canvas);
                         }
                     }
                     check_canvas(&client_canvas, &frame);
 
-                    // Step 3: 1 dirty quadrant in (0,0,256,256) + 2 dirty quadrants in clipped
-                    // right edge (256,0,144,256) + 1 dirty quadrant in bottom edge (0,256,256,104).
-                    set_px(&mut frame, 150, 10, 0x33, 0); // TR of (0,0,256,256) -> (128,0,128,128)
-                    set_px(&mut frame, 390, 5, 0x44, 0); // TR of (256,0,144,256) -> (384,0,16,128)
-                    set_px(&mut frame, 260, 200, 0x55, 0); // BL of (256,0,144,256) -> (256,128,128,128)
-                    set_px(&mut frame, 200, 300, 0x66, 0); // right of (0,256,256,104) -> (128,256,128,104)
+                    // Step 3: Scattered single-pixel edits across 4 distinct quadrants
+                    // emit tight `1x1` cropped rects in raster order.
+                    set_px(&mut frame, 150, 10, 0x33, 0); // TR of (0,0,256,256)
+                    set_px(&mut frame, 390, 5, 0x44, 0); // TR of (256,0,144,256)
+                    set_px(&mut frame, 260, 200, 0x55, 0); // BL of (256,0,144,256)
+                    set_px(&mut frame, 200, 300, 0x66, 0); // right of (0,256,256,104)
                     {
                         let ptr = frame.as_ptr();
                         let bp = unsafe { BufferPointer::new(&ptr, len) };
@@ -5868,25 +6345,30 @@ mod tests {
                         assert_eq!(
                             diff.dirty_tiles,
                             vec![
-                                tr(128, 0, 128, 128),
-                                tr(384, 0, 16, 128),
-                                tr(256, 128, 128, 128),
-                                tr(128, 256, 128, 104),
+                                tr(150, 10, 1, 1),
+                                tr(390, 5, 1, 1),
+                                tr(260, 200, 1, 1),
+                                tr(200, 300, 1, 1),
                             ]
                         );
                         apply_stream(streaming.unwrap(), decompressor, &mut client_canvas);
                     }
                     check_canvas(&client_canvas, &frame);
 
-                    // Step 4: All 4 quadrants dirty in (0,0,256,256) -> coalesces to ONE `256x256`
-                    // tile! Also all 2 quadrants dirty in bottom-right (256,256,144,104) -> ONE
-                    // `144x104` tile!
-                    set_px(&mut frame, 1, 1, 0x11, 0);
-                    set_px(&mut frame, 130, 1, 0x11, 0);
-                    set_px(&mut frame, 1, 130, 0x11, 0);
-                    set_px(&mut frame, 130, 130, 0x11, 0);
-                    set_px(&mut frame, 260, 260, 0x22, 0);
-                    set_px(&mut frame, 395, 355, 0x22, 0);
+                    // Step 4: All 4 quadrants exceed the crop threshold in (0,0,256,256)
+                    // -> coalesces to ONE `256x256` tile! Same for all 2 quadrants in
+                    // bottom-right (256,256,144,104) -> ONE `144x104` tile!
+                    for (qx0, qy0, qw, qh) in [
+                        (0usize, 0usize, 128usize, 128usize),
+                        (128, 0, 128, 128),
+                        (0, 128, 128, 128),
+                        (128, 128, 128, 128),
+                        (256, 256, 128, 104),
+                        (384, 256, 16, 104),
+                    ] {
+                        set_px(&mut frame, qx0 + 1, qy0 + 1, 0x11, 0);
+                        set_px(&mut frame, qx0 + qw - 2, qy0 + qh - 2, 0x22, 0);
+                    }
                     {
                         let ptr = frame.as_ptr();
                         let bp = unsafe { BufferPointer::new(&ptr, len) };
@@ -9381,6 +9863,718 @@ mod tests {
                 )
                 .is_err()
             );
+        });
+    }
+
+    #[test]
+    fn test_merge_cropped_quad_slots_seams_and_disjoint_safety() {
+        let tr = |x, y, w, h| TileRect { x, y, w, h };
+
+        // Horizontal seam merge (`128x12 + 128x12 -> 256x12`).
+        let mut g = [
+            None,
+            None,
+            Some(tr(0, 244, 128, 12)),
+            Some(tr(128, 244, 128, 12)),
+        ];
+        merge_cropped_quad_slots(&mut g);
+        assert_eq!(g, [None, None, Some(tr(0, 244, 256, 12)), None]);
+
+        // Vertical seam merge (`12x128 + 12x128 -> 12x256`).
+        let mut g = [
+            None,
+            Some(tr(244, 0, 12, 128)),
+            None,
+            Some(tr(244, 128, 12, 128)),
+        ];
+        merge_cropped_quad_slots(&mut g);
+        assert_eq!(g, [None, Some(tr(244, 0, 12, 256)), None, None]);
+
+        // 4-quadrant seam merge across both horizontal and vertical seams.
+        let mut g = [
+            Some(tr(0, 118, 128, 10)),
+            Some(tr(128, 118, 128, 10)),
+            Some(tr(0, 128, 128, 10)),
+            Some(tr(128, 128, 128, 10)),
+        ];
+        merge_cropped_quad_slots(&mut g);
+        assert_eq!(g, [Some(tr(0, 118, 256, 20)), None, None, None]);
+
+        // Safety invariant: when `TL+TR` merge horizontally and `BL` is cropped
+        // while `BR` is `None` (clean / Full / CacheHit), vertical merge MUST
+        // NOT fire because merging `TL+TR` with `BL` would overlap `BR`.
+        let mut g = [
+            Some(tr(0, 118, 128, 10)),
+            Some(tr(128, 118, 128, 10)),
+            Some(tr(0, 128, 128, 10)),
+            None,
+        ];
+        merge_cropped_quad_slots(&mut g);
+        assert_eq!(
+            g,
+            [
+                Some(tr(0, 118, 256, 10)),
+                None,
+                Some(tr(0, 128, 128, 10)),
+                None,
+            ]
+        );
+        let rects: Vec<TileRect> = g
+            .into_iter()
+            .flatten()
+            .chain([tr(128, 128, 128, 128)])
+            .collect();
+        validate_tile_rects(&rects, 256, 256).unwrap();
+
+        // Non-touching gap (`x=124` vs `x=130`) must NOT merge.
+        let mut g = [
+            Some(tr(0, 10, 124, 12)),
+            Some(tr(130, 10, 126, 12)),
+            None,
+            None,
+        ];
+        merge_cropped_quad_slots(&mut g);
+        assert_eq!(
+            g,
+            [
+                Some(tr(0, 10, 124, 12)),
+                Some(tr(130, 10, 126, 12)),
+                None,
+                None,
+            ]
+        );
+
+        // Excess bounding-box slack (`128x2 + 128x40` -> union `256x40 = 10240`,
+        // sum = `5376`, slack = `4864` >> cap) must NOT merge.
+        let mut g = [
+            Some(tr(0, 10, 128, 2)),
+            Some(tr(128, 10, 128, 40)),
+            None,
+            None,
+        ];
+        merge_cropped_quad_slots(&mut g);
+        assert_eq!(
+            g,
+            [
+                Some(tr(0, 10, 128, 2)),
+                Some(tr(128, 10, 128, 40)),
+                None,
+                None,
+            ]
+        );
+    }
+
+    #[test]
+    #[cfg_attr(miri, ignore)]
+    fn test_tight_bbox_crop_odd_shapes_alpha_hybrid_and_cross_tier_parity() {
+        with_test_codec(|compressor, decompressor| {
+            let tr = |x, y, w, h| TileRect { x, y, w, h };
+            let tiers = arch::Tier::supported_tiers();
+            let width = 300usize;
+            let height = 280usize;
+
+            for format in [BufferFormat::Xrgb8888, BufferFormat::Argb8888] {
+                for pad_bytes in [0usize, 16usize] {
+                    let stride = width * 4 + pad_bytes;
+                    let len = stride * height;
+                    let meta = BufferMetadata {
+                        width: width as i32,
+                        height: height as i32,
+                        stride: stride as i32,
+                        format,
+                    };
+                    let base = test_vec(len);
+
+                    // Construct an incremental frame exercising:
+                    // - Q(0,0): scattered interior multi-pixel edit (`13..=29, 7..=25` -> `17x19` odd bbox)
+                    // - Q(1,0): single-pixel `1x1` edit at `(191, 43)`
+                    // - Q(0,1): alpha-only edit at `(55, 177)` (ignored on Xrgb, `1x1` on Argb)
+                    // - Q(2,1): odd clipped right-edge edit (`259..=298, 140..=145` -> `40x6`)
+                    let mut edited = base.clone();
+                    edited[7 * stride + 13 * 4] ^= 0x55;
+                    edited[25 * stride + 29 * 4 + 2] ^= 0x33;
+                    edited[43 * stride + 191 * 4 + 1] ^= 0x77;
+                    edited[177 * stride + 55 * 4 + 3] ^= 0x40;
+                    edited[140 * stride + 259 * 4] ^= 0x19;
+                    edited[145 * stride + 298 * 4 + 1] ^= 0x2A;
+
+                    let mut expected_rects = vec![tr(13, 7, 17, 19), tr(191, 43, 1, 1)];
+                    if format == BufferFormat::Argb8888 {
+                        expected_rects.push(tr(55, 177, 1, 1));
+                    }
+                    expected_rects.push(tr(259, 140, 40, 6));
+
+                    let mut ref_shadow = None;
+                    for &tier in &tiers {
+                        let mut shadow = Vec::new();
+                        let mut canvas = AlignedVec::<64>::with_capacity(len);
+                        canvas.resize(len, 0xCC);
+                        {
+                            let p = base.as_ptr();
+                            let bp = unsafe { BufferPointer::new(&p, len) };
+                            let mut st = None;
+                            filter_and_compress_full_streaming_with_tier(
+                                tier,
+                                bp,
+                                ClientId(1),
+                                WlSurfaceId(10),
+                                meta,
+                                CompressionMode::Lossless,
+                                Some(&mut shadow),
+                                None,
+                                compressor,
+                                |s| st = Some(s),
+                            );
+                            let mut wire = Vec::new();
+                            st.unwrap().framed_write(&mut wire).unwrap();
+                            let mut rx = None;
+                            CompressedTileStream::read_from_stream(&mut wire.as_slice(), |s| {
+                                rx = Some(s);
+                                Ok(())
+                            })
+                            .unwrap();
+                            let validated = ValidatedTileStream::new(rx.unwrap()).unwrap();
+                            decompress_and_unfilter_streaming(
+                                validated,
+                                decompressor,
+                                &mut canvas,
+                                None,
+                            )
+                            .unwrap();
+                        }
+
+                        let p = edited.as_ptr();
+                        let bp = unsafe { BufferPointer::new(&p, len) };
+                        let mut st = None;
+                        let diff = filter_and_compress_incremental_streaming_with_tier(
+                            tier,
+                            bp,
+                            ClientId(1),
+                            WlSurfaceId(10),
+                            meta,
+                            CompressionMode::Lossless,
+                            None,
+                            &mut shadow,
+                            None,
+                            compressor,
+                            |s| st = Some(s),
+                        );
+                        assert_eq!(
+                            diff.dirty_tiles, expected_rects,
+                            "cropped rects mismatch tier={tier:?} format={format:?} pad={pad_bytes}"
+                        );
+                        let mut wire = Vec::new();
+                        st.unwrap().framed_write(&mut wire).unwrap();
+                        let mut rx = None;
+                        CompressedTileStream::read_from_stream(&mut wire.as_slice(), |s| {
+                            rx = Some(s);
+                            Ok(())
+                        })
+                        .unwrap();
+                        let validated = ValidatedTileStream::new(rx.unwrap()).unwrap();
+                        decompress_and_unfilter_streaming(
+                            validated,
+                            decompressor,
+                            &mut canvas,
+                            None,
+                        )
+                        .unwrap();
+                        assert_canvas_matches_frame(&canvas, &edited, meta, 0xCC);
+                        if let Some(prev) = &ref_shadow {
+                            assert_eq!(
+                                &shadow, prev,
+                                "shadow mismatch across tiers ({tier:?}, {format:?})"
+                            );
+                        } else {
+                            ref_shadow = Some(shadow);
+                        }
+                    }
+                }
+            }
+
+            // Hybrid mode on odd-sized cropped patches (`17x19` photo -> JPEG,
+            // `11x13` photo -> lossless fallback because `< MIN_JPEG_DIM`).
+            let h_meta = BufferMetadata {
+                width: 256,
+                height: 256,
+                stride: 256 * 4,
+                format: BufferFormat::Argb8888,
+            };
+            let h_len = 256 * 256 * 4;
+            let mut f0 = vec![0xFFu8; h_len];
+            fill_ui_text(&mut f0, 256, tr(0, 0, 256, 256), true);
+            let mut f1 = f0.clone();
+            fill_smooth_photo(&mut f1, 256, tr(13, 11, 17, 19), 0x80);
+            fill_smooth_photo(&mut f1, 256, tr(141, 17, 11, 13), 0xC0);
+
+            let mut shadow = Vec::new();
+            let mut canvas = vec![0u8; h_len];
+            {
+                let p = f0.as_ptr();
+                let bp = unsafe { BufferPointer::new(&p, h_len) };
+                let mut st = None;
+                filter_and_compress_full_streaming(
+                    bp,
+                    ClientId(1),
+                    WlSurfaceId(11),
+                    h_meta,
+                    CompressionMode::hybrid_default(),
+                    Some(&mut shadow),
+                    None,
+                    compressor,
+                    |s| st = Some(s),
+                );
+                let mut wire = Vec::new();
+                st.unwrap().framed_write(&mut wire).unwrap();
+                let mut rx = None;
+                CompressedTileStream::read_from_stream(&mut wire.as_slice(), |s| {
+                    rx = Some(s);
+                    Ok(())
+                })
+                .unwrap();
+                let validated = ValidatedTileStream::new(rx.unwrap()).unwrap();
+                decompress_and_unfilter_streaming(validated, decompressor, &mut canvas, None)
+                    .unwrap();
+            }
+            {
+                let p = f1.as_ptr();
+                let bp = unsafe { BufferPointer::new(&p, h_len) };
+                let mut st = None;
+                let diff = filter_and_compress_incremental_streaming(
+                    bp,
+                    ClientId(1),
+                    WlSurfaceId(11),
+                    h_meta,
+                    CompressionMode::hybrid_default(),
+                    None,
+                    &mut shadow,
+                    None,
+                    compressor,
+                    |s| st = Some(s),
+                );
+                assert_eq!(
+                    diff.dirty_tiles,
+                    vec![tr(13, 11, 17, 19), tr(141, 17, 11, 13)]
+                );
+                let mut wire = Vec::new();
+                st.unwrap().framed_write(&mut wire).unwrap();
+                let mut rx = None;
+                CompressedTileStream::read_from_stream(&mut wire.as_slice(), |s| {
+                    rx = Some(s);
+                    Ok(())
+                })
+                .unwrap();
+                let validated = ValidatedTileStream::new(rx.unwrap()).unwrap();
+                decompress_and_unfilter_streaming(validated, decompressor, &mut canvas, None)
+                    .unwrap();
+                // `< MIN_JPEG_DIM` patch (`11x13`) stays strictly lossless, and alpha is
+                // bit-exact everywhere including inside the `17x19` JPEG patch.
+                assert!(rect_psnr_rgb(&f1, &canvas, 256, tr(141, 17, 11, 13)).is_infinite());
+                assert!(rect_psnr_rgb(&f1, &canvas, 256, tr(13, 11, 17, 19)) > 30.0);
+                for (i, (got, exp)) in canvas
+                    .as_chunks::<4>()
+                    .0
+                    .iter()
+                    .zip(f1.as_chunks::<4>().0.iter())
+                    .enumerate()
+                {
+                    assert_eq!(got[3], exp[3], "hybrid cropped alpha mismatch at px {i}");
+                }
+            }
+        });
+    }
+
+    #[test]
+    #[cfg_attr(miri, ignore)]
+    fn test_tight_bbox_threshold_gating_and_tile_cache_isolation() {
+        with_test_codec(|compressor, decompressor| {
+            let tr = |x, y, w, h| TileRect { x, y, w, h };
+            let width = 512usize;
+            let height = 256usize;
+            let stride = width * 4;
+            let len = stride * height;
+            let meta = BufferMetadata {
+                width: width as i32,
+                height: height as i32,
+                stride: stride as i32,
+                format: BufferFormat::Xrgb8888,
+            };
+
+            let base = test_vec(len);
+            let mut srv = ServerTileCache::new();
+            let mut cli = ClientTileCache::new();
+            let mut shadow = Vec::new();
+            let mut canvas = vec![0u8; len];
+
+            let apply = |st: StreamingCompressedTiles,
+                         decomp: &mut ShardingDecompressor,
+                         canvas: &mut [u8],
+                         cli: &mut ClientTileCache|
+             -> (Vec<TileRect>, Vec<CompressedTile>) {
+                let mut wire = Vec::new();
+                st.framed_write(&mut wire).unwrap();
+                let mut rx = None;
+                CompressedTileStream::read_from_stream(&mut wire.as_slice(), |s| {
+                    rx = Some(s);
+                    Ok(())
+                })
+                .unwrap();
+                let stream = rx.unwrap();
+                let rects = stream.header.tile_rects.clone();
+                let mut tiles: Vec<CompressedTile> =
+                    stream.tiles.into_iter().map(Result::unwrap).collect();
+                tiles.sort_by_key(|t| t.tile_idx);
+                let (tx, ch_rx) = crossbeam_channel::unbounded();
+                for t in &tiles {
+                    tx.send(Ok(t.clone())).unwrap();
+                }
+                drop(tx);
+                let validated = ValidatedTileStream::new(CompressedTileStream {
+                    header: stream.header,
+                    tiles: ch_rx,
+                })
+                .unwrap();
+                decompress_and_unfilter_streaming(validated, decomp, canvas, Some(cli)).unwrap();
+                (rects, tiles)
+            };
+
+            // 1. Initial full frame seeds the tile cache with 2 `256x256` tiles.
+            {
+                let p = base.as_ptr();
+                let bp = unsafe { BufferPointer::new(&p, len) };
+                let mut st = None;
+                filter_and_compress_full_streaming(
+                    bp,
+                    ClientId(1),
+                    WlSurfaceId(20),
+                    meta,
+                    CompressionMode::Lossless,
+                    Some(&mut shadow),
+                    Some(&mut srv),
+                    compressor,
+                    |s| st = Some(s),
+                );
+                apply(st.unwrap(), decompressor, &mut canvas, &mut cli);
+                assert_canvas_matches_frame(&canvas, &base, meta, 0);
+            }
+            let initial_slots = srv.occupied_slots();
+            let initial_bytes = srv.used_bytes();
+            assert_eq!(initial_slots, 2);
+
+            // 2. Repeated tiny transient edits (`<= 45%`, e.g. `16x20` cursor blinks)
+            //    crop tightly and NEVER pollute or evict tile cache slots.
+            for step in 1u8..=8 {
+                let mut frame = base.clone();
+                let cx = 20 + (step as usize) * 8;
+                for y in 30..50 {
+                    for x in cx..cx + 16 {
+                        frame[y * stride + x * 4] ^= step.wrapping_mul(17);
+                    }
+                }
+                let p = frame.as_ptr();
+                let bp = unsafe { BufferPointer::new(&p, len) };
+                let mut st = None;
+                filter_and_compress_incremental_streaming(
+                    bp,
+                    ClientId(1),
+                    WlSurfaceId(20),
+                    meta,
+                    CompressionMode::Lossless,
+                    None,
+                    &mut shadow,
+                    Some(&mut srv),
+                    compressor,
+                    |s| st = Some(s),
+                );
+                let (rects, tiles) = apply(st.unwrap(), decompressor, &mut canvas, &mut cli);
+                assert_eq!(rects.len(), 1);
+                assert!(
+                    rects[0].w <= 24 && rects[0].h == 20,
+                    "expected tight crop: {rects:?}"
+                );
+                assert!(tiles.iter().all(|t| t.cache_put.is_none()));
+                assert_eq!(srv.occupied_slots(), initial_slots);
+                assert_eq!(srv.used_bytes(), initial_bytes);
+                assert_canvas_matches_frame(&canvas, &frame, meta, 0);
+            }
+
+            // Reset back to `base`.
+            {
+                let p = base.as_ptr();
+                let bp = unsafe { BufferPointer::new(&p, len) };
+                let mut st = None;
+                filter_and_compress_incremental_streaming(
+                    bp,
+                    ClientId(1),
+                    WlSurfaceId(20),
+                    meta,
+                    CompressionMode::Lossless,
+                    None,
+                    &mut shadow,
+                    Some(&mut srv),
+                    compressor,
+                    |s| st = Some(s),
+                );
+                apply(st.unwrap(), decompressor, &mut canvas, &mut cli);
+                assert_canvas_matches_frame(&canvas, &base, meta, 0);
+            }
+
+            // 3. Popup-like overlay on tile `(0, 0, 256, 256)`: top half (`y=0..128`)
+            //    is `100%` dirty (`Full` -> `CachePut`), while bottom quadrants only
+            //    change `28` rows (`21.9% <= 45%`, `3584 px >= 1024` -> cropped
+            //    `Uncached` merged to `256x28`, zero cache pollution).
+            let mut popup = base.clone();
+            for y in 0..156 {
+                for x in 0..256 {
+                    let off = y * stride + x * 4;
+                    popup[off] ^= 0x6B ^ ((x >> 4) as u8);
+                    popup[off + 1] ^= 0x3D ^ ((y >> 3) as u8);
+                }
+            }
+            {
+                let p = popup.as_ptr();
+                let bp = unsafe { BufferPointer::new(&p, len) };
+                let mut st = None;
+                filter_and_compress_incremental_streaming(
+                    bp,
+                    ClientId(1),
+                    WlSurfaceId(20),
+                    meta,
+                    CompressionMode::Lossless,
+                    None,
+                    &mut shadow,
+                    Some(&mut srv),
+                    compressor,
+                    |s| st = Some(s),
+                );
+                let (rects, tiles) = apply(st.unwrap(), decompressor, &mut canvas, &mut cli);
+                assert_eq!(
+                    rects,
+                    vec![
+                        tr(0, 0, 128, 128),
+                        tr(128, 0, 128, 128),
+                        tr(0, 128, 256, 28)
+                    ]
+                );
+                assert!(tiles[0].cache_put.is_some());
+                assert!(tiles[1].cache_put.is_some());
+                assert!(
+                    tiles[2].cache_put.is_none(),
+                    "cropped bottom strip must not CachePut"
+                );
+                assert_canvas_matches_frame(&canvas, &popup, meta, 0);
+            }
+
+            // 4. Closing the popup reverts `(0, 0, 256, 256)` back to `base`: all 4
+            //    quadrants carry hashes (`2 Full + 2 lookup-hashed Cropped`), so
+            //    `PartialTile2D` coalesces them into ONE `256x256` parent `CacheHit`!
+            {
+                let p = base.as_ptr();
+                let bp = unsafe { BufferPointer::new(&p, len) };
+                let mut st = None;
+                filter_and_compress_incremental_streaming(
+                    bp,
+                    ClientId(1),
+                    WlSurfaceId(20),
+                    meta,
+                    CompressionMode::Lossless,
+                    None,
+                    &mut shadow,
+                    Some(&mut srv),
+                    compressor,
+                    |s| st = Some(s),
+                );
+                let (rects, tiles) = apply(st.unwrap(), decompressor, &mut canvas, &mut cli);
+                assert_eq!(rects, vec![tr(0, 0, 256, 256)]);
+                assert_eq!(tiles.len(), 1);
+                assert!(matches!(tiles[0].payload, TilePayload::CacheHit(_)));
+                assert_canvas_matches_frame(&canvas, &base, meta, 0);
+            }
+        });
+    }
+
+    #[test]
+    #[cfg_attr(miri, ignore)]
+    fn test_tight_bbox_scroll_exposed_strip_and_overlay_scrollbar() {
+        with_test_codec(|compressor, decompressor| {
+            let tr = |x, y, w, h| TileRect { x, y, w, h };
+            let width = 512usize;
+            let height = 512usize;
+            let sb_w = 12usize;
+
+            for format in [BufferFormat::Xrgb8888, BufferFormat::Argb8888] {
+                let pad = 16usize;
+                let stride = width * 4 + pad;
+                let len = stride * height;
+                let meta = BufferMetadata {
+                    width: width as i32,
+                    height: height as i32,
+                    stride: stride as i32,
+                    format,
+                };
+
+                // Build a textured scrollable document with a moving 12px right-edge
+                // overlay scrollbar thumb.
+                let mut doc = vec![0u8; (height + 200) * stride];
+                for y in 0..(height + 200) {
+                    for x in 0..width {
+                        let off = y * stride + x * 4;
+                        let v = ((x * 13 + y * 29 + (x ^ y) * 7) & 0xFF) as u8;
+                        doc[off] = v;
+                        doc[off + 1] = v.wrapping_add((y & 0x7F) as u8);
+                        doc[off + 2] = v.wrapping_mul(3);
+                        doc[off + 3] = if format == BufferFormat::Argb8888 {
+                            0xE0 | ((x + y) & 0x1F) as u8
+                        } else {
+                            0xFF
+                        };
+                    }
+                }
+                let make_frame = |scroll_y: usize, thumb_y: usize| -> Vec<u8> {
+                    let mut f = doc[scroll_y * stride..scroll_y * stride + len].to_vec();
+                    for y in 0..height {
+                        let in_thumb = y >= thumb_y && y < thumb_y + 96;
+                        for x in (width - sb_w)..width {
+                            let off = y * stride + x * 4;
+                            f[off..off + 4].copy_from_slice(if in_thumb {
+                                &[120, 120, 125, 0xFF]
+                            } else {
+                                &[230, 230, 232, 0xFF]
+                            });
+                        }
+                    }
+                    f
+                };
+
+                let f0 = make_frame(64, 40);
+                let f1 = make_frame(88, 64); // dy = -24 exposed strip at bottom + scrollbar moved
+                let f2 = make_frame(64, 40); // dy = +24 exposed strip at top + scrollbar restored
+
+                let mut srv = ServerTileCache::new();
+                let mut cli = ClientTileCache::new();
+                let mut shadow = Vec::new();
+                let mut canvas = AlignedVec::<64>::with_capacity(len);
+                canvas.resize(len, 0xCC);
+
+                let apply = |st: StreamingCompressedTiles,
+                             decomp: &mut ShardingDecompressor,
+                             canvas: &mut [u8],
+                             cli: &mut ClientTileCache|
+                 -> (Option<ScrollRect>, Vec<TileRect>, Vec<CompressedTile>) {
+                    let mut wire = Vec::new();
+                    st.framed_write(&mut wire).unwrap();
+                    let mut rx = None;
+                    CompressedTileStream::read_from_stream(&mut wire.as_slice(), |s| {
+                        rx = Some(s);
+                        Ok(())
+                    })
+                    .unwrap();
+                    let stream = rx.unwrap();
+                    let sr = stream.header.scroll_rect;
+                    let rects = stream.header.tile_rects.clone();
+                    let tiles: Vec<CompressedTile> =
+                        stream.tiles.into_iter().map(Result::unwrap).collect();
+                    let (tx, ch_rx) = crossbeam_channel::unbounded();
+                    for t in &tiles {
+                        tx.send(Ok(t.clone())).unwrap();
+                    }
+                    drop(tx);
+                    let validated = ValidatedTileStream::new(CompressedTileStream {
+                        header: stream.header,
+                        tiles: ch_rx,
+                    })
+                    .unwrap();
+                    if let Some(scroll_rect) = validated.scroll_rect() {
+                        apply_scroll_rect_in_place_parallel(canvas, stride, scroll_rect, decomp);
+                    }
+                    decompress_and_unfilter_streaming(validated, decomp, canvas, Some(cli))
+                        .unwrap();
+                    (sr, rects, tiles)
+                };
+
+                {
+                    let p = f0.as_ptr();
+                    let bp = unsafe { BufferPointer::new(&p, len) };
+                    let mut st = None;
+                    filter_and_compress_full_streaming(
+                        bp,
+                        ClientId(1),
+                        WlSurfaceId(21),
+                        meta,
+                        CompressionMode::Lossless,
+                        Some(&mut shadow),
+                        Some(&mut srv),
+                        compressor,
+                        |s| st = Some(s),
+                    );
+                    apply(st.unwrap(), decompressor, &mut canvas, &mut cli);
+                    assert_canvas_matches_frame(&canvas, &f0, meta, 0xCC);
+                }
+                let slots_after_f0 = srv.occupied_slots();
+
+                // Forward scroll (`dy = -24`) exposes a tight `24`-row bottom strip
+                // (merged to `256x24` across horizontal seam) + tight `12`-px
+                // scrollbar column without polluting the tile cache.
+                {
+                    let p = f1.as_ptr();
+                    let bp = unsafe { BufferPointer::new(&p, len) };
+                    let mut st = None;
+                    filter_and_compress_incremental_streaming(
+                        bp,
+                        ClientId(1),
+                        WlSurfaceId(21),
+                        meta,
+                        CompressionMode::Lossless,
+                        None,
+                        &mut shadow,
+                        Some(&mut srv),
+                        compressor,
+                        |s| st = Some(s),
+                    );
+                    let (sr, rects, tiles) =
+                        apply(st.unwrap(), decompressor, &mut canvas, &mut cli);
+                    assert_eq!(sr.expect("expected dy=-24 scroll").dy, -24);
+                    assert!(
+                        rects.contains(&tr(0, 488, 256, 24)),
+                        "expected merged 256x24 bottom strip in {rects:?}"
+                    );
+                    assert!(
+                        rects
+                            .iter()
+                            .any(|r| r.x == (width - sb_w) as u32 && r.w == sb_w as u32),
+                        "expected tight 12px scrollbar crop in {rects:?}"
+                    );
+                    assert!(
+                        tiles.iter().all(|t| t.cache_put.is_none()),
+                        "cropped scroll strip/scrollbar must not pollute tile cache"
+                    );
+                    assert_eq!(srv.occupied_slots(), slots_after_f0);
+                    assert_canvas_matches_frame(&canvas, &f1, meta, 0xCC);
+                }
+
+                // Reverse scroll (`dy = +24`) restores `f0` bit-exact.
+                {
+                    let p = f2.as_ptr();
+                    let bp = unsafe { BufferPointer::new(&p, len) };
+                    let mut st = None;
+                    filter_and_compress_incremental_streaming(
+                        bp,
+                        ClientId(1),
+                        WlSurfaceId(21),
+                        meta,
+                        CompressionMode::Lossless,
+                        None,
+                        &mut shadow,
+                        Some(&mut srv),
+                        compressor,
+                        |s| st = Some(s),
+                    );
+                    let (sr, rects, _) = apply(st.unwrap(), decompressor, &mut canvas, &mut cli);
+                    assert_eq!(sr.expect("expected dy=+24 scroll").dy, 24);
+                    validate_tile_rects(&rects, width as u32, height as u32).unwrap();
+                    assert_canvas_matches_frame(&canvas, &f2, meta, 0xCC);
+                }
+            }
         });
     }
 }
