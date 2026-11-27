@@ -292,6 +292,7 @@ pub enum ToplevelRequestPayload {
 
     Move(Move),
     Resize(Resize),
+    ShowWindowMenu { serial: u32, location: Point<i32> },
 }
 
 #[derive(Debug, Copy, Clone, Eq, PartialEq, Archive, Deserialize, Serialize)]

@@ -271,6 +271,13 @@ impl WprsClientState {
             return Ok(());
         }
 
+        let primary_seat = matches!(
+            request.payload,
+            ToplevelRequestPayload::ShowWindowMenu { .. }
+        )
+        .then(|| self.primary_seat())
+        .flatten();
+
         let Some(client) = self.remote_display.clients.get_mut(&request.client) else {
             return Ok(());
         };
@@ -315,6 +322,12 @@ impl WprsClientState {
                             .map_err(|_| anyhow!("invalid edge"))
                             .location(loc!())?,
                     );
+                },
+                ToplevelRequestPayload::ShowWindowMenu { serial, location } => {
+                    let seat = primary_seat.location(loc!())?;
+                    toplevel
+                        .local_window
+                        .show_window_menu(&seat, serial, (location.x, location.y));
                 },
             }
         }
@@ -770,6 +783,7 @@ mod tests {
     use smithay::reexports::wayland_protocols::xdg::shell::server::xdg_positioner::XdgPositioner as ServerXdgPositioner;
     use smithay::reexports::wayland_protocols::xdg::shell::server::xdg_surface as server_xdg_surface;
     use smithay::reexports::wayland_protocols::xdg::shell::server::xdg_surface::XdgSurface as ServerXdgSurface;
+    use smithay::reexports::wayland_protocols::xdg::shell::server::xdg_toplevel as server_xdg_toplevel;
     use smithay::reexports::wayland_protocols::xdg::shell::server::xdg_toplevel::XdgToplevel as ServerXdgToplevel;
     use smithay::reexports::wayland_protocols::xdg::shell::server::xdg_wm_base;
     use smithay::reexports::wayland_protocols::xdg::shell::server::xdg_wm_base::XdgWmBase as ServerXdgWmBase;
@@ -862,10 +876,27 @@ mod tests {
 
     #[derive(Debug, Eq, PartialEq)]
     enum HostXdgReq {
-        SurfaceCommit { surface_id: u32 },
-        PopupGrab { surface_id: u32, serial: u32 },
-        SubsurfacePlaceAbove { surface_id: u32, sibling_id: u32 },
-        SubsurfacePlaceBelow { surface_id: u32, sibling_id: u32 },
+        SurfaceCommit {
+            surface_id: u32,
+        },
+        PopupGrab {
+            surface_id: u32,
+            serial: u32,
+        },
+        SubsurfacePlaceAbove {
+            surface_id: u32,
+            sibling_id: u32,
+        },
+        SubsurfacePlaceBelow {
+            surface_id: u32,
+            sibling_id: u32,
+        },
+        ToplevelShowWindowMenu {
+            surface_id: u32,
+            serial: u32,
+            x: i32,
+            y: i32,
+        },
     }
 
     #[derive(Default)]
@@ -1174,14 +1205,22 @@ mod tests {
 
     impl ServerDispatch<ServerXdgToplevel, u32> for MockHostState {
         fn request(
-            _state: &mut Self,
+            state: &mut Self,
             _client: &ServerClient,
             _resource: &ServerXdgToplevel,
-            _request: <ServerXdgToplevel as Resource>::Request,
-            _data: &u32,
+            request: server_xdg_toplevel::Request,
+            &surface_id: &u32,
             _dh: &DisplayHandle,
             _data_init: &mut DataInit<'_, Self>,
         ) {
+            if let server_xdg_toplevel::Request::ShowWindowMenu { serial, x, y, .. } = request {
+                state.xdg_reqs.push(HostXdgReq::ToplevelShowWindowMenu {
+                    surface_id,
+                    serial,
+                    x,
+                    y,
+                });
+            }
         }
     }
 
@@ -2173,5 +2212,57 @@ mod tests {
             r,
             HostXdgReq::SubsurfacePlaceAbove { .. } | HostXdgReq::SubsurfacePlaceBelow { .. }
         )));
+    }
+
+    #[test]
+    #[cfg_attr(miri, ignore)]
+    fn test_wprsc_toplevel_show_window_menu_wire() {
+        let mut h = ClientDndHarness::new();
+        let client_id = ClientId(1);
+        let tl_id = WlSurfaceId(300);
+
+        h.client
+            .handle_request(RecvType::Object(Request::Surface(SurfaceRequest {
+                client: client_id,
+                surface: tl_id,
+                payload: SurfaceRequestPayload::Commit(make_client_surface_state(
+                    client_id,
+                    tl_id,
+                    Some(wayland::Role::XdgToplevel(Default::default())),
+                )),
+            })));
+        h.sync();
+        h.host.xdg_reqs.clear();
+
+        h.client
+            .handle_request(RecvType::Object(Request::Toplevel(ToplevelRequest {
+                client: client_id,
+                surface: tl_id,
+                payload: ToplevelRequestPayload::ShowWindowMenu {
+                    serial: 777,
+                    location: (120, 45).into(),
+                },
+            })));
+        h.sync();
+
+        let tl_proto = h
+            .client
+            .remote_display
+            .client(&client_id)
+            .surfaces
+            .get(&tl_id)
+            .unwrap()
+            .wl_surface()
+            .id()
+            .protocol_id();
+        assert_eq!(
+            h.host.xdg_reqs,
+            vec![HostXdgReq::ToplevelShowWindowMenu {
+                surface_id: tl_proto,
+                serial: 777,
+                x: 120,
+                y: 45,
+            }]
+        );
     }
 }

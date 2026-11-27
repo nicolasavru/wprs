@@ -40,6 +40,8 @@ use smithay::reexports::wayland_server::protocol::wl_surface::WlSurface;
 use smithay::reexports::wayland_server::Client;
 use smithay::reexports::wayland_server::Resource;
 use smithay::reexports::wayland_server::WEnum;
+use smithay::utils::Logical;
+use smithay::utils::Point;
 use smithay::utils::Serial;
 use smithay::wayland::buffer::BufferHandler;
 use smithay::wayland::compositor;
@@ -492,7 +494,26 @@ impl XdgShellHandler for WprsServerState {
         }
     }
 
-    // TODO: show_window_menu
+    fn show_window_menu(
+        &mut self,
+        surface: ToplevelSurface,
+        _seat: wl_seat::WlSeat,
+        serial: Serial,
+        location: Point<i32, Logical>,
+    ) {
+        let Some(client_serial) = self.serial_map.get(serial) else {
+            warn!("Received show_window_menu request with unknown serial {serial:?}.");
+            return;
+        };
+
+        self.send_toplevel_request(
+            &surface,
+            ToplevelRequestPayload::ShowWindowMenu {
+                serial: client_serial,
+                location: location.into(),
+            },
+        );
+    }
 }
 
 impl SelectionHandler for WprsServerState {
@@ -3373,5 +3394,90 @@ mod tests {
             last_z_order(&sync_reqs, c1_id),
             vec![sp(gc_id, 7, 8), sp(c1_id, 0, 0)]
         );
+    }
+
+    #[test]
+    #[cfg_attr(miri, ignore)]
+    fn test_toplevel_show_window_menu_forwards_mapped_serial_and_skips_unmapped_wire() {
+        use crate::serialization::wayland::PointerEvent;
+        use crate::serialization::wayland::PointerEventKind;
+
+        let mut h = WaylandTestHarness::new(true);
+        let conn_id = h.conn_id.unwrap();
+        let compositor = h.client_data.compositor.clone().unwrap();
+        let wm_base = h.client_data.xdg_wm_base.clone().unwrap();
+        let seat = h.client_data.seat.clone().unwrap();
+
+        let surface = compositor.create_surface(&h.qh, ());
+        let xdg_surf = wm_base.get_xdg_surface(&surface, &h.qh, ());
+        let toplevel = xdg_surf.get_toplevel(&h.qh, ());
+        h.roundtrip();
+        let sid = h.server_surface_id(&surface);
+
+        // Deliver a pointer button press with host serial 777 so `serial_map`
+        // maps the client's server serial back to 777.
+        h.state.handle_event(
+            conn_id,
+            RecvType::Object(Event::PointerFrame(vec![
+                PointerEvent {
+                    surface_id: sid,
+                    position: (120.0, 45.0).into(),
+                    kind: PointerEventKind::Enter { serial: 776 },
+                },
+                PointerEvent {
+                    surface_id: sid,
+                    position: (120.0, 45.0).into(),
+                    kind: PointerEventKind::Press {
+                        button: 0x111,
+                        serial: 777,
+                    },
+                },
+            ])),
+        );
+        h.roundtrip();
+        let server_button_serial = h
+            .client_data
+            .last_button_serial
+            .expect("client must receive wl_pointer.button serial");
+
+        // 1. Pre-commit `show_window_menu` is suppressed by `committed_surfaces`.
+        toplevel.show_window_menu(&seat, server_button_serial, 120, 45);
+        h.roundtrip();
+        assert!(h.drain_requests().is_empty());
+
+        // 2. Post-commit `show_window_menu` forwards mapped serial 777 + coords.
+        surface.commit();
+        h.roundtrip();
+        h.drain_requests();
+
+        toplevel.show_window_menu(&seat, server_button_serial, 120, 45);
+        h.roundtrip();
+        let reqs = h.drain_requests();
+        assert!(
+            reqs.iter().any(|r| matches!(
+                r,
+                Request::Toplevel(ToplevelRequest {
+                    surface,
+                    payload: ToplevelRequestPayload::ShowWindowMenu {
+                        serial: 777,
+                        location,
+                    },
+                    ..
+                }) if *surface == sid && *location == (120, 45).into()
+            )),
+            "expected ShowWindowMenu with serial 777 and location (120, 45), got {reqs:?}"
+        );
+
+        // 3. Unmapped serial is ignored.
+        toplevel.show_window_menu(&seat, 888_888, 10, 20);
+        h.roundtrip();
+        assert!(h.drain_requests().is_empty());
+
+        // 4. Stale serial from prior session is ignored after reconnect.
+        h.connect_wprsc();
+        h.drain_requests();
+        toplevel.show_window_menu(&seat, server_button_serial, 30, 40);
+        h.roundtrip();
+        assert!(h.drain_requests().is_empty());
     }
 }
