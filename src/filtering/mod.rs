@@ -871,78 +871,42 @@ fn select_and_filter_row<K: RowKernel>(
     cur_raw: &[u8],
     prev_raw: &[u8],
     filt_row: &mut [u8],
-    cand_row: &mut [u8],
+    cand_sub: &mut [u8],
+    cand_up: &mut [u8],
+    cand_su: &mut [u8],
 ) -> u8 {
-    let row_b = cur_raw.len();
     let mut best_p = 0u8;
     let mut best_cost = kernel.sad_signed_bytes(cur_raw);
-
-    if row_b <= TILE_W * 3 {
-        // Common 2D tile path (`row_b <= 768 B`): evaluate candidates in L1d
-        // stack buffers and copy only the single winner into `filt_row`.
-        if best_cost == 0 {
-            filt_row.copy_from_slice(cur_raw);
-            return 0;
-        }
-        let mut cand_sub = [0u8; TILE_W * 3];
-        let mut cand_up = [0u8; TILE_W * 3];
-        let mut cand_su = [0u8; TILE_W * 3];
-
-        let cost_sub = kernel.row_sub3_forward_sad(cur_raw, &mut cand_sub[..row_b]);
-        if cost_sub < best_cost {
-            best_cost = cost_sub;
-            best_p = 1;
-        }
-        if ry > 0 && best_cost > 0 {
-            let cost_up = kernel.row_up_forward_sad(cur_raw, prev_raw, &mut cand_up[..row_b]);
-            if cost_up < best_cost {
-                best_cost = cost_up;
-                best_p = 2;
-            }
-            if best_cost > 0 {
-                let cost_su =
-                    kernel.row_subup3_forward_sad(cur_raw, prev_raw, &mut cand_su[..row_b]);
-                if cost_su < best_cost {
-                    best_p = 3;
-                }
-            }
-        }
-        let chosen = match best_p {
-            0 => cur_raw,
-            1 => &cand_sub[..row_b],
-            2 => &cand_up[..row_b],
-            _ => &cand_su[..row_b],
-        };
-        filt_row.copy_from_slice(chosen);
-        return best_p;
-    }
-
-    // Wide `< 8`-row 1D strip path (`row_b > 768 B`): reuse worker heap scratch.
-    filt_row.copy_from_slice(cur_raw);
     if best_cost == 0 {
+        filt_row.copy_from_slice(cur_raw);
         return 0;
     }
-    let cost_sub = kernel.row_sub3_forward_sad(cur_raw, &mut cand_row[..row_b]);
+
+    let cost_sub = kernel.row_sub3_forward_sad(cur_raw, cand_sub);
     if cost_sub < best_cost {
         best_cost = cost_sub;
         best_p = 1;
-        filt_row.copy_from_slice(&cand_row[..row_b]);
     }
     if ry > 0 && best_cost > 0 {
-        let cost_up = kernel.row_up_forward_sad(cur_raw, prev_raw, &mut cand_row[..row_b]);
+        let cost_up = kernel.row_up_forward_sad(cur_raw, prev_raw, cand_up);
         if cost_up < best_cost {
             best_cost = cost_up;
             best_p = 2;
-            filt_row.copy_from_slice(&cand_row[..row_b]);
         }
         if best_cost > 0 {
-            let cost_su = kernel.row_subup3_forward_sad(cur_raw, prev_raw, &mut cand_row[..row_b]);
+            let cost_su = kernel.row_subup3_forward_sad(cur_raw, prev_raw, cand_su);
             if cost_su < best_cost {
                 best_p = 3;
-                filt_row.copy_from_slice(&cand_row[..row_b]);
             }
         }
     }
+    let chosen: &[u8] = match best_p {
+        0 => cur_raw,
+        1 => cand_sub,
+        2 => cand_up,
+        _ => cand_su,
+    };
+    filt_row.copy_from_slice(chosen);
     best_p
 }
 
@@ -1062,50 +1026,49 @@ fn filter_aos_zstd_leaf_with<K: RowKernel, const HAS_ALPHA: bool>(
     let row_b = tw * 3;
     let total_b = row_b * th;
     ensure_len(&mut state.raw_row_a, row_b);
+    ensure_len(&mut state.cand_sub, row_b);
     if th > 1 {
         ensure_len(&mut state.raw_row_b, row_b);
-    }
-    if row_b > TILE_W * 3 {
-        ensure_len(&mut state.cand_row, row_b);
+        ensure_len(&mut state.cand_up, row_b);
+        ensure_len(&mut state.cand_su, row_b);
     }
     if HAS_ALPHA {
         ensure_len(&mut state.raw_alpha, TILE_PIXELS);
     }
 
+    let raw_row_a = &mut state.raw_row_a[..row_b];
+    let raw_row_b = &mut state.raw_row_b[..if th > 1 { row_b } else { 0 }];
+    let filt_bgr = &mut state.filt_bgr[..total_b];
+    let cand_sub = &mut state.cand_sub[..row_b];
+    let cand_up = &mut state.cand_up[..if th > 1 { row_b } else { 0 }];
+    let cand_su = &mut state.cand_su[..if th > 1 { row_b } else { 0 }];
+    let raw_alpha = &mut state.raw_alpha[..if HAS_ALPHA { tw * th } else { 0 }];
+
     let mut predictors = vec![0u8; th.div_ceil(4)];
     let mut use_a = true;
-    for ry in 0..th {
+    for (ry, filt_row) in filt_bgr.chunks_exact_mut(row_b).enumerate() {
         let row_start = (y0 + ry) * stride_px + x0;
         let (_, after_start) = aos.split_at(row_start);
         let (row_ptr, _) = after_start.split_at(tw);
 
         let (cur_raw, prev_raw): (&mut [u8], &[u8]) = if use_a {
-            (
-                &mut state.raw_row_a[..row_b],
-                &state.raw_row_b[..if ry > 0 { row_b } else { 0 }],
-            )
+            (raw_row_a, raw_row_b)
         } else {
-            (&mut state.raw_row_b[..row_b], &state.raw_row_a[..row_b])
+            (raw_row_b, raw_row_a)
         };
 
         if HAS_ALPHA {
             kernel.bgra_to_subgreen_bgr3::<true>(
                 row_ptr,
                 cur_raw,
-                &mut state.raw_alpha[ry * tw..(ry + 1) * tw],
+                &mut raw_alpha[ry * tw..(ry + 1) * tw],
             );
         } else {
             kernel.bgra_to_subgreen_bgr3::<false>(row_ptr, cur_raw, &mut []);
         }
 
-        let filt_row = &mut state.filt_bgr[ry * row_b..(ry + 1) * row_b];
         let best_p = select_and_filter_row::<K>(
-            kernel,
-            ry,
-            cur_raw,
-            prev_raw,
-            filt_row,
-            &mut state.cand_row,
+            kernel, ry, cur_raw, prev_raw, filt_row, cand_sub, cand_up, cand_su,
         );
         predictors[ry >> 2] |= best_p << ((ry & 3) * 2);
         use_a = !use_a;
@@ -1972,38 +1935,10 @@ unsafe fn decode_one_tile<'a, K: RowKernel, const HAS_ALPHA: bool>(
                     );
                 }
 
-                if ctx.puts_only {
-                    // SAFETY: `put_claimed[slot_idx]` grants exclusive ownership of `slot_id`.
-                    let slot_frame = unsafe {
-                        ClientTileCache::prepare_slot_target(&ctx.slots, slot_id, rect, HAS_ALPHA)
-                    };
-                    // SAFETY: `slot_frame` is sized to `rect.w x rect.h` and exclusively owned;
-                    // shifting by `dst_origin = (rect.x, rect.y)` maps `rect` (and any `Split`
-                    // sub-rects inside it) strictly within `0..rect.w x 0..rect.h`.
-                    let res = unsafe {
-                        unfilter_tile::<K, HAS_ALPHA>(
-                            kernel,
-                            tier,
-                            rect,
-                            (rect.x as usize, rect.y as usize),
-                            false,
-                            &tile.payload,
-                            &slot_frame,
-                            state,
-                        )
-                    };
-                    if let Err(err) = res {
-                        // SAFETY: Exclusive ownership of `slot_id` still held.
-                        unsafe { ClientTileCache::invalidate_slot(&ctx.slots, slot_id) };
-                        return Err(err);
-                    }
-                    return Ok(false);
-                }
-
                 // Decode directly into L2-hot `ClientTileCache` slot capacity
-                // (without zero-filling) and then stream the L2-hot slot into
-                // `frame` via non-temporal stores, avoiding `wl_shm` RFO
-                // traffic and cache pollution.
+                // (without zero-filling) and, unless `puts_only`, stream the
+                // committed slot into `frame` via non-temporal stores, avoiding
+                // `wl_shm` RFO traffic and cache pollution.
                 // SAFETY: `put_claimed[slot_idx]` grants exclusive ownership of `slot_id`.
                 let slot_frame = unsafe {
                     ClientTileCache::prepare_slot_target_uninit(&ctx.slots, slot_id, rect)
@@ -2033,6 +1968,9 @@ unsafe fn decode_one_tile<'a, K: RowKernel, const HAS_ALPHA: bool>(
                 // `0..rect.w * rect.h` was written into `slot_frame`.
                 let slot_pixels =
                     unsafe { ClientTileCache::commit_slot(&ctx.slots, slot_id, rect, HAS_ALPHA) };
+                if ctx.puts_only {
+                    return Ok(false);
+                }
                 // SAFETY: Caller validated `tile_rects` in-bounds and pairwise disjoint, and
                 // `claimed[idx]` guarantees exclusive ownership of `rect` for this worker.
                 let streamed = unsafe {
@@ -2196,11 +2134,14 @@ impl ShadowRows {
     }
 }
 
-/// Copies `rect` from `src` (`wl_shm` via [`BufferPointer`]) into `shadow`.
+/// Copies `rect` from `src` (`wl_shm` via [`BufferPointer`]) into `shadow`
+/// without reading destination bytes (safe when `shadow` points to
+/// uninitialized spare capacity).
 ///
 /// # Safety
-/// `rect` must be strictly in-bounds within `shadow` and disjoint from all
-/// regions concurrently accessed by other threads.
+/// `rect` must be strictly in-bounds within `shadow`, non-overlapping with
+/// `src`, and disjoint from all regions concurrently accessed by other
+/// threads.
 #[inline]
 unsafe fn copy_rect_to_shadow(
     src: BufferPointer<u8>,
@@ -2211,14 +2152,48 @@ unsafe fn copy_rect_to_shadow(
     let x_bytes = rect.x as usize * 4;
     let row_bytes = rect.w as usize * 4;
     let y0 = rect.y as usize;
-    for ry in 0..rect.h as usize {
+    let h = rect.h as usize;
+    if h > 0 && row_bytes > 0 {
+        let last_end = (y0 + h - 1) * stride + x_bytes + row_bytes;
+        assert!(last_end <= src.len());
+    }
+    for ry in 0..h {
         let row_off = (y0 + ry) * stride + x_bytes;
-        let (_, after_start) = src.split_at(row_off);
-        let (src_row, _) = after_start.split_at(row_bytes);
-        // SAFETY: Caller guarantees `rect` is in-bounds and disjoint across workers.
-        let dst_row =
-            unsafe { slice::from_raw_parts_mut(shadow.row_ptr(y0 + ry, x_bytes), row_bytes) };
-        src_row.copy_to_nonoverlapping(dst_row);
+        // SAFETY: Validated `last_end <= src.len()` above, and caller
+        // guarantees `rect` is in-bounds, non-overlapping with `src`, and
+        // disjoint across workers. Raw pointer copy avoids forming `&mut [u8]`
+        // over uninitialized spare capacity.
+        unsafe {
+            ptr::copy_nonoverlapping(
+                src.ptr().add(row_off),
+                shadow.row_ptr(y0 + ry, x_bytes),
+                row_bytes,
+            );
+        }
+    }
+}
+
+/// Zero-initializes trailing row-stride padding (`width_bytes..shadow.stride`)
+/// for rows `rect.y..rect.y + rect.h` when `rect` touches the right edge of the
+/// frame.
+///
+/// # Safety
+/// `(rect.y + rect.h) * shadow.stride` must lie within `shadow`'s allocated
+/// capacity, `width_bytes <= shadow.stride`, and no other thread may
+/// concurrently access trailing padding bytes of rows `rect.y..rect.y + rect.h`.
+#[inline]
+unsafe fn zero_shadow_row_padding(shadow: &ShadowRows, width_bytes: usize, rect: TileRect) {
+    let pad_bytes = shadow.stride - width_bytes;
+    if pad_bytes != 0 && (rect.x + rect.w) as usize * 4 == width_bytes {
+        let y0 = rect.y as usize;
+        for ry in 0..rect.h as usize {
+            // SAFETY: Caller guarantees `(y0 + ry, width_bytes..shadow.stride)`
+            // lies within `shadow` and is exclusively owned by this right-edge
+            // rect.
+            unsafe {
+                ptr::write_bytes(shadow.row_ptr(y0 + ry, width_bytes), 0, pad_bytes);
+            }
+        }
     }
 }
 
@@ -3294,6 +3269,7 @@ fn filter_and_compress_full_streaming_with_tier(
     let byte_len = total_pixels * 4;
     assert!(data.len() >= byte_len);
 
+    let width_bytes = metadata.width as usize * 4;
     let stride = metadata.stride as usize;
     let stride_px = stride / 4;
     let has_alpha = metadata.format == BufferFormat::Argb8888;
@@ -3302,13 +3278,11 @@ fn filter_and_compress_full_streaming_with_tier(
 
     let mut shadow_opt = shadow_out;
     if let Some(shadow) = shadow_opt.as_deref_mut() {
-        if shadow.len() < byte_len {
-            shadow.resize(byte_len, 0);
-        } else {
-            shadow.truncate(byte_len);
-            if shadow.capacity() > byte_len.saturating_mul(2) {
-                shadow.shrink_to(byte_len);
-            }
+        shadow.clear();
+        if shadow.capacity() < byte_len {
+            shadow.reserve_exact(byte_len);
+        } else if shadow.capacity() > byte_len.saturating_mul(2) {
+            shadow.shrink_to(byte_len);
         }
     }
 
@@ -3366,10 +3340,10 @@ fn filter_and_compress_full_streaming_with_tier(
                 let shadow_ptr;
                 let encode_aos = if let Some(shadow) = &shadow_rows {
                     shadow_ptr = shadow.base.cast_const().cast::<Vec4u8>();
-                    // SAFETY: `shadow.base` is valid for `total_pixels` `Vec4u8`s;
-                    // each tile's rect is read only after its `publish_hash` ->
-                    // `advance` -> `planned_up_to` Release/Acquire happens-before
-                    // edge completes its exclusive `&mut [u8]` write.
+                    // SAFETY: `shadow.base` points to `total_pixels * 4` bytes of
+                    // allocated capacity; each tile's rect is read only after its
+                    // `publish_hash` -> `advance` -> `planned_up_to` Release/Acquire
+                    // happens-before edge completes its exclusive write.
                     unsafe { BufferPointer::new(&shadow_ptr, total_pixels) }
                 } else {
                     aos
@@ -3435,10 +3409,12 @@ fn filter_and_compress_full_streaming_with_tier(
                             if h >= n_tiles {
                                 break;
                             }
+                            let rect = base_entries[h].rect();
                             // SAFETY: `base_entries` are pairwise disjoint and in-bounds,
                             // and each `h` is claimed once.
                             unsafe {
-                                copy_rect_to_shadow(data, shadow, stride, base_entries[h].rect());
+                                copy_rect_to_shadow(data, shadow, stride, rect);
+                                zero_shadow_row_padding(shadow, width_bytes, rect);
                             }
                             continue;
                         }
@@ -3453,7 +3429,7 @@ fn filter_and_compress_full_streaming_with_tier(
                                 let digest = if let Some(shadow) = &shadow_rows {
                                     // SAFETY: `base_entries` are pairwise disjoint and in-bounds.
                                     unsafe {
-                                        if has_alpha {
+                                        let h = if has_alpha {
                                             tile_cache::copy_and_hash_rect_to_shadow::<true>(
                                                 data,
                                                 shadow.base,
@@ -3471,7 +3447,9 @@ fn filter_and_compress_full_streaming_with_tier(
                                                 0,
                                                 &mut state.hash_buf,
                                             )
-                                        }
+                                        };
+                                        zero_shadow_row_padding(shadow, width_bytes, rect);
+                                        h
                                     }
                                 } else if has_alpha {
                                     tile_cache::hash_rect_from_ptr::<true>(
@@ -3533,6 +3511,11 @@ fn filter_and_compress_full_streaming_with_tier(
                                         )
                                     };
                                 }
+                                if let Some(shadow) = &shadow_rows {
+                                    // SAFETY: `rect` is exclusively owned by this worker and
+                                    // disjoint from all other `base_entries`.
+                                    unsafe { zero_shadow_row_padding(shadow, width_bytes, rect) };
+                                }
                                 if n_quads == 1 {
                                     (quad_hashes[0], None)
                                 } else {
@@ -3571,6 +3554,14 @@ fn filter_and_compress_full_streaming_with_tier(
                 }
             });
 
+            if let Some(shadow) = shadow_opt {
+                // SAFETY: `base_entries` partitions `[0, width) x [0, height)`,
+                // every tile was written (even on early stream disconnect), and
+                // right-edge tiles zeroed trailing row-stride padding, so all
+                // `byte_len` bytes are initialized.
+                unsafe { shadow.set_len(byte_len) };
+            }
+
             if disconnected.load(Ordering::Relaxed) {
                 cache.reset_for_peer();
             } else {
@@ -3608,7 +3599,7 @@ fn filter_and_compress_full_streaming_with_tier(
                                 // SAFETY: `base_entries` are pairwise disjoint and in-bounds,
                                 // and each `entry_idx` is claimed once.
                                 let h = unsafe {
-                                    if has_alpha {
+                                    let h = if has_alpha {
                                         tile_cache::copy_and_hash_rect_to_shadow::<true>(
                                             data,
                                             shadow.base,
@@ -3626,7 +3617,9 @@ fn filter_and_compress_full_streaming_with_tier(
                                             0,
                                             &mut state.hash_buf,
                                         )
-                                    }
+                                    };
+                                    zero_shadow_row_padding(shadow, width_bytes, rect);
+                                    h
                                 };
                                 // SAFETY: `slot_idx` is exclusively owned by this entry.
                                 unsafe { slot_hashes.write(slot_idx, h) };
@@ -3663,6 +3656,9 @@ fn filter_and_compress_full_streaming_with_tier(
                                     // SAFETY: `quad_slots[q]` is exclusively owned by this entry.
                                     unsafe { slot_hashes.write(quad_slots[q], h) };
                                 }
+                                // SAFETY: `rect` is exclusively owned by this worker and
+                                // disjoint from all other `base_entries`.
+                                unsafe { zero_shadow_row_padding(shadow, width_bytes, rect) };
                             },
                         }
                     } else {
@@ -3716,6 +3712,12 @@ fn filter_and_compress_full_streaming_with_tier(
                     }
                 }
             });
+        }
+        if let Some(shadow) = shadow_opt.as_deref_mut() {
+            // SAFETY: Phase A workers have joined after writing every base tile
+            // and zeroing trailing row-stride padding, initializing all
+            // `byte_len` bytes.
+            unsafe { shadow.set_len(byte_len) };
         }
 
         let hashes = slot_hashes.into_vec();
@@ -3821,7 +3823,7 @@ fn filter_and_compress_full_streaming_with_tier(
     let tile_rects: Vec<TileRect> = base_entries.into_iter().map(BaseScanEntry::rect).collect();
     let n_tiles = tile_rects.len();
     let rects_for_workers = tile_rects.clone();
-    let shadow_rows = shadow_opt.map(|shadow| ShadowRows {
+    let shadow_rows = shadow_opt.as_deref_mut().map(|shadow| ShadowRows {
         base: shadow.as_mut_ptr(),
         stride,
     });
@@ -3856,14 +3858,17 @@ fn filter_and_compress_full_streaming_with_tier(
             let encode_aos = if let Some(shadow) = &shadow_rows {
                 // SAFETY: `rects_for_workers` are pairwise disjoint and in-bounds,
                 // and each `tile_idx` is claimed once.
-                unsafe { copy_rect_to_shadow(data, shadow, stride, rect) };
+                unsafe {
+                    copy_rect_to_shadow(data, shadow, stride, rect);
+                    zero_shadow_row_padding(shadow, width_bytes, rect);
+                }
                 if disconnected {
                     continue;
                 }
                 shadow_ptr = shadow.base.cast_const().cast::<Vec4u8>();
-                // SAFETY: `shadow.base` is valid for `total_pixels` `Vec4u8`s and
-                // this worker holds exclusive access to `rect`'s pixels after the
-                // `&mut [u8]` row writes in `copy_rect_to_shadow` ended.
+                // SAFETY: `shadow.base` points to `total_pixels * 4` bytes of
+                // allocated capacity and this worker holds exclusive access to
+                // `rect`'s initialized pixels after `copy_rect_to_shadow`.
                 unsafe { BufferPointer::new(&shadow_ptr, total_pixels) }
             } else {
                 aos
@@ -3890,6 +3895,13 @@ fn filter_and_compress_full_streaming_with_tier(
             }
         }
     });
+
+    if let Some(shadow) = shadow_opt {
+        // SAFETY: Every tile in `rects_for_workers` was copied into `shadow`
+        // (even on early stream disconnect) and right-edge tiles zeroed
+        // trailing row-stride padding, initializing all `byte_len` bytes.
+        unsafe { shadow.set_len(byte_len) };
+    }
 }
 
 /// Streams a full (`incremental = false`) frame covering the entire buffer.
@@ -10575,6 +10587,518 @@ mod tests {
                     assert_canvas_matches_frame(&canvas, &f2, meta, 0xCC);
                 }
             }
+        });
+    }
+
+    #[test]
+    fn test_uninit_shadow_slot_and_row_scratch_miri_safe() {
+        // 1. Uninitialized shadow spare-capacity population across packed and
+        //    padded strides (`Strip1D` and `Tile2D` partitions).
+        for (width, height) in [(300usize, 5usize), (300usize, 20usize)] {
+            for pad_bytes in [0usize, 12usize] {
+                let width_bytes = width * 4;
+                let stride = width_bytes + pad_bytes;
+                let byte_len = height * stride;
+                let src = test_vec(byte_len);
+                let src_ptr = src.as_ptr();
+                let bp = unsafe { BufferPointer::new(&src_ptr, byte_len) };
+
+                let meta = BufferMetadata {
+                    width: width as i32,
+                    height: height as i32,
+                    stride: stride as i32,
+                    format: BufferFormat::Argb8888,
+                };
+                let (_, base_entries, _) = plan_incremental_scan(&meta, None).unwrap();
+
+                let mut shadow = Vec::with_capacity(byte_len);
+                let shadow_rows = ShadowRows {
+                    base: shadow.as_mut_ptr(),
+                    stride,
+                };
+                for entry in &base_entries {
+                    let rect = entry.rect();
+                    // SAFETY: `base_entries` partitions `[0, width) x [0, height)`
+                    // strictly in-bounds and disjointly.
+                    unsafe {
+                        copy_rect_to_shadow(bp, &shadow_rows, stride, rect);
+                        zero_shadow_row_padding(&shadow_rows, width_bytes, rect);
+                    }
+                }
+                // SAFETY: Every pixel byte and right-edge stride padding byte
+                // in `0..byte_len` was initialized above.
+                unsafe { shadow.set_len(byte_len) };
+
+                for y in 0..height {
+                    let row = y * stride;
+                    assert_eq!(
+                        &shadow[row..row + width_bytes],
+                        &src[row..row + width_bytes],
+                        "pixel mismatch at row {y} ({width}x{height}, pad={pad_bytes})"
+                    );
+                    assert_eq!(
+                        &shadow[row + width_bytes..row + stride],
+                        &vec![0u8; pad_bytes][..],
+                        "stride padding not zeroed at row {y} ({width}x{height}, pad={pad_bytes})"
+                    );
+                }
+            }
+        }
+
+        // 2. `ClientTileCache` uninit slot target + commit + invalidate.
+        let mut cli = ClientTileCache::new();
+        let rect = TileRect {
+            x: 16,
+            y: 8,
+            w: 12,
+            h: 6,
+        };
+        let px = Vec4u8(0x11, 0x22, 0x33, 0xFF);
+        {
+            let slots = cli.sync_slots();
+            // SAFETY: Single-threaded exclusive ownership of slot 3.
+            let slot_frame =
+                unsafe { ClientTileCache::prepare_slot_target_uninit(&slots, 3, rect) };
+            for ry in 0..rect.h as usize {
+                // SAFETY: Row lies strictly inside `slot_frame` (`12x6`).
+                let row = unsafe {
+                    slice::from_raw_parts_mut(slot_frame.row_ptr(ry, 0), rect.w as usize)
+                };
+                // SAFETY: `STREAM = false` has no alignment requirement.
+                unsafe { ScalarKernel.splat_row::<false>(row, px) };
+            }
+            // SAFETY: All `12 * 6` pixels were initialized above.
+            let committed = unsafe { ClientTileCache::commit_slot(&slots, 3, rect, false) };
+            assert_eq!(committed.len(), (rect.w * rect.h) as usize);
+            assert!(committed.iter().all(|&p| p == px));
+        }
+        cli.recompute_and_verify_bytes().unwrap();
+        assert_eq!(cli.occupied_slots(), 1);
+        assert_eq!(cli.used_bytes(), (rect.w * rect.h * 4) as usize);
+
+        {
+            let slots = cli.sync_slots();
+            // SAFETY: Single-threaded exclusive ownership of slot 3.
+            let _slot_frame =
+                unsafe { ClientTileCache::prepare_slot_target_uninit(&slots, 3, rect) };
+            // Simulate decode error before `commit_slot`.
+            unsafe { ClientTileCache::invalidate_slot(&slots, 3) };
+        }
+        cli.recompute_and_verify_bytes().unwrap();
+        assert_eq!(cli.occupied_slots(), 0);
+        assert_eq!(cli.used_bytes(), 0);
+
+        // 3. `select_and_filter_row` with reusable candidate scratch across
+        //    short cropped (`tw < 256`), full `256`, and wide 1D strip (`tw > 256`).
+        let mut cand_sub = vec![0u8; TILE_W * 3];
+        let mut cand_up = vec![0u8; TILE_W * 3];
+        let mut cand_su = vec![0u8; TILE_W * 3];
+        for tw in [1usize, 7, 16, 128, 256, 300] {
+            let row_b = tw * 3;
+            ensure_len(&mut cand_sub, row_b);
+            ensure_len(&mut cand_up, row_b);
+            ensure_len(&mut cand_su, row_b);
+            let row0 = test_vec(row_b);
+            let row1: Vec<u8> = row0
+                .iter()
+                .enumerate()
+                .map(|(i, &b)| b.wrapping_add(((i % 7) as u8).wrapping_sub(3)))
+                .collect();
+            let mut filt0 = vec![0u8; row_b];
+            let mut filt1 = vec![0u8; row_b];
+            let p0 = select_and_filter_row(
+                ScalarKernel,
+                0,
+                &row0,
+                &[],
+                &mut filt0,
+                &mut cand_sub[..row_b],
+                &mut [],
+                &mut [],
+            );
+            assert!(p0 < 2, "row 0 predictor must be None or Sub, got {p0}");
+            let p1 = select_and_filter_row(
+                ScalarKernel,
+                1,
+                &row1,
+                &row0,
+                &mut filt1,
+                &mut cand_sub[..row_b],
+                &mut cand_up[..row_b],
+                &mut cand_su[..row_b],
+            );
+
+            let mut dec0 = vec![0u8; row_b];
+            match p0 {
+                0 => dec0.copy_from_slice(&filt0),
+                1 => ScalarKernel.row_sub3_inverse(&filt0, &mut dec0),
+                _ => unreachable!(),
+            }
+            assert_eq!(dec0, row0, "row 0 roundtrip failed for tw={tw}");
+
+            let mut dec1 = vec![0u8; row_b];
+            match p1 {
+                0 => dec1.copy_from_slice(&filt1),
+                1 => ScalarKernel.row_sub3_inverse(&filt1, &mut dec1),
+                2 => ScalarKernel.row_up_inverse(&filt1, &dec0, &mut dec1),
+                _ => ScalarKernel.row_subup3_inverse(&filt1, &dec0, &mut dec1),
+            }
+            assert_eq!(dec1, row1, "row 1 roundtrip failed for tw={tw}");
+        }
+    }
+
+    #[test]
+    #[cfg_attr(miri, ignore)]
+    fn test_uninit_shadow_full_frame_and_puts_only_soundness() {
+        use crate::serialization::framing::CacheHitRegion;
+
+        with_test_codec(|compressor, decompressor| {
+            let assert_shadow_exact = |shadow: &[u8],
+                                       src: &[u8],
+                                       width: usize,
+                                       height: usize,
+                                       stride: usize,
+                                       ctx: &str| {
+                let width_bytes = width * 4;
+                let pad_bytes = stride - width_bytes;
+                assert_eq!(shadow.len(), height * stride, "shadow len mismatch ({ctx})");
+                for y in 0..height {
+                    let row = y * stride;
+                    assert_eq!(
+                        &shadow[row..row + width_bytes],
+                        &src[row..row + width_bytes],
+                        "shadow pixel mismatch row {y} ({ctx})"
+                    );
+                    if pad_bytes > 0 {
+                        assert_eq!(
+                            &shadow[row + width_bytes..row + stride],
+                            &vec![0u8; pad_bytes][..],
+                            "shadow padding not zeroed row {y} ({ctx})"
+                        );
+                    }
+                }
+            };
+
+            let decode_stream =
+                |st: StreamingCompressedTiles,
+                 decomp: &mut ShardingDecompressor,
+                 canvas: &mut [u8],
+                 cli: Option<&mut ClientTileCache>| {
+                    let mut wire = Vec::new();
+                    st.framed_write(&mut wire).unwrap();
+                    let mut rx = None;
+                    CompressedTileStream::read_from_stream(&mut wire.as_slice(), |s| {
+                        rx = Some(s);
+                        Ok(())
+                    })
+                    .unwrap();
+                    let validated = ValidatedTileStream::new(rx.unwrap()).unwrap();
+                    decompress_and_unfilter_streaming(validated, decomp, canvas, cli).unwrap();
+                };
+
+            // 1. Uninit shadow full frame across tightly packed and padded strides,
+            //    `Strip1D` (`300x5`) and multi-tile `Tile2D` (`300x270`), both
+            //    formats, cold-fill / warm-2-pass / no-cache, and early receiver drop.
+            for format in [BufferFormat::Xrgb8888, BufferFormat::Argb8888] {
+                for (width, height) in [(300usize, 5usize), (300usize, 270usize)] {
+                    for pad_bytes in [0usize, 16usize] {
+                        let stride = width * 4 + pad_bytes;
+                        let byte_len = height * stride;
+                        let meta = BufferMetadata {
+                            width: width as i32,
+                            height: height as i32,
+                            stride: stride as i32,
+                            format,
+                        };
+                        let frame_a = test_vec(byte_len);
+                        let frame_b: Vec<u8> = frame_a.iter().map(|&b| b ^ 0x5A).collect();
+                        let mut canvas = vec![0xCCu8; byte_len];
+
+                        // (a) `tile_cache = Some` cold-fill (fresh empty shadow).
+                        let mut srv = ServerTileCache::new();
+                        let mut cli = ClientTileCache::new();
+                        let mut shadow = Vec::new();
+                        {
+                            let ptr = frame_a.as_ptr();
+                            let bp = unsafe { BufferPointer::new(&ptr, byte_len) };
+                            let mut st = None;
+                            filter_and_compress_full_streaming(
+                                bp,
+                                ClientId(1),
+                                WlSurfaceId(1),
+                                meta,
+                                CompressionMode::Lossless,
+                                Some(&mut shadow),
+                                Some(&mut srv),
+                                compressor,
+                                |s| st = Some(s),
+                            );
+                            decode_stream(st.unwrap(), decompressor, &mut canvas, Some(&mut cli));
+                        }
+                        assert_shadow_exact(&shadow, &frame_a, width, height, stride, "cold_fill");
+                        assert_canvas_matches_frame(&canvas, &frame_a, meta, 0xCC);
+                        assert!(srv.occupied_slots() > 0);
+
+                        // (b) `tile_cache = Some` warm 2-pass with oversized sentinel shadow
+                        //     (verifies shrink + zeroed padding with no stale `0xDD` bytes).
+                        let mut oversized_shadow = vec![0xDDu8; byte_len * 3];
+                        {
+                            let ptr = frame_b.as_ptr();
+                            let bp = unsafe { BufferPointer::new(&ptr, byte_len) };
+                            let mut st = None;
+                            filter_and_compress_full_streaming(
+                                bp,
+                                ClientId(1),
+                                WlSurfaceId(1),
+                                meta,
+                                CompressionMode::Lossless,
+                                Some(&mut oversized_shadow),
+                                Some(&mut srv),
+                                compressor,
+                                |s| st = Some(s),
+                            );
+                            decode_stream(st.unwrap(), decompressor, &mut canvas, Some(&mut cli));
+                        }
+                        assert_shadow_exact(
+                            &oversized_shadow,
+                            &frame_b,
+                            width,
+                            height,
+                            stride,
+                            "warm_2pass",
+                        );
+                        assert!(
+                            oversized_shadow.capacity() <= byte_len.saturating_mul(2),
+                            "oversized shadow did not shrink"
+                        );
+                        assert_canvas_matches_frame(&canvas, &frame_b, meta, 0xCC);
+
+                        // (c) `tile_cache = Some` cold-fill with early receiver drop
+                        //     (`disconnected = true`).
+                        let mut srv_drop = ServerTileCache::new();
+                        let mut shadow_cold_drop = Vec::new();
+                        {
+                            let ptr = frame_a.as_ptr();
+                            let bp = unsafe { BufferPointer::new(&ptr, byte_len) };
+                            filter_and_compress_full_streaming(
+                                bp,
+                                ClientId(1),
+                                WlSurfaceId(1),
+                                meta,
+                                CompressionMode::Lossless,
+                                Some(&mut shadow_cold_drop),
+                                Some(&mut srv_drop),
+                                compressor,
+                                drop,
+                            );
+                        }
+                        assert_shadow_exact(
+                            &shadow_cold_drop,
+                            &frame_a,
+                            width,
+                            height,
+                            stride,
+                            "cold_fill_drop",
+                        );
+
+                        // (d) `tile_cache = None` normal.
+                        let mut shadow_nc = Vec::new();
+                        {
+                            let ptr = frame_a.as_ptr();
+                            let bp = unsafe { BufferPointer::new(&ptr, byte_len) };
+                            let mut st = None;
+                            filter_and_compress_full_streaming(
+                                bp,
+                                ClientId(1),
+                                WlSurfaceId(1),
+                                meta,
+                                CompressionMode::Lossless,
+                                Some(&mut shadow_nc),
+                                None,
+                                compressor,
+                                |s| st = Some(s),
+                            );
+                            decode_stream(st.unwrap(), decompressor, &mut canvas, None);
+                        }
+                        assert_shadow_exact(&shadow_nc, &frame_a, width, height, stride, "nocache");
+                        assert_canvas_matches_frame(&canvas, &frame_a, meta, 0xCC);
+
+                        // (e) `tile_cache = None` early receiver drop (`disconnected = true`).
+                        let mut shadow_nc_drop = Vec::new();
+                        {
+                            let ptr = frame_b.as_ptr();
+                            let bp = unsafe { BufferPointer::new(&ptr, byte_len) };
+                            filter_and_compress_full_streaming(
+                                bp,
+                                ClientId(1),
+                                WlSurfaceId(1),
+                                meta,
+                                CompressionMode::Lossless,
+                                Some(&mut shadow_nc_drop),
+                                None,
+                                compressor,
+                                drop,
+                            );
+                        }
+                        assert_shadow_exact(
+                            &shadow_nc_drop,
+                            &frame_b,
+                            width,
+                            height,
+                            stride,
+                            "nocache_drop",
+                        );
+                    }
+                }
+            }
+
+            // 2. `decompress_cache_puts_only` success (uninit slot commit + bit-exact
+            //    subsequent `CacheHit` replay) and decode error (slot invalidated cleanly).
+            let width = 300usize;
+            let height = 270usize;
+            let stride = width * 4;
+            let byte_len = height * stride;
+            let meta = BufferMetadata {
+                width: width as i32,
+                height: height as i32,
+                stride: stride as i32,
+                format: BufferFormat::Xrgb8888,
+            };
+            let frame = make_textured_document(width, height, stride, BufferFormat::Xrgb8888);
+            let mut srv = ServerTileCache::new();
+            let mut shadow = Vec::new();
+            let mut wire_puts = Vec::new();
+            {
+                let ptr = frame.as_ptr();
+                let bp = unsafe { BufferPointer::new(&ptr, byte_len) };
+                let mut st = None;
+                filter_and_compress_full_streaming(
+                    bp,
+                    ClientId(1),
+                    WlSurfaceId(2),
+                    meta,
+                    CompressionMode::Lossless,
+                    Some(&mut shadow),
+                    Some(&mut srv),
+                    compressor,
+                    |s| st = Some(s),
+                );
+                st.unwrap().framed_write(&mut wire_puts).unwrap();
+            }
+            let mut wire_hits = Vec::new();
+            {
+                let ptr = frame.as_ptr();
+                let bp = unsafe { BufferPointer::new(&ptr, byte_len) };
+                let mut st = None;
+                filter_and_compress_full_streaming(
+                    bp,
+                    ClientId(1),
+                    WlSurfaceId(2),
+                    meta,
+                    CompressionMode::Lossless,
+                    Some(&mut shadow),
+                    Some(&mut srv),
+                    compressor,
+                    |s| st = Some(s),
+                );
+                st.unwrap().framed_write(&mut wire_hits).unwrap();
+            }
+
+            let mut cli = ClientTileCache::new();
+            {
+                let mut rx = None;
+                CompressedTileStream::read_from_stream(&mut wire_puts.as_slice(), |s| {
+                    rx = Some(s);
+                    Ok(())
+                })
+                .unwrap();
+                let validated = ValidatedTileStream::new(rx.unwrap()).unwrap();
+                decompress_cache_puts_only(validated, decompressor, &mut cli).unwrap();
+            }
+            assert_eq!(cli.occupied_slots(), srv.occupied_slots());
+            assert_eq!(cli.used_bytes(), srv.used_bytes());
+
+            let mut canvas = vec![0xCCu8; byte_len];
+            {
+                let mut rx = None;
+                CompressedTileStream::read_from_stream(&mut wire_hits.as_slice(), |s| {
+                    rx = Some(s);
+                    Ok(())
+                })
+                .unwrap();
+                let validated = ValidatedTileStream::new(rx.unwrap()).unwrap();
+                decompress_and_unfilter_streaming(
+                    validated,
+                    decompressor,
+                    &mut canvas,
+                    Some(&mut cli),
+                )
+                .unwrap();
+            }
+            assert_canvas_matches_frame(&canvas, &frame, meta, 0xCC);
+
+            // Decode error inside `decompress_cache_puts_only` (both on an empty slot
+            // and overwriting an occupied slot) must invalidate the slot cleanly without
+            // committing uninitialized memory.
+            let r64 = TileRect {
+                x: 0,
+                y: 0,
+                w: 64,
+                h: 64,
+            };
+            let m64 = BufferMetadata {
+                width: 64,
+                height: 64,
+                stride: 64 * 4,
+                format: BufferFormat::Xrgb8888,
+            };
+            let occupied_before = cli.occupied_slots();
+            let used_before = cli.used_bytes();
+            let empty_slot = 900u16;
+            let occupied_slot = 0u16;
+
+            for target_slot in [empty_slot, occupied_slot] {
+                let (tx, rx) = crossbeam_channel::unbounded();
+                tx.send(Ok(CompressedTile {
+                    tile_idx: 0,
+                    cache_put: Some(target_slot),
+                    // Translucent Solid on Xrgb8888 triggers an immediate decode error.
+                    payload: TilePayload::Leaf(LeafPayload::Solid([1, 2, 3, 0x80])),
+                }))
+                .unwrap();
+                drop(tx);
+                let validated = ValidatedTileStream::new(CompressedTileStream {
+                    header: RawBufferHeader {
+                        frame_seq: 0,
+                        client: ClientId(1),
+                        surface: WlSurfaceId(2),
+                        metadata: m64,
+                        incremental: true,
+                        scroll_rect: None,
+                        reset_tile_cache: false,
+                        evict_slots: Vec::new(),
+                        tile_rects: vec![r64],
+                    },
+                    tiles: rx,
+                })
+                .unwrap();
+                assert!(decompress_cache_puts_only(validated, decompressor, &mut cli).is_err());
+                // Target slot must now be empty (a CacheHit referencing it must fail).
+                assert!(
+                    cli.validate_hit(
+                        0,
+                        CacheHitRef {
+                            slot_id: target_slot,
+                            region: CacheHitRegion::Full,
+                        },
+                        r64,
+                        false,
+                    )
+                    .is_err()
+                );
+            }
+            assert_eq!(cli.occupied_slots(), occupied_before - 1);
+            assert!(cli.used_bytes() < used_before);
         });
     }
 }

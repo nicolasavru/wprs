@@ -279,8 +279,10 @@ pub(crate) unsafe fn hash_rect_from_shadow<const HAS_ALPHA: bool>(
 ///
 /// # Safety
 /// `shadow_base` must be exclusively writable for `rect` across `(rect.y +
-/// rect.h) * stride` bytes with `(rect.x + rect.w) * 4 <= stride`, and
-/// `copy_from_ry <= rect.h as usize`.
+/// rect.h) * stride` bytes with `(rect.x + rect.w) * 4 <= stride`,
+/// `copy_from_ry <= rect.h as usize`, and rows `[0..copy_from_ry)` must
+/// already be initialized (rows `[copy_from_ry..rect.h)` may be uninitialized
+/// spare capacity).
 #[inline(never)]
 pub(crate) unsafe fn copy_and_hash_rect_to_shadow<const HAS_ALPHA: bool>(
     src: BufferPointer<u8>,
@@ -304,7 +306,8 @@ pub(crate) unsafe fn copy_and_hash_rect_to_shadow<const HAS_ALPHA: bool>(
 
     for ry in 0..copy_from_ry {
         let row_off = (y0 + ry) * stride + x_bytes;
-        // SAFETY: Caller guarantees `rect` is in-bounds and exclusively owned.
+        // SAFETY: Caller guarantees `rect` is in-bounds, exclusively owned, and
+        // rows `[0..copy_from_ry)` are initialized.
         let sh_row = unsafe { slice::from_raw_parts(shadow_base.add(row_off), row_bytes) };
         let dst_hash = &mut buf[ry * row_bytes..(ry + 1) * row_bytes];
         if HAS_ALPHA {
@@ -319,38 +322,38 @@ pub(crate) unsafe fn copy_and_hash_rect_to_shadow<const HAS_ALPHA: bool>(
     }
     for ry in copy_from_ry..th {
         let row_off = (y0 + ry) * stride + x_bytes;
-        // SAFETY: Validated `last_end <= src.len()` above, and caller guarantees
-        // `rect` is in-bounds and exclusively owned in `shadow_base`.
+        // SAFETY: Validated `last_end <= src.len()` above, `MaybeUninit<[u8; 4]>`
+        // has alignment 1 and permits uninitialized destination storage, and
+        // caller guarantees `rect` is in-bounds and exclusively owned in
+        // `shadow_base`.
         let src_row_ptr = unsafe { src.ptr().add(row_off) };
-        let dst_shadow = unsafe { slice::from_raw_parts_mut(shadow_base.add(row_off), row_bytes) };
+        let dst_shadow = unsafe {
+            slice::from_raw_parts_mut(shadow_base.add(row_off).cast::<MaybeUninit<[u8; 4]>>(), tw)
+        };
         let dst_hash = &mut buf[ry * row_bytes..(ry + 1) * row_bytes];
         // Single-load dual-store: read each `wl_shm` pixel once via raw pointer
         // (never creating `&[u8]` over shared memory), writing raw bytes to
         // `shadow` and normalized bytes to L1-hot `hash_buf`.
         if HAS_ALPHA {
             for (i, (ds, dh)) in dst_shadow
-                .as_chunks_mut::<4>()
-                .0
                 .iter_mut()
                 .zip(dst_hash.as_chunks_mut::<4>().0.iter_mut())
                 .enumerate()
             {
                 // SAFETY: `i * 4 + 4 <= row_bytes` and `last_end <= src.len()`.
                 let px = unsafe { src_row_ptr.add(i * 4).cast::<[u8; 4]>().read_unaligned() };
-                *ds = px;
+                ds.write(px);
                 *dh = px;
             }
         } else {
             for (i, (ds, dh)) in dst_shadow
-                .as_chunks_mut::<4>()
-                .0
                 .iter_mut()
                 .zip(dst_hash.as_chunks_mut::<4>().0.iter_mut())
                 .enumerate()
             {
                 // SAFETY: `i * 4 + 4 <= row_bytes` and `last_end <= src.len()`.
                 let px = unsafe { src_row_ptr.add(i * 4).cast::<[u8; 4]>().read_unaligned() };
-                *ds = px;
+                ds.write(px);
                 *dh = (u32::from_ne_bytes(px) | XRGB_ALPHA_MASK).to_ne_bytes();
             }
         }
@@ -1914,43 +1917,6 @@ impl ClientTileCache {
         slot.has_alpha = has_alpha;
         slot.occupied = true;
         &slot.pixels
-    }
-
-    /// Prepares `slots[slot_id]` as a direct decode target for
-    /// `decompress_cache_puts_only` and returns a [`FrameRows`] pointing to its
-    /// tightly packed pixel storage (`stride_px = rect.w`).
-    ///
-    /// # Safety
-    /// Caller must hold exclusive ownership of `slot_id < MAX_TILE_CACHE_SLOTS`
-    /// and drop the returned [`FrameRows`] before releasing the slot.
-    #[inline]
-    pub(crate) unsafe fn prepare_slot_target(
-        slots: &SyncClientSlots,
-        slot_id: u16,
-        rect: TileRect,
-        has_alpha: bool,
-    ) -> FrameRows {
-        let tw = rect.w as usize;
-        let th = rect.h as usize;
-        let n_px = tw * th;
-        // SAFETY: Caller holds exclusive ownership of `slot_id`.
-        let slot = unsafe { &mut *slots.slot_ptr(slot_id) };
-        if slot.pixels.len() < n_px {
-            slot.pixels.resize(n_px, Vec4u8(0, 0, 0, 0));
-        } else {
-            slot.pixels.truncate(n_px);
-            if slot.pixels.capacity() > n_px.saturating_mul(2) {
-                slot.pixels.shrink_to(n_px);
-            }
-        }
-        slot.w = rect.w;
-        slot.h = rect.h;
-        slot.has_alpha = has_alpha;
-        slot.occupied = true;
-        FrameRows {
-            base: slot.pixels.as_mut_ptr().cast(),
-            stride_px: tw,
-        }
     }
 
     /// Marks `slot_id` empty after a failed `CachePut` decode so stale pixels
