@@ -17,7 +17,7 @@
 //! Detects full-window and split-pane vertical scrolling (both smooth small-`dy`
 //! scrolls and coarse wheel/page scrolls) on incremental same-size commits
 //! before 2D sub-tile diffing:
-//! - **Tier 0 activity screen**: zero-hash `u64`-packed 16-pixel probe grid
+//! - **Tier 0 activity screen**: zero-hash 16-pixel (`64 B`) SIMD probe grid
 //!   (`step_x = 240`, `step_y <= 97`) that early-exits static and small-edit
 //!   frames with minimal cache traffic and bounds active vertical ranges.
 //! - **Phase 1b ruler sampling**: inserts up to 18 bursts of 7 consecutive
@@ -34,6 +34,8 @@ use std::sync::atomic::AtomicUsize;
 use std::sync::atomic::Ordering;
 
 use crate::buffer_pointer::BufferPointer;
+use crate::filtering::RowKernel;
+use crate::filtering::arch;
 use crate::serialization::framing::RowBand;
 use crate::serialization::framing::ScrollRect;
 use crate::serialization::wayland::BufferFormat;
@@ -54,7 +56,11 @@ const MIN_SCROLL_COPY_AREA: u64 = 256 * 256;
 
 /// Width in pixels of each cache-line-aligned horizontal probe strip
 /// (`16 * 4 = 64 B`, one cache line).
-const STRIP_W: usize = 16;
+pub(crate) const STRIP_W: usize = 16;
+
+/// Horizontal pixel offset of the first probe strip (clears left borders and
+/// guarantees `MIN_SCROLL_DIM >= STRIP_START_X + STRIP_W`).
+const STRIP_START_X: usize = 112;
 
 /// Spacing in pixels between horizontal probe strips (`240 + 16 = 256`,
 /// guaranteeing every `>= 256`px pane fully contains at least one strip).
@@ -62,7 +68,7 @@ const STRIP_STEP_X: usize = 240;
 
 /// Maximum number of horizontal probe strips placed across a frame (covers up
 /// to `32 * 240 = 7680`px 8K width).
-const MAX_STRIPS: usize = 32;
+pub(crate) const MAX_STRIPS: usize = 32;
 
 /// Maximum vertical stride in Tier 0 (prime `97` avoids phase-locking with
 /// common 16/18/20/24px UI line heights, and `256 > 2 * 97` guarantees every
@@ -100,9 +106,72 @@ const STACK_SCORE_CAP: usize = 512;
 /// background worker threads.
 const PARALLEL_SCROLL_MIN_BYTES: usize = 512 * 1024;
 
-/// Multiplicative 64-bit mixing constants for strip row hashes.
+/// Minimum byte payload before [`apply_scroll_rect_in_place_parallel`] and
+/// swapchain scroll blits emit non-temporal streaming stores into the
+/// destination buffer (keeps smaller L2/L3-resident buffers warm in cache while
+/// bypassing destination RFO traffic on large 4K frames).
+pub(crate) const STREAM_SCROLL_MIN_BYTES: usize = 12 * 1024 * 1024;
+
+/// Minimum per-worker byte reuse distance (`|dy| * stripe_bytes`) before
+/// non-temporal streaming stores are enabled on overlapping (`|dy| < copy_h`)
+/// in-place scrolls. Below private L2 capacity (`~512 KiB`), every destination
+/// cache line was just fetched into L1D/L2 by the `src` read `|dy|` rows
+/// earlier, so regular stores pay zero RFO traffic whereas `vmovntdq` triggers
+/// expensive cache-hit evictions and write-combining flushes.
+const STREAM_OVERLAP_MIN_REUSE_BYTES: usize = 512 * 1024;
+
+/// Minimum vertical column stripe width (bytes) when partitioning overlapping
+/// (`|dy| < copy_h`) parallel scroll blits across workers.
+const MIN_VERTICAL_STRIPE_BYTES: usize = 512;
+
+/// 16 distinct odd 32-bit lane multipliers (MSB set) for 16-pixel (`64 B`)
+/// strip hashing across scalar and SIMD tiers.
+#[cfg_attr(
+    all(
+        target_arch = "x86_64",
+        not(miri),
+        any(
+            target_feature = "ssse3",
+            target_feature = "avx2",
+            all(
+                target_feature = "avx512bw",
+                target_feature = "avx512vl",
+                target_feature = "avx512vbmi",
+            ),
+        ),
+    ),
+    allow(dead_code)
+)]
+pub(crate) const STRIP_HASH_MULS: [u32; STRIP_W] = [
+    0x9E37_79B1,
+    0x85EB_CA77,
+    0xC2B2_AE3D,
+    0xA24B_AED5,
+    0xB7E1_5163,
+    0xD1B5_4A35,
+    0x94D0_49BB,
+    0xE703_7ED1,
+    0x9E37_79B9,
+    0xC6BC_2797,
+    0xA5A3_564F,
+    0xD6E8_FEB9,
+    0xB529_7A4D,
+    0xE19B_01AB,
+    0x9FB2_1C65,
+    0xF135_7AEB,
+];
+
+/// Multiplicative 64-bit mixing constants for strip row hash finalization.
 const HASH_MUL1: u64 = 0x517c_c1b7_2722_0a95;
 const HASH_MUL2: u64 = 0x9e37_79b9_7f4a_7c15;
+
+/// Finalizes the two folded 64-bit strip hash lanes `(x0, x1)` into a 64-bit
+/// row hash shared identically across scalar and SIMD tiers.
+#[inline(always)]
+pub(crate) fn finalize_strip_hash(x0: u64, x1: u64) -> u64 {
+    let h = (x0.wrapping_mul(HASH_MUL1) ^ x1.rotate_left(29)).wrapping_mul(HASH_MUL2);
+    h ^ (h >> 32)
+}
 
 /// Applies a validated [`ScrollRect`] in place on a pixel buffer of `stride`
 /// bytes per row (`buf.len() >= (scroll.y + scroll.height) * stride`).
@@ -112,6 +181,9 @@ pub fn apply_scroll_rect_in_place(buf: &mut [u8], stride: usize, scroll: ScrollR
     let shift = scroll.dy.unsigned_abs() as usize;
     let copy_h = scroll.height as usize - shift;
     let y0 = scroll.y as usize;
+    if shift == 0 || copy_h == 0 || row_bytes == 0 {
+        return;
+    }
 
     if scroll.dy < 0 {
         // Content moves up: copy top-to-bottom (`dst_y < src_y`).
@@ -155,20 +227,194 @@ impl SyncMutBuf {
     }
 }
 
-// SAFETY: `apply_scroll_rect_in_place_parallel` partitions `[x_bytes, x_bytes +
-// row_bytes)` into strictly disjoint 64-byte-aligned vertical column stripes,
-// and each stripe is claimed at most once via `AtomicUsize`.
+// SAFETY: `apply_scroll_rect_in_place_parallel_with` partitions work into
+// pairwise disjoint horizontal row bands (when `shift >= copy_h`) or pairwise
+// disjoint vertical column stripes (when `shift < copy_h`), and each task is
+// claimed at most once via `AtomicUsize`.
 unsafe impl Send for SyncMutBuf {}
 unsafe impl Sync for SyncMutBuf {}
 
-/// Applies a validated [`ScrollRect`] in place, parallelizing large blits
-/// across `decompressor`'s worker pool via cache-line-aligned disjoint
-/// vertical column stripes.
-pub fn apply_scroll_rect_in_place_parallel(
+/// Computes the unified `(rows, row_len, first_src_row, first_dst_row, step)`
+/// traversal parameters for a scroll blit stripe or band.
+#[inline(always)]
+fn scroll_row_plan(
+    stride: usize,
+    sx: usize,
+    len: usize,
+    src_y0: usize,
+    dst_y0: usize,
+    copy_h: usize,
+    rev: bool,
+    disjoint: bool,
+) -> (usize, usize, usize, usize, isize) {
+    if disjoint && sx == 0 && len == stride {
+        (1usize, copy_h * stride, src_y0, dst_y0, 0isize)
+    } else if !rev {
+        (copy_h, len, src_y0, dst_y0, stride as isize)
+    } else {
+        (
+            copy_h,
+            len,
+            src_y0 + copy_h - 1,
+            dst_y0 + copy_h - 1,
+            -(stride as isize),
+        )
+    }
+}
+
+/// Copies `copy_h` rows of `len` bytes at horizontal byte offset `sx` within
+/// `base` (`stride` bytes/row) from `src_y0` to `dst_y0` using regular temporal
+/// `memcpy` (`ptr::copy_nonoverlapping`).
+///
+/// # Safety
+/// Every accessed row `[y * stride + sx .. y * stride + sx + len)` must lie
+/// within `base`'s allocation, writes must be exclusively owned by this worker,
+/// `src_y0 != dst_y0` must hold, and when `disjoint` is `true`, the full `src`
+/// and `dst` row ranges must not overlap.
+#[inline]
+pub(super) unsafe fn apply_scroll_rows_temporal(
+    base: *mut u8,
+    stride: usize,
+    sx: usize,
+    len: usize,
+    src_y0: usize,
+    dst_y0: usize,
+    copy_h: usize,
+    rev: bool,
+    disjoint: bool,
+) {
+    if copy_h == 0 || len == 0 {
+        return;
+    }
+    let (rows, row_len, first_src_row, first_dst_row, step) =
+        scroll_row_plan(stride, sx, len, src_y0, dst_y0, copy_h, rev, disjoint);
+    // SAFETY: Caller guarantees every `[y * stride + sx .. y * stride + sx + len)`
+    // is in-bounds and non-overlapping per row (and across all rows when `disjoint`).
+    // `wrapping_offset` keeps the final post-loop pointer step UB-free.
+    unsafe {
+        let mut s = base.add(first_src_row * stride + sx).cast_const();
+        let mut d = base.add(first_dst_row * stride + sx);
+        for _ in 0..rows {
+            ptr::copy_nonoverlapping(s, d, row_len);
+            s = s.wrapping_offset(step);
+            d = d.wrapping_offset(step);
+        }
+    }
+}
+
+/// Copies `copy_h` rows of `len` bytes at horizontal byte offset `sx` within
+/// `base` (`stride` bytes/row) from `src_y0` to `dst_y0` using cache-line-aligned
+/// non-temporal streaming stores and a single trailing [`RowKernel::fence_stream`].
+///
+/// # Safety
+/// Caller must uphold [`apply_scroll_rows_temporal`] invariants.
+#[cfg_attr(not(all(target_arch = "x86_64", not(miri))), allow(dead_code))]
+#[inline(always)]
+pub(super) unsafe fn apply_scroll_rows_stream_with<K: RowKernel>(
+    kernel: K,
+    base: *mut u8,
+    stride: usize,
+    sx: usize,
+    len: usize,
+    src_y0: usize,
+    dst_y0: usize,
+    copy_h: usize,
+    rev: bool,
+    disjoint: bool,
+) {
+    if copy_h == 0 || len == 0 {
+        return;
+    }
+    let (rows, row_len, first_src_row, first_dst_row, step) =
+        scroll_row_plan(stride, sx, len, src_y0, dst_y0, copy_h, rev, disjoint);
+    // SAFETY: Caller guarantees every `[y * stride + sx .. y * stride + sx + len)`
+    // is in-bounds and non-overlapping per row (and across all rows when `disjoint`).
+    // `wrapping_offset` keeps the final post-loop pointer step UB-free.
+    unsafe {
+        let mut s = base.add(first_src_row * stride + sx).cast_const();
+        let mut d = base.add(first_dst_row * stride + sx);
+        for _ in 0..rows {
+            kernel.copy_bytes_stream(s, d, row_len);
+            s = s.wrapping_offset(step);
+            d = d.wrapping_offset(step);
+        }
+    }
+    kernel.fence_stream();
+}
+
+/// Copies `rows` tightly-packed rows of `row_bytes` from `src_packed` into
+/// `dst` at `(x_bytes, dst_y0)` (`dst_stride` bytes/row) using cache-line-aligned
+/// non-temporal streaming stores and a single trailing [`RowKernel::fence_stream`].
+#[inline(always)]
+pub(super) fn copy_packed_rows_stream_with<K: RowKernel>(
+    kernel: K,
+    src_packed: &[u8],
+    dst: &mut [u8],
+    dst_stride: usize,
+    x_bytes: usize,
+    dst_y0: usize,
+    row_bytes: usize,
+    rows: usize,
+) {
+    if rows == 0 || row_bytes == 0 {
+        return;
+    }
+    assert!(src_packed.len() >= rows * row_bytes);
+    assert!(x_bytes + row_bytes <= dst_stride);
+    assert!(dst.len() >= (dst_y0 + rows) * dst_stride);
+    if x_bytes == 0 && row_bytes == dst_stride {
+        // SAFETY: Bounds asserted above; `src_packed` and `dst` are distinct slices.
+        unsafe {
+            kernel.copy_bytes_stream(
+                src_packed.as_ptr(),
+                dst.as_mut_ptr().add(dst_y0 * dst_stride),
+                rows * row_bytes,
+            );
+        }
+    } else {
+        for i in 0..rows {
+            let dst_off = (dst_y0 + i) * dst_stride + x_bytes;
+            // SAFETY: Bounds asserted above; `src_packed` and `dst` are distinct slices.
+            unsafe {
+                kernel.copy_bytes_stream(
+                    src_packed.as_ptr().add(i * row_bytes),
+                    dst.as_mut_ptr().add(dst_off),
+                    row_bytes,
+                );
+            }
+        }
+    }
+    kernel.fence_stream();
+}
+
+/// Copies `rows` tightly-packed rows of `row_bytes` from `src_packed` into
+/// `dst` (typically a `wl_shm` swapchain slot) using non-temporal streaming
+/// stores on the highest host SIMD tier, issuing one `sfence` per batch.
+pub(crate) fn copy_packed_rows_stream(
+    src_packed: &[u8],
+    dst: &mut [u8],
+    dst_stride: usize,
+    x_bytes: usize,
+    dst_y0: usize,
+    row_bytes: usize,
+    rows: usize,
+) {
+    arch::Tier::detect().copy_packed_rows_stream(
+        src_packed, dst, dst_stride, x_bytes, dst_y0, row_bytes, rows,
+    );
+}
+
+/// Applies a validated [`ScrollRect`] in place using the supplied SIMD `tier`
+/// and streaming-store mode, partitioning disjoint (`|dy| >= copy_h`) blits
+/// into horizontal row bands and overlapping (`|dy| < copy_h`) blits into
+/// cache-line-aligned vertical column stripes.
+pub(super) fn apply_scroll_rect_in_place_parallel_with(
     buf: &mut [u8],
     stride: usize,
     scroll: ScrollRect,
     decompressor: &mut ShardingDecompressor,
+    tier: arch::Tier,
+    stream: bool,
 ) {
     let x_bytes = scroll.x as usize * 4;
     let row_bytes = scroll.width as usize * 4;
@@ -177,95 +423,308 @@ pub fn apply_scroll_rect_in_place_parallel(
     let y0 = scroll.y as usize;
     assert!(x_bytes + row_bytes <= stride);
     assert!(buf.len() >= (y0 + scroll.height as usize) * stride);
+    if shift == 0 || copy_h == 0 || row_bytes == 0 {
+        return;
+    }
 
+    let move_up = scroll.dy < 0;
+    let src_y0 = if move_up { y0 + shift } else { y0 };
+    let dst_y0 = if move_up { y0 } else { y0 + shift };
+    let disjoint = shift >= copy_h;
     let copy_bytes = copy_h.saturating_mul(row_bytes);
     let n_threads = decompressor.pool.parallelism();
-    if n_threads <= 1 || copy_bytes < PARALLEL_SCROLL_MIN_BYTES || row_bytes < 1024 {
-        apply_scroll_rect_in_place(buf, stride, scroll);
+    let use_stream = stream && tier.stream_align() > 1;
+
+    if n_threads <= 1 || copy_bytes < PARALLEL_SCROLL_MIN_BYTES {
+        // SAFETY: Bounds asserted above, single-threaded exclusive `buf`, `shift >= 1`.
+        unsafe {
+            if use_stream {
+                tier.apply_scroll_rows_stream(
+                    buf.as_mut_ptr(),
+                    stride,
+                    x_bytes,
+                    row_bytes,
+                    src_y0,
+                    dst_y0,
+                    copy_h,
+                    !move_up,
+                    disjoint,
+                );
+            } else {
+                apply_scroll_rows_temporal(
+                    buf.as_mut_ptr(),
+                    stride,
+                    x_bytes,
+                    row_bytes,
+                    src_y0,
+                    dst_y0,
+                    copy_h,
+                    !move_up,
+                    disjoint,
+                );
+            }
+        }
         return;
     }
 
-    let target_stripes = n_threads.min(row_bytes / 512).max(1);
-    let stripe_w = row_bytes.div_ceil(target_stripes).next_multiple_of(64);
-    let n_stripes = row_bytes.div_ceil(stripe_w);
-    if n_stripes <= 1 {
-        apply_scroll_rect_in_place(buf, stride, scroll);
+    if disjoint {
+        let n_bands = n_threads.min(copy_h);
+        if n_bands <= 1 {
+            // SAFETY: Bounds asserted above, single band, `shift >= copy_h`.
+            unsafe {
+                if use_stream {
+                    tier.apply_scroll_rows_stream(
+                        buf.as_mut_ptr(),
+                        stride,
+                        x_bytes,
+                        row_bytes,
+                        src_y0,
+                        dst_y0,
+                        copy_h,
+                        false,
+                        true,
+                    );
+                } else {
+                    apply_scroll_rows_temporal(
+                        buf.as_mut_ptr(),
+                        stride,
+                        x_bytes,
+                        row_bytes,
+                        src_y0,
+                        dst_y0,
+                        copy_h,
+                        false,
+                        true,
+                    );
+                }
+            }
+            return;
+        }
+        let sync_buf = SyncMutBuf {
+            base: buf.as_mut_ptr(),
+        };
+        let next_band = AtomicUsize::new(0);
+        decompressor.pool.execute(n_bands, |_| {
+            loop {
+                let idx = next_band.fetch_add(1, Ordering::Relaxed);
+                if idx >= n_bands {
+                    break;
+                }
+                let r0 = (idx * copy_h) / n_bands;
+                let r1 = ((idx + 1) * copy_h) / n_bands;
+                let band_h = r1 - r0;
+                // SAFETY: `disjoint` guarantees `[src_y0, src_y0 + copy_h)` and
+                // `[dst_y0, dst_y0 + copy_h)` are completely disjoint, and
+                // horizontal bands `[r0, r1)` partition `0..copy_h` without overlap.
+                unsafe {
+                    if use_stream {
+                        tier.apply_scroll_rows_stream(
+                            sync_buf.base(),
+                            stride,
+                            x_bytes,
+                            row_bytes,
+                            src_y0 + r0,
+                            dst_y0 + r0,
+                            band_h,
+                            false,
+                            true,
+                        );
+                    } else {
+                        apply_scroll_rows_temporal(
+                            sync_buf.base(),
+                            stride,
+                            x_bytes,
+                            row_bytes,
+                            src_y0 + r0,
+                            dst_y0 + r0,
+                            band_h,
+                            false,
+                            true,
+                        );
+                    }
+                }
+            }
+        });
         return;
     }
+
+    if row_bytes < MIN_VERTICAL_STRIPE_BYTES * 2 {
+        // SAFETY: Bounds asserted above, single-threaded exclusive `buf`, `shift >= 1`.
+        unsafe {
+            if use_stream {
+                tier.apply_scroll_rows_stream(
+                    buf.as_mut_ptr(),
+                    stride,
+                    x_bytes,
+                    row_bytes,
+                    src_y0,
+                    dst_y0,
+                    copy_h,
+                    !move_up,
+                    false,
+                );
+            } else {
+                apply_scroll_rows_temporal(
+                    buf.as_mut_ptr(),
+                    stride,
+                    x_bytes,
+                    row_bytes,
+                    src_y0,
+                    dst_y0,
+                    copy_h,
+                    !move_up,
+                    false,
+                );
+            }
+        }
+        return;
+    }
+
+    let n_stripes = n_threads.min(row_bytes / MIN_VERTICAL_STRIPE_BYTES).max(1);
+    if n_stripes <= 1 {
+        // SAFETY: Bounds asserted above, single-threaded exclusive `buf`, `shift >= 1`.
+        unsafe {
+            if use_stream {
+                tier.apply_scroll_rows_stream(
+                    buf.as_mut_ptr(),
+                    stride,
+                    x_bytes,
+                    row_bytes,
+                    src_y0,
+                    dst_y0,
+                    copy_h,
+                    !move_up,
+                    false,
+                );
+            } else {
+                apply_scroll_rows_temporal(
+                    buf.as_mut_ptr(),
+                    stride,
+                    x_bytes,
+                    row_bytes,
+                    src_y0,
+                    dst_y0,
+                    copy_h,
+                    !move_up,
+                    false,
+                );
+            }
+        }
+        return;
+    }
+
+    // Snap interior vertical stripe boundaries to actual 64 B cache-line
+    // addresses of the first row so middle stripes have zero false sharing and
+    // zero unaligned head/tail bytes whenever `stride % 64 == 0`.
+    let first_row_addr = buf.as_ptr() as usize + y0 * stride + x_bytes;
+    let end_addr = first_row_addr + row_bytes;
+    let align_interior = |off: usize| -> usize {
+        let aligned = (first_row_addr + off + 32) & !63;
+        aligned.clamp(first_row_addr, end_addr) - first_row_addr
+    };
 
     let sync_buf = SyncMutBuf {
         base: buf.as_mut_ptr(),
     };
     let next_stripe = AtomicUsize::new(0);
-    let move_up = scroll.dy < 0;
-
     decompressor.pool.execute(n_stripes, |_| {
         loop {
             let idx = next_stripe.fetch_add(1, Ordering::Relaxed);
             if idx >= n_stripes {
                 break;
             }
-            let off = idx * stripe_w;
-            let len = (row_bytes - off).min(stripe_w);
-            let sx = x_bytes + off;
-            let base = sync_buf.base();
-            if move_up {
-                for ry in 0..copy_h {
-                    let src_off = (y0 + shift + ry) * stride + sx;
-                    let dst_off = (y0 + ry) * stride + sx;
-                    // SAFETY: Stripes are pairwise disjoint across threads,
-                    // `shift >= 1` ensures `src` and `dst` lie on distinct rows
-                    // (`|src_off - dst_off| >= stride >= len`), and both lie
-                    // within `buf.len()`.
-                    unsafe {
-                        ptr::copy_nonoverlapping(base.add(src_off), base.add(dst_off), len);
-                    }
-                }
+            let start = if idx == 0 {
+                0
             } else {
-                for ry in (0..copy_h).rev() {
-                    let src_off = (y0 + ry) * stride + sx;
-                    let dst_off = (y0 + shift + ry) * stride + sx;
-                    // SAFETY: Same disjoint-stripe and distinct-row bounds.
-                    unsafe {
-                        ptr::copy_nonoverlapping(base.add(src_off), base.add(dst_off), len);
-                    }
+                align_interior((idx * row_bytes) / n_stripes)
+            };
+            let end = if idx + 1 == n_stripes {
+                row_bytes
+            } else {
+                align_interior(((idx + 1) * row_bytes) / n_stripes)
+            };
+            let len = end - start;
+            if len == 0 {
+                continue;
+            }
+            let sx = x_bytes + start;
+            // SAFETY: Stripes `[start, end)` form an exact monotone partition
+            // of `[0, row_bytes)` (adjacent stripes share the identical
+            // `align_interior` split point), `shift >= 1` ensures `src` and
+            // `dst` lie on distinct rows, and `!move_up` sets overlap-safe order.
+            unsafe {
+                if use_stream {
+                    tier.apply_scroll_rows_stream(
+                        sync_buf.base(),
+                        stride,
+                        sx,
+                        len,
+                        src_y0,
+                        dst_y0,
+                        copy_h,
+                        !move_up,
+                        false,
+                    );
+                } else {
+                    apply_scroll_rows_temporal(
+                        sync_buf.base(),
+                        stride,
+                        sx,
+                        len,
+                        src_y0,
+                        dst_y0,
+                        copy_h,
+                        !move_up,
+                        false,
+                    );
                 }
             }
         }
     });
 }
 
+/// Applies a validated [`ScrollRect`] in place, parallelizing large blits
+/// across `decompressor`'s worker pool via horizontal row bands (when
+/// `|dy| >= copy_h`) or cache-line-aligned vertical column stripes (when
+/// `|dy| < copy_h`), using non-temporal streaming stores on large `wl_shm`
+/// payloads to avoid destination RFO traffic.
+pub fn apply_scroll_rect_in_place_parallel(
+    buf: &mut [u8],
+    stride: usize,
+    scroll: ScrollRect,
+    decompressor: &mut ShardingDecompressor,
+) {
+    let row_bytes = scroll.width as usize * 4;
+    let shift = scroll.dy.unsigned_abs() as usize;
+    let copy_h = (scroll.height as usize).saturating_sub(shift);
+    let copy_bytes = copy_h.saturating_mul(row_bytes);
+    let disjoint = shift >= copy_h;
+    let n_threads = decompressor.pool.parallelism();
+    let n_stripes = if n_threads <= 1
+        || copy_bytes < PARALLEL_SCROLL_MIN_BYTES
+        || row_bytes < MIN_VERTICAL_STRIPE_BYTES * 2
+    {
+        1
+    } else {
+        n_threads.min(row_bytes / MIN_VERTICAL_STRIPE_BYTES).max(1)
+    };
+    let stripe_bytes = row_bytes / n_stripes;
+    let stream = copy_bytes >= STREAM_SCROLL_MIN_BYTES
+        && (disjoint || shift.saturating_mul(stripe_bytes) >= STREAM_OVERLAP_MIN_REUSE_BYTES);
+    apply_scroll_rect_in_place_parallel_with(
+        buf,
+        stride,
+        scroll,
+        decompressor,
+        arch::Tier::detect(),
+        stream,
+    );
+}
+
 #[inline(always)]
 fn pixel_key<const HAS_ALPHA: bool>(px: Vec4u8) -> u32 {
     let raw = u32::from_le_bytes([px.0, px.1, px.2, px.3]);
     if HAS_ALPHA { raw } else { raw & 0x00FF_FFFF }
-}
-
-#[inline(always)]
-const fn pair_mask<const HAS_ALPHA: bool>() -> u64 {
-    if HAS_ALPHA {
-        u64::MAX
-    } else {
-        0x00FF_FFFF_00FF_FFFF
-    }
-}
-
-#[inline(always)]
-fn pack_pair<const HAS_ALPHA: bool>(a: Vec4u8, b: Vec4u8) -> u64 {
-    u64::from_le_bytes([a.0, a.1, a.2, a.3, b.0, b.1, b.2, b.3]) & pair_mask::<HAS_ALPHA>()
-}
-
-/// Fast 2-level multiply-XOR hash over 8 packed pixel pairs (16 pixels).
-#[inline(always)]
-fn hash_pair_words(w: [u64; 8]) -> u64 {
-    let a = w[0].wrapping_mul(HASH_MUL1) ^ w[1].rotate_left(17);
-    let b = w[2].wrapping_mul(HASH_MUL2) ^ w[3].rotate_left(23);
-    let c = w[4].wrapping_mul(HASH_MUL1) ^ w[5].rotate_left(29);
-    let d = w[6].wrapping_mul(HASH_MUL2) ^ w[7].rotate_left(37);
-    let ab = (a ^ b.rotate_left(13)).wrapping_mul(HASH_MUL1);
-    let cd = (c ^ d.rotate_left(19)).wrapping_mul(HASH_MUL2);
-    let h = (ab ^ cd).wrapping_mul(HASH_MUL1);
-    h ^ (h >> 32)
 }
 
 /// Reads a single pixel from `aos` at `(y, x)` without forming a Rust slice
@@ -293,105 +752,6 @@ fn read_prev_px<const HAS_ALPHA: bool>(
     x: usize,
 ) -> u32 {
     pixel_key::<HAS_ALPHA>(prev[y * stride_px + x])
-}
-
-/// Zero-hash Tier-0 strip activity probe returning `(changed, non_uniform)`.
-///
-/// # Safety
-/// `row_base + sx + STRIP_W <= aos.len()` and `<= prev.len()`.
-#[inline(always)]
-unsafe fn probe_strip_activity<const HAS_ALPHA: bool>(
-    aos: BufferPointer<Vec4u8>,
-    prev: &[Vec4u8],
-    row_base: usize,
-    sx: usize,
-) -> (bool, bool) {
-    let base_ptr = aos.ptr();
-    let prev_slice = &prev[row_base + sx..row_base + sx + STRIP_W];
-    // SAFETY: Caller guarantees `row_base + sx + STRIP_W <= aos.len()`.
-    let c0 = unsafe { base_ptr.add(row_base + sx).read() };
-    let p0_pair = pack_pair::<HAS_ALPHA>(c0, c0);
-    let mut changed_diff = 0u64;
-    let mut uniform_diff = 0u64;
-    for pair in 0..(STRIP_W / 2) {
-        let i0 = pair * 2;
-        let i1 = i0 + 1;
-        // SAFETY: `i0 < i1 < STRIP_W`.
-        let ca = unsafe { base_ptr.add(row_base + sx + i0).read() };
-        // SAFETY: `i1 < STRIP_W`.
-        let cb = unsafe { base_ptr.add(row_base + sx + i1).read() };
-        let cw = pack_pair::<HAS_ALPHA>(ca, cb);
-        let pw = pack_pair::<HAS_ALPHA>(prev_slice[i0], prev_slice[i1]);
-        changed_diff |= cw ^ pw;
-        uniform_diff |= cw ^ p0_pair;
-    }
-    (changed_diff != 0, uniform_diff != 0)
-}
-
-/// Phase 1b `curr` probe: returns `(changed, Option<hash>)`, skipping hashing
-/// completely on unchanged or uniform strips.
-///
-/// # Safety
-/// `row_base + sx + STRIP_W <= aos.len()` and `<= prev.len()`.
-#[inline(always)]
-unsafe fn probe_curr_strip_hash<const HAS_ALPHA: bool>(
-    aos: BufferPointer<Vec4u8>,
-    prev: &[Vec4u8],
-    row_base: usize,
-    sx: usize,
-) -> (bool, Option<u64>) {
-    let base_ptr = aos.ptr();
-    let prev_slice = &prev[row_base + sx..row_base + sx + STRIP_W];
-    let mut words = [0u64; 8];
-    let mut changed_diff = 0u64;
-    for (pair, word) in words.iter_mut().enumerate() {
-        let i0 = pair * 2;
-        let i1 = i0 + 1;
-        // SAFETY: `i0 < i1 < STRIP_W`.
-        let ca = unsafe { base_ptr.add(row_base + sx + i0).read() };
-        // SAFETY: `i1 < STRIP_W`.
-        let cb = unsafe { base_ptr.add(row_base + sx + i1).read() };
-        let cw = pack_pair::<HAS_ALPHA>(ca, cb);
-        let pw = pack_pair::<HAS_ALPHA>(prev_slice[i0], prev_slice[i1]);
-        *word = cw;
-        changed_diff |= cw ^ pw;
-    }
-    if changed_diff == 0 {
-        return (false, None);
-    }
-    let p0 = words[0] & 0xFFFF_FFFF;
-    let p0_pair = p0 | (p0 << 32);
-    let mut uniform_diff = 0u64;
-    for &w in &words {
-        uniform_diff |= w ^ p0_pair;
-    }
-    if uniform_diff == 0 {
-        return (true, None);
-    }
-    (true, Some(hash_pair_words(words)))
-}
-
-/// Computes the strip hash in `prev`, returning `None` immediately on uniform
-/// solid-color strips.
-#[inline(always)]
-fn hash_prev_strip_non_uniform<const HAS_ALPHA: bool>(
-    prev: &[Vec4u8],
-    row_base: usize,
-    sx: usize,
-) -> Option<u64> {
-    let slice = &prev[row_base + sx..row_base + sx + STRIP_W];
-    let mut words = [0u64; 8];
-    for (pair, word) in words.iter_mut().enumerate() {
-        let i0 = pair * 2;
-        *word = pack_pair::<HAS_ALPHA>(slice[i0], slice[i0 + 1]);
-    }
-    let p0 = words[0] & 0xFFFF_FFFF;
-    let p0_pair = p0 | (p0 << 32);
-    let mut uniform_diff = 0u64;
-    for &w in &words {
-        uniform_diff |= w ^ p0_pair;
-    }
-    (uniform_diff != 0).then(|| hash_pair_words(words))
 }
 
 #[derive(Copy, Clone)]
@@ -557,57 +917,21 @@ fn kadane_best_range(scores: &[i32]) -> Option<(usize, usize)> {
     (best_sum > 0).then_some((best_start, best_end))
 }
 
-/// Places cache-line-aligned 16px horizontal probe strips across `0..width`
-/// spaced by `<= 240`px so every `>= 256`px pane fully contains at least one
-/// strip while staying clear of window borders and edge scrollbars.
-fn build_strip_positions(width: usize) -> ([usize; MAX_STRIPS], usize) {
-    let mut xs = [0usize; MAX_STRIPS];
+/// Returns the number of cache-line-aligned 16px horizontal probe strips placed
+/// across `0..width` spaced by `STRIP_STEP_X` (`240` px) starting at
+/// `STRIP_START_X` (`112` px).
+#[inline(always)]
+fn strip_count(width: usize) -> usize {
     if width < MIN_SCROLL_DIM as usize {
-        return (xs, 0);
+        return 0;
     }
-    let mut n = 0usize;
-    let mut sx = 112usize;
-    while sx + STRIP_W <= width && n < MAX_STRIPS {
-        xs[n] = sx;
-        n += 1;
-        sx += STRIP_STEP_X;
-    }
-    (xs, n)
+    (((width - STRIP_START_X - STRIP_W) / STRIP_STEP_X) + 1).min(MAX_STRIPS)
 }
 
-/// Computes strip-level row match score on `[sx, sx + STRIP_W)` at `dst_y`.
-///
-/// # Safety
-/// `dst_y` and `src_y` must be strictly `< height` and `sx + STRIP_W <= width`.
-#[inline]
-unsafe fn score_strip_row<const HAS_ALPHA: bool>(
-    aos: BufferPointer<Vec4u8>,
-    prev: &[Vec4u8],
-    stride_px: usize,
-    dst_y: usize,
-    src_y: usize,
-    sx: usize,
-) -> i32 {
-    let mut ok = 0usize;
-    let mut moved = 0usize;
-    for dx in 0..STRIP_W {
-        let x = sx + dx;
-        // SAFETY: Caller guarantees `(dst_y, x)` is in-bounds.
-        let c = unsafe { read_curr_px::<HAS_ALPHA>(aos, stride_px, dst_y, x) };
-        let ps = read_prev_px::<HAS_ALPHA>(prev, stride_px, src_y, x);
-        if c == ps {
-            ok += 1;
-            let p0 = read_prev_px::<HAS_ALPHA>(prev, stride_px, dst_y, x);
-            if c != p0 {
-                moved += 1;
-            }
-        }
-    }
-    if ok * 4 >= STRIP_W * 3 {
-        if moved > 0 { 3 } else { 0 }
-    } else {
-        -4
-    }
+/// Returns the horizontal pixel offset of probe strip `si`.
+#[inline(always)]
+const fn strip_x(si: usize) -> usize {
+    STRIP_START_X + si * STRIP_STEP_X
 }
 
 /// Evaluates whether a single pixel column `x` across `sample_rows` matches
@@ -648,7 +972,7 @@ unsafe fn eval_column<const HAS_ALPHA: bool>(
 ///
 /// # Safety
 /// `dst_y`, `src_y`, and all `sample_cols` must be in-bounds.
-#[inline]
+#[inline(always)]
 unsafe fn eval_row_cols<const HAS_ALPHA: bool>(
     aos: BufferPointer<Vec4u8>,
     prev: &[Vec4u8],
@@ -674,6 +998,30 @@ unsafe fn eval_row_cols<const HAS_ALPHA: bool>(
     (moved, ok)
 }
 
+/// Scores a single candidate row `dst_y` across `sample_cols`.
+///
+/// # Safety
+/// `dst_y`, `(dst_y - dy)`, and all `sample_cols` must be in-bounds.
+#[inline(always)]
+unsafe fn score_candidate_row<const HAS_ALPHA: bool>(
+    aos: BufferPointer<Vec4u8>,
+    prev: &[Vec4u8],
+    stride_px: usize,
+    sample_cols: &[usize],
+    dy: i32,
+    dst_y: usize,
+) -> (i32, bool) {
+    let src_y = (dst_y as isize - dy as isize) as usize;
+    // SAFETY: Caller guarantees `dst_y`, `src_y`, and `sample_cols` are in-bounds.
+    let (moved, ok) =
+        unsafe { eval_row_cols::<HAS_ALPHA>(aos, prev, stride_px, dst_y, src_y, sample_cols) };
+    if ok * 4 >= sample_cols.len() * 3 {
+        if moved > 0 { (3, true) } else { (0, false) }
+    } else {
+        (-5, false)
+    }
+}
+
 /// Phase 2: given candidate vertical shift `dy` detected on strip `seed_sx`,
 /// expands and refines exact `(x, y, width, height)` bounds inside
 /// `[band_y0, band_y1)` and applies the profitability & match-ratio gate.
@@ -681,8 +1029,9 @@ unsafe fn eval_row_cols<const HAS_ALPHA: bool>(
 /// # Safety
 /// `aos` and `prev` must be valid for `height * stride_px` pixels,
 /// `band_y1 <= height`, `width <= stride_px`, and `seed_sx + STRIP_W <= width`.
-#[inline(never)]
-unsafe fn expand_and_verify_candidate<const HAS_ALPHA: bool>(
+#[inline(always)]
+pub(super) unsafe fn expand_and_verify_candidate_with<K: RowKernel, const HAS_ALPHA: bool>(
+    kernel: K,
     aos: BufferPointer<Vec4u8>,
     prev: &[Vec4u8],
     width: usize,
@@ -721,12 +1070,20 @@ unsafe fn expand_and_verify_candidate<const HAS_ALPHA: bool>(
         heap_scores.resize(n_seed_steps, 0);
         &mut heap_scores
     };
+    let curr_base = aos.ptr();
+    let prev_base = prev.as_ptr();
     for (i, slot) in seed_scores.iter_mut().enumerate() {
         let dst_y = valid_y_start + i * y_coarse_step;
         let src_y = (dst_y as isize - dy as isize) as usize;
-        // SAFETY: `dst_y` and `src_y` lie in `[band_y0, band_y1) <= height`.
-        *slot =
-            unsafe { score_strip_row::<HAS_ALPHA>(aos, prev, stride_px, dst_y, src_y, seed_sx) };
+        // SAFETY: `dst_y` and `src_y` lie in `[band_y0, band_y1) <= height`,
+        // and `seed_sx + STRIP_W <= width <= stride_px`.
+        *slot = unsafe {
+            kernel.score_strip_row::<HAS_ALPHA>(
+                curr_base.add(dst_y * stride_px + seed_sx),
+                prev_base.add(src_y * stride_px + seed_sx),
+                prev_base.add(dst_y * stride_px + seed_sx),
+            )
+        };
     }
     let (seed_i0, seed_i1) = kadane_best_range(seed_scores)?;
     let seed_y0 = valid_y_start + seed_i0 * y_coarse_step;
@@ -911,21 +1268,12 @@ unsafe fn expand_and_verify_candidate<const HAS_ALPHA: bool>(
         *col = x0 + ((i * 2 + 1) * span_w) / (Y_SAMPLE_COLS * 2);
     }
 
-    let score_row = |dst_y: usize| -> (i32, bool) {
-        let src_y = (dst_y as isize - dy as isize) as usize;
-        // SAFETY: `dst_y` and `src_y` lie in `[band_y0, band_y1) <= height`.
-        let (moved, ok) =
-            unsafe { eval_row_cols::<HAS_ALPHA>(aos, prev, stride_px, dst_y, src_y, &sample_cols) };
-        if ok * 4 >= Y_SAMPLE_COLS * 3 {
-            if moved > 0 { (3, true) } else { (0, false) }
-        } else {
-            (-5, false)
-        }
-    };
-
     for (i, slot) in seed_scores.iter_mut().enumerate() {
         let dst_y = valid_y_start + i * y_coarse_step;
-        *slot = score_row(dst_y).0;
+        // SAFETY: `dst_y`, `dst_y - dy`, and `sample_cols` are in-bounds.
+        *slot = unsafe {
+            score_candidate_row::<HAS_ALPHA>(aos, prev, stride_px, &sample_cols, dy, dst_y).0
+        };
     }
     let (yi0, yi1) = kadane_best_range(seed_scores)?;
     let mut dst_y0 = valid_y_start + yi0 * y_coarse_step;
@@ -934,17 +1282,28 @@ unsafe fn expand_and_verify_candidate<const HAS_ALPHA: bool>(
     // Refine top edge `dst_y0` row-by-row, bridging matching blank line-spacing
     // gaps (up to `MAX_EDGE_GAP` rows) until a mismatch or `valid_y_start`.
     {
-        let (s0, _) = score_row(dst_y0);
+        // SAFETY: `dst_y0`, `dst_y0 - dy`, and `sample_cols` are in-bounds.
+        let (s0, _) = unsafe {
+            score_candidate_row::<HAS_ALPHA>(aos, prev, stride_px, &sample_cols, dy, dst_y0)
+        };
         if s0 < 0 {
             let limit = (dst_y0 + y_coarse_step).min(dst_y1);
-            while dst_y0 < limit && score_row(dst_y0).0 < 0 {
+            while dst_y0 < limit
+                && unsafe {
+                    score_candidate_row::<HAS_ALPHA>(aos, prev, stride_px, &sample_cols, dy, dst_y0)
+                        .0
+                } < 0
+            {
                 dst_y0 += 1;
             }
         } else {
             let mut best_y0 = dst_y0;
             let mut gap = 0usize;
             for cy in (valid_y_start..dst_y0).rev() {
-                let (s, strong) = score_row(cy);
+                // SAFETY: `cy`, `cy - dy`, and `sample_cols` are in-bounds.
+                let (s, strong) = unsafe {
+                    score_candidate_row::<HAS_ALPHA>(aos, prev, stride_px, &sample_cols, dy, cy)
+                };
                 if s < 0 {
                     break;
                 }
@@ -964,17 +1323,35 @@ unsafe fn expand_and_verify_candidate<const HAS_ALPHA: bool>(
 
     // Refine bottom edge `dst_y1` row-by-row.
     if dst_y1 > dst_y0 {
-        let (s_last, _) = score_row(dst_y1 - 1);
+        // SAFETY: `dst_y1 - 1`, `dst_y1 - 1 - dy`, and `sample_cols` are in-bounds.
+        let (s_last, _) = unsafe {
+            score_candidate_row::<HAS_ALPHA>(aos, prev, stride_px, &sample_cols, dy, dst_y1 - 1)
+        };
         if s_last < 0 {
             let limit = dst_y1.saturating_sub(y_coarse_step).max(dst_y0);
-            while dst_y1 > limit && score_row(dst_y1 - 1).0 < 0 {
+            while dst_y1 > limit
+                && unsafe {
+                    score_candidate_row::<HAS_ALPHA>(
+                        aos,
+                        prev,
+                        stride_px,
+                        &sample_cols,
+                        dy,
+                        dst_y1 - 1,
+                    )
+                    .0
+                } < 0
+            {
                 dst_y1 -= 1;
             }
         } else {
             let mut best_y1 = dst_y1;
             let mut gap = 0usize;
             for cy in dst_y1..valid_y_end {
-                let (s, strong) = score_row(cy);
+                // SAFETY: `cy`, `cy - dy`, and `sample_cols` are in-bounds.
+                let (s, strong) = unsafe {
+                    score_candidate_row::<HAS_ALPHA>(aos, prev, stride_px, &sample_cols, dy, cy)
+                };
                 if s < 0 {
                     break;
                 }
@@ -1054,67 +1431,29 @@ unsafe fn expand_and_verify_candidate<const HAS_ALPHA: bool>(
     Some((sr, copy_area))
 }
 
-/// Detects the dominant vertical [`ScrollRect`] within a single contiguous
-/// band `[band_y0, band_y1)`.
+/// Phase 1b: 7-row burst ruler sampling on `curr` against every 7th `prev` row,
+/// split out of Tier 0 so unchanged frames never allocate the 4 KiB
+/// [`RowHashTable`] / [`VoteTable`] stack frame or execute stack probes.
 ///
 /// # Safety
 /// `aos` and `prev` must be valid for `height * stride_px` pixels,
-/// `band_y1 <= height`, and `width <= stride_px`.
-#[inline(never)]
-unsafe fn detect_scroll_in_band<const HAS_ALPHA: bool>(
+/// `band_y1 <= height`, `width <= stride_px`, and `n_strips == strip_count(width)`.
+#[inline(always)]
+pub(super) unsafe fn detect_scroll_phase1b_with<K: RowKernel, const HAS_ALPHA: bool>(
+    kernel: K,
     aos: BufferPointer<Vec4u8>,
     prev: &[Vec4u8],
     width: usize,
     stride_px: usize,
     band_y0: usize,
     band_y1: usize,
+    n_strips: usize,
+    tier0_step_y: usize,
+    changed_rows: &[u16; MAX_STRIPS],
+    changed_non_uniform: &[u16; MAX_STRIPS],
+    min_y: &[u32; MAX_STRIPS],
+    max_y: &[u32; MAX_STRIPS],
 ) -> Option<(ScrollRect, u64)> {
-    let band_h = band_y1.saturating_sub(band_y0);
-    if width < MIN_SCROLL_DIM as usize || band_h < MIN_SCROLL_DIM as usize {
-        return None;
-    }
-
-    let (strip_xs, n_strips) = build_strip_positions(width);
-    if n_strips == 0 {
-        return None;
-    }
-
-    // Tier 0: zero-hash coarse activity grid (72 probes on 1080p, 304 on 4K).
-    let tier0_step_y = (band_h / 4).clamp(32, TIER0_MAX_STEP_Y);
-    let mut changed_rows = [0u16; MAX_STRIPS];
-    let mut changed_non_uniform = [0u16; MAX_STRIPS];
-    let mut min_y = [u32::MAX; MAX_STRIPS];
-    let mut max_y = [0u32; MAX_STRIPS];
-    let mut any_changed = false;
-
-    let mut ry = band_y0 + tier0_step_y / 2;
-    while ry < band_y1 {
-        let row_base = ry * stride_px;
-        let ry_u32 = ry as u32;
-        for (si, &sx) in strip_xs[..n_strips].iter().enumerate() {
-            // SAFETY: `ry < band_y1 <= height` and `sx + STRIP_W <= width <= stride_px`.
-            let (changed, non_uniform) =
-                unsafe { probe_strip_activity::<HAS_ALPHA>(aos, prev, row_base, sx) };
-            if changed {
-                any_changed = true;
-                changed_rows[si] += 1;
-                if non_uniform {
-                    changed_non_uniform[si] += 1;
-                }
-                if ry_u32 < min_y[si] {
-                    min_y[si] = ry_u32;
-                }
-                if ry_u32 > max_y[si] {
-                    max_y[si] = ry_u32;
-                }
-            }
-        }
-        ry += tier0_step_y;
-    }
-    if !any_changed {
-        return None;
-    }
-
     // Pick up to 2 best active strips, preferring horizontal separation >= 2
     // strips for the second probe so a local overlay/animation doesn't hide a
     // scrolling pane.
@@ -1158,15 +1497,15 @@ unsafe fn detect_scroll_in_band<const HAS_ALPHA: bool>(
         }
     }
 
-    // Phase 1b: 7-row burst ruler sampling on `curr` against every 7th `prev`
-    // row (primary strip first; secondary only if primary lacks a decisive hit).
+    let curr_base = aos.ptr();
+    let prev_base = prev.as_ptr();
     let mut best_result: Option<(ScrollRect, u64)> = None;
     let probe_order = [Some(first_si), second_si];
     for (attempt, si_opt) in probe_order.into_iter().enumerate() {
         let Some(si) = si_opt else {
             break;
         };
-        let sx = strip_xs[si];
+        let sx = strip_x(si);
 
         // Bound anchor placement to the strip's active vertical window (at
         // least `MIN_SCROLL_DIM` tall) so small scrolling panes on large
@@ -1192,9 +1531,12 @@ unsafe fn detect_scroll_in_band<const HAS_ALPHA: bool>(
         let mut n_anchors = 0usize;
         while anchor_y + PREV_STEP <= win_y1 && n_anchors < MAX_ANCHORS {
             for ry in anchor_y..anchor_y + PREV_STEP {
-                // SAFETY: `ry < win_y1 <= band_y1 <= height` and `sx + STRIP_W <= width`.
-                let (changed, hash_opt) =
-                    unsafe { probe_curr_strip_hash::<HAS_ALPHA>(aos, prev, ry * stride_px, sx) };
+                let off = ry * stride_px + sx;
+                // SAFETY: `ry < win_y1 <= band_y1 <= height` and `sx + STRIP_W <= width <= stride_px`.
+                let (changed, hash_opt) = unsafe {
+                    kernel
+                        .probe_curr_strip_hash::<HAS_ALPHA>(curr_base.add(off), prev_base.add(off))
+                };
                 if changed {
                     curr_min_y = curr_min_y.min(ry);
                     curr_max_y = curr_max_y.max(ry);
@@ -1215,8 +1557,10 @@ unsafe fn detect_scroll_in_band<const HAS_ALPHA: bool>(
         let mut votes = VoteTable::new();
         let mut yp = band_y0;
         while yp < band_y1 {
-            if let Some(h) = hash_prev_strip_non_uniform::<HAS_ALPHA>(prev, yp * stride_px, sx)
-                && let Some(yc) = table.lookup_unique(h)
+            // SAFETY: `yp < band_y1 <= height` and `sx + STRIP_W <= width <= stride_px`.
+            if let Some(h) = unsafe {
+                kernel.hash_prev_strip_non_uniform::<HAS_ALPHA>(prev_base.add(yp * stride_px + sx))
+            } && let Some(yc) = table.lookup_unique(h)
             {
                 let dy = yc as i32 - yp as i32;
                 if dy != 0 {
@@ -1230,7 +1574,7 @@ unsafe fn detect_scroll_in_band<const HAS_ALPHA: bool>(
         for cand in &top[..n_top] {
             // SAFETY: Band bounds and `sx + STRIP_W <= width` were verified above.
             if let Some((sr, area)) = unsafe {
-                expand_and_verify_candidate::<HAS_ALPHA>(
+                kernel.expand_and_verify_scroll_candidate::<HAS_ALPHA>(
                     aos, prev, width, stride_px, band_y0, band_y1, sx, cand.dy,
                 )
             } && best_result.is_none_or(|(_, best_area)| area > best_area)
@@ -1247,18 +1591,101 @@ unsafe fn detect_scroll_in_band<const HAS_ALPHA: bool>(
     best_result
 }
 
-/// Detects a profitable vertical scroll blit between `prev_shadow` and `curr`
-/// within `bands` (or the full frame when `bands` is `None`).
+/// Detects the dominant vertical [`ScrollRect`] within a single contiguous
+/// band `[band_y0, band_y1)`, keeping the Tier-0 clean-frame fast path tiny and
+/// stack-probe-free before handing off to [`RowKernel::detect_scroll_phase1b`].
 ///
-/// Reads `curr` exclusively through [`BufferPointer`] within the caller's
-/// fault-probed `bands` so shared-memory aliasing and `SIGBUS` boundaries are
-/// preserved. Returns `None` when no profitable scroll is found.
-#[inline(never)]
-pub fn detect_scroll_rect(
+/// # Safety
+/// `aos` and `prev` must be valid for `height * stride_px` pixels,
+/// `band_y1 <= height`, and `width <= stride_px`.
+#[inline(always)]
+pub(super) unsafe fn detect_scroll_in_band_with<K: RowKernel, const HAS_ALPHA: bool>(
+    kernel: K,
+    aos: BufferPointer<Vec4u8>,
+    prev: &[Vec4u8],
+    width: usize,
+    stride_px: usize,
+    band_y0: usize,
+    band_y1: usize,
+) -> Option<(ScrollRect, u64)> {
+    let band_h = band_y1.saturating_sub(band_y0);
+    if width < MIN_SCROLL_DIM as usize || band_h < MIN_SCROLL_DIM as usize {
+        return None;
+    }
+
+    let n_strips = strip_count(width);
+    if n_strips == 0 {
+        return None;
+    }
+
+    // Tier 0: zero-hash coarse SIMD activity grid (72 probes on 1080p, 352 on 4K).
+    let tier0_step_y = (band_h / 4).clamp(32, TIER0_MAX_STEP_Y);
+    let mut changed_rows = [0u16; MAX_STRIPS];
+    let mut changed_non_uniform = [0u16; MAX_STRIPS];
+    let mut min_y = [0u32; MAX_STRIPS];
+    let mut max_y = [0u32; MAX_STRIPS];
+    let mut any_changed = false;
+
+    let curr_base = aos.ptr();
+    let prev_base = prev.as_ptr();
+    let mut ry = band_y0 + tier0_step_y / 2;
+    while ry < band_y1 {
+        let row_start = ry * stride_px + STRIP_START_X;
+        let ry_u32 = ry as u32;
+        // SAFETY: `ry < band_y1 <= height` and `strip_x(n_strips - 1) + STRIP_W <= width <= stride_px`.
+        let row_curr = unsafe { curr_base.add(row_start) };
+        let row_prev = unsafe { prev_base.add(row_start) };
+        for si in 0..n_strips {
+            let off_x = si * STRIP_STEP_X;
+            // SAFETY: `STRIP_START_X + off_x + STRIP_W <= width <= stride_px`, so both
+            // offset pointers and their 16-pixel windows are strictly in-bounds on row `ry`.
+            if let Some(non_uniform) = unsafe {
+                kernel.probe_strip_activity::<HAS_ALPHA>(row_curr.add(off_x), row_prev.add(off_x))
+            } {
+                any_changed = true;
+                let prev_rows = changed_rows[si];
+                changed_rows[si] = prev_rows + 1;
+                if non_uniform {
+                    changed_non_uniform[si] += 1;
+                }
+                if prev_rows == 0 {
+                    min_y[si] = ry_u32;
+                }
+                max_y[si] = ry_u32;
+            }
+        }
+        ry += tier0_step_y;
+    }
+    if !any_changed {
+        return None;
+    }
+
+    // SAFETY: Band bounds and `n_strips == strip_count(width)` were verified above.
+    unsafe {
+        kernel.detect_scroll_phase1b::<HAS_ALPHA>(
+            aos,
+            prev,
+            width,
+            stride_px,
+            band_y0,
+            band_y1,
+            n_strips,
+            tier0_step_y,
+            &changed_rows,
+            &changed_non_uniform,
+            &min_y,
+            &max_y,
+        )
+    }
+}
+
+/// Detects a profitable vertical scroll blit using an explicit SIMD `tier`.
+pub(super) fn detect_scroll_rect_with_tier(
     curr: BufferPointer<u8>,
     prev_shadow: &[u8],
     metadata: BufferMetadata,
     bands: Option<&[RowBand]>,
+    tier: arch::Tier,
 ) -> Option<ScrollRect> {
     let total_pixels = metadata.validate().ok()?;
     let byte_len = total_pixels.checked_mul(4)?;
@@ -1295,9 +1722,9 @@ pub fn detect_scroll_rect(
         // `y1 <= height`, and `width <= stride_px`.
         let cand = unsafe {
             if has_alpha {
-                detect_scroll_in_band::<true>(aos, prev, width, stride_px, y0, y1)
+                tier.detect_scroll_in_band::<true>(aos, prev, width, stride_px, y0, y1)
             } else {
-                detect_scroll_in_band::<false>(aos, prev, width, stride_px, y0, y1)
+                tier.detect_scroll_in_band::<false>(aos, prev, width, stride_px, y0, y1)
             }
         };
         if let Some((sr, area)) = cand
@@ -1314,4 +1741,20 @@ pub fn detect_scroll_rect(
         );
         sr
     })
+}
+
+/// Detects a profitable vertical scroll blit between `prev_shadow` and `curr`
+/// within `bands` (or the full frame when `bands` is `None`).
+///
+/// Reads `curr` exclusively through [`BufferPointer`] within the caller's
+/// fault-probed `bands` so shared-memory aliasing and `SIGBUS` boundaries are
+/// preserved. Returns `None` when no profitable scroll is found.
+#[inline(never)]
+pub fn detect_scroll_rect(
+    curr: BufferPointer<u8>,
+    prev_shadow: &[u8],
+    metadata: BufferMetadata,
+    bands: Option<&[RowBand]>,
+) -> Option<ScrollRect> {
+    detect_scroll_rect_with_tier(curr, prev_shadow, metadata, bands, arch::Tier::detect())
 }

@@ -466,6 +466,64 @@ macro_rules! impl_finish_active_row_band_aes {
                 }
             }
         }
+
+        #[inline(never)]
+        #[target_feature(enable = $base_feat)]
+        unsafe fn detect_scroll_phase1b_impl<const HAS_ALPHA: bool>(
+            kernel: Kernel,
+            aos: crate::buffer_pointer::BufferPointer<crate::vec4u8::Vec4u8>,
+            prev: &[crate::vec4u8::Vec4u8],
+            width: usize,
+            stride_px: usize,
+            band_y0: usize,
+            band_y1: usize,
+            n_strips: usize,
+            tier0_step_y: usize,
+            changed_rows: &[u16; crate::filtering::scroll::MAX_STRIPS],
+            changed_non_uniform: &[u16; crate::filtering::scroll::MAX_STRIPS],
+            min_y: &[u32; crate::filtering::scroll::MAX_STRIPS],
+            max_y: &[u32; crate::filtering::scroll::MAX_STRIPS],
+        ) -> Option<(crate::serialization::framing::ScrollRect, u64)> {
+            // SAFETY: Caller upholds band and buffer bounds invariants.
+            unsafe {
+                crate::filtering::scroll::detect_scroll_phase1b_with::<Kernel, HAS_ALPHA>(
+                    kernel,
+                    aos,
+                    prev,
+                    width,
+                    stride_px,
+                    band_y0,
+                    band_y1,
+                    n_strips,
+                    tier0_step_y,
+                    changed_rows,
+                    changed_non_uniform,
+                    min_y,
+                    max_y,
+                )
+            }
+        }
+
+        #[inline(never)]
+        #[target_feature(enable = $base_feat)]
+        unsafe fn expand_and_verify_scroll_candidate_impl<const HAS_ALPHA: bool>(
+            kernel: Kernel,
+            aos: crate::buffer_pointer::BufferPointer<crate::vec4u8::Vec4u8>,
+            prev: &[crate::vec4u8::Vec4u8],
+            width: usize,
+            stride_px: usize,
+            band_y0: usize,
+            band_y1: usize,
+            seed_sx: usize,
+            dy: i32,
+        ) -> Option<(crate::serialization::framing::ScrollRect, u64)> {
+            // SAFETY: Caller upholds band and buffer bounds invariants.
+            unsafe {
+                crate::filtering::scroll::expand_and_verify_candidate_with::<Kernel, HAS_ALPHA>(
+                    kernel, aos, prev, width, stride_px, band_y0, band_y1, seed_sx, dy,
+                )
+            }
+        }
     };
 }
 
@@ -473,39 +531,53 @@ mod avx512 {
     use std::arch::x86_64::__m128i;
     use std::arch::x86_64::__m256i;
     use std::arch::x86_64::__m512i;
+    use std::arch::x86_64::_mm_cvtsi128_si64;
+    use std::arch::x86_64::_mm_extract_epi64;
     use std::arch::x86_64::_mm_loadl_epi64;
     use std::arch::x86_64::_mm_loadu_si128;
     use std::arch::x86_64::_mm_sfence;
     use std::arch::x86_64::_mm_srli_epi16;
     use std::arch::x86_64::_mm_storeu_si128;
     use std::arch::x86_64::_mm_unpacklo_epi8;
+    use std::arch::x86_64::_mm_xor_si128;
+    use std::arch::x86_64::_mm256_add_epi64;
+    use std::arch::x86_64::_mm256_castsi256_si128;
+    use std::arch::x86_64::_mm256_extracti128_si256;
     use std::arch::x86_64::_mm256_setr_epi32;
     use std::arch::x86_64::_mm256_storeu_si256;
+    use std::arch::x86_64::_mm256_xor_si256;
     use std::arch::x86_64::_mm512_abs_epi8;
     use std::arch::x86_64::_mm512_add_epi8;
     use std::arch::x86_64::_mm512_add_epi64;
     use std::arch::x86_64::_mm512_and_si512;
     use std::arch::x86_64::_mm512_andnot_si512;
     use std::arch::x86_64::_mm512_broadcast_i32x4;
+    use std::arch::x86_64::_mm512_broadcastd_epi32;
     use std::arch::x86_64::_mm512_bslli_epi128;
     use std::arch::x86_64::_mm512_castsi256_si512;
+    use std::arch::x86_64::_mm512_castsi512_si128;
+    use std::arch::x86_64::_mm512_castsi512_si256;
     use std::arch::x86_64::_mm512_cmpeq_epi8_mask;
+    use std::arch::x86_64::_mm512_cmpeq_epi32_mask;
     use std::arch::x86_64::_mm512_cmpneq_epi8_mask;
     use std::arch::x86_64::_mm512_cvtepi16_epi8;
     use std::arch::x86_64::_mm512_cvtepi32_epi8;
     use std::arch::x86_64::_mm512_cvtepu8_epi32;
     use std::arch::x86_64::_mm512_extracti32x4_epi32;
+    use std::arch::x86_64::_mm512_extracti64x4_epi64;
     use std::arch::x86_64::_mm512_inserti64x4;
     use std::arch::x86_64::_mm512_loadu_si512;
     use std::arch::x86_64::_mm512_madd_epi16;
     use std::arch::x86_64::_mm512_maddubs_epi16;
     use std::arch::x86_64::_mm512_mask_blend_epi32;
+    use std::arch::x86_64::_mm512_mask_cmpneq_epi32_mask;
     use std::arch::x86_64::_mm512_mask_storeu_epi8;
     use std::arch::x86_64::_mm512_mask_test_epi8_mask;
     use std::arch::x86_64::_mm512_maskz_loadu_epi8;
     use std::arch::x86_64::_mm512_maskz_permutexvar_epi8;
     use std::arch::x86_64::_mm512_maskz_sub_epi8;
     use std::arch::x86_64::_mm512_max_epu8;
+    use std::arch::x86_64::_mm512_mul_epu32;
     use std::arch::x86_64::_mm512_or_si512;
     use std::arch::x86_64::_mm512_permutex2var_epi8;
     use std::arch::x86_64::_mm512_permutexvar_epi8;
@@ -518,6 +590,7 @@ mod avx512 {
     use std::arch::x86_64::_mm512_setzero_si512;
     use std::arch::x86_64::_mm512_shuffle_epi8;
     use std::arch::x86_64::_mm512_srli_epi16;
+    use std::arch::x86_64::_mm512_srli_epi64;
     use std::arch::x86_64::_mm512_srlv_epi32;
     use std::arch::x86_64::_mm512_storeu_si512;
     use std::arch::x86_64::_mm512_stream_si512;
@@ -1246,6 +1319,212 @@ mod avx512 {
                 let v = _mm512_loadu_si512(src.as_ptr().add(x).cast());
                 _mm512_stream_si512(dst.as_mut_ptr().add(x).cast::<__m512i>(), v);
                 x += 16;
+            }
+        }
+    }
+
+    #[target_feature(enable = "avx512bw,avx512vl,avx512vbmi")]
+    #[inline]
+    unsafe fn hash_strip_avx512<const HAS_ALPHA: bool>(c: __m512i) -> u64 {
+        const M: [u32; 16] = crate::filtering::scroll::STRIP_HASH_MULS;
+        const MUL_EVEN: [u64; 8] = [
+            M[0] as u64,
+            M[2] as u64,
+            M[4] as u64,
+            M[6] as u64,
+            M[8] as u64,
+            M[10] as u64,
+            M[12] as u64,
+            M[14] as u64,
+        ];
+        const MUL_ODD: [u64; 8] = [
+            M[1] as u64,
+            M[3] as u64,
+            M[5] as u64,
+            M[7] as u64,
+            M[9] as u64,
+            M[11] as u64,
+            M[13] as u64,
+            M[15] as u64,
+        ];
+        // SAFETY: Caller guarantees AVX-512BW/VL/VBMI.
+        unsafe {
+            let cm = if HAS_ALPHA {
+                c
+            } else {
+                _mm512_and_si512(c, _mm512_set1_epi32(0x00FF_FFFFu32 as i32))
+            };
+            let me = _mm512_loadu_si512(MUL_EVEN.as_ptr().cast());
+            let mo = _mm512_loadu_si512(MUL_ODD.as_ptr().cast());
+            let even = _mm512_mul_epu32(cm, me);
+            let odd = _mm512_mul_epu32(_mm512_srli_epi64::<32>(cm), mo);
+            let a0 = _mm512_castsi512_si256(even);
+            let b0 = _mm512_extracti64x4_epi64::<1>(even);
+            let a1 = _mm512_castsi512_si256(odd);
+            let b1 = _mm512_extracti64x4_epi64::<1>(odd);
+            let t = _mm256_add_epi64(_mm256_xor_si256(a0, b0), _mm256_xor_si256(a1, b1));
+            let v128 = _mm_xor_si128(_mm256_castsi256_si128(t), _mm256_extracti128_si256::<1>(t));
+            let x0 = _mm_cvtsi128_si64(v128) as u64;
+            let x1 = _mm_extract_epi64::<1>(v128) as u64;
+            crate::filtering::scroll::finalize_strip_hash(x0, x1)
+        }
+    }
+
+    #[target_feature(enable = "avx512bw,avx512vl,avx512vbmi")]
+    #[inline]
+    unsafe fn probe_strip_activity_impl<const HAS_ALPHA: bool>(
+        curr: *const Vec4u8,
+        prev: *const Vec4u8,
+    ) -> Option<bool> {
+        // SAFETY: Caller guarantees AVX-512BW/VL/VBMI and 16 readable pixels.
+        unsafe {
+            let c = _mm512_loadu_si512(curr.cast());
+            let p = _mm512_loadu_si512(prev.cast());
+            let diff = _mm512_xor_si512(c, p);
+            if avx512_diff_mask::<HAS_ALPHA>(diff) == 0 {
+                return None;
+            }
+            let first = _mm512_broadcastd_epi32(_mm512_castsi512_si128(c));
+            let uniform = _mm512_xor_si512(c, first);
+            Some(avx512_diff_mask::<HAS_ALPHA>(uniform) != 0)
+        }
+    }
+
+    #[target_feature(enable = "avx512bw,avx512vl,avx512vbmi")]
+    #[inline]
+    unsafe fn probe_curr_strip_hash_impl<const HAS_ALPHA: bool>(
+        curr: *const Vec4u8,
+        prev: *const Vec4u8,
+    ) -> (bool, Option<u64>) {
+        // SAFETY: Caller guarantees AVX-512BW/VL/VBMI and 16 readable pixels.
+        unsafe {
+            let c = _mm512_loadu_si512(curr.cast());
+            let p = _mm512_loadu_si512(prev.cast());
+            let diff = _mm512_xor_si512(c, p);
+            if avx512_diff_mask::<HAS_ALPHA>(diff) == 0 {
+                return (false, None);
+            }
+            let first = _mm512_broadcastd_epi32(_mm512_castsi512_si128(c));
+            let uniform = _mm512_xor_si512(c, first);
+            if avx512_diff_mask::<HAS_ALPHA>(uniform) == 0 {
+                return (true, None);
+            }
+            (true, Some(hash_strip_avx512::<HAS_ALPHA>(c)))
+        }
+    }
+
+    #[target_feature(enable = "avx512bw,avx512vl,avx512vbmi")]
+    #[inline]
+    unsafe fn hash_prev_strip_non_uniform_impl<const HAS_ALPHA: bool>(
+        prev: *const Vec4u8,
+    ) -> Option<u64> {
+        // SAFETY: Caller guarantees AVX-512BW/VL/VBMI and 16 readable pixels.
+        unsafe {
+            let p = _mm512_loadu_si512(prev.cast());
+            let first = _mm512_broadcastd_epi32(_mm512_castsi512_si128(p));
+            let uniform = _mm512_xor_si512(p, first);
+            if avx512_diff_mask::<HAS_ALPHA>(uniform) == 0 {
+                return None;
+            }
+            Some(hash_strip_avx512::<HAS_ALPHA>(p))
+        }
+    }
+
+    #[target_feature(enable = "avx512bw,avx512vl,avx512vbmi")]
+    #[inline]
+    unsafe fn score_strip_row_impl<const HAS_ALPHA: bool>(
+        curr: *const Vec4u8,
+        prev_src: *const Vec4u8,
+        prev_dst: *const Vec4u8,
+    ) -> i32 {
+        // SAFETY: Caller guarantees AVX-512BW/VL/VBMI and 16 readable pixels.
+        unsafe {
+            let rgb_mask = _mm512_set1_epi32(0x00FF_FFFFu32 as i32);
+            let c_raw = _mm512_loadu_si512(curr.cast());
+            let ps_raw = _mm512_loadu_si512(prev_src.cast());
+            let (cm, psm) = if HAS_ALPHA {
+                (c_raw, ps_raw)
+            } else {
+                (
+                    _mm512_and_si512(c_raw, rgb_mask),
+                    _mm512_and_si512(ps_raw, rgb_mask),
+                )
+            };
+            let eq_ps = _mm512_cmpeq_epi32_mask(cm, psm);
+            if eq_ps.count_ones() < 12 {
+                return -4;
+            }
+            let p0_raw = _mm512_loadu_si512(prev_dst.cast());
+            let p0m = if HAS_ALPHA {
+                p0_raw
+            } else {
+                _mm512_and_si512(p0_raw, rgb_mask)
+            };
+            let moved = _mm512_mask_cmpneq_epi32_mask(eq_ps, cm, p0m);
+            if moved != 0 { 3 } else { 0 }
+        }
+    }
+
+    #[target_feature(enable = "avx512bw,avx512vl,avx512vbmi")]
+    #[inline]
+    unsafe fn copy_bytes_stream_impl(src: *const u8, dst: *mut u8, len: usize) {
+        if len == 0 {
+            return;
+        }
+        // SAFETY: Caller guarantees AVX-512BW/VL/VBMI and valid non-overlapping ranges.
+        unsafe {
+            if len < 128 {
+                if len <= 64 {
+                    let mask = if len == 64 {
+                        u64::MAX
+                    } else {
+                        (1u64 << len) - 1
+                    };
+                    let v = _mm512_maskz_loadu_epi8(mask, src.cast());
+                    _mm512_mask_storeu_epi8(dst.cast(), mask, v);
+                } else {
+                    let v0 = _mm512_loadu_si512(src.cast());
+                    let rem = len - 64;
+                    let mask = (1u64 << rem) - 1;
+                    let v1 = _mm512_maskz_loadu_epi8(mask, src.add(64).cast());
+                    _mm512_storeu_si512(dst.cast(), v0);
+                    _mm512_mask_storeu_epi8(dst.add(64).cast(), mask, v1);
+                }
+                return;
+            }
+            let head = (64 - (dst as usize & 63)) & 63;
+            if head != 0 {
+                let mask = (1u64 << head) - 1;
+                let v = _mm512_maskz_loadu_epi8(mask, src.cast());
+                _mm512_mask_storeu_epi8(dst.cast(), mask, v);
+            }
+            let s = src.add(head);
+            let d = dst.add(head);
+            let rem = len - head;
+            let lim256 = rem & !255;
+            let lim64 = rem & !63;
+            let mut i = 0usize;
+            while i < lim256 {
+                let v0 = _mm512_loadu_si512(s.add(i).cast());
+                let v1 = _mm512_loadu_si512(s.add(i + 64).cast());
+                let v2 = _mm512_loadu_si512(s.add(i + 128).cast());
+                let v3 = _mm512_loadu_si512(s.add(i + 192).cast());
+                _mm512_stream_si512(d.add(i).cast::<__m512i>(), v0);
+                _mm512_stream_si512(d.add(i + 64).cast::<__m512i>(), v1);
+                _mm512_stream_si512(d.add(i + 128).cast::<__m512i>(), v2);
+                _mm512_stream_si512(d.add(i + 192).cast::<__m512i>(), v3);
+                i += 256;
+            }
+            while i < lim64 {
+                let v = _mm512_loadu_si512(s.add(i).cast());
+                _mm512_stream_si512(d.add(i).cast::<__m512i>(), v);
+                i += 64;
+            }
+            let tail = rem - lim64;
+            if tail != 0 {
+                let mask = (1u64 << tail) - 1;
+                let v = _mm512_maskz_loadu_epi8(mask, s.add(i).cast());
+                _mm512_mask_storeu_epi8(d.add(i).cast(), mask, v);
             }
         }
     }
@@ -2171,6 +2450,108 @@ mod avx512 {
         }
 
         #[inline(always)]
+        unsafe fn probe_strip_activity<const HAS_ALPHA: bool>(
+            self,
+            curr: *const Vec4u8,
+            prev: *const Vec4u8,
+        ) -> Option<bool> {
+            // SAFETY: `self` witnesses AVX-512BW/VL/VBMI; caller guarantees 16 readable pixels.
+            unsafe { probe_strip_activity_impl::<HAS_ALPHA>(curr, prev) }
+        }
+
+        #[inline(always)]
+        unsafe fn probe_curr_strip_hash<const HAS_ALPHA: bool>(
+            self,
+            curr: *const Vec4u8,
+            prev: *const Vec4u8,
+        ) -> (bool, Option<u64>) {
+            // SAFETY: `self` witnesses AVX-512BW/VL/VBMI; caller guarantees 16 readable pixels.
+            unsafe { probe_curr_strip_hash_impl::<HAS_ALPHA>(curr, prev) }
+        }
+
+        #[inline(always)]
+        unsafe fn hash_prev_strip_non_uniform<const HAS_ALPHA: bool>(
+            self,
+            prev: *const Vec4u8,
+        ) -> Option<u64> {
+            // SAFETY: `self` witnesses AVX-512BW/VL/VBMI; caller guarantees 16 readable pixels.
+            unsafe { hash_prev_strip_non_uniform_impl::<HAS_ALPHA>(prev) }
+        }
+
+        #[inline(always)]
+        unsafe fn score_strip_row<const HAS_ALPHA: bool>(
+            self,
+            curr: *const Vec4u8,
+            prev_src: *const Vec4u8,
+            prev_dst: *const Vec4u8,
+        ) -> i32 {
+            // SAFETY: `self` witnesses AVX-512BW/VL/VBMI; caller guarantees 16 readable pixels.
+            unsafe { score_strip_row_impl::<HAS_ALPHA>(curr, prev_src, prev_dst) }
+        }
+
+        #[inline(always)]
+        unsafe fn copy_bytes_stream(self, src: *const u8, dst: *mut u8, len: usize) {
+            // SAFETY: `self` witnesses AVX-512BW/VL/VBMI; caller guarantees non-overlapping ranges.
+            unsafe { copy_bytes_stream_impl(src, dst, len) }
+        }
+
+        #[inline(always)]
+        unsafe fn detect_scroll_phase1b<const HAS_ALPHA: bool>(
+            self,
+            aos: BufferPointer<Vec4u8>,
+            prev: &[Vec4u8],
+            width: usize,
+            stride_px: usize,
+            band_y0: usize,
+            band_y1: usize,
+            n_strips: usize,
+            tier0_step_y: usize,
+            changed_rows: &[u16; crate::filtering::scroll::MAX_STRIPS],
+            changed_non_uniform: &[u16; crate::filtering::scroll::MAX_STRIPS],
+            min_y: &[u32; crate::filtering::scroll::MAX_STRIPS],
+            max_y: &[u32; crate::filtering::scroll::MAX_STRIPS],
+        ) -> Option<(crate::serialization::framing::ScrollRect, u64)> {
+            // SAFETY: `self` witnesses AVX-512BW/VL/VBMI; caller upholds band bounds invariants.
+            unsafe {
+                detect_scroll_phase1b_impl::<HAS_ALPHA>(
+                    self,
+                    aos,
+                    prev,
+                    width,
+                    stride_px,
+                    band_y0,
+                    band_y1,
+                    n_strips,
+                    tier0_step_y,
+                    changed_rows,
+                    changed_non_uniform,
+                    min_y,
+                    max_y,
+                )
+            }
+        }
+
+        #[inline(always)]
+        unsafe fn expand_and_verify_scroll_candidate<const HAS_ALPHA: bool>(
+            self,
+            aos: BufferPointer<Vec4u8>,
+            prev: &[Vec4u8],
+            width: usize,
+            stride_px: usize,
+            band_y0: usize,
+            band_y1: usize,
+            seed_sx: usize,
+            dy: i32,
+        ) -> Option<(crate::serialization::framing::ScrollRect, u64)> {
+            // SAFETY: `self` witnesses AVX-512BW/VL/VBMI; caller upholds band bounds invariants.
+            unsafe {
+                expand_and_verify_scroll_candidate_impl::<HAS_ALPHA>(
+                    self, aos, prev, width, stride_px, band_y0, band_y1, seed_sx, dy,
+                )
+            }
+        }
+
+        #[inline(always)]
         unsafe fn diff_and_update_row_band_2d<const HAS_ALPHA: bool>(
             self,
             ctx: &ActiveRowBandCtx<'_>,
@@ -2252,6 +2633,7 @@ mod avx2 {
     use std::arch::x86_64::_mm_sub_epi8;
     use std::arch::x86_64::_mm_unpacklo_epi32;
     use std::arch::x86_64::_mm_unpacklo_epi64;
+    use std::arch::x86_64::_mm_xor_si128;
     use std::arch::x86_64::_mm256_abs_epi8;
     use std::arch::x86_64::_mm256_add_epi8;
     use std::arch::x86_64::_mm256_add_epi64;
@@ -2259,6 +2641,7 @@ mod avx2 {
     use std::arch::x86_64::_mm256_and_si256;
     use std::arch::x86_64::_mm256_andnot_si256;
     use std::arch::x86_64::_mm256_blendv_ps;
+    use std::arch::x86_64::_mm256_broadcastd_epi32;
     use std::arch::x86_64::_mm256_broadcastsi128_si256;
     use std::arch::x86_64::_mm256_castps_si256;
     use std::arch::x86_64::_mm256_castsi256_ps;
@@ -2272,6 +2655,7 @@ mod avx2 {
     use std::arch::x86_64::_mm256_max_epu8;
     use std::arch::x86_64::_mm256_movemask_epi8;
     use std::arch::x86_64::_mm256_movemask_ps;
+    use std::arch::x86_64::_mm256_mul_epu32;
     use std::arch::x86_64::_mm256_or_si256;
     use std::arch::x86_64::_mm256_packus_epi16;
     use std::arch::x86_64::_mm256_permute2x128_si256;
@@ -2292,6 +2676,7 @@ mod avx2 {
     use std::arch::x86_64::_mm256_slli_si256;
     use std::arch::x86_64::_mm256_sllv_epi32;
     use std::arch::x86_64::_mm256_srli_epi16;
+    use std::arch::x86_64::_mm256_srli_epi64;
     use std::arch::x86_64::_mm256_srlv_epi32;
     use std::arch::x86_64::_mm256_storeu_si256;
     use std::arch::x86_64::_mm256_stream_si256;
@@ -3432,6 +3817,280 @@ mod avx2 {
 
     #[target_feature(enable = "avx2")]
     #[inline]
+    unsafe fn hash_strip_avx2<const HAS_ALPHA: bool>(
+        c0: __m256i,
+        c1: __m256i,
+        rgb_mask: __m256i,
+    ) -> u64 {
+        const M: [u32; 16] = crate::filtering::scroll::STRIP_HASH_MULS;
+        const MUL_EVEN_LO: [u64; 4] = [M[0] as u64, M[2] as u64, M[4] as u64, M[6] as u64];
+        const MUL_ODD_LO: [u64; 4] = [M[1] as u64, M[3] as u64, M[5] as u64, M[7] as u64];
+        const MUL_EVEN_HI: [u64; 4] = [M[8] as u64, M[10] as u64, M[12] as u64, M[14] as u64];
+        const MUL_ODD_HI: [u64; 4] = [M[9] as u64, M[11] as u64, M[13] as u64, M[15] as u64];
+        // SAFETY: Caller guarantees AVX2.
+        unsafe {
+            let (cm0, cm1) = if HAS_ALPHA {
+                (c0, c1)
+            } else {
+                (
+                    _mm256_and_si256(c0, rgb_mask),
+                    _mm256_and_si256(c1, rgb_mask),
+                )
+            };
+            let me_lo = _mm256_loadu_si256(MUL_EVEN_LO.as_ptr().cast::<__m256i>());
+            let mo_lo = _mm256_loadu_si256(MUL_ODD_LO.as_ptr().cast::<__m256i>());
+            let me_hi = _mm256_loadu_si256(MUL_EVEN_HI.as_ptr().cast::<__m256i>());
+            let mo_hi = _mm256_loadu_si256(MUL_ODD_HI.as_ptr().cast::<__m256i>());
+            let a0 = _mm256_mul_epu32(cm0, me_lo);
+            let a1 = _mm256_mul_epu32(_mm256_srli_epi64::<32>(cm0), mo_lo);
+            let b0 = _mm256_mul_epu32(cm1, me_hi);
+            let b1 = _mm256_mul_epu32(_mm256_srli_epi64::<32>(cm1), mo_hi);
+            let t = _mm256_add_epi64(_mm256_xor_si256(a0, b0), _mm256_xor_si256(a1, b1));
+            let v128 = _mm_xor_si128(_mm256_castsi256_si128(t), _mm256_extracti128_si256::<1>(t));
+            let x0 = _mm_cvtsi128_si64(v128) as u64;
+            let x1 = _mm_extract_epi64::<1>(v128) as u64;
+            crate::filtering::scroll::finalize_strip_hash(x0, x1)
+        }
+    }
+
+    #[target_feature(enable = "avx2")]
+    #[inline]
+    unsafe fn probe_strip_activity_impl<const HAS_ALPHA: bool>(
+        curr: *const Vec4u8,
+        prev: *const Vec4u8,
+    ) -> Option<bool> {
+        // SAFETY: Caller guarantees AVX2 and 16 readable pixels.
+        unsafe {
+            let rgb_mask = _mm256_set1_epi32(0x00FF_FFFFu32 as i32);
+            let c0 = _mm256_loadu_si256(curr.cast::<__m256i>());
+            let c1 = _mm256_loadu_si256(curr.add(8).cast::<__m256i>());
+            let d0 = _mm256_xor_si256(c0, _mm256_loadu_si256(prev.cast::<__m256i>()));
+            let d1 = _mm256_xor_si256(c1, _mm256_loadu_si256(prev.add(8).cast::<__m256i>()));
+            let diff = _mm256_or_si256(d0, d1);
+            let changed = if HAS_ALPHA {
+                _mm256_testz_si256(diff, diff) == 0
+            } else {
+                _mm256_testz_si256(diff, rgb_mask) == 0
+            };
+            if !changed {
+                return None;
+            }
+            let first = _mm256_broadcastd_epi32(_mm256_castsi256_si128(c0));
+            let u = _mm256_or_si256(_mm256_xor_si256(c0, first), _mm256_xor_si256(c1, first));
+            let non_uniform = if HAS_ALPHA {
+                _mm256_testz_si256(u, u) == 0
+            } else {
+                _mm256_testz_si256(u, rgb_mask) == 0
+            };
+            Some(non_uniform)
+        }
+    }
+
+    #[target_feature(enable = "avx2")]
+    #[inline]
+    unsafe fn probe_curr_strip_hash_impl<const HAS_ALPHA: bool>(
+        curr: *const Vec4u8,
+        prev: *const Vec4u8,
+    ) -> (bool, Option<u64>) {
+        // SAFETY: Caller guarantees AVX2 and 16 readable pixels.
+        unsafe {
+            let rgb_mask = _mm256_set1_epi32(0x00FF_FFFFu32 as i32);
+            let c0 = _mm256_loadu_si256(curr.cast::<__m256i>());
+            let c1 = _mm256_loadu_si256(curr.add(8).cast::<__m256i>());
+            let d0 = _mm256_xor_si256(c0, _mm256_loadu_si256(prev.cast::<__m256i>()));
+            let d1 = _mm256_xor_si256(c1, _mm256_loadu_si256(prev.add(8).cast::<__m256i>()));
+            let diff = _mm256_or_si256(d0, d1);
+            let changed = if HAS_ALPHA {
+                _mm256_testz_si256(diff, diff) == 0
+            } else {
+                _mm256_testz_si256(diff, rgb_mask) == 0
+            };
+            if !changed {
+                return (false, None);
+            }
+            let first = _mm256_broadcastd_epi32(_mm256_castsi256_si128(c0));
+            let u = _mm256_or_si256(_mm256_xor_si256(c0, first), _mm256_xor_si256(c1, first));
+            let non_uniform = if HAS_ALPHA {
+                _mm256_testz_si256(u, u) == 0
+            } else {
+                _mm256_testz_si256(u, rgb_mask) == 0
+            };
+            if !non_uniform {
+                return (true, None);
+            }
+            (true, Some(hash_strip_avx2::<HAS_ALPHA>(c0, c1, rgb_mask)))
+        }
+    }
+
+    #[target_feature(enable = "avx2")]
+    #[inline]
+    unsafe fn hash_prev_strip_non_uniform_impl<const HAS_ALPHA: bool>(
+        prev: *const Vec4u8,
+    ) -> Option<u64> {
+        // SAFETY: Caller guarantees AVX2 and 16 readable pixels.
+        unsafe {
+            let rgb_mask = _mm256_set1_epi32(0x00FF_FFFFu32 as i32);
+            let p0 = _mm256_loadu_si256(prev.cast::<__m256i>());
+            let p1 = _mm256_loadu_si256(prev.add(8).cast::<__m256i>());
+            let first = _mm256_broadcastd_epi32(_mm256_castsi256_si128(p0));
+            let u = _mm256_or_si256(_mm256_xor_si256(p0, first), _mm256_xor_si256(p1, first));
+            let non_uniform = if HAS_ALPHA {
+                _mm256_testz_si256(u, u) == 0
+            } else {
+                _mm256_testz_si256(u, rgb_mask) == 0
+            };
+            if !non_uniform {
+                return None;
+            }
+            Some(hash_strip_avx2::<HAS_ALPHA>(p0, p1, rgb_mask))
+        }
+    }
+
+    #[target_feature(enable = "avx2")]
+    #[inline]
+    unsafe fn score_strip_row_impl<const HAS_ALPHA: bool>(
+        curr: *const Vec4u8,
+        prev_src: *const Vec4u8,
+        prev_dst: *const Vec4u8,
+    ) -> i32 {
+        // SAFETY: Caller guarantees AVX2 and 16 readable pixels.
+        unsafe {
+            let rgb_mask = _mm256_set1_epi32(0x00FF_FFFFu32 as i32);
+            let zero = _mm256_setzero_si256();
+            let c0 = _mm256_loadu_si256(curr.cast::<__m256i>());
+            let c1 = _mm256_loadu_si256(curr.add(8).cast::<__m256i>());
+            let d0 = _mm256_xor_si256(c0, _mm256_loadu_si256(prev_src.cast::<__m256i>()));
+            let d1 = _mm256_xor_si256(c1, _mm256_loadu_si256(prev_src.add(8).cast::<__m256i>()));
+            let (dm0, dm1) = if HAS_ALPHA {
+                (d0, d1)
+            } else {
+                (
+                    _mm256_and_si256(d0, rgb_mask),
+                    _mm256_and_si256(d1, rgb_mask),
+                )
+            };
+            let eq0 = _mm256_movemask_ps(_mm256_castsi256_ps(_mm256_cmpeq_epi32(dm0, zero))) as u32;
+            let eq1 = _mm256_movemask_ps(_mm256_castsi256_ps(_mm256_cmpeq_epi32(dm1, zero))) as u32;
+            let eq_ps = eq0 | (eq1 << 8);
+            if eq_ps.count_ones() < 12 {
+                return -4;
+            }
+            let e0 = _mm256_xor_si256(c0, _mm256_loadu_si256(prev_dst.cast::<__m256i>()));
+            let e1 = _mm256_xor_si256(c1, _mm256_loadu_si256(prev_dst.add(8).cast::<__m256i>()));
+            let (em0, em1) = if HAS_ALPHA {
+                (e0, e1)
+            } else {
+                (
+                    _mm256_and_si256(e0, rgb_mask),
+                    _mm256_and_si256(e1, rgb_mask),
+                )
+            };
+            let eq_p0_0 =
+                _mm256_movemask_ps(_mm256_castsi256_ps(_mm256_cmpeq_epi32(em0, zero))) as u32;
+            let eq_p0_1 =
+                _mm256_movemask_ps(_mm256_castsi256_ps(_mm256_cmpeq_epi32(em1, zero))) as u32;
+            let eq_p0 = eq_p0_0 | (eq_p0_1 << 8);
+            if (eq_ps & !eq_p0) != 0 { 3 } else { 0 }
+        }
+    }
+
+    #[target_feature(enable = "avx2")]
+    #[inline]
+    unsafe fn copy_lt64_avx2(src: *const u8, dst: *mut u8, len: usize) {
+        debug_assert!(len > 0 && len < 64);
+        // SAFETY: Caller guarantees AVX2, `1 <= len < 64`, and valid non-overlapping ranges.
+        unsafe {
+            if len >= 32 {
+                let a = _mm256_loadu_si256(src.cast::<__m256i>());
+                let b = _mm256_loadu_si256(src.add(len - 32).cast::<__m256i>());
+                _mm256_storeu_si256(dst.cast::<__m256i>(), a);
+                _mm256_storeu_si256(dst.add(len - 32).cast::<__m256i>(), b);
+            } else if len >= 16 {
+                let a = _mm_loadu_si128(src.cast::<__m128i>());
+                let b = _mm_loadu_si128(src.add(len - 16).cast::<__m128i>());
+                _mm_storeu_si128(dst.cast::<__m128i>(), a);
+                _mm_storeu_si128(dst.add(len - 16).cast::<__m128i>(), b);
+            } else if len >= 8 {
+                let a = src.cast::<u64>().read_unaligned();
+                let b = src.add(len - 8).cast::<u64>().read_unaligned();
+                dst.cast::<u64>().write_unaligned(a);
+                dst.add(len - 8).cast::<u64>().write_unaligned(b);
+            } else if len >= 4 {
+                let a = src.cast::<u32>().read_unaligned();
+                let b = src.add(len - 4).cast::<u32>().read_unaligned();
+                dst.cast::<u32>().write_unaligned(a);
+                dst.add(len - 4).cast::<u32>().write_unaligned(b);
+            } else if len >= 2 {
+                let a = src.cast::<u16>().read_unaligned();
+                let b = src.add(len - 2).cast::<u16>().read_unaligned();
+                dst.cast::<u16>().write_unaligned(a);
+                dst.add(len - 2).cast::<u16>().write_unaligned(b);
+            } else {
+                *dst = *src;
+            }
+        }
+    }
+
+    #[target_feature(enable = "avx2")]
+    #[inline]
+    unsafe fn copy_bytes_stream_impl(src: *const u8, dst: *mut u8, len: usize) {
+        if len == 0 {
+            return;
+        }
+        // SAFETY: Caller guarantees AVX2 and valid non-overlapping ranges.
+        unsafe {
+            if len < 128 {
+                if len < 64 {
+                    copy_lt64_avx2(src, dst, len);
+                } else {
+                    let a = _mm256_loadu_si256(src.cast::<__m256i>());
+                    let b = _mm256_loadu_si256(src.add(32).cast::<__m256i>());
+                    let c = _mm256_loadu_si256(src.add(len - 64).cast::<__m256i>());
+                    let d = _mm256_loadu_si256(src.add(len - 32).cast::<__m256i>());
+                    _mm256_storeu_si256(dst.cast::<__m256i>(), a);
+                    _mm256_storeu_si256(dst.add(32).cast::<__m256i>(), b);
+                    _mm256_storeu_si256(dst.add(len - 64).cast::<__m256i>(), c);
+                    _mm256_storeu_si256(dst.add(len - 32).cast::<__m256i>(), d);
+                }
+                return;
+            }
+            let head = (64 - (dst as usize & 63)) & 63;
+            if head != 0 {
+                copy_lt64_avx2(src, dst, head);
+            }
+            let s = src.add(head);
+            let d = dst.add(head);
+            let rem = len - head;
+            let lim128 = rem & !127;
+            let lim64 = rem & !63;
+            let mut i = 0usize;
+            while i < lim128 {
+                let v0 = _mm256_loadu_si256(s.add(i).cast::<__m256i>());
+                let v1 = _mm256_loadu_si256(s.add(i + 32).cast::<__m256i>());
+                let v2 = _mm256_loadu_si256(s.add(i + 64).cast::<__m256i>());
+                let v3 = _mm256_loadu_si256(s.add(i + 96).cast::<__m256i>());
+                _mm256_stream_si256(d.add(i).cast::<__m256i>(), v0);
+                _mm256_stream_si256(d.add(i + 32).cast::<__m256i>(), v1);
+                _mm256_stream_si256(d.add(i + 64).cast::<__m256i>(), v2);
+                _mm256_stream_si256(d.add(i + 96).cast::<__m256i>(), v3);
+                i += 128;
+            }
+            if i < lim64 {
+                let v0 = _mm256_loadu_si256(s.add(i).cast::<__m256i>());
+                let v1 = _mm256_loadu_si256(s.add(i + 32).cast::<__m256i>());
+                _mm256_stream_si256(d.add(i).cast::<__m256i>(), v0);
+                _mm256_stream_si256(d.add(i + 32).cast::<__m256i>(), v1);
+                i += 64;
+            }
+            let tail = rem - lim64;
+            if tail != 0 {
+                copy_lt64_avx2(s.add(i), d.add(i), tail);
+            }
+        }
+    }
+
+    #[target_feature(enable = "avx2")]
+    #[inline]
     unsafe fn is_constant_plane_impl(data: &[u8]) -> Option<u8> {
         let first = *data.first()?;
         let lim = (data.len() / 32) * 32;
@@ -4508,6 +5167,108 @@ mod avx2 {
         }
 
         #[inline(always)]
+        unsafe fn probe_strip_activity<const HAS_ALPHA: bool>(
+            self,
+            curr: *const Vec4u8,
+            prev: *const Vec4u8,
+        ) -> Option<bool> {
+            // SAFETY: `self` witnesses AVX2; caller guarantees 16 readable pixels.
+            unsafe { probe_strip_activity_impl::<HAS_ALPHA>(curr, prev) }
+        }
+
+        #[inline(always)]
+        unsafe fn probe_curr_strip_hash<const HAS_ALPHA: bool>(
+            self,
+            curr: *const Vec4u8,
+            prev: *const Vec4u8,
+        ) -> (bool, Option<u64>) {
+            // SAFETY: `self` witnesses AVX2; caller guarantees 16 readable pixels.
+            unsafe { probe_curr_strip_hash_impl::<HAS_ALPHA>(curr, prev) }
+        }
+
+        #[inline(always)]
+        unsafe fn hash_prev_strip_non_uniform<const HAS_ALPHA: bool>(
+            self,
+            prev: *const Vec4u8,
+        ) -> Option<u64> {
+            // SAFETY: `self` witnesses AVX2; caller guarantees 16 readable pixels.
+            unsafe { hash_prev_strip_non_uniform_impl::<HAS_ALPHA>(prev) }
+        }
+
+        #[inline(always)]
+        unsafe fn score_strip_row<const HAS_ALPHA: bool>(
+            self,
+            curr: *const Vec4u8,
+            prev_src: *const Vec4u8,
+            prev_dst: *const Vec4u8,
+        ) -> i32 {
+            // SAFETY: `self` witnesses AVX2; caller guarantees 16 readable pixels.
+            unsafe { score_strip_row_impl::<HAS_ALPHA>(curr, prev_src, prev_dst) }
+        }
+
+        #[inline(always)]
+        unsafe fn copy_bytes_stream(self, src: *const u8, dst: *mut u8, len: usize) {
+            // SAFETY: `self` witnesses AVX2; caller guarantees non-overlapping ranges.
+            unsafe { copy_bytes_stream_impl(src, dst, len) }
+        }
+
+        #[inline(always)]
+        unsafe fn detect_scroll_phase1b<const HAS_ALPHA: bool>(
+            self,
+            aos: BufferPointer<Vec4u8>,
+            prev: &[Vec4u8],
+            width: usize,
+            stride_px: usize,
+            band_y0: usize,
+            band_y1: usize,
+            n_strips: usize,
+            tier0_step_y: usize,
+            changed_rows: &[u16; crate::filtering::scroll::MAX_STRIPS],
+            changed_non_uniform: &[u16; crate::filtering::scroll::MAX_STRIPS],
+            min_y: &[u32; crate::filtering::scroll::MAX_STRIPS],
+            max_y: &[u32; crate::filtering::scroll::MAX_STRIPS],
+        ) -> Option<(crate::serialization::framing::ScrollRect, u64)> {
+            // SAFETY: `self` witnesses AVX2; caller upholds band bounds invariants.
+            unsafe {
+                detect_scroll_phase1b_impl::<HAS_ALPHA>(
+                    self,
+                    aos,
+                    prev,
+                    width,
+                    stride_px,
+                    band_y0,
+                    band_y1,
+                    n_strips,
+                    tier0_step_y,
+                    changed_rows,
+                    changed_non_uniform,
+                    min_y,
+                    max_y,
+                )
+            }
+        }
+
+        #[inline(always)]
+        unsafe fn expand_and_verify_scroll_candidate<const HAS_ALPHA: bool>(
+            self,
+            aos: BufferPointer<Vec4u8>,
+            prev: &[Vec4u8],
+            width: usize,
+            stride_px: usize,
+            band_y0: usize,
+            band_y1: usize,
+            seed_sx: usize,
+            dy: i32,
+        ) -> Option<(crate::serialization::framing::ScrollRect, u64)> {
+            // SAFETY: `self` witnesses AVX2; caller upholds band bounds invariants.
+            unsafe {
+                expand_and_verify_scroll_candidate_impl::<HAS_ALPHA>(
+                    self, aos, prev, width, stride_px, band_y0, band_y1, seed_sx, dy,
+                )
+            }
+        }
+
+        #[inline(always)]
         unsafe fn diff_and_update_row_band_2d<const HAS_ALPHA: bool>(
             self,
             ctx: &ActiveRowBandCtx<'_>,
@@ -4580,6 +5341,7 @@ mod ssse3 {
     use std::arch::x86_64::_mm_max_epu8;
     use std::arch::x86_64::_mm_movemask_epi8;
     use std::arch::x86_64::_mm_movemask_ps;
+    use std::arch::x86_64::_mm_mul_epu32;
     use std::arch::x86_64::_mm_or_si128;
     use std::arch::x86_64::_mm_packus_epi16;
     use std::arch::x86_64::_mm_sad_epu8;
@@ -4593,9 +5355,11 @@ mod ssse3 {
     use std::arch::x86_64::_mm_setzero_si128;
     use std::arch::x86_64::_mm_sfence;
     use std::arch::x86_64::_mm_shuffle_epi8;
+    use std::arch::x86_64::_mm_shuffle_epi32;
     use std::arch::x86_64::_mm_slli_epi16;
     use std::arch::x86_64::_mm_slli_si128;
     use std::arch::x86_64::_mm_srli_epi16;
+    use std::arch::x86_64::_mm_srli_epi64;
     use std::arch::x86_64::_mm_srli_si128;
     use std::arch::x86_64::_mm_storel_epi64;
     use std::arch::x86_64::_mm_storeu_si128;
@@ -5283,6 +6047,311 @@ mod ssse3 {
                 _mm_stream_si128(dst.as_mut_ptr().add(x + 8).cast::<__m128i>(), v2);
                 _mm_stream_si128(dst.as_mut_ptr().add(x + 12).cast::<__m128i>(), v3);
                 x += 16;
+            }
+        }
+    }
+
+    #[target_feature(enable = "ssse3")]
+    #[inline]
+    fn ssse3_any_nonzero<const HAS_ALPHA: bool>(
+        v: __m128i,
+        rgb_mask: __m128i,
+        zero: __m128i,
+    ) -> bool {
+        let masked = if HAS_ALPHA {
+            v
+        } else {
+            _mm_and_si128(v, rgb_mask)
+        };
+        _mm_movemask_ps(_mm_castsi128_ps(_mm_cmpeq_epi32(masked, zero))) != 0xF
+    }
+
+    #[target_feature(enable = "ssse3")]
+    #[inline]
+    unsafe fn hash_strip_ssse3<const HAS_ALPHA: bool>(
+        v0: __m128i,
+        v1: __m128i,
+        v2: __m128i,
+        v3: __m128i,
+        rgb_mask: __m128i,
+    ) -> u64 {
+        const M: [u32; 16] = crate::filtering::scroll::STRIP_HASH_MULS;
+        const ME0: [u64; 2] = [M[0] as u64, M[2] as u64];
+        const MO0: [u64; 2] = [M[1] as u64, M[3] as u64];
+        const ME1: [u64; 2] = [M[4] as u64, M[6] as u64];
+        const MO1: [u64; 2] = [M[5] as u64, M[7] as u64];
+        const ME2: [u64; 2] = [M[8] as u64, M[10] as u64];
+        const MO2: [u64; 2] = [M[9] as u64, M[11] as u64];
+        const ME3: [u64; 2] = [M[12] as u64, M[14] as u64];
+        const MO3: [u64; 2] = [M[13] as u64, M[15] as u64];
+        // SAFETY: SSE2 is mandatory on x86_64.
+        unsafe {
+            let (c0, c1, c2, c3) = if HAS_ALPHA {
+                (v0, v1, v2, v3)
+            } else {
+                (
+                    _mm_and_si128(v0, rgb_mask),
+                    _mm_and_si128(v1, rgb_mask),
+                    _mm_and_si128(v2, rgb_mask),
+                    _mm_and_si128(v3, rgb_mask),
+                )
+            };
+            let a0_lo = _mm_mul_epu32(c0, _mm_loadu_si128(ME0.as_ptr().cast::<__m128i>()));
+            let a1_lo = _mm_mul_epu32(
+                _mm_srli_epi64::<32>(c0),
+                _mm_loadu_si128(MO0.as_ptr().cast::<__m128i>()),
+            );
+            let b0_lo = _mm_mul_epu32(c2, _mm_loadu_si128(ME2.as_ptr().cast::<__m128i>()));
+            let b1_lo = _mm_mul_epu32(
+                _mm_srli_epi64::<32>(c2),
+                _mm_loadu_si128(MO2.as_ptr().cast::<__m128i>()),
+            );
+            let t_lo = _mm_add_epi64(_mm_xor_si128(a0_lo, b0_lo), _mm_xor_si128(a1_lo, b1_lo));
+
+            let a0_hi = _mm_mul_epu32(c1, _mm_loadu_si128(ME1.as_ptr().cast::<__m128i>()));
+            let a1_hi = _mm_mul_epu32(
+                _mm_srli_epi64::<32>(c1),
+                _mm_loadu_si128(MO1.as_ptr().cast::<__m128i>()),
+            );
+            let b0_hi = _mm_mul_epu32(c3, _mm_loadu_si128(ME3.as_ptr().cast::<__m128i>()));
+            let b1_hi = _mm_mul_epu32(
+                _mm_srli_epi64::<32>(c3),
+                _mm_loadu_si128(MO3.as_ptr().cast::<__m128i>()),
+            );
+            let t_hi = _mm_add_epi64(_mm_xor_si128(a0_hi, b0_hi), _mm_xor_si128(a1_hi, b1_hi));
+
+            let v128 = _mm_xor_si128(t_lo, t_hi);
+            let x0 = _mm_cvtsi128_si64(v128) as u64;
+            let x1 = _mm_cvtsi128_si64(_mm_unpackhi_epi64(v128, v128)) as u64;
+            crate::filtering::scroll::finalize_strip_hash(x0, x1)
+        }
+    }
+
+    #[target_feature(enable = "ssse3")]
+    #[inline]
+    unsafe fn probe_strip_activity_impl<const HAS_ALPHA: bool>(
+        curr: *const Vec4u8,
+        prev: *const Vec4u8,
+    ) -> Option<bool> {
+        // SAFETY: Caller guarantees SSSE3 and 16 readable pixels.
+        unsafe {
+            let rgb_mask = _mm_set1_epi32(0x00FF_FFFFu32 as i32);
+            let zero = _mm_setzero_si128();
+            let c0 = _mm_loadu_si128(curr.cast::<__m128i>());
+            let c1 = _mm_loadu_si128(curr.add(4).cast::<__m128i>());
+            let c2 = _mm_loadu_si128(curr.add(8).cast::<__m128i>());
+            let c3 = _mm_loadu_si128(curr.add(12).cast::<__m128i>());
+            let d0 = _mm_xor_si128(c0, _mm_loadu_si128(prev.cast::<__m128i>()));
+            let d1 = _mm_xor_si128(c1, _mm_loadu_si128(prev.add(4).cast::<__m128i>()));
+            let d2 = _mm_xor_si128(c2, _mm_loadu_si128(prev.add(8).cast::<__m128i>()));
+            let d3 = _mm_xor_si128(c3, _mm_loadu_si128(prev.add(12).cast::<__m128i>()));
+            let diff = _mm_or_si128(_mm_or_si128(d0, d1), _mm_or_si128(d2, d3));
+            if !ssse3_any_nonzero::<HAS_ALPHA>(diff, rgb_mask, zero) {
+                return None;
+            }
+            let first = _mm_shuffle_epi32::<0x00>(c0);
+            let u = _mm_or_si128(
+                _mm_or_si128(_mm_xor_si128(c0, first), _mm_xor_si128(c1, first)),
+                _mm_or_si128(_mm_xor_si128(c2, first), _mm_xor_si128(c3, first)),
+            );
+            Some(ssse3_any_nonzero::<HAS_ALPHA>(u, rgb_mask, zero))
+        }
+    }
+
+    #[target_feature(enable = "ssse3")]
+    #[inline]
+    unsafe fn probe_curr_strip_hash_impl<const HAS_ALPHA: bool>(
+        curr: *const Vec4u8,
+        prev: *const Vec4u8,
+    ) -> (bool, Option<u64>) {
+        // SAFETY: Caller guarantees SSSE3 and 16 readable pixels.
+        unsafe {
+            let rgb_mask = _mm_set1_epi32(0x00FF_FFFFu32 as i32);
+            let zero = _mm_setzero_si128();
+            let c0 = _mm_loadu_si128(curr.cast::<__m128i>());
+            let c1 = _mm_loadu_si128(curr.add(4).cast::<__m128i>());
+            let c2 = _mm_loadu_si128(curr.add(8).cast::<__m128i>());
+            let c3 = _mm_loadu_si128(curr.add(12).cast::<__m128i>());
+            let d0 = _mm_xor_si128(c0, _mm_loadu_si128(prev.cast::<__m128i>()));
+            let d1 = _mm_xor_si128(c1, _mm_loadu_si128(prev.add(4).cast::<__m128i>()));
+            let d2 = _mm_xor_si128(c2, _mm_loadu_si128(prev.add(8).cast::<__m128i>()));
+            let d3 = _mm_xor_si128(c3, _mm_loadu_si128(prev.add(12).cast::<__m128i>()));
+            let diff = _mm_or_si128(_mm_or_si128(d0, d1), _mm_or_si128(d2, d3));
+            if !ssse3_any_nonzero::<HAS_ALPHA>(diff, rgb_mask, zero) {
+                return (false, None);
+            }
+            let first = _mm_shuffle_epi32::<0x00>(c0);
+            let u = _mm_or_si128(
+                _mm_or_si128(_mm_xor_si128(c0, first), _mm_xor_si128(c1, first)),
+                _mm_or_si128(_mm_xor_si128(c2, first), _mm_xor_si128(c3, first)),
+            );
+            if !ssse3_any_nonzero::<HAS_ALPHA>(u, rgb_mask, zero) {
+                return (true, None);
+            }
+            (
+                true,
+                Some(hash_strip_ssse3::<HAS_ALPHA>(c0, c1, c2, c3, rgb_mask)),
+            )
+        }
+    }
+
+    #[target_feature(enable = "ssse3")]
+    #[inline]
+    unsafe fn hash_prev_strip_non_uniform_impl<const HAS_ALPHA: bool>(
+        prev: *const Vec4u8,
+    ) -> Option<u64> {
+        // SAFETY: Caller guarantees SSSE3 and 16 readable pixels.
+        unsafe {
+            let rgb_mask = _mm_set1_epi32(0x00FF_FFFFu32 as i32);
+            let zero = _mm_setzero_si128();
+            let p0 = _mm_loadu_si128(prev.cast::<__m128i>());
+            let p1 = _mm_loadu_si128(prev.add(4).cast::<__m128i>());
+            let p2 = _mm_loadu_si128(prev.add(8).cast::<__m128i>());
+            let p3 = _mm_loadu_si128(prev.add(12).cast::<__m128i>());
+            let first = _mm_shuffle_epi32::<0x00>(p0);
+            let u = _mm_or_si128(
+                _mm_or_si128(_mm_xor_si128(p0, first), _mm_xor_si128(p1, first)),
+                _mm_or_si128(_mm_xor_si128(p2, first), _mm_xor_si128(p3, first)),
+            );
+            if !ssse3_any_nonzero::<HAS_ALPHA>(u, rgb_mask, zero) {
+                return None;
+            }
+            Some(hash_strip_ssse3::<HAS_ALPHA>(p0, p1, p2, p3, rgb_mask))
+        }
+    }
+
+    #[target_feature(enable = "ssse3")]
+    #[inline]
+    unsafe fn score_strip_row_impl<const HAS_ALPHA: bool>(
+        curr: *const Vec4u8,
+        prev_src: *const Vec4u8,
+        prev_dst: *const Vec4u8,
+    ) -> i32 {
+        // SAFETY: Caller guarantees SSSE3 and 16 readable pixels.
+        unsafe {
+            let rgb_mask = _mm_set1_epi32(0x00FF_FFFFu32 as i32);
+            let zero = _mm_setzero_si128();
+            let c0 = _mm_loadu_si128(curr.cast::<__m128i>());
+            let c1 = _mm_loadu_si128(curr.add(4).cast::<__m128i>());
+            let c2 = _mm_loadu_si128(curr.add(8).cast::<__m128i>());
+            let c3 = _mm_loadu_si128(curr.add(12).cast::<__m128i>());
+            let eq4 = |a: __m128i, b: __m128i| -> u32 {
+                let d = _mm_xor_si128(a, b);
+                let dm = if HAS_ALPHA {
+                    d
+                } else {
+                    _mm_and_si128(d, rgb_mask)
+                };
+                _mm_movemask_ps(_mm_castsi128_ps(_mm_cmpeq_epi32(dm, zero))) as u32
+            };
+            let eq_ps = eq4(c0, _mm_loadu_si128(prev_src.cast::<__m128i>()))
+                | (eq4(c1, _mm_loadu_si128(prev_src.add(4).cast::<__m128i>())) << 4)
+                | (eq4(c2, _mm_loadu_si128(prev_src.add(8).cast::<__m128i>())) << 8)
+                | (eq4(c3, _mm_loadu_si128(prev_src.add(12).cast::<__m128i>())) << 12);
+            if eq_ps.count_ones() < 12 {
+                return -4;
+            }
+            let eq_p0 = eq4(c0, _mm_loadu_si128(prev_dst.cast::<__m128i>()))
+                | (eq4(c1, _mm_loadu_si128(prev_dst.add(4).cast::<__m128i>())) << 4)
+                | (eq4(c2, _mm_loadu_si128(prev_dst.add(8).cast::<__m128i>())) << 8)
+                | (eq4(c3, _mm_loadu_si128(prev_dst.add(12).cast::<__m128i>())) << 12);
+            if (eq_ps & !eq_p0) != 0 { 3 } else { 0 }
+        }
+    }
+
+    #[target_feature(enable = "ssse3")]
+    #[inline]
+    unsafe fn copy_lt64_ssse3(src: *const u8, dst: *mut u8, len: usize) {
+        debug_assert!(len > 0 && len < 64);
+        // SAFETY: SSE2 is mandatory on x86_64; `1 <= len < 64` and non-overlapping.
+        unsafe {
+            let mut off = 0usize;
+            while off + 16 <= len {
+                let v = _mm_loadu_si128(src.add(off).cast::<__m128i>());
+                _mm_storeu_si128(dst.add(off).cast::<__m128i>(), v);
+                off += 16;
+            }
+            let rem = len - off;
+            if rem != 0 {
+                if len >= 16 {
+                    let v = _mm_loadu_si128(src.add(len - 16).cast::<__m128i>());
+                    _mm_storeu_si128(dst.add(len - 16).cast::<__m128i>(), v);
+                } else if rem >= 8 {
+                    let a = src.cast::<u64>().read_unaligned();
+                    let b = src.add(rem - 8).cast::<u64>().read_unaligned();
+                    dst.cast::<u64>().write_unaligned(a);
+                    dst.add(rem - 8).cast::<u64>().write_unaligned(b);
+                } else if rem >= 4 {
+                    let a = src.cast::<u32>().read_unaligned();
+                    let b = src.add(rem - 4).cast::<u32>().read_unaligned();
+                    dst.cast::<u32>().write_unaligned(a);
+                    dst.add(rem - 4).cast::<u32>().write_unaligned(b);
+                } else if rem >= 2 {
+                    let a = src.cast::<u16>().read_unaligned();
+                    let b = src.add(rem - 2).cast::<u16>().read_unaligned();
+                    dst.cast::<u16>().write_unaligned(a);
+                    dst.add(rem - 2).cast::<u16>().write_unaligned(b);
+                } else {
+                    *dst = *src;
+                }
+            }
+        }
+    }
+
+    #[target_feature(enable = "ssse3")]
+    #[inline]
+    unsafe fn copy_bytes_stream_impl(src: *const u8, dst: *mut u8, len: usize) {
+        if len == 0 {
+            return;
+        }
+        // SAFETY: SSE2 is mandatory on x86_64; caller guarantees valid non-overlapping ranges.
+        unsafe {
+            if len < 128 {
+                if len < 64 {
+                    copy_lt64_ssse3(src, dst, len);
+                } else {
+                    let a = _mm_loadu_si128(src.cast::<__m128i>());
+                    let b = _mm_loadu_si128(src.add(16).cast::<__m128i>());
+                    let c = _mm_loadu_si128(src.add(32).cast::<__m128i>());
+                    let d = _mm_loadu_si128(src.add(48).cast::<__m128i>());
+                    let e = _mm_loadu_si128(src.add(len - 64).cast::<__m128i>());
+                    let f = _mm_loadu_si128(src.add(len - 48).cast::<__m128i>());
+                    let g = _mm_loadu_si128(src.add(len - 32).cast::<__m128i>());
+                    let h = _mm_loadu_si128(src.add(len - 16).cast::<__m128i>());
+                    _mm_storeu_si128(dst.cast::<__m128i>(), a);
+                    _mm_storeu_si128(dst.add(16).cast::<__m128i>(), b);
+                    _mm_storeu_si128(dst.add(32).cast::<__m128i>(), c);
+                    _mm_storeu_si128(dst.add(48).cast::<__m128i>(), d);
+                    _mm_storeu_si128(dst.add(len - 64).cast::<__m128i>(), e);
+                    _mm_storeu_si128(dst.add(len - 48).cast::<__m128i>(), f);
+                    _mm_storeu_si128(dst.add(len - 32).cast::<__m128i>(), g);
+                    _mm_storeu_si128(dst.add(len - 16).cast::<__m128i>(), h);
+                }
+                return;
+            }
+            let head = (64 - (dst as usize & 63)) & 63;
+            if head != 0 {
+                copy_lt64_ssse3(src, dst, head);
+            }
+            let s = src.add(head);
+            let d = dst.add(head);
+            let rem = len - head;
+            let lim64 = rem & !63;
+            let mut i = 0usize;
+            while i < lim64 {
+                let v0 = _mm_loadu_si128(s.add(i).cast::<__m128i>());
+                let v1 = _mm_loadu_si128(s.add(i + 16).cast::<__m128i>());
+                let v2 = _mm_loadu_si128(s.add(i + 32).cast::<__m128i>());
+                let v3 = _mm_loadu_si128(s.add(i + 48).cast::<__m128i>());
+                _mm_stream_si128(d.add(i).cast::<__m128i>(), v0);
+                _mm_stream_si128(d.add(i + 16).cast::<__m128i>(), v1);
+                _mm_stream_si128(d.add(i + 32).cast::<__m128i>(), v2);
+                _mm_stream_si128(d.add(i + 48).cast::<__m128i>(), v3);
+                i += 64;
+            }
+            let tail = rem - lim64;
+            if tail != 0 {
+                copy_lt64_ssse3(s.add(i), d.add(i), tail);
             }
         }
     }
@@ -6301,6 +7370,108 @@ mod ssse3 {
         }
 
         #[inline(always)]
+        unsafe fn probe_strip_activity<const HAS_ALPHA: bool>(
+            self,
+            curr: *const Vec4u8,
+            prev: *const Vec4u8,
+        ) -> Option<bool> {
+            // SAFETY: `self` witnesses SSSE3; caller guarantees 16 readable pixels.
+            unsafe { probe_strip_activity_impl::<HAS_ALPHA>(curr, prev) }
+        }
+
+        #[inline(always)]
+        unsafe fn probe_curr_strip_hash<const HAS_ALPHA: bool>(
+            self,
+            curr: *const Vec4u8,
+            prev: *const Vec4u8,
+        ) -> (bool, Option<u64>) {
+            // SAFETY: `self` witnesses SSSE3; caller guarantees 16 readable pixels.
+            unsafe { probe_curr_strip_hash_impl::<HAS_ALPHA>(curr, prev) }
+        }
+
+        #[inline(always)]
+        unsafe fn hash_prev_strip_non_uniform<const HAS_ALPHA: bool>(
+            self,
+            prev: *const Vec4u8,
+        ) -> Option<u64> {
+            // SAFETY: `self` witnesses SSSE3; caller guarantees 16 readable pixels.
+            unsafe { hash_prev_strip_non_uniform_impl::<HAS_ALPHA>(prev) }
+        }
+
+        #[inline(always)]
+        unsafe fn score_strip_row<const HAS_ALPHA: bool>(
+            self,
+            curr: *const Vec4u8,
+            prev_src: *const Vec4u8,
+            prev_dst: *const Vec4u8,
+        ) -> i32 {
+            // SAFETY: `self` witnesses SSSE3; caller guarantees 16 readable pixels.
+            unsafe { score_strip_row_impl::<HAS_ALPHA>(curr, prev_src, prev_dst) }
+        }
+
+        #[inline(always)]
+        unsafe fn copy_bytes_stream(self, src: *const u8, dst: *mut u8, len: usize) {
+            // SAFETY: `self` witnesses SSSE3; caller guarantees non-overlapping ranges.
+            unsafe { copy_bytes_stream_impl(src, dst, len) }
+        }
+
+        #[inline(always)]
+        unsafe fn detect_scroll_phase1b<const HAS_ALPHA: bool>(
+            self,
+            aos: BufferPointer<Vec4u8>,
+            prev: &[Vec4u8],
+            width: usize,
+            stride_px: usize,
+            band_y0: usize,
+            band_y1: usize,
+            n_strips: usize,
+            tier0_step_y: usize,
+            changed_rows: &[u16; crate::filtering::scroll::MAX_STRIPS],
+            changed_non_uniform: &[u16; crate::filtering::scroll::MAX_STRIPS],
+            min_y: &[u32; crate::filtering::scroll::MAX_STRIPS],
+            max_y: &[u32; crate::filtering::scroll::MAX_STRIPS],
+        ) -> Option<(crate::serialization::framing::ScrollRect, u64)> {
+            // SAFETY: `self` witnesses SSSE3; caller upholds band bounds invariants.
+            unsafe {
+                detect_scroll_phase1b_impl::<HAS_ALPHA>(
+                    self,
+                    aos,
+                    prev,
+                    width,
+                    stride_px,
+                    band_y0,
+                    band_y1,
+                    n_strips,
+                    tier0_step_y,
+                    changed_rows,
+                    changed_non_uniform,
+                    min_y,
+                    max_y,
+                )
+            }
+        }
+
+        #[inline(always)]
+        unsafe fn expand_and_verify_scroll_candidate<const HAS_ALPHA: bool>(
+            self,
+            aos: BufferPointer<Vec4u8>,
+            prev: &[Vec4u8],
+            width: usize,
+            stride_px: usize,
+            band_y0: usize,
+            band_y1: usize,
+            seed_sx: usize,
+            dy: i32,
+        ) -> Option<(crate::serialization::framing::ScrollRect, u64)> {
+            // SAFETY: `self` witnesses SSSE3; caller upholds band bounds invariants.
+            unsafe {
+                expand_and_verify_scroll_candidate_impl::<HAS_ALPHA>(
+                    self, aos, prev, width, stride_px, band_y0, band_y1, seed_sx, dy,
+                )
+            }
+        }
+
+        #[inline(always)]
         unsafe fn diff_and_update_row_band_2d<const HAS_ALPHA: bool>(
             self,
             ctx: &ActiveRowBandCtx<'_>,
@@ -6707,6 +7878,68 @@ macro_rules! define_tier_wrappers {
                         kernel, &ctx,
                     );
                 }
+            }
+
+            #[target_feature(enable = $feat)]
+            #[inline(never)]
+            pub(super) unsafe fn detect_scroll_in_band<const HAS_ALPHA: bool>(
+                aos: BufferPointer<Vec4u8>,
+                prev: &[Vec4u8],
+                width: usize,
+                stride_px: usize,
+                band_y0: usize,
+                band_y1: usize,
+            ) -> Option<(ScrollRect, u64)> {
+                // SAFETY: Caller verified CPU feature support and band bounds invariants.
+                unsafe {
+                    let kernel = super::$tier_mod::Kernel::new_unchecked();
+                    crate::filtering::scroll::detect_scroll_in_band_with::<
+                        super::$tier_mod::Kernel,
+                        HAS_ALPHA,
+                    >(kernel, aos, prev, width, stride_px, band_y0, band_y1)
+                }
+            }
+
+            #[target_feature(enable = $feat)]
+            #[inline(never)]
+            pub(super) unsafe fn apply_scroll_rows_stream(
+                base: *mut u8,
+                stride: usize,
+                sx: usize,
+                len: usize,
+                src_y0: usize,
+                dst_y0: usize,
+                copy_h: usize,
+                rev: bool,
+                disjoint: bool,
+            ) {
+                // SAFETY: Caller verified CPU feature support and disjoint-stripe bounds.
+                unsafe {
+                    let kernel = super::$tier_mod::Kernel::new_unchecked();
+                    crate::filtering::scroll::apply_scroll_rows_stream_with::<
+                        super::$tier_mod::Kernel,
+                    >(
+                        kernel, base, stride, sx, len, src_y0, dst_y0, copy_h, rev, disjoint,
+                    );
+                }
+            }
+
+            #[target_feature(enable = $feat)]
+            #[inline(never)]
+            pub(super) unsafe fn copy_packed_rows_stream(
+                src_packed: &[u8],
+                dst: &mut [u8],
+                dst_stride: usize,
+                x_bytes: usize,
+                dst_y0: usize,
+                row_bytes: usize,
+                rows: usize,
+            ) {
+                // SAFETY: Caller verified CPU feature support via `X86Tier::detect()`.
+                let kernel = unsafe { super::$tier_mod::Kernel::new_unchecked() };
+                crate::filtering::scroll::copy_packed_rows_stream_with(
+                    kernel, src_packed, dst, dst_stride, x_bytes, dst_y0, row_bytes, rows,
+                );
             }
 
             #[cfg(test)]
@@ -7893,6 +9126,191 @@ impl X86Tier {
                     dirty_slots,
                 ),
             }
+        }
+    }
+
+    /// # Safety
+    /// Caller must uphold [`super::scroll::detect_scroll_in_band_with`] invariants.
+    #[inline(always)]
+    pub(super) unsafe fn detect_scroll_in_band<const HAS_ALPHA: bool>(
+        self,
+        aos: BufferPointer<Vec4u8>,
+        prev: &[Vec4u8],
+        width: usize,
+        stride_px: usize,
+        band_y0: usize,
+        band_y1: usize,
+    ) -> Option<(ScrollRect, u64)> {
+        // SAFETY: Each arm's tier witness verifies required CPU features, and
+        // caller upholds band and buffer bounds invariants.
+        unsafe {
+            match self {
+                #[cfg(all(
+                    not(target_feature = "ssse3"),
+                    not(target_feature = "avx2"),
+                    not(all(
+                        target_feature = "avx512bw",
+                        target_feature = "avx512vl",
+                        target_feature = "avx512vbmi",
+                    )),
+                ))]
+                Self::Scalar => {
+                    super::scroll::detect_scroll_in_band_with::<ScalarKernel, HAS_ALPHA>(
+                        ScalarKernel,
+                        aos,
+                        prev,
+                        width,
+                        stride_px,
+                        band_y0,
+                        band_y1,
+                    )
+                },
+                #[cfg(all(
+                    not(target_feature = "avx2"),
+                    not(all(
+                        target_feature = "avx512bw",
+                        target_feature = "avx512vl",
+                        target_feature = "avx512vbmi",
+                    )),
+                ))]
+                Self::Ssse3 => dispatch_ssse3::detect_scroll_in_band::<HAS_ALPHA>(
+                    aos, prev, width, stride_px, band_y0, band_y1,
+                ),
+                #[cfg(not(all(
+                    target_feature = "avx512bw",
+                    target_feature = "avx512vl",
+                    target_feature = "avx512vbmi",
+                )))]
+                Self::Avx2 => dispatch_avx2::detect_scroll_in_band::<HAS_ALPHA>(
+                    aos, prev, width, stride_px, band_y0, band_y1,
+                ),
+                Self::Avx512 => dispatch_avx512::detect_scroll_in_band::<HAS_ALPHA>(
+                    aos, prev, width, stride_px, band_y0, band_y1,
+                ),
+            }
+        }
+    }
+
+    /// # Safety
+    /// Caller must uphold [`super::scroll::apply_scroll_rows_stream_with`] invariants.
+    #[inline(always)]
+    pub(super) unsafe fn apply_scroll_rows_stream(
+        self,
+        base: *mut u8,
+        stride: usize,
+        sx: usize,
+        len: usize,
+        src_y0: usize,
+        dst_y0: usize,
+        copy_h: usize,
+        rev: bool,
+        disjoint: bool,
+    ) {
+        // SAFETY: Each arm's tier witness verifies required CPU features, and
+        // caller upholds disjoint-stripe and buffer bounds invariants.
+        unsafe {
+            match self {
+                #[cfg(all(
+                    not(target_feature = "ssse3"),
+                    not(target_feature = "avx2"),
+                    not(all(
+                        target_feature = "avx512bw",
+                        target_feature = "avx512vl",
+                        target_feature = "avx512vbmi",
+                    )),
+                ))]
+                Self::Scalar => super::scroll::apply_scroll_rows_temporal(
+                    base, stride, sx, len, src_y0, dst_y0, copy_h, rev, disjoint,
+                ),
+                #[cfg(all(
+                    not(target_feature = "avx2"),
+                    not(all(
+                        target_feature = "avx512bw",
+                        target_feature = "avx512vl",
+                        target_feature = "avx512vbmi",
+                    )),
+                ))]
+                Self::Ssse3 => dispatch_ssse3::apply_scroll_rows_stream(
+                    base, stride, sx, len, src_y0, dst_y0, copy_h, rev, disjoint,
+                ),
+                #[cfg(not(all(
+                    target_feature = "avx512bw",
+                    target_feature = "avx512vl",
+                    target_feature = "avx512vbmi",
+                )))]
+                Self::Avx2 => dispatch_avx2::apply_scroll_rows_stream(
+                    base, stride, sx, len, src_y0, dst_y0, copy_h, rev, disjoint,
+                ),
+                Self::Avx512 => dispatch_avx512::apply_scroll_rows_stream(
+                    base, stride, sx, len, src_y0, dst_y0, copy_h, rev, disjoint,
+                ),
+            }
+        }
+    }
+
+    #[inline(always)]
+    pub(super) fn copy_packed_rows_stream(
+        self,
+        src_packed: &[u8],
+        dst: &mut [u8],
+        dst_stride: usize,
+        x_bytes: usize,
+        dst_y0: usize,
+        row_bytes: usize,
+        rows: usize,
+    ) {
+        match self {
+            #[cfg(all(
+                not(target_feature = "ssse3"),
+                not(target_feature = "avx2"),
+                not(all(
+                    target_feature = "avx512bw",
+                    target_feature = "avx512vl",
+                    target_feature = "avx512vbmi",
+                )),
+            ))]
+            Self::Scalar => super::scroll::copy_packed_rows_stream_with(
+                ScalarKernel,
+                src_packed,
+                dst,
+                dst_stride,
+                x_bytes,
+                dst_y0,
+                row_bytes,
+                rows,
+            ),
+            #[cfg(all(
+                not(target_feature = "avx2"),
+                not(all(
+                    target_feature = "avx512bw",
+                    target_feature = "avx512vl",
+                    target_feature = "avx512vbmi",
+                )),
+            ))]
+            // SAFETY: `X86Tier::Ssse3` is produced only after verifying `ssse3`.
+            Self::Ssse3 => unsafe {
+                dispatch_ssse3::copy_packed_rows_stream(
+                    src_packed, dst, dst_stride, x_bytes, dst_y0, row_bytes, rows,
+                );
+            },
+            #[cfg(not(all(
+                target_feature = "avx512bw",
+                target_feature = "avx512vl",
+                target_feature = "avx512vbmi",
+            )))]
+            // SAFETY: `X86Tier::Avx2` is produced only after verifying `avx2`.
+            Self::Avx2 => unsafe {
+                dispatch_avx2::copy_packed_rows_stream(
+                    src_packed, dst, dst_stride, x_bytes, dst_y0, row_bytes, rows,
+                );
+            },
+            // SAFETY: `X86Tier::Avx512` is produced only after verifying
+            // `avx512bw + avx512vl + avx512vbmi`.
+            Self::Avx512 => unsafe {
+                dispatch_avx512::copy_packed_rows_stream(
+                    src_packed, dst, dst_stride, x_bytes, dst_y0, row_bytes, rows,
+                );
+            },
         }
     }
 

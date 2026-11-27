@@ -32,24 +32,34 @@ use std::arch::aarch64::uint8x8x4_t;
 use std::arch::aarch64::uint8x16_t;
 use std::arch::aarch64::uint8x16x3_t;
 use std::arch::aarch64::uint8x16x4_t;
+use std::arch::aarch64::uint32x4_t;
 use std::arch::aarch64::vabsq_s8;
 use std::arch::aarch64::vadd_u8;
 use std::arch::aarch64::vaddq_u8;
+use std::arch::aarch64::vaddq_u32;
+use std::arch::aarch64::vaddq_u64;
 use std::arch::aarch64::vaddv_u8;
+use std::arch::aarch64::vaddvq_s32;
 use std::arch::aarch64::vaddvq_u32;
 use std::arch::aarch64::vand_u8;
 use std::arch::aarch64::vandq_u8;
 use std::arch::aarch64::vandq_u32;
 use std::arch::aarch64::vbslq_u32;
+use std::arch::aarch64::vceqq_u32;
 use std::arch::aarch64::vcombine_u8;
 use std::arch::aarch64::vdup_n_u8;
 use std::arch::aarch64::vdupq_laneq_u8;
+use std::arch::aarch64::vdupq_laneq_u32;
 use std::arch::aarch64::vdupq_n_u8;
 use std::arch::aarch64::vdupq_n_u32;
 use std::arch::aarch64::veorq_u8;
+use std::arch::aarch64::veorq_u32;
+use std::arch::aarch64::veorq_u64;
 use std::arch::aarch64::vextq_u8;
 use std::arch::aarch64::vget_high_u8;
 use std::arch::aarch64::vget_low_u8;
+use std::arch::aarch64::vget_low_u32;
+use std::arch::aarch64::vgetq_lane_u64;
 use std::arch::aarch64::vld1_u8;
 use std::arch::aarch64::vld1q_u8;
 use std::arch::aarch64::vld1q_u32;
@@ -61,11 +71,15 @@ use std::arch::aarch64::vld4q_u8;
 use std::arch::aarch64::vmaxq_u8;
 use std::arch::aarch64::vmaxvq_u8;
 use std::arch::aarch64::vmaxvq_u32;
+use std::arch::aarch64::vmull_high_u32;
+use std::arch::aarch64::vmull_u32;
 use std::arch::aarch64::vorrq_u8;
+use std::arch::aarch64::vorrq_u32;
 use std::arch::aarch64::vpadalq_u16;
 use std::arch::aarch64::vpaddlq_u8;
 use std::arch::aarch64::vqtbl1q_u8;
 use std::arch::aarch64::vreinterpretq_s8_u8;
+use std::arch::aarch64::vreinterpretq_s32_u32;
 use std::arch::aarch64::vreinterpretq_u8_s8;
 use std::arch::aarch64::vreinterpretq_u8_u16;
 use std::arch::aarch64::vreinterpretq_u8_u32;
@@ -84,6 +98,8 @@ use std::arch::aarch64::vsub_u8;
 use std::arch::aarch64::vsubq_u8;
 use std::arch::aarch64::vtstq_u8;
 use std::arch::aarch64::vtstq_u32;
+use std::arch::aarch64::vuzp1q_u32;
+use std::arch::aarch64::vuzp2q_u32;
 use std::arch::aarch64::vzip1q_u8;
 use std::arch::aarch64::vzip1q_u16;
 use std::borrow::Cow;
@@ -1224,6 +1240,222 @@ impl RowKernel for Kernel {
 
     #[inline(always)]
     fn fence_stream(self) {}
+
+    #[inline(always)]
+    unsafe fn probe_strip_activity<const HAS_ALPHA: bool>(
+        self,
+        curr: *const Vec4u8,
+        prev: *const Vec4u8,
+    ) -> Option<bool> {
+        // SAFETY: NEON is mandatory on AArch64; caller guarantees 16 readable pixels.
+        unsafe {
+            let cp = curr.cast::<u8>();
+            let pp = prev.cast::<u8>();
+            let c0 = vreinterpretq_u32_u8(vld1q_u8(cp));
+            let c1 = vreinterpretq_u32_u8(vld1q_u8(cp.add(16)));
+            let c2 = vreinterpretq_u32_u8(vld1q_u8(cp.add(32)));
+            let c3 = vreinterpretq_u32_u8(vld1q_u8(cp.add(48)));
+            let d0 = veorq_u32(c0, vreinterpretq_u32_u8(vld1q_u8(pp)));
+            let d1 = veorq_u32(c1, vreinterpretq_u32_u8(vld1q_u8(pp.add(16))));
+            let d2 = veorq_u32(c2, vreinterpretq_u32_u8(vld1q_u8(pp.add(32))));
+            let d3 = veorq_u32(c3, vreinterpretq_u32_u8(vld1q_u8(pp.add(48))));
+            let diff = vorrq_u32(vorrq_u32(d0, d1), vorrq_u32(d2, d3));
+            let rgb_mask = vdupq_n_u32(0x00FF_FFFF);
+            let diff_m = if HAS_ALPHA {
+                diff
+            } else {
+                vandq_u32(diff, rgb_mask)
+            };
+            if vmaxvq_u32(diff_m) == 0 {
+                return None;
+            }
+            let first = vdupq_laneq_u32::<0>(c0);
+            let u = vorrq_u32(
+                vorrq_u32(veorq_u32(c0, first), veorq_u32(c1, first)),
+                vorrq_u32(veorq_u32(c2, first), veorq_u32(c3, first)),
+            );
+            let u_m = if HAS_ALPHA { u } else { vandq_u32(u, rgb_mask) };
+            Some(vmaxvq_u32(u_m) != 0)
+        }
+    }
+
+    #[inline(always)]
+    unsafe fn probe_curr_strip_hash<const HAS_ALPHA: bool>(
+        self,
+        curr: *const Vec4u8,
+        prev: *const Vec4u8,
+    ) -> (bool, Option<u64>) {
+        // SAFETY: NEON is mandatory on AArch64; caller guarantees 16 readable pixels.
+        unsafe {
+            let cp = curr.cast::<u8>();
+            let pp = prev.cast::<u8>();
+            let c0 = vreinterpretq_u32_u8(vld1q_u8(cp));
+            let c1 = vreinterpretq_u32_u8(vld1q_u8(cp.add(16)));
+            let c2 = vreinterpretq_u32_u8(vld1q_u8(cp.add(32)));
+            let c3 = vreinterpretq_u32_u8(vld1q_u8(cp.add(48)));
+            let d0 = veorq_u32(c0, vreinterpretq_u32_u8(vld1q_u8(pp)));
+            let d1 = veorq_u32(c1, vreinterpretq_u32_u8(vld1q_u8(pp.add(16))));
+            let d2 = veorq_u32(c2, vreinterpretq_u32_u8(vld1q_u8(pp.add(32))));
+            let d3 = veorq_u32(c3, vreinterpretq_u32_u8(vld1q_u8(pp.add(48))));
+            let diff = vorrq_u32(vorrq_u32(d0, d1), vorrq_u32(d2, d3));
+            let rgb_mask = vdupq_n_u32(0x00FF_FFFF);
+            let diff_m = if HAS_ALPHA {
+                diff
+            } else {
+                vandq_u32(diff, rgb_mask)
+            };
+            if vmaxvq_u32(diff_m) == 0 {
+                return (false, None);
+            }
+            let first = vdupq_laneq_u32::<0>(c0);
+            let u = vorrq_u32(
+                vorrq_u32(veorq_u32(c0, first), veorq_u32(c1, first)),
+                vorrq_u32(veorq_u32(c2, first), veorq_u32(c3, first)),
+            );
+            let u_m = if HAS_ALPHA { u } else { vandq_u32(u, rgb_mask) };
+            if vmaxvq_u32(u_m) == 0 {
+                return (true, None);
+            }
+            (
+                true,
+                Some(hash_strip_neon::<HAS_ALPHA>(c0, c1, c2, c3, rgb_mask)),
+            )
+        }
+    }
+
+    #[inline(always)]
+    unsafe fn hash_prev_strip_non_uniform<const HAS_ALPHA: bool>(
+        self,
+        prev: *const Vec4u8,
+    ) -> Option<u64> {
+        // SAFETY: NEON is mandatory on AArch64; caller guarantees 16 readable pixels.
+        unsafe {
+            let pp = prev.cast::<u8>();
+            let p0 = vreinterpretq_u32_u8(vld1q_u8(pp));
+            let p1 = vreinterpretq_u32_u8(vld1q_u8(pp.add(16)));
+            let p2 = vreinterpretq_u32_u8(vld1q_u8(pp.add(32)));
+            let p3 = vreinterpretq_u32_u8(vld1q_u8(pp.add(48)));
+            let first = vdupq_laneq_u32::<0>(p0);
+            let u = vorrq_u32(
+                vorrq_u32(veorq_u32(p0, first), veorq_u32(p1, first)),
+                vorrq_u32(veorq_u32(p2, first), veorq_u32(p3, first)),
+            );
+            let rgb_mask = vdupq_n_u32(0x00FF_FFFF);
+            let u_m = if HAS_ALPHA { u } else { vandq_u32(u, rgb_mask) };
+            if vmaxvq_u32(u_m) == 0 {
+                return None;
+            }
+            Some(hash_strip_neon::<HAS_ALPHA>(p0, p1, p2, p3, rgb_mask))
+        }
+    }
+
+    #[inline(always)]
+    unsafe fn score_strip_row<const HAS_ALPHA: bool>(
+        self,
+        curr: *const Vec4u8,
+        prev_src: *const Vec4u8,
+        prev_dst: *const Vec4u8,
+    ) -> i32 {
+        // SAFETY: NEON is mandatory on AArch64; caller guarantees 16 readable pixels.
+        unsafe {
+            let cp = curr.cast::<u8>();
+            let sp = prev_src.cast::<u8>();
+            let dp = prev_dst.cast::<u8>();
+            let rgb_mask = vdupq_n_u32(0x00FF_FFFF);
+            let load4 = |p: *const u8| -> [uint32x4_t; 4] {
+                let mut v = [
+                    vreinterpretq_u32_u8(vld1q_u8(p)),
+                    vreinterpretq_u32_u8(vld1q_u8(p.add(16))),
+                    vreinterpretq_u32_u8(vld1q_u8(p.add(32))),
+                    vreinterpretq_u32_u8(vld1q_u8(p.add(48))),
+                ];
+                if !HAS_ALPHA {
+                    for slot in &mut v {
+                        *slot = vandq_u32(*slot, rgb_mask);
+                    }
+                }
+                v
+            };
+            let c = load4(cp);
+            let ps = load4(sp);
+            let eq0 = vceqq_u32(c[0], ps[0]);
+            let eq1 = vceqq_u32(c[1], ps[1]);
+            let eq2 = vceqq_u32(c[2], ps[2]);
+            let eq3 = vceqq_u32(c[3], ps[3]);
+            // Each matching lane is `0xFFFF_FFFF` (`-1i32`); negate sum to get count `0..=16`.
+            let neg_ok = vaddvq_s32(vreinterpretq_s32_u32(vaddq_u32(
+                vaddq_u32(eq0, eq1),
+                vaddq_u32(eq2, eq3),
+            )));
+            if (-neg_ok) < 12 {
+                return -4;
+            }
+            let p0 = load4(dp);
+            let m0 = vandq_u32(eq0, veorq_u32(c[0], p0[0]));
+            let m1 = vandq_u32(eq1, veorq_u32(c[1], p0[1]));
+            let m2 = vandq_u32(eq2, veorq_u32(c[2], p0[2]));
+            let m3 = vandq_u32(eq3, veorq_u32(c[3], p0[3]));
+            let any_moved = vorrq_u32(vorrq_u32(m0, m1), vorrq_u32(m2, m3));
+            if vmaxvq_u32(any_moved) != 0 { 3 } else { 0 }
+        }
+    }
+
+    #[inline(always)]
+    unsafe fn copy_bytes_stream(self, src: *const u8, dst: *mut u8, len: usize) {
+        // SAFETY: Caller guarantees non-overlapping readable `src` and writable `dst`.
+        unsafe { ptr::copy_nonoverlapping(src, dst, len) };
+    }
+}
+
+#[inline(always)]
+unsafe fn hash_strip_neon<const HAS_ALPHA: bool>(
+    v0: uint32x4_t,
+    v1: uint32x4_t,
+    v2: uint32x4_t,
+    v3: uint32x4_t,
+    rgb_mask: uint32x4_t,
+) -> u64 {
+    const M: [u32; 16] = crate::filtering::scroll::STRIP_HASH_MULS;
+    const M_EVEN_LO: [u32; 4] = [M[0], M[2], M[4], M[6]];
+    const M_ODD_LO: [u32; 4] = [M[1], M[3], M[5], M[7]];
+    const M_EVEN_HI: [u32; 4] = [M[8], M[10], M[12], M[14]];
+    const M_ODD_HI: [u32; 4] = [M[9], M[11], M[13], M[15]];
+    // SAFETY: NEON is mandatory on AArch64; constant tables are 16 bytes aligned.
+    unsafe {
+        let (c0, c1, c2, c3) = if HAS_ALPHA {
+            (v0, v1, v2, v3)
+        } else {
+            (
+                vandq_u32(v0, rgb_mask),
+                vandq_u32(v1, rgb_mask),
+                vandq_u32(v2, rgb_mask),
+                vandq_u32(v3, rgb_mask),
+            )
+        };
+        let even_a = vuzp1q_u32(c0, c1);
+        let odd_a = vuzp2q_u32(c0, c1);
+        let even_b = vuzp1q_u32(c2, c3);
+        let odd_b = vuzp2q_u32(c2, c3);
+        let me_lo = vld1q_u32(M_EVEN_LO.as_ptr());
+        let mo_lo = vld1q_u32(M_ODD_LO.as_ptr());
+        let me_hi = vld1q_u32(M_EVEN_HI.as_ptr());
+        let mo_hi = vld1q_u32(M_ODD_HI.as_ptr());
+        let a0_lo = vmull_u32(vget_low_u32(even_a), vget_low_u32(me_lo));
+        let a0_hi = vmull_high_u32(even_a, me_lo);
+        let a1_lo = vmull_u32(vget_low_u32(odd_a), vget_low_u32(mo_lo));
+        let a1_hi = vmull_high_u32(odd_a, mo_lo);
+        let b0_lo = vmull_u32(vget_low_u32(even_b), vget_low_u32(me_hi));
+        let b0_hi = vmull_high_u32(even_b, me_hi);
+        let b1_lo = vmull_u32(vget_low_u32(odd_b), vget_low_u32(mo_hi));
+        let b1_hi = vmull_high_u32(odd_b, mo_hi);
+        let t_lo = vaddq_u64(veorq_u64(a0_lo, b0_lo), veorq_u64(a1_lo, b1_lo));
+        let t_hi = vaddq_u64(veorq_u64(a0_hi, b0_hi), veorq_u64(a1_hi, b1_hi));
+        let folded = veorq_u64(t_lo, t_hi);
+        crate::filtering::scroll::finalize_strip_hash(
+            vgetq_lane_u64::<0>(folded),
+            vgetq_lane_u64::<1>(folded),
+        )
+    }
 }
 
 #[derive(Debug, Copy, Clone, Eq, PartialEq)]
@@ -1572,6 +1804,65 @@ impl Tier {
         unsafe {
             super::diff_and_update_row_band_2d_with::<Kernel, HAS_ALPHA>(Kernel, &ctx);
         }
+    }
+
+    /// # Safety
+    /// Caller must uphold [`super::scroll::detect_scroll_in_band_with`] invariants.
+    #[inline(never)]
+    pub(super) unsafe fn detect_scroll_in_band<const HAS_ALPHA: bool>(
+        self,
+        aos: BufferPointer<Vec4u8>,
+        prev: &[Vec4u8],
+        width: usize,
+        stride_px: usize,
+        band_y0: usize,
+        band_y1: usize,
+    ) -> Option<(ScrollRect, u64)> {
+        // SAFETY: Caller upholds band and buffer bounds invariants.
+        unsafe {
+            super::scroll::detect_scroll_in_band_with::<Kernel, HAS_ALPHA>(
+                Kernel, aos, prev, width, stride_px, band_y0, band_y1,
+            )
+        }
+    }
+
+    /// # Safety
+    /// Caller must uphold [`super::scroll::apply_scroll_rows_stream_with`] invariants.
+    #[inline(always)]
+    pub(super) unsafe fn apply_scroll_rows_stream(
+        self,
+        base: *mut u8,
+        stride: usize,
+        sx: usize,
+        len: usize,
+        src_y0: usize,
+        dst_y0: usize,
+        copy_h: usize,
+        rev: bool,
+        disjoint: bool,
+    ) {
+        // SAFETY: Caller upholds disjoint-stripe and buffer bounds invariants.
+        unsafe {
+            super::scroll::apply_scroll_rows_temporal(
+                base, stride, sx, len, src_y0, dst_y0, copy_h, rev, disjoint,
+            );
+        }
+    }
+
+    #[inline(always)]
+    pub(super) fn copy_packed_rows_stream(
+        self,
+        src_packed: &[u8],
+        dst: &mut [u8],
+        dst_stride: usize,
+        x_bytes: usize,
+        dst_y0: usize,
+        row_bytes: usize,
+        rows: usize,
+    ) {
+        super::scroll::copy_packed_rows_stream_with(
+            Kernel, src_packed, dst, dst_stride, x_bytes, dst_y0, row_bytes, rows,
+        );
     }
 
     #[cfg(test)]

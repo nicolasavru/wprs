@@ -515,6 +515,9 @@ fn copy_slot_region_with<P, S>(
                 sr.y as usize + shift
             };
             let rows_per_batch = (SLOT_COPY_CHUNK / row_bytes).max(1);
+            let use_stream =
+                copy_h.saturating_mul(row_bytes) >= filtering::scroll::STREAM_SCROLL_MIN_BYTES;
+            let flat = x_bytes == 0 && row_bytes == stride;
             let mut ry = 0;
             while ry < copy_h {
                 let batch_rows = (copy_h - ry).min(rows_per_batch);
@@ -524,18 +527,40 @@ fn copy_slot_region_with<P, S>(
                 }
                 {
                     let src = slot_data(pool, src_slot);
-                    for i in 0..batch_rows {
-                        let src_off = (src_y0 + ry + i) * stride + x_bytes;
-                        scratch[i * row_bytes..(i + 1) * row_bytes]
-                            .copy_from_slice(&src[src_off..src_off + row_bytes]);
+                    if flat {
+                        let src_off = (src_y0 + ry) * stride;
+                        scratch[..batch_bytes]
+                            .copy_from_slice(&src[src_off..src_off + batch_bytes]);
+                    } else {
+                        for i in 0..batch_rows {
+                            let src_off = (src_y0 + ry + i) * stride + x_bytes;
+                            scratch[i * row_bytes..(i + 1) * row_bytes]
+                                .copy_from_slice(&src[src_off..src_off + row_bytes]);
+                        }
                     }
                 }
                 {
                     let dst = slot_data(pool, dst_slot);
-                    for i in 0..batch_rows {
-                        let dst_off = (dst_y0 + ry + i) * stride + x_bytes;
-                        dst[dst_off..dst_off + row_bytes]
-                            .copy_from_slice(&scratch[i * row_bytes..(i + 1) * row_bytes]);
+                    if use_stream {
+                        filtering::scroll::copy_packed_rows_stream(
+                            &scratch[..batch_bytes],
+                            dst,
+                            stride,
+                            x_bytes,
+                            dst_y0 + ry,
+                            row_bytes,
+                            batch_rows,
+                        );
+                    } else if flat {
+                        let dst_off = (dst_y0 + ry) * stride;
+                        dst[dst_off..dst_off + batch_bytes]
+                            .copy_from_slice(&scratch[..batch_bytes]);
+                    } else {
+                        for i in 0..batch_rows {
+                            let dst_off = (dst_y0 + ry + i) * stride + x_bytes;
+                            dst[dst_off..dst_off + row_bytes]
+                                .copy_from_slice(&scratch[i * row_bytes..(i + 1) * row_bytes]);
+                        }
                     }
                 }
                 bytes_copied += batch_bytes;

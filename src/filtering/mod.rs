@@ -472,6 +472,78 @@ mod arch {
             }
         }
 
+        /// # Safety
+        /// Caller must uphold [`super::scroll::detect_scroll_in_band_with`] invariants.
+        #[inline(never)]
+        pub(super) unsafe fn detect_scroll_in_band<const HAS_ALPHA: bool>(
+            self,
+            aos: BufferPointer<Vec4u8>,
+            prev: &[Vec4u8],
+            width: usize,
+            stride_px: usize,
+            band_y0: usize,
+            band_y1: usize,
+        ) -> Option<(ScrollRect, u64)> {
+            // SAFETY: Caller upholds band and buffer bounds invariants.
+            unsafe {
+                super::scroll::detect_scroll_in_band_with::<ScalarKernel, HAS_ALPHA>(
+                    ScalarKernel,
+                    aos,
+                    prev,
+                    width,
+                    stride_px,
+                    band_y0,
+                    band_y1,
+                )
+            }
+        }
+
+        /// # Safety
+        /// Caller must uphold [`super::scroll::apply_scroll_rows_stream_with`] invariants.
+        #[inline(always)]
+        pub(super) unsafe fn apply_scroll_rows_stream(
+            self,
+            base: *mut u8,
+            stride: usize,
+            sx: usize,
+            len: usize,
+            src_y0: usize,
+            dst_y0: usize,
+            copy_h: usize,
+            rev: bool,
+            disjoint: bool,
+        ) {
+            // SAFETY: Caller upholds disjoint-stripe and buffer bounds invariants.
+            unsafe {
+                super::scroll::apply_scroll_rows_temporal(
+                    base, stride, sx, len, src_y0, dst_y0, copy_h, rev, disjoint,
+                );
+            }
+        }
+
+        #[inline(always)]
+        pub(super) fn copy_packed_rows_stream(
+            self,
+            src_packed: &[u8],
+            dst: &mut [u8],
+            dst_stride: usize,
+            x_bytes: usize,
+            dst_y0: usize,
+            row_bytes: usize,
+            rows: usize,
+        ) {
+            super::scroll::copy_packed_rows_stream_with(
+                ScalarKernel,
+                src_packed,
+                dst,
+                dst_stride,
+                x_bytes,
+                dst_y0,
+                row_bytes,
+                rows,
+            );
+        }
+
         #[cfg(test)]
         pub(super) fn supported_tiers() -> Vec<Self> {
             vec![Self]
@@ -805,6 +877,142 @@ pub(crate) trait RowKernel: Copy {
     );
 
     fn fence_stream(self);
+
+    /// Zero-hash Tier-0 16-pixel (`64 B`) scroll strip activity probe.
+    ///
+    /// Reads `curr` strictly once through raw loads (TOCTOU-safe over `wl_shm`)
+    /// and compares against `prev` (`BGRA` when `HAS_ALPHA`, ignoring byte 3
+    /// when `!HAS_ALPHA`). Returns `None` when all 16 pixels match `prev`, or
+    /// `Some(non_uniform)` when at least one pixel differs (`non_uniform` is
+    /// `true` iff the 16 canonical `curr` pixels are not all identical).
+    ///
+    /// # Safety
+    /// `curr` and `prev` must each be readable for at least 16 `Vec4u8` pixels.
+    unsafe fn probe_strip_activity<const HAS_ALPHA: bool>(
+        self,
+        curr: *const Vec4u8,
+        prev: *const Vec4u8,
+    ) -> Option<bool>;
+
+    /// Phase-1b 16-pixel (`64 B`) `curr` scroll strip probe returning
+    /// `(changed, Option<hash>)`.
+    ///
+    /// Reads `curr` strictly once (TOCTOU-safe over `wl_shm`). Returns
+    /// `(false, None)` when all 16 pixels match `prev`, `(true, None)` when
+    /// changed but uniform, or `(true, Some(hash))` with the canonical 64-bit
+    /// strip hash matching [`Self::hash_prev_strip_non_uniform`].
+    ///
+    /// # Safety
+    /// `curr` and `prev` must each be readable for at least 16 `Vec4u8` pixels.
+    unsafe fn probe_curr_strip_hash<const HAS_ALPHA: bool>(
+        self,
+        curr: *const Vec4u8,
+        prev: *const Vec4u8,
+    ) -> (bool, Option<u64>);
+
+    /// Phase-1b 16-pixel (`64 B`) `prev` scroll strip probe returning `None` on
+    /// uniform solid-color strips and `Some(hash)` otherwise, producing the
+    /// exact same 64-bit hash as [`Self::probe_curr_strip_hash`] across all tiers.
+    ///
+    /// # Safety
+    /// `prev` must be readable for at least 16 `Vec4u8` pixels.
+    unsafe fn hash_prev_strip_non_uniform<const HAS_ALPHA: bool>(
+        self,
+        prev: *const Vec4u8,
+    ) -> Option<u64>;
+
+    /// Phase-2a 16-pixel (`64 B`) scroll strip match score comparing `curr`
+    /// (`dst_y`) against `prev_src` (`src_y`) and `prev_dst` (`dst_y`).
+    ///
+    /// Reads `curr` strictly once (TOCTOU-safe). Returns `3` when `>= 12/16`
+    /// pixels match `prev_src` and at least one matching pixel differs from
+    /// `prev_dst`, `0` when `>= 12/16` match `prev_src` with zero moved pixels,
+    /// and `-4` otherwise.
+    ///
+    /// # Safety
+    /// `curr`, `prev_src`, and `prev_dst` must each be readable for at least 16
+    /// `Vec4u8` pixels.
+    unsafe fn score_strip_row<const HAS_ALPHA: bool>(
+        self,
+        curr: *const Vec4u8,
+        prev_src: *const Vec4u8,
+        prev_dst: *const Vec4u8,
+    ) -> i32;
+
+    /// Copies `len` non-overlapping bytes from `src` to `dst` using
+    /// cache-line-aligned non-temporal streaming stores on the interior (and
+    /// regular stores on unaligned head/tail bytes). Caller must execute
+    /// [`Self::fence_stream`] once after all streaming copies complete.
+    ///
+    /// # Safety
+    /// `src` must be readable for `len` bytes, `dst` must be writable for `len`
+    /// bytes, and `[src, src + len)` must not overlap `[dst, dst + len)`.
+    unsafe fn copy_bytes_stream(self, src: *const u8, dst: *mut u8, len: usize);
+
+    /// Runs Phase-1b scroll ruler sampling out-of-line from Tier 0 so unchanged
+    /// frames never allocate the 4 KiB hash table or trigger stack probes.
+    ///
+    /// # Safety
+    /// Caller must uphold [`scroll::detect_scroll_phase1b_with`] invariants.
+    #[inline(never)]
+    unsafe fn detect_scroll_phase1b<const HAS_ALPHA: bool>(
+        self,
+        aos: BufferPointer<Vec4u8>,
+        prev: &[Vec4u8],
+        width: usize,
+        stride_px: usize,
+        band_y0: usize,
+        band_y1: usize,
+        n_strips: usize,
+        tier0_step_y: usize,
+        changed_rows: &[u16; scroll::MAX_STRIPS],
+        changed_non_uniform: &[u16; scroll::MAX_STRIPS],
+        min_y: &[u32; scroll::MAX_STRIPS],
+        max_y: &[u32; scroll::MAX_STRIPS],
+    ) -> Option<(ScrollRect, u64)> {
+        // SAFETY: Caller upholds band and buffer bounds invariants.
+        unsafe {
+            scroll::detect_scroll_phase1b_with::<Self, HAS_ALPHA>(
+                self,
+                aos,
+                prev,
+                width,
+                stride_px,
+                band_y0,
+                band_y1,
+                n_strips,
+                tier0_step_y,
+                changed_rows,
+                changed_non_uniform,
+                min_y,
+                max_y,
+            )
+        }
+    }
+
+    /// Runs Phase-2 scroll candidate extent expansion and verification.
+    ///
+    /// # Safety
+    /// Caller must uphold [`scroll::expand_and_verify_candidate_with`] invariants.
+    #[inline(never)]
+    unsafe fn expand_and_verify_scroll_candidate<const HAS_ALPHA: bool>(
+        self,
+        aos: BufferPointer<Vec4u8>,
+        prev: &[Vec4u8],
+        width: usize,
+        stride_px: usize,
+        band_y0: usize,
+        band_y1: usize,
+        seed_sx: usize,
+        dy: i32,
+    ) -> Option<(ScrollRect, u64)> {
+        // SAFETY: Caller upholds band and buffer bounds invariants.
+        unsafe {
+            scroll::expand_and_verify_candidate_with::<Self, HAS_ALPHA>(
+                self, aos, prev, width, stride_px, band_y0, band_y1, seed_sx, dy,
+            )
+        }
+    }
 
     /// Scans a horizontal `<= 128`-row 2D sub-band linearly row-by-row.
     ///
@@ -1230,6 +1438,157 @@ impl RowKernel for ScalarKernel {
 
     #[inline(always)]
     fn fence_stream(self) {}
+
+    #[inline(always)]
+    unsafe fn probe_strip_activity<const HAS_ALPHA: bool>(
+        self,
+        curr: *const Vec4u8,
+        prev: *const Vec4u8,
+    ) -> Option<bool> {
+        let mask = if HAS_ALPHA { u32::MAX } else { 0x00FF_FFFF };
+        let mut c_words = [0u32; scroll::STRIP_W];
+        let mut changed_diff = 0u32;
+        for (i, slot) in c_words.iter_mut().enumerate() {
+            // SAFETY: Caller guarantees `curr` and `prev` are readable for 16 pixels.
+            let cpx = unsafe { curr.add(i).read() };
+            let ppx = unsafe { prev.add(i).read() };
+            let cw = u32::from_le_bytes([cpx.0, cpx.1, cpx.2, cpx.3]) & mask;
+            let pw = u32::from_le_bytes([ppx.0, ppx.1, ppx.2, ppx.3]) & mask;
+            *slot = cw;
+            changed_diff |= cw ^ pw;
+        }
+        if changed_diff == 0 {
+            return None;
+        }
+        let c0 = c_words[0];
+        let mut uniform_diff = 0u32;
+        for &cw in &c_words[1..] {
+            uniform_diff |= cw ^ c0;
+        }
+        Some(uniform_diff != 0)
+    }
+
+    #[inline(always)]
+    unsafe fn probe_curr_strip_hash<const HAS_ALPHA: bool>(
+        self,
+        curr: *const Vec4u8,
+        prev: *const Vec4u8,
+    ) -> (bool, Option<u64>) {
+        let mask = if HAS_ALPHA { u32::MAX } else { 0x00FF_FFFF };
+        let mut c_words = [0u32; scroll::STRIP_W];
+        let mut changed_diff = 0u32;
+        for (i, slot) in c_words.iter_mut().enumerate() {
+            // SAFETY: Caller guarantees `curr` and `prev` are readable for 16 pixels.
+            let cpx = unsafe { curr.add(i).read() };
+            let ppx = unsafe { prev.add(i).read() };
+            let cw = u32::from_le_bytes([cpx.0, cpx.1, cpx.2, cpx.3]) & mask;
+            let pw = u32::from_le_bytes([ppx.0, ppx.1, ppx.2, ppx.3]) & mask;
+            *slot = cw;
+            changed_diff |= cw ^ pw;
+        }
+        if changed_diff == 0 {
+            return (false, None);
+        }
+        let c0 = c_words[0];
+        let mut uniform_diff = 0u32;
+        for &cw in &c_words[1..] {
+            uniform_diff |= cw ^ c0;
+        }
+        if uniform_diff == 0 {
+            return (true, None);
+        }
+        (true, Some(hash_strip_words_scalar(&c_words)))
+    }
+
+    #[inline(always)]
+    unsafe fn hash_prev_strip_non_uniform<const HAS_ALPHA: bool>(
+        self,
+        prev: *const Vec4u8,
+    ) -> Option<u64> {
+        let mask = if HAS_ALPHA { u32::MAX } else { 0x00FF_FFFF };
+        let mut p_words = [0u32; scroll::STRIP_W];
+        for (i, slot) in p_words.iter_mut().enumerate() {
+            // SAFETY: Caller guarantees `prev` is readable for 16 pixels.
+            let ppx = unsafe { prev.add(i).read() };
+            *slot = u32::from_le_bytes([ppx.0, ppx.1, ppx.2, ppx.3]) & mask;
+        }
+        let p0 = p_words[0];
+        let mut uniform_diff = 0u32;
+        for &pw in &p_words[1..] {
+            uniform_diff |= pw ^ p0;
+        }
+        (uniform_diff != 0).then(|| hash_strip_words_scalar(&p_words))
+    }
+
+    #[inline(always)]
+    unsafe fn score_strip_row<const HAS_ALPHA: bool>(
+        self,
+        curr: *const Vec4u8,
+        prev_src: *const Vec4u8,
+        prev_dst: *const Vec4u8,
+    ) -> i32 {
+        let mask = if HAS_ALPHA { u32::MAX } else { 0x00FF_FFFF };
+        let mut ok = 0usize;
+        let mut moved = 0usize;
+        for i in 0..scroll::STRIP_W {
+            // SAFETY: Caller guarantees `curr`, `prev_src`, `prev_dst` are readable for 16 pixels.
+            let cpx = unsafe { curr.add(i).read() };
+            let pspx = unsafe { prev_src.add(i).read() };
+            let c = u32::from_le_bytes([cpx.0, cpx.1, cpx.2, cpx.3]) & mask;
+            let ps = u32::from_le_bytes([pspx.0, pspx.1, pspx.2, pspx.3]) & mask;
+            if c == ps {
+                ok += 1;
+                let p0px = unsafe { prev_dst.add(i).read() };
+                let p0 = u32::from_le_bytes([p0px.0, p0px.1, p0px.2, p0px.3]) & mask;
+                if c != p0 {
+                    moved += 1;
+                }
+            }
+        }
+        if ok * 4 >= scroll::STRIP_W * 3 {
+            if moved > 0 { 3 } else { 0 }
+        } else {
+            -4
+        }
+    }
+
+    #[inline(always)]
+    unsafe fn copy_bytes_stream(self, src: *const u8, dst: *mut u8, len: usize) {
+        // SAFETY: Caller guarantees non-overlapping readable `src` and writable `dst`.
+        unsafe { ptr::copy_nonoverlapping(src, dst, len) };
+    }
+}
+
+#[cfg_attr(
+    not(any(
+        test,
+        miri,
+        all(
+            target_arch = "x86_64",
+            not(target_feature = "ssse3"),
+            not(target_feature = "avx2"),
+            not(all(
+                target_feature = "avx512bw",
+                target_feature = "avx512vl",
+                target_feature = "avx512vbmi",
+            )),
+        ),
+        not(any(target_arch = "x86_64", target_arch = "aarch64")),
+    )),
+    allow(dead_code)
+)]
+#[inline(always)]
+fn hash_strip_words_scalar(p: &[u32; scroll::STRIP_W]) -> u64 {
+    let m = &scroll::STRIP_HASH_MULS;
+    let mut t = [0u64; 4];
+    for (l, slot) in t.iter_mut().enumerate() {
+        let a0 = u64::from(p[2 * l]).wrapping_mul(u64::from(m[2 * l]));
+        let a1 = u64::from(p[2 * l + 1]).wrapping_mul(u64::from(m[2 * l + 1]));
+        let b0 = u64::from(p[8 + 2 * l]).wrapping_mul(u64::from(m[8 + 2 * l]));
+        let b1 = u64::from(p[8 + 2 * l + 1]).wrapping_mul(u64::from(m[8 + 2 * l + 1]));
+        *slot = (a0 ^ b0).wrapping_add(a1 ^ b1);
+    }
+    scroll::finalize_strip_hash(t[0] ^ t[2], t[1] ^ t[3])
 }
 
 #[inline]
@@ -6899,6 +7258,258 @@ mod tests {
         // (including streaming and unaligned `idx_pos` offsets) must match
         // `ScalarKernel` bit-for-bit.
         verify_palette_kernel_matches_scalar(kernel, tier_name);
+
+        // Scroll detection 64B probes, strip scoring, and aligned non-temporal
+        // byte copy must match `ScalarKernel` bit-for-bit across all alignments
+        // and edge cases.
+        verify_scroll_kernel_matches_scalar(kernel, tier_name);
+    }
+
+    #[inline(always)]
+    fn verify_scroll_kernel_matches_scalar<K: RowKernel>(kernel: K, tier_name: &str) {
+        // 1. 16-pixel (`64 B`) scroll strip activity, curr hash, prev hash, and
+        //    `score_strip_row` parity across `HAS_ALPHA = false / true`, unaligned
+        //    offsets, solid/uniform, alpha-only, single-pixel diff, and `ok`
+        //    threshold boundaries (`11` vs `12`).
+        let mut curr_raw = vec![0u8; 256];
+        let mut prev_raw = vec![0u8; 256];
+        let mut prev_dst_raw = vec![0u8; 256];
+        let textured: [Vec4u8; 16] = std::array::from_fn(|i| {
+            let k = (i * 37 + 13) as u8;
+            Vec4u8(
+                k.wrapping_mul(3),
+                k.wrapping_add(71),
+                k.wrapping_mul(11),
+                0x80u8.wrapping_add((i * 7) as u8),
+            )
+        });
+        let solid = [Vec4u8(0x2A, 0x54, 0x7E, 0xFF); 16];
+
+        let check_probes =
+            |curr_px: &[Vec4u8; 16], prev_px: &[Vec4u8; 16], off: usize, tag: &str| {
+                let mut cbuf = [0u8; 128];
+                let mut pbuf = [0u8; 128];
+                cbuf[off..off + 64].copy_from_slice(bytemuck::bytes_of(curr_px));
+                pbuf[off..off + 64].copy_from_slice(bytemuck::bytes_of(prev_px));
+                let cp = cbuf.as_ptr().wrapping_add(off).cast::<Vec4u8>();
+                let pp = pbuf.as_ptr().wrapping_add(off).cast::<Vec4u8>();
+
+                let (act_s0, act_k0) = unsafe {
+                    (
+                        ScalarKernel.probe_strip_activity::<false>(cp, pp),
+                        kernel.probe_strip_activity::<false>(cp, pp),
+                    )
+                };
+                assert_eq!(
+                    act_k0, act_s0,
+                    "[{tier_name}] probe_strip_activity<false> {tag} off={off}"
+                );
+
+                let (act_s1, act_k1) = unsafe {
+                    (
+                        ScalarKernel.probe_strip_activity::<true>(cp, pp),
+                        kernel.probe_strip_activity::<true>(cp, pp),
+                    )
+                };
+                assert_eq!(
+                    act_k1, act_s1,
+                    "[{tier_name}] probe_strip_activity<true> {tag} off={off}"
+                );
+
+                let (ch_s0, ch_k0) = unsafe {
+                    (
+                        ScalarKernel.probe_curr_strip_hash::<false>(cp, pp),
+                        kernel.probe_curr_strip_hash::<false>(cp, pp),
+                    )
+                };
+                assert_eq!(
+                    ch_k0, ch_s0,
+                    "[{tier_name}] probe_curr_strip_hash<false> {tag} off={off}"
+                );
+
+                let (ch_s1, ch_k1) = unsafe {
+                    (
+                        ScalarKernel.probe_curr_strip_hash::<true>(cp, pp),
+                        kernel.probe_curr_strip_hash::<true>(cp, pp),
+                    )
+                };
+                assert_eq!(
+                    ch_k1, ch_s1,
+                    "[{tier_name}] probe_curr_strip_hash<true> {tag} off={off}"
+                );
+
+                let (ph_s0, ph_k0) = unsafe {
+                    (
+                        ScalarKernel.hash_prev_strip_non_uniform::<false>(cp),
+                        kernel.hash_prev_strip_non_uniform::<false>(cp),
+                    )
+                };
+                assert_eq!(
+                    ph_k0, ph_s0,
+                    "[{tier_name}] hash_prev_strip_non_uniform<false> {tag} off={off}"
+                );
+                if ch_k0.0 {
+                    assert_eq!(
+                        ph_k0, ch_k0.1,
+                        "[{tier_name}] curr vs prev hash<false> mismatch {tag} off={off}"
+                    );
+                } else {
+                    assert_eq!(
+                        ch_k0.1, None,
+                        "[{tier_name}] unchanged curr hash<false> must be None {tag} off={off}"
+                    );
+                }
+
+                let (ph_s1, ph_k1) = unsafe {
+                    (
+                        ScalarKernel.hash_prev_strip_non_uniform::<true>(cp),
+                        kernel.hash_prev_strip_non_uniform::<true>(cp),
+                    )
+                };
+                assert_eq!(
+                    ph_k1, ph_s1,
+                    "[{tier_name}] hash_prev_strip_non_uniform<true> {tag} off={off}"
+                );
+                if ch_k1.0 {
+                    assert_eq!(
+                        ph_k1, ch_k1.1,
+                        "[{tier_name}] curr vs prev hash<true> mismatch {tag} off={off}"
+                    );
+                } else {
+                    assert_eq!(
+                        ch_k1.1, None,
+                        "[{tier_name}] unchanged curr hash<true> must be None {tag} off={off}"
+                    );
+                }
+            };
+
+        for off in [0usize, 1, 3, 4, 7, 12, 16, 28, 32, 60] {
+            check_probes(&textured, &textured, off, "identical_textured");
+            check_probes(&solid, &solid, off, "identical_solid");
+            check_probes(&solid, &textured, off, "solid_vs_textured");
+            check_probes(&textured, &solid, off, "textured_vs_solid");
+        }
+        // Per-lane alpha-only, single-pixel RGB diff, and single-pixel non-uniformity.
+        for lane in 0..16usize {
+            let mut alpha_only = textured;
+            alpha_only[lane].3 ^= 0x55;
+            check_probes(&alpha_only, &textured, lane * 4, "alpha_only_textured");
+
+            let mut solid_alpha_diff = solid;
+            solid_alpha_diff[lane].3 ^= 0x33;
+            check_probes(&solid_alpha_diff, &solid, 4, "alpha_only_solid");
+
+            let mut rgb_diff = textured;
+            rgb_diff[lane].1 ^= 0x01;
+            check_probes(&rgb_diff, &textured, 8, "single_px_rgb_diff");
+
+            let mut almost_solid = solid;
+            almost_solid[lane].2 ^= 0x10;
+            check_probes(&almost_solid, &solid, 12, "almost_solid_non_uniform");
+        }
+
+        // `score_strip_row`: sweep matching counts `ok = 0..=16` (including the
+        // exact `11` vs `12` boundary), `moved = 0` vs `moved = 1` at each lane,
+        // and alpha-only diffs under `HAS_ALPHA = false / true`.
+        for ok in 0..=16usize {
+            let mut curr = textured;
+            for px in curr.iter_mut().skip(ok) {
+                px.0 ^= 0xFF;
+            }
+            // Static (`prev_dst == curr`): `moved == 0`.
+            let prev_src = textured;
+            let prev_dst_static = curr;
+            curr_raw[4..68].copy_from_slice(bytemuck::bytes_of(&curr));
+            prev_raw[8..72].copy_from_slice(bytemuck::bytes_of(&prev_src));
+            prev_dst_raw[12..76].copy_from_slice(bytemuck::bytes_of(&prev_dst_static));
+            let cp = curr_raw.as_ptr().wrapping_add(4).cast::<Vec4u8>();
+            let psp = prev_raw.as_ptr().wrapping_add(8).cast::<Vec4u8>();
+            let pdp = prev_dst_raw.as_ptr().wrapping_add(12).cast::<Vec4u8>();
+            let s0 = unsafe { ScalarKernel.score_strip_row::<false>(cp, psp, pdp) };
+            let k0 = unsafe { kernel.score_strip_row::<false>(cp, psp, pdp) };
+            assert_eq!(
+                k0, s0,
+                "[{tier_name}] score_strip_row<false> static ok={ok}"
+            );
+            let s1 = unsafe { ScalarKernel.score_strip_row::<true>(cp, psp, pdp) };
+            let k1 = unsafe { kernel.score_strip_row::<true>(cp, psp, pdp) };
+            assert_eq!(k1, s1, "[{tier_name}] score_strip_row<true> static ok={ok}");
+
+            // Moved in a single lane (`0..16`), plus alpha-only move test.
+            for move_lane in [0usize, 1, 7, 8, 11, 12, 15] {
+                let mut pd_rgb = curr;
+                pd_rgb[move_lane].2 ^= 0x7F;
+                prev_dst_raw[12..76].copy_from_slice(bytemuck::bytes_of(&pd_rgb));
+                let s0 = unsafe { ScalarKernel.score_strip_row::<false>(cp, psp, pdp) };
+                let k0 = unsafe { kernel.score_strip_row::<false>(cp, psp, pdp) };
+                assert_eq!(
+                    k0, s0,
+                    "[{tier_name}] score_strip_row<false> moved ok={ok} lane={move_lane}"
+                );
+                let s1 = unsafe { ScalarKernel.score_strip_row::<true>(cp, psp, pdp) };
+                let k1 = unsafe { kernel.score_strip_row::<true>(cp, psp, pdp) };
+                assert_eq!(
+                    k1, s1,
+                    "[{tier_name}] score_strip_row<true> moved ok={ok} lane={move_lane}"
+                );
+
+                let mut pd_alpha = curr;
+                pd_alpha[move_lane].3 ^= 0x44;
+                prev_dst_raw[12..76].copy_from_slice(bytemuck::bytes_of(&pd_alpha));
+                let s0 = unsafe { ScalarKernel.score_strip_row::<false>(cp, psp, pdp) };
+                let k0 = unsafe { kernel.score_strip_row::<false>(cp, psp, pdp) };
+                assert_eq!(
+                    k0, s0,
+                    "[{tier_name}] score_strip_row<false> alpha_move ok={ok} lane={move_lane}"
+                );
+                let s1 = unsafe { ScalarKernel.score_strip_row::<true>(cp, psp, pdp) };
+                let k1 = unsafe { kernel.score_strip_row::<true>(cp, psp, pdp) };
+                assert_eq!(
+                    k1, s1,
+                    "[{tier_name}] score_strip_row<true> alpha_move ok={ok} lane={move_lane}"
+                );
+            }
+        }
+
+        // 2. `copy_bytes_stream` across lengths `0..=65, 127, 128, 129, 255, 256, 300`
+        //    and all 64B-relative destination alignments with sentinel guard bytes.
+        let mut src_buf = vec![0u8; 512];
+        for (i, b) in src_buf.iter_mut().enumerate() {
+            *b = ((i * 53 + 17) & 0xFF) as u8;
+        }
+        let mut dst_buf = vec![0xA5u8; 640];
+        let base_align = (64 - (dst_buf.as_ptr() as usize & 63)) & 63;
+        let lengths: Vec<usize> = (0..=65).chain([127, 128, 129, 255, 256, 300]).collect();
+        let align_offsets = [0usize, 1, 3, 4, 7, 8, 15, 16, 17, 31, 32, 33, 63];
+        for &dst_misalign in &align_offsets {
+            let dst_off = 64 + base_align + dst_misalign;
+            let src_off = (dst_misalign * 7) % 61;
+            for &len in &lengths {
+                dst_buf.fill(0xA5);
+                // SAFETY: `src_off + len <= 512`, `dst_off + len <= 640`, non-overlapping.
+                unsafe {
+                    kernel.copy_bytes_stream(
+                        src_buf.as_ptr().add(src_off),
+                        dst_buf.as_mut_ptr().add(dst_off),
+                        len,
+                    );
+                }
+                kernel.fence_stream();
+                assert!(
+                    dst_buf[..dst_off].iter().all(|&b| b == 0xA5),
+                    "[{tier_name}] copy_bytes_stream clobbered prefix len={len} misalign={dst_misalign}"
+                );
+                assert_eq!(
+                    &dst_buf[dst_off..dst_off + len],
+                    &src_buf[src_off..src_off + len],
+                    "[{tier_name}] copy_bytes_stream payload mismatch len={len} misalign={dst_misalign}"
+                );
+                assert!(
+                    dst_buf[dst_off + len..].iter().all(|&b| b == 0xA5),
+                    "[{tier_name}] copy_bytes_stream clobbered suffix len={len} misalign={dst_misalign}"
+                );
+            }
+        }
     }
 
     #[inline(always)]
@@ -16040,6 +16651,360 @@ mod tests {
                             expected_bytes,
                             "tier={tier:?} tw={tw} alpha_kind={alpha_kind} use_cache={use_cache}"
                         );
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn test_scroll_probes_and_row_blit_cross_tier_parity() {
+        let tiers = arch::Tier::supported_tiers();
+        assert!(!tiers.is_empty());
+
+        // 1. `detect_scroll_rect_with_tier` parity across all supported tiers
+        //    for scrolling (`Xrgb8888`/`Argb8888`, up/down, split-pane) and
+        //    non-scrolling (unchanged, alpha-only XRGB, typing, solid fill, tab
+        //    switch) frames.
+        let width = 512usize;
+        let height = 400usize;
+        let stride = width * 4 + 16;
+        let doc = make_textured_document(width, height + 160, stride, BufferFormat::Argb8888);
+        let prev = doc[..height * stride].to_vec();
+
+        let make_split_scroll = |base: &[u8], dy: i32| -> Vec<u8> {
+            let mut curr = base.to_vec();
+            let sx = 69usize;
+            let sw = 365usize;
+            let sy0 = 24usize;
+            let sh = 352usize;
+            let shift = dy.unsigned_abs() as usize;
+            let copy_h = sh - shift;
+            if dy < 0 {
+                for ry in 0..copy_h {
+                    let s = (sy0 + shift + ry) * stride + sx * 4;
+                    let d = (sy0 + ry) * stride + sx * 4;
+                    curr[d..d + sw * 4].copy_from_slice(&base[s..s + sw * 4]);
+                }
+                for ry in copy_h..sh {
+                    let s = (height + ry - copy_h) * stride + sx * 4;
+                    let d = (sy0 + ry) * stride + sx * 4;
+                    curr[d..d + sw * 4].copy_from_slice(&doc[s..s + sw * 4]);
+                }
+            } else {
+                for ry in 0..copy_h {
+                    let s = (sy0 + ry) * stride + sx * 4;
+                    let d = (sy0 + shift + ry) * stride + sx * 4;
+                    curr[d..d + sw * 4].copy_from_slice(&base[s..s + sw * 4]);
+                }
+                for ry in 0..shift {
+                    let s = (height + ry) * stride + sx * 4;
+                    let d = (sy0 + ry) * stride + sx * 4;
+                    curr[d..d + sw * 4].copy_from_slice(&doc[s..s + sw * 4]);
+                }
+            }
+            curr
+        };
+
+        let mut curr_up = vec![0u8; height * stride];
+        curr_up.copy_from_slice(&doc[48 * stride..(height + 48) * stride]);
+        let mut curr_down = prev.clone();
+        curr_down[52 * stride..height * stride].copy_from_slice(&prev[..(height - 52) * stride]);
+        curr_down[..52 * stride].copy_from_slice(&doc[height * stride..(height + 52) * stride]);
+        let curr_split_up = make_split_scroll(&prev, -37);
+        let curr_split_down = make_split_scroll(&prev, 43);
+
+        let mut curr_alpha_only = prev.clone();
+        for y in 0..height {
+            for x in 0..width {
+                curr_alpha_only[y * stride + x * 4 + 3] ^= 0x77;
+            }
+        }
+        let mut curr_typing = prev.clone();
+        for y in 100..118 {
+            for x in 80..220 {
+                curr_typing[y * stride + x * 4] ^= 0x5A;
+            }
+        }
+        let curr_solid = vec![0x42u8; height * stride];
+        let curr_tab_switch: Vec<u8> = prev.iter().map(|&b| b.wrapping_add(0x6D) ^ 0x3C).collect();
+
+        for format in [BufferFormat::Xrgb8888, BufferFormat::Argb8888] {
+            let meta = BufferMetadata {
+                width: width as i32,
+                height: height as i32,
+                stride: stride as i32,
+                format,
+            };
+            let cases: [(&str, &[u8], Option<i32>); 9] = [
+                ("full_up", &curr_up, Some(-48)),
+                ("full_down", &curr_down, Some(52)),
+                ("split_up", &curr_split_up, Some(-37)),
+                ("split_down", &curr_split_down, Some(43)),
+                ("unchanged", &prev, None),
+                ("alpha_only", &curr_alpha_only, None),
+                ("typing", &curr_typing, None),
+                ("solid", &curr_solid, None),
+                ("tab_switch", &curr_tab_switch, None),
+            ];
+            for (name, curr_bytes, expected_dy) in cases {
+                let p = curr_bytes.as_ptr();
+                let bp = unsafe { BufferPointer::new(&p, curr_bytes.len()) };
+                let baseline =
+                    scroll::detect_scroll_rect_with_tier(bp, &prev, meta, None, tiers[0]);
+                match expected_dy {
+                    Some(dy) => {
+                        let sr = baseline.unwrap_or_else(|| {
+                            panic!("expected scroll dy={dy} on {name} ({format:?})")
+                        });
+                        assert_eq!(sr.dy, dy, "unexpected dy on {name} ({format:?})");
+                    },
+                    None => assert_eq!(
+                        baseline, None,
+                        "false positive scroll on {name} ({format:?})"
+                    ),
+                }
+                for &tier in &tiers[1..] {
+                    let got = scroll::detect_scroll_rect_with_tier(bp, &prev, meta, None, tier);
+                    assert_eq!(
+                        got, baseline,
+                        "tier={tier:?} vs {:?} mismatch on {name} ({format:?})",
+                        tiers[0]
+                    );
+                }
+            }
+        }
+
+        // 2. Direct `tier.apply_scroll_rows_stream` / `apply_scroll_rows_temporal`
+        //    and `tier.copy_packed_rows_stream` parity across all supported tiers,
+        //    odd widths, aligned/unaligned `rect.x`, padded strides, and every
+        //    `dy` overlap/disjoint boundary.
+        let rect_xs: &[u32] = if cfg!(miri) {
+            &[0, 1, 7, 16, 17]
+        } else {
+            &[0, 1, 3, 7, 8, 15, 16, 17]
+        };
+        let widths: Vec<u32> = if cfg!(miri) {
+            vec![1, 2, 7, 15, 16, 17, 33, 64, 65]
+        } else {
+            (1u32..=65).chain([127, 128, 129, 255, 256]).collect()
+        };
+        let scroll_h = 36u32;
+        let dys: &[i32] = &[
+            -1, 1, -7, 7, -12, // `|dy| == copy_h / 2` (`12 == 24 / 2`)
+            12, -15, // `|dy| > copy_h / 2` yet still overlapping (`15 < 21`)
+            15, -18, // `|dy| == copy_h` (exact disjoint boundary)
+            18, -25, // `|dy| > copy_h` (strictly disjoint)
+            25, -35, // `|dy| == height - 1` (`copy_h == 1`)
+            35,
+        ];
+        for &stride_pad in &[0usize, 4, 20, 64] {
+            for &rx in rect_xs {
+                for &rw in &widths {
+                    let frame_w = rx as usize + rw as usize + 3;
+                    let frame_h = scroll_h as usize + 4;
+                    let st = frame_w * 4 + stride_pad;
+                    let base: Vec<u8> = (0..frame_h * st)
+                        .map(|i| ((i * 29 + rw as usize * 7 + rx as usize) & 0xFF) as u8)
+                        .collect();
+
+                    // Test `copy_packed_rows_stream` per tier.
+                    let packed: Vec<u8> = (0..7 * rw as usize * 4)
+                        .map(|i| ((i * 41 + 9) & 0xFF) as u8)
+                        .collect();
+                    let mut ref_dst = base.clone();
+                    for r in 0..7usize {
+                        let d = (2 + r) * st + rx as usize * 4;
+                        ref_dst[d..d + rw as usize * 4].copy_from_slice(
+                            &packed[r * rw as usize * 4..(r + 1) * rw as usize * 4],
+                        );
+                    }
+                    for &tier in &tiers {
+                        let mut dst = base.clone();
+                        tier.copy_packed_rows_stream(
+                            &packed,
+                            &mut dst,
+                            st,
+                            rx as usize * 4,
+                            2,
+                            rw as usize * 4,
+                            7,
+                        );
+                        assert_eq!(
+                            dst, ref_dst,
+                            "copy_packed_rows_stream mismatch tier={tier:?} rx={rx} rw={rw} pad={stride_pad}"
+                        );
+                    }
+
+                    // Test streaming and temporal scroll-row blits.
+                    // Sweep all `dy` cases on representative widths and a fast
+                    // subset on the dense `1..=65` width sweep.
+                    let active_dys: &[i32] = if matches!(
+                        rw,
+                        1 | 7
+                            | 15
+                            | 16
+                            | 17
+                            | 31
+                            | 32
+                            | 33
+                            | 63
+                            | 64
+                            | 65
+                            | 127
+                            | 128
+                            | 129
+                            | 255
+                            | 256
+                    ) {
+                        dys
+                    } else {
+                        &[-1, 1, -12, 18, -25, 35]
+                    };
+                    for &dy in active_dys {
+                        let sr = ScrollRect {
+                            x: rx,
+                            y: 2,
+                            width: rw,
+                            height: scroll_h,
+                            dy,
+                        };
+                        let mut expected = base.clone();
+                        apply_scroll_rect_in_place(&mut expected, st, sr);
+                        let shift = dy.unsigned_abs() as usize;
+                        let copy_h = scroll_h as usize - shift;
+                        let move_up = dy < 0;
+                        let src_y0 = if move_up { 2 + shift } else { 2 };
+                        let dst_y0 = if move_up { 2 } else { 2 + shift };
+                        let disjoint = shift >= copy_h;
+                        for &tier in &tiers {
+                            for stream in [false, true] {
+                                let mut buf = base.clone();
+                                unsafe {
+                                    if stream {
+                                        tier.apply_scroll_rows_stream(
+                                            buf.as_mut_ptr(),
+                                            st,
+                                            rx as usize * 4,
+                                            rw as usize * 4,
+                                            src_y0,
+                                            dst_y0,
+                                            copy_h,
+                                            !move_up,
+                                            disjoint,
+                                        );
+                                    } else {
+                                        scroll::apply_scroll_rows_temporal(
+                                            buf.as_mut_ptr(),
+                                            st,
+                                            rx as usize * 4,
+                                            rw as usize * 4,
+                                            src_y0,
+                                            dst_y0,
+                                            copy_h,
+                                            !move_up,
+                                            disjoint,
+                                        );
+                                    }
+                                }
+                                assert_eq!(
+                                    buf, expected,
+                                    "apply_scroll_rows mismatch tier={tier:?} stream={stream} sr={sr:?} pad={stride_pad}"
+                                );
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    #[cfg_attr(miri, ignore)]
+    fn test_scroll_parallel_blit_cross_tier_parity() {
+        let tiers = arch::Tier::supported_tiers();
+        let mut decomp = ShardingDecompressor::new(NonZeroUsize::new(4).unwrap()).unwrap();
+
+        // Full-width and partial-pane parallel blits (`>= 512 KiB`) across
+        // 64B-aligned and unaligned `x`, padded strides (`stride % 64 == 0` and
+        // `stride % 64 != 0`), `3840`-wide 4K width, and every overlap/disjoint
+        // `dy` regime (`|dy| == 1`, `< copy_h/2`, `== copy_h/2`, `> copy_h/2`
+        // overlapping, `== copy_h` disjoint, `> copy_h` disjoint, `== height-1`).
+        let geometries: &[(usize, usize, &[(u32, u32, u32, u32)])] = &[
+            (
+                320,
+                1024 * 4,
+                &[
+                    (0, 0, 1024, 320),
+                    (1, 8, 1007, 300),
+                    (3, 8, 993, 300),
+                    (7, 8, 977, 300),
+                    (8, 8, 960, 300),
+                    (15, 8, 945, 300),
+                    (16, 8, 944, 300),
+                    (17, 8, 943, 300),
+                ],
+            ),
+            (
+                320,
+                1024 * 4 + 20, // `stride % 64 != 0`
+                &[(0, 0, 1024, 320), (17, 12, 929, 296)],
+            ),
+            (
+                160,
+                3840 * 4, // 4K width, `2.46 MiB` (`>= 512 KiB`)
+                &[(0, 0, 3840, 160), (773, 12, 3051, 140)],
+            ),
+        ];
+
+        for &(fh, stride, rects) in geometries {
+            let base: Vec<u8> = (0..fh * stride)
+                .map(|i| ((i * 31 + (i >> 8) * 17) & 0xFF) as u8)
+                .collect();
+            for &(rx, ry, rw, rh) in rects {
+                let h = rh as i32;
+                let dys = [
+                    -1,
+                    1,
+                    -(h / 4),
+                    h / 4,
+                    -(h / 3), // `|dy| == copy_h / 2`
+                    h / 3,
+                    -(h * 2 / 5), // `|dy| > copy_h / 2`, still overlapping (`shift < copy_h`)
+                    h * 2 / 5,
+                    -(h / 2), // `|dy| == copy_h` (disjoint boundary)
+                    h / 2,
+                    -(h * 3 / 5), // `|dy| > copy_h` (disjoint horizontal bands)
+                    h * 3 / 5,
+                    -(h - 1), // `copy_h == 1`
+                    h - 1,
+                ];
+                for dy in dys {
+                    let sr = ScrollRect {
+                        x: rx,
+                        y: ry,
+                        width: rw,
+                        height: rh,
+                        dy,
+                    };
+                    let mut expected = base.clone();
+                    apply_scroll_rect_in_place(&mut expected, stride, sr);
+                    for &tier in &tiers {
+                        for stream in [false, true] {
+                            let mut got = base.clone();
+                            scroll::apply_scroll_rect_in_place_parallel_with(
+                                &mut got,
+                                stride,
+                                sr,
+                                &mut decomp,
+                                tier,
+                                stream,
+                            );
+                            assert_eq!(
+                                got, expected,
+                                "parallel scroll mismatch tier={tier:?} stream={stream} sr={sr:?} stride={stride}"
+                            );
+                        }
                     }
                 }
             }
