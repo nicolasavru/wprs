@@ -578,50 +578,110 @@ impl XdgSurface for RemoteXdgPopup {
     }
 }
 
+#[derive(Debug, Copy, Clone, Eq, PartialEq)]
+pub(crate) enum ZOrderMove {
+    PlaceAbove {
+        surface: WlSurfaceId,
+        sibling: WlSurfaceId,
+    },
+    PlaceBelow {
+        surface: WlSurfaceId,
+        sibling: WlSurfaceId,
+    },
+}
+
 fn reorder_children_list(
     self_id: WlSurfaceId,
     z_ordered_children: &mut Vec<SubsurfacePosition>,
     new_order: &[SubsurfacePosition],
-) -> Vec<(WlSurfaceId, WlSurfaceId)> {
-    let mut moves = Vec::new();
-
-    let mut new_order = new_order.to_vec();
-    new_order.reverse();
-
+) -> Vec<ZOrderMove> {
     debug!(
         "REORDER_CHILDREN, {:?}, {:?}, {:?}",
         &self_id, &z_ordered_children, &new_order
     );
 
-    let z_ordered_children_set: HashSet<WlSurfaceId> =
-        z_ordered_children.iter().map(|c| c.id).collect();
-    let mut seen = HashSet::with_capacity(new_order.len());
-
-    let new_order: Vec<SubsurfacePosition> = new_order
-        .into_iter()
-        .filter(|elem| z_ordered_children_set.contains(&elem.id) && seen.insert(elem.id))
+    let present_ids: HashSet<WlSurfaceId> = z_ordered_children.iter().map(|c| c.id).collect();
+    let mut seen = HashSet::with_capacity(z_ordered_children.len());
+    let mut target: Vec<SubsurfacePosition> = new_order
+        .iter()
+        .copied()
+        .filter(|elem| present_ids.contains(&elem.id) && seen.insert(elem.id))
         .collect();
-
-    for (idx, elem) in new_order.iter().enumerate() {
-        let current_elem = z_ordered_children[idx];
-        if current_elem.id == elem.id {
-            z_ordered_children[idx] = *elem; // position may have changed
-            continue;
-        }
-
-        let current_idx = z_ordered_children
-            .iter()
-            .position(|x| x.id == elem.id)
-            .unwrap(); // we already filtered and deduplicated present elements
-
-        z_ordered_children.remove(current_idx);
-        // Insert elem instead of child because position may have changed.
-        z_ordered_children.insert(idx, *elem);
-        if elem.id != self_id {
-            moves.push((elem.id, current_elem.id));
+    // Preserve any existing entries omitted from `new_order` so `target` is
+    // always a permutation of `z_ordered_children`.
+    for &existing in z_ordered_children.iter() {
+        if seen.insert(existing.id) {
+            target.push(existing);
         }
     }
 
+    let Some(parent_idx) = target.iter().position(|elem| elem.id == self_id) else {
+        *z_ordered_children = target;
+        return Vec::new();
+    };
+
+    let mut moves = Vec::new();
+    if !z_ordered_children
+        .iter()
+        .map(|c| c.id)
+        .eq(target.iter().map(|c| c.id))
+    {
+        // Both `z_ordered_children` and `target` are ordered bottom-to-top.
+        // Sweep upward from `self_id` using `place_above`, then downward below
+        // `self_id` using `place_below`, so `self_id` is never moved and every
+        // direct child lands in its exact stacking position.
+        for idx in (parent_idx + 1)..target.len() {
+            let anchor_id = target[idx - 1].id;
+            let elem = target[idx];
+            let anchor_pos = z_ordered_children
+                .iter()
+                .position(|c| c.id == anchor_id)
+                .unwrap();
+            let elem_pos = z_ordered_children
+                .iter()
+                .position(|c| c.id == elem.id)
+                .unwrap();
+            if elem_pos != anchor_pos + 1 {
+                let item = z_ordered_children.remove(elem_pos);
+                let new_anchor_pos = z_ordered_children
+                    .iter()
+                    .position(|c| c.id == anchor_id)
+                    .unwrap();
+                z_ordered_children.insert(new_anchor_pos + 1, item);
+                moves.push(ZOrderMove::PlaceAbove {
+                    surface: elem.id,
+                    sibling: anchor_id,
+                });
+            }
+        }
+
+        for idx in (0..parent_idx).rev() {
+            let anchor_id = target[idx + 1].id;
+            let elem = target[idx];
+            let anchor_pos = z_ordered_children
+                .iter()
+                .position(|c| c.id == anchor_id)
+                .unwrap();
+            let elem_pos = z_ordered_children
+                .iter()
+                .position(|c| c.id == elem.id)
+                .unwrap();
+            if elem_pos + 1 != anchor_pos {
+                let item = z_ordered_children.remove(elem_pos);
+                let new_anchor_pos = z_ordered_children
+                    .iter()
+                    .position(|c| c.id == anchor_id)
+                    .unwrap();
+                z_ordered_children.insert(new_anchor_pos, item);
+                moves.push(ZOrderMove::PlaceBelow {
+                    surface: elem.id,
+                    sibling: anchor_id,
+                });
+            }
+        }
+    }
+
+    *z_ordered_children = target;
     moves
 }
 
@@ -676,10 +736,7 @@ impl RemoteSurface {
         })
     }
 
-    fn reorder_children(
-        &mut self,
-        new_order: &[SubsurfacePosition],
-    ) -> Vec<(WlSurfaceId, WlSurfaceId)> {
+    fn reorder_children(&mut self, new_order: &[SubsurfacePosition]) -> Vec<ZOrderMove> {
         reorder_children_list(self.id, &mut self.z_ordered_children, new_order)
     }
 
@@ -1385,10 +1442,26 @@ mod tests {
             position: (x, y).into(),
         };
 
-        // Even if `p` isn't at index 0 and `new_order` contains duplicate IDs
-        // or unknown IDs, `reorder_children_list` deduplicates cleanly and
-        // never emits `p` itself as a `wl_subsurface` move target.
+        let apply_moves = |stack: &mut Vec<WlSurfaceId>, moves: &[ZOrderMove]| {
+            for &mv in moves {
+                let (surface, sibling, above) = match mv {
+                    ZOrderMove::PlaceAbove { surface, sibling } => (surface, sibling, true),
+                    ZOrderMove::PlaceBelow { surface, sibling } => (surface, sibling, false),
+                };
+                assert_ne!(surface, p, "parent surface must never be moved");
+                assert_ne!(surface, sibling, "cannot place surface relative to itself");
+                let src = stack.iter().position(|&id| id == surface).unwrap();
+                let item = stack.remove(src);
+                let dst = stack.iter().position(|&id| id == sibling).unwrap();
+                stack.insert(if above { dst + 1 } else { dst }, item);
+            }
+        };
+
+        // `reorder_children_list` preserves canonical bottom-to-top order,
+        // deduplicates duplicate/unknown IDs, never moves `p`, and emits exact
+        // `PlaceAbove`/`PlaceBelow` operations matching the Wayland stack.
         let mut current = vec![pos(c1, 0, 0), pos(p, 0, 0), pos(c2, 0, 0)];
+        let mut host_stack = vec![c1, p, c2];
         let moves = reorder_children_list(
             p,
             &mut current,
@@ -1400,11 +1473,52 @@ mod tests {
                 pos(p, 0, 0),
             ],
         );
-        assert!(moves.iter().all(|&(moved, _)| moved != p));
+        apply_moves(&mut host_stack, &moves);
+        assert_eq!(host_stack, vec![c1, c2, p]);
         assert_eq!(
             current,
-            vec![pos(p, 0, 0), pos(c2, 99, 99), pos(c1, 10, 20)]
+            vec![pos(c1, 10, 20), pos(c2, 30, 40), pos(p, 0, 0)]
         );
+
+        // Exhaustively verify all 24 x 24 transitions of `[p, c1, c2, c3]`.
+        let c3 = WlSurfaceId(4);
+        let mut perms: Vec<Vec<WlSurfaceId>> = Vec::new();
+        let elems = [p, c1, c2, c3];
+        for i in 0..4 {
+            for j in 0..4 {
+                if j == i {
+                    continue;
+                }
+                for k in 0..4 {
+                    if k == i || k == j {
+                        continue;
+                    }
+                    let l = 6 - i - j - k;
+                    perms.push(vec![elems[i], elems[j], elems[k], elems[l]]);
+                }
+            }
+        }
+        assert_eq!(perms.len(), 24);
+
+        for start in &perms {
+            for target in &perms {
+                let mut cur: Vec<_> = start.iter().map(|&id| pos(id, 0, 0)).collect();
+                let desired: Vec<_> = target
+                    .iter()
+                    .enumerate()
+                    .map(|(idx, &id)| pos(id, idx as i32, idx as i32 * 2))
+                    .collect();
+                let mut simulated_host = start.clone();
+                let moves = reorder_children_list(p, &mut cur, &desired);
+                apply_moves(&mut simulated_host, &moves);
+                assert_eq!(&simulated_host, target, "{start:?} -> {target:?}");
+                assert_eq!(cur, desired);
+
+                // Already-matching order must emit zero moves.
+                let noop_moves = reorder_children_list(p, &mut cur, &desired);
+                assert!(noop_moves.is_empty(), "expected 0 moves for {target:?}");
+            }
+        }
     }
 
     #[test]

@@ -808,6 +808,7 @@ mod tests {
     use smithay::reexports::wayland_server::protocol::wl_shm_pool::WlShmPool as ServerWlShmPool;
     use smithay::reexports::wayland_server::protocol::wl_subcompositor;
     use smithay::reexports::wayland_server::protocol::wl_subcompositor::WlSubcompositor as ServerWlSubcompositor;
+    use smithay::reexports::wayland_server::protocol::wl_subsurface as server_subsurface;
     use smithay::reexports::wayland_server::protocol::wl_subsurface::WlSubsurface as ServerWlSubsurface;
     use smithay::reexports::wayland_server::protocol::wl_surface as server_surface;
     use smithay::reexports::wayland_server::protocol::wl_surface::WlSurface as ServerWlSurface;
@@ -863,6 +864,8 @@ mod tests {
     enum HostXdgReq {
         SurfaceCommit { surface_id: u32 },
         PopupGrab { surface_id: u32, serial: u32 },
+        SubsurfacePlaceAbove { surface_id: u32, sibling_id: u32 },
+        SubsurfacePlaceBelow { surface_id: u32, sibling_id: u32 },
     }
 
     #[derive(Default)]
@@ -871,6 +874,8 @@ mod tests {
         pointer: Option<ServerWlPointer>,
         data_device: Option<ServerWlDataDevice>,
         surfaces: Vec<ServerWlSurface>,
+        subsurface_stacks: HashMap<u32, Vec<u32>>,
+        subsurface_positions: HashMap<u32, (i32, i32)>,
         xdg_popups: HashMap<u32, ServerXdgPopup>,
         last_source: Option<ServerWlDataSource>,
         receive_fds: Vec<(String, OwnedFd)>,
@@ -964,6 +969,8 @@ mod tests {
             match request {
                 wl_compositor::Request::CreateSurface { id } => {
                     let s = data_init.init(id, ());
+                    let proto_id = s.id().protocol_id();
+                    state.subsurface_stacks.insert(proto_id, vec![proto_id]);
                     state.surfaces.push(s);
                 },
                 wl_compositor::Request::CreateRegion { id } => {
@@ -1020,7 +1027,7 @@ mod tests {
 
     impl ServerDispatch<ServerWlSubcompositor, ()> for MockHostState {
         fn request(
-            _state: &mut Self,
+            state: &mut Self,
             _client: &ServerClient,
             _resource: &ServerWlSubcompositor,
             request: wl_subcompositor::Request,
@@ -1028,22 +1035,69 @@ mod tests {
             _dh: &DisplayHandle,
             data_init: &mut DataInit<'_, Self>,
         ) {
-            if let wl_subcompositor::Request::GetSubsurface { id, .. } = request {
-                data_init.init(id, ());
+            if let wl_subcompositor::Request::GetSubsurface {
+                id,
+                surface,
+                parent,
+            } = request
+            {
+                let surface_id = surface.id().protocol_id();
+                let parent_id = parent.id().protocol_id();
+                data_init.init(id, (surface_id, parent_id));
+                state
+                    .subsurface_stacks
+                    .entry(parent_id)
+                    .or_insert_with(|| vec![parent_id])
+                    .push(surface_id);
             }
         }
     }
 
-    impl ServerDispatch<ServerWlSubsurface, ()> for MockHostState {
+    impl ServerDispatch<ServerWlSubsurface, (u32, u32)> for MockHostState {
         fn request(
-            _state: &mut Self,
+            state: &mut Self,
             _client: &ServerClient,
             _resource: &ServerWlSubsurface,
-            _request: <ServerWlSubsurface as Resource>::Request,
-            _data: &(),
+            request: server_subsurface::Request,
+            &(surface_id, parent_id): &(u32, u32),
             _dh: &DisplayHandle,
             _data_init: &mut DataInit<'_, Self>,
         ) {
+            match request {
+                server_subsurface::Request::SetPosition { x, y } => {
+                    state.subsurface_positions.insert(surface_id, (x, y));
+                },
+                server_subsurface::Request::PlaceAbove { sibling } => {
+                    let sibling_id = sibling.id().protocol_id();
+                    state.xdg_reqs.push(HostXdgReq::SubsurfacePlaceAbove {
+                        surface_id,
+                        sibling_id,
+                    });
+                    let stack = state.subsurface_stacks.get_mut(&parent_id).unwrap();
+                    let src = stack.iter().position(|&id| id == surface_id).unwrap();
+                    stack.remove(src);
+                    let dst = stack.iter().position(|&id| id == sibling_id).unwrap();
+                    stack.insert(dst + 1, surface_id);
+                },
+                server_subsurface::Request::PlaceBelow { sibling } => {
+                    let sibling_id = sibling.id().protocol_id();
+                    state.xdg_reqs.push(HostXdgReq::SubsurfacePlaceBelow {
+                        surface_id,
+                        sibling_id,
+                    });
+                    let stack = state.subsurface_stacks.get_mut(&parent_id).unwrap();
+                    let src = stack.iter().position(|&id| id == surface_id).unwrap();
+                    stack.remove(src);
+                    let dst = stack.iter().position(|&id| id == sibling_id).unwrap();
+                    stack.insert(dst, surface_id);
+                },
+                server_subsurface::Request::Destroy => {
+                    if let Some(stack) = state.subsurface_stacks.get_mut(&parent_id) {
+                        stack.retain(|&id| id != surface_id);
+                    }
+                },
+                _ => {},
+            }
         }
     }
 
@@ -1988,5 +2042,136 @@ mod tests {
                 surface_id: nograb_proto_id,
             }]
         );
+    }
+
+    #[test]
+    #[cfg_attr(miri, ignore)]
+    fn test_wprsc_subsurface_z_order_above_below_parent_and_nested_wire() {
+        let mut h = ClientDndHarness::new();
+        let client_id = ClientId(1);
+        let p = WlSurfaceId(200);
+        let c1 = WlSurfaceId(201);
+        let c2 = WlSurfaceId(202);
+        let c3 = WlSurfaceId(203);
+        let gc = WlSurfaceId(204);
+        let sp = |id, x, y| wayland::SubsurfacePosition {
+            id,
+            position: (x, y).into(),
+        };
+
+        let proto_id_of = |h: &mut ClientDndHarness, sid: WlSurfaceId| {
+            h.client
+                .remote_display
+                .client(&client_id)
+                .surfaces
+                .get(&sid)
+                .unwrap()
+                .wl_surface()
+                .id()
+                .protocol_id()
+        };
+
+        // 1. Initial commit places `c2` and `c1` below `p` and `c3` above `p`:
+        //    bottom-to-top `[c2, c1, p, c3]`.
+        let mut p_state = make_client_surface_state(
+            client_id,
+            p,
+            Some(wayland::Role::XdgToplevel(Default::default())),
+        );
+        p_state.z_ordered_children =
+            vec![sp(c2, 30, 40), sp(c1, 10, 20), sp(p, 0, 0), sp(c3, 50, 60)];
+        h.client
+            .handle_request(RecvType::Object(Request::Surface(SurfaceRequest {
+                client: client_id,
+                surface: p,
+                payload: SurfaceRequestPayload::Commit(p_state),
+            })));
+        h.sync();
+
+        let p_proto = proto_id_of(&mut h, p);
+        let c1_proto = proto_id_of(&mut h, c1);
+        let c2_proto = proto_id_of(&mut h, c2);
+        let c3_proto = proto_id_of(&mut h, c3);
+        assert_eq!(
+            h.host.subsurface_stacks[&p_proto],
+            vec![c2_proto, c1_proto, p_proto, c3_proto]
+        );
+        assert!(h.host.xdg_reqs.contains(&HostXdgReq::SubsurfacePlaceBelow {
+            surface_id: c1_proto,
+            sibling_id: p_proto,
+        }));
+        assert!(h.host.xdg_reqs.contains(&HostXdgReq::SubsurfacePlaceBelow {
+            surface_id: c2_proto,
+            sibling_id: c1_proto,
+        }));
+        assert_eq!(h.host.subsurface_positions[&c1_proto], (10, 20));
+        assert_eq!(h.host.subsurface_positions[&c2_proto], (30, 40));
+        assert_eq!(h.host.subsurface_positions[&c3_proto], (50, 60));
+
+        // 2. Nested grandchild `gc` below `c1` updates `c1`'s stack without
+        //    altering `p`'s direct stack.
+        h.host.xdg_reqs.clear();
+        let mut c1_state = make_client_surface_state(
+            client_id,
+            c1,
+            Some(wayland::Role::SubSurface(wayland::SubSurfaceState {
+                parent: p,
+                location: (10, 20).into(),
+                sync: true,
+            })),
+        );
+        c1_state.z_ordered_children = vec![sp(gc, 7, 8), sp(c1, 0, 0)];
+        h.client
+            .handle_request(RecvType::Object(Request::Surface(SurfaceRequest {
+                client: client_id,
+                surface: c1,
+                payload: SurfaceRequestPayload::Commit(c1_state),
+            })));
+        h.sync();
+
+        let gc_proto = proto_id_of(&mut h, gc);
+        assert_eq!(
+            h.host.subsurface_stacks[&c1_proto],
+            vec![gc_proto, c1_proto]
+        );
+        assert_eq!(
+            h.host.subsurface_stacks[&p_proto],
+            vec![c2_proto, c1_proto, p_proto, c3_proto]
+        );
+
+        // 3. Reorder `p`'s children across `p` to `[c3, p, c2, c1]`.
+        h.host.xdg_reqs.clear();
+        let mut p_state2 = make_client_surface_state(
+            client_id,
+            p,
+            Some(wayland::Role::XdgToplevel(Default::default())),
+        );
+        p_state2.z_ordered_children =
+            vec![sp(c3, 50, 60), sp(p, 0, 0), sp(c2, 30, 40), sp(c1, 10, 20)];
+        h.client
+            .handle_request(RecvType::Object(Request::Surface(SurfaceRequest {
+                client: client_id,
+                surface: p,
+                payload: SurfaceRequestPayload::Commit(p_state2.clone()),
+            })));
+        h.sync();
+        assert_eq!(
+            h.host.subsurface_stacks[&p_proto],
+            vec![c3_proto, p_proto, c2_proto, c1_proto]
+        );
+
+        // 4. Re-committing unchanged order sends zero place_above/place_below requests.
+        h.host.xdg_reqs.clear();
+        h.client
+            .handle_request(RecvType::Object(Request::Surface(SurfaceRequest {
+                client: client_id,
+                surface: p,
+                payload: SurfaceRequestPayload::Commit(p_state2),
+            })));
+        h.sync();
+        assert!(!h.host.xdg_reqs.iter().any(|r| matches!(
+            r,
+            HostXdgReq::SubsurfacePlaceAbove { .. } | HostXdgReq::SubsurfacePlaceBelow { .. }
+        )));
     }
 }

@@ -27,6 +27,7 @@ use crate::client::ObjectBimap;
 use crate::client::RemoteSurface;
 use crate::client::Role;
 use crate::client::WprsClientState;
+use crate::client::ZOrderMove;
 use crate::client::smithay_handlers::SubSurfaceData;
 use crate::fallible_entry::FallibleEntryExt;
 use crate::prelude::*;
@@ -387,6 +388,11 @@ pub(crate) fn reorder_subsurfaces(
     surface_state: &SurfaceState,
     surfaces: &mut HashMap<WlSurfaceId, RemoteSurface>,
 ) -> Result<()> {
+    enum ResolvedZOrderMove<'a> {
+        PlaceAbove(&'a WlSubsurface, &'a WlSurface),
+        PlaceBelow(&'a WlSubsurface, &'a WlSurface),
+    }
+
     let moves = {
         let remote_surface = surfaces.get_mut(&surface_id).location(loc!())?;
         remote_surface.reorder_children(&surface_state.z_ordered_children)
@@ -394,31 +400,38 @@ pub(crate) fn reorder_subsurfaces(
 
     let moves: Result<Vec<_>> = moves
         .iter()
-        .map(
-            |(surf_to_move, surf_to_move_to)| -> Result<(&WlSubsurface, &WlSurface)> {
-                let sub = surfaces
-                    .get(surf_to_move)
-                    .location(loc!())?
-                    .get_role()
-                    .location(loc!())?
-                    .as_sub_surface()
-                    .location(loc!())?;
-                if sub.parent != surface_id {
-                    bail!(
-                        "subsurface {surf_to_move:?} has parent {:?}, expected {surface_id:?}",
-                        sub.parent
-                    );
-                }
-                Ok((
-                    &sub.local_subsurface.0,
-                    surfaces.get(surf_to_move_to).location(loc!())?.wl_surface(),
-                ))
-            },
-        )
+        .map(|&mv| -> Result<ResolvedZOrderMove<'_>> {
+            let (surf_to_move, sibling, above) = match mv {
+                ZOrderMove::PlaceAbove { surface, sibling } => (surface, sibling, true),
+                ZOrderMove::PlaceBelow { surface, sibling } => (surface, sibling, false),
+            };
+            let sub = surfaces
+                .get(&surf_to_move)
+                .location(loc!())?
+                .get_role()
+                .location(loc!())?
+                .as_sub_surface()
+                .location(loc!())?;
+            if sub.parent != surface_id {
+                bail!(
+                    "subsurface {surf_to_move:?} has parent {:?}, expected {surface_id:?}",
+                    sub.parent
+                );
+            }
+            let sibling_surface = surfaces.get(&sibling).location(loc!())?.wl_surface();
+            Ok(if above {
+                ResolvedZOrderMove::PlaceAbove(&sub.local_subsurface.0, sibling_surface)
+            } else {
+                ResolvedZOrderMove::PlaceBelow(&sub.local_subsurface.0, sibling_surface)
+            })
+        })
         .collect();
 
-    for (surf_to_move, surf_to_move_to) in moves.location(loc!())? {
-        surf_to_move.place_above(surf_to_move_to);
+    for mv in moves.location(loc!())? {
+        match mv {
+            ResolvedZOrderMove::PlaceAbove(sub, sibling) => sub.place_above(sibling),
+            ResolvedZOrderMove::PlaceBelow(sub, sibling) => sub.place_below(sibling),
+        }
     }
 
     let children = surfaces

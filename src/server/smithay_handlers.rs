@@ -50,6 +50,7 @@ use smithay::wayland::compositor::CompositorState;
 use smithay::wayland::compositor::SubsurfaceCachedState;
 use smithay::wayland::compositor::SurfaceAttributes;
 use smithay::wayland::compositor::SurfaceData;
+use smithay::wayland::compositor::TraversalAction;
 use smithay::wayland::output::OutputHandler;
 use smithay::wayland::selection::SelectionHandler;
 use smithay::wayland::selection::SelectionSource;
@@ -582,30 +583,41 @@ fn take_dirty_sync_descendants<N>(
 }
 
 #[instrument(ret, level = "debug")]
-pub fn get_child_positions(surface: &WlSurface) -> Vec<SubsurfacePosition> {
-    compositor::get_children(surface)
-        .iter()
-        .map(|child| SubsurfacePosition {
-            id: WlSurfaceId::new(child),
-            position: compositor::with_states(child, |surface_data| {
+pub(crate) fn get_surface_z_order(surface: &WlSurface) -> Vec<SubsurfacePosition> {
+    let mut surface_order = Vec::new();
+    // `with_surface_tree_upward` iterates `PrivateSurfaceData::children`
+    // bottom-to-top (deepest to topmost), including `surface` itself in its
+    // true stacking position relative to its direct children. Returning
+    // `SkipChildren` at depth 1 skips grandchildren while still running the
+    // processor on each direct child.
+    compositor::with_surface_tree_upward(
+        surface,
+        true,
+        |_s, _data, &is_root| {
+            if is_root {
+                TraversalAction::DoChildren(false)
+            } else {
+                TraversalAction::SkipChildren
+            }
+        },
+        |s, surface_data, &is_root| {
+            let position = if is_root {
+                (0, 0).into()
+            } else {
                 surface_data
                     .cached_state
                     .get::<SubsurfaceCachedState>()
                     .pending()
                     .location
                     .into()
-            }),
-        })
-        .collect()
-}
-
-pub(crate) fn get_surface_z_order(surface: &WlSurface) -> Vec<SubsurfacePosition> {
-    let mut surface_order = get_child_positions(surface);
-    // TODO: get actual surface position, for now put it at the end
-    surface_order.push(SubsurfacePosition {
-        id: WlSurfaceId::new(surface),
-        position: (0, 0).into(),
-    });
+            };
+            surface_order.push(SubsurfacePosition {
+                id: WlSurfaceId::new(s),
+                position,
+            });
+        },
+        |_, _, _| true,
+    );
     surface_order
 }
 
@@ -3237,6 +3249,129 @@ mod tests {
         assert_eq!(
             h.client_data.configures,
             vec![ClientConfigureEvent::PopupDone]
+        );
+    }
+
+    #[test]
+    #[cfg_attr(miri, ignore)]
+    fn test_subsurface_parent_z_order_and_nested_subsurfaces_wire() {
+        let mut h = WaylandTestHarness::new(true);
+        let compositor = h.client_data.compositor.clone().unwrap();
+        let subcompositor = h.client_data.subcompositor.clone().unwrap();
+        let wm_base = h.client_data.xdg_wm_base.clone().unwrap();
+
+        let p = compositor.create_surface(&h.qh, ());
+        let p_xdg = wm_base.get_xdg_surface(&p, &h.qh, ());
+        let _p_toplevel = p_xdg.get_toplevel(&h.qh, ());
+        let c1 = compositor.create_surface(&h.qh, ());
+        let c2 = compositor.create_surface(&h.qh, ());
+        let c3 = compositor.create_surface(&h.qh, ());
+        let gc = compositor.create_surface(&h.qh, ());
+
+        let sub_c1 = subcompositor.get_subsurface(&c1, &p, &h.qh, ());
+        sub_c1.set_position(10, 20);
+        let sub_c2 = subcompositor.get_subsurface(&c2, &p, &h.qh, ());
+        sub_c2.set_position(30, 40);
+        let sub_c3 = subcompositor.get_subsurface(&c3, &p, &h.qh, ());
+        sub_c3.set_position(50, 60);
+        // Nested grandchild under `c1` must NOT appear in `p`'s direct z-order.
+        let sub_gc = subcompositor.get_subsurface(&gc, &c1, &h.qh, ());
+        sub_gc.set_position(7, 8);
+
+        gc.commit();
+        c1.commit();
+        c2.commit();
+        c3.commit();
+        p.commit();
+        h.roundtrip();
+
+        let p_id = h.server_surface_id(&p);
+        let c1_id = h.server_surface_id(&c1);
+        let c2_id = h.server_surface_id(&c2);
+        let c3_id = h.server_surface_id(&c3);
+        let gc_id = h.server_surface_id(&gc);
+        let sp = |id, x, y| SubsurfacePosition {
+            id,
+            position: (x, y).into(),
+        };
+
+        let last_z_order = |reqs: &[Request], target_sid: WlSurfaceId| {
+            reqs.iter()
+                .rev()
+                .find_map(|req| match req {
+                    Request::Surface(SurfaceRequest {
+                        surface,
+                        payload: SurfaceRequestPayload::Commit(state),
+                        ..
+                    }) if *surface == target_sid => Some(state.z_ordered_children.clone()),
+                    _ => None,
+                })
+                .expect("expected Commit for surface")
+        };
+
+        // 1. Default stacking order: new subsurfaces stack above parent bottom-to-top.
+        let reqs = h.drain_requests();
+        assert_eq!(
+            last_z_order(&reqs, p_id),
+            vec![
+                sp(p_id, 0, 0),
+                sp(c1_id, 10, 20),
+                sp(c2_id, 30, 40),
+                sp(c3_id, 50, 60),
+            ]
+        );
+        assert_eq!(
+            last_z_order(&reqs, c1_id),
+            vec![sp(c1_id, 0, 0), sp(gc_id, 7, 8)]
+        );
+
+        // 2. Place `c1` below `p`, `c2` below `c1`, and `gc` below `c1`.
+        sub_c1.place_below(&p);
+        sub_c2.place_below(&c1);
+        sub_gc.place_below(&c1);
+        c1.commit();
+        p.commit();
+        h.roundtrip();
+
+        let reqs = h.drain_requests();
+        assert_eq!(
+            last_z_order(&reqs, p_id),
+            vec![
+                sp(c2_id, 30, 40),
+                sp(c1_id, 10, 20),
+                sp(p_id, 0, 0),
+                sp(c3_id, 50, 60),
+            ]
+        );
+        assert_eq!(
+            last_z_order(&reqs, c1_id),
+            vec![sp(gc_id, 7, 8), sp(c1_id, 0, 0)]
+        );
+
+        // 3. Reorder siblings across parent: `c3` below `p`, `c1` above `p` ->
+        //    `[c2, c3, p, c1]`.
+        sub_c3.place_below(&p);
+        sub_c1.place_above(&p);
+        p.commit();
+        h.roundtrip();
+
+        let reqs = h.drain_requests();
+        let expected_p_order = vec![
+            sp(c2_id, 30, 40),
+            sp(c3_id, 50, 60),
+            sp(p_id, 0, 0),
+            sp(c1_id, 10, 20),
+        ];
+        assert_eq!(last_z_order(&reqs, p_id), expected_p_order);
+
+        // 4. Reconnect `sync_surface_tree` preserves exact stacking order for
+        //    both parent and nested child without mixing grandchildren.
+        h.connect_wprsc();
+        let sync_reqs = h.drain_requests();
+        assert_eq!(last_z_order(&sync_reqs, p_id), expected_p_order);
+        assert_eq!(
+            last_z_order(&sync_reqs, c1_id),
+            vec![sp(gc_id, 7, 8), sp(c1_id, 0, 0)]
         );
     }
 }

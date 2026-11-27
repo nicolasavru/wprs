@@ -642,8 +642,8 @@ impl From<Transform> for SmithayTransform {
 }
 
 /// An entry for a vector of child surfaces. The (x, y) position is stored
-/// explicitly, the z position (stacking order) is stored implicitly based on
-/// the index of the item in the vector.
+/// explicitly; the z position (stacking order) is stored implicitly from
+/// bottom-most (index 0) to top-most (last index).
 #[derive(Debug, Copy, Clone, Eq, PartialEq, Archive, Deserialize, Serialize)]
 pub struct SubsurfacePosition {
     pub id: WlSurfaceId,
