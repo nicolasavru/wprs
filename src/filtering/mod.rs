@@ -6462,23 +6462,59 @@ unsafe fn diff_and_update_scroll_worker_with<K: RowKernel, const HAS_ALPHA: bool
     }
 }
 
-/// Validates that every rect in `tile_rects` is non-empty, within
-/// [`TILE_PIXELS`], strictly inside `[0, width) x [0, height)`, and pairwise
-/// disjoint in `O(N log N)` time via a horizontal scanline sweep. Returns the
-/// total number of pixels covered.
-pub(crate) fn validate_tile_rects(tile_rects: &[TileRect], width: u32, height: u32) -> Result<u64> {
+#[cold]
+#[inline(never)]
+fn validate_rect_bounds_cold(rect: &TileRect, width: u32, height: u32) -> Result<u64> {
+    rect.validate_in_bounds(width, height)
+        .location(loc!())
+        .map(|px| px as u64)
+}
+
+#[cold]
+#[inline(never)]
+fn validate_tile_rects_fallback(tile_rects: &[TileRect], width: u32, height: u32) -> Result<u64> {
     let mut total_pixels = 0u64;
     for &rect in tile_rects {
         let px = rect.validate_in_bounds(width, height).location(loc!())?;
         total_pixels += px as u64;
     }
-    if tile_rects.len() <= 1 {
-        return Ok(total_pixels);
-    }
 
     let mut sorted = tile_rects.to_vec();
     sorted.sort_unstable_by_key(|r| (r.y, r.x));
 
+    // Zero-tree `O(N)` band check on `(y, x)`-sorted rects: proves disjointness
+    // for arbitrary-order uniform grids, 128-split grids, and vertical strip
+    // arrays without allocating a `BTreeMap` or `BinaryHeap`.
+    //
+    // Soundness: `sorted` is non-decreasing in `y`, so once a band starts at
+    // `r.y >= prev_band_y_end`, every subsequent rect in `sorted` also has
+    // `y >= prev_band_y_end` and is disjoint from all prior bands; within the
+    // band, `r.x >= x_end` proves disjointness from every earlier rect in the
+    // band.
+    let mut band_y_end = 0u32;
+    let mut x_end = 0u32;
+    let mut band_ok = true;
+    for &r in &sorted {
+        let rx1 = r.x + r.w;
+        let ry1 = r.y + r.h;
+        if r.y >= band_y_end {
+            band_y_end = ry1;
+            x_end = rx1;
+        } else if r.x >= x_end {
+            x_end = rx1;
+            band_y_end = band_y_end.max(ry1);
+        } else {
+            band_ok = false;
+            break;
+        }
+    }
+    if band_ok {
+        return Ok(total_pixels);
+    }
+
+    // Exact `O(N log N)` horizontal scanline sweep for arbitrary 2D layouts and
+    // adversarial inputs (prevents quadratic DoS up to `MAX_FRAME_TILES`).
+    //
     // Invariant: `active_x` maps `x0 -> x1` for every earlier rect with
     // `y1 > cur.y`. Because all active rects overlap at `y = cur.y` and have
     // already been proven pairwise disjoint, their `[x0, x1)` intervals are
@@ -6513,6 +6549,154 @@ pub(crate) fn validate_tile_rects(tile_rects: &[TileRect], width: u32, height: u
 
         active_x.insert(rx0, rx1);
         expire.push(Reverse((ry1, rx0)));
+    }
+
+    Ok(total_pixels)
+}
+
+/// Validates that every rect in `tile_rects` is non-empty, within
+/// [`TILE_PIXELS`], strictly inside `[0, width) x [0, height)`, and pairwise
+/// disjoint. Returns the total number of pixels covered.
+///
+/// Uses a zero-allocation `O(N)` monotone band + 4-rect macro-column fast path
+/// covering `wprsd`'s emitted raster, `128x128` quadrant, cropped/merged, and
+/// 1D strip layouts, falling back to an exact `O(N log N)` scanline sweep for
+/// arbitrary orderings or overlaps.
+pub(crate) fn validate_tile_rects(tile_rects: &[TileRect], width: u32, height: u32) -> Result<u64> {
+    const MACRO_TILE_DIM: u32 = TILE_W as u32;
+    const MACRO_TILE_MASK: u32 = !(MACRO_TILE_DIM - 1);
+    const _: () = assert!(TILE_W.is_power_of_two() && TILE_H == TILE_W);
+
+    let width_u64 = u64::from(width);
+    let height_u64 = u64::from(height);
+    if tile_rects.len() <= 1 {
+        return match tile_rects {
+            [] => Ok(0),
+            [rect] => {
+                let w = u64::from(rect.w);
+                let h = u64::from(rect.h);
+                let px = w * h;
+                let x1 = u64::from(rect.x) + w;
+                let y1 = u64::from(rect.y) + h;
+                if (px.wrapping_sub(1) >= TILE_PIXELS as u64) | (x1 > width_u64) | (y1 > height_u64)
+                {
+                    return validate_rect_bounds_cold(rect, width, height);
+                }
+                Ok(px)
+            },
+            _ => unreachable!(),
+        };
+    }
+
+    // Fast-path invariants across already-accepted rects:
+    // 1. Every rect in prior outer row-bands has `y1 <= band_y_min`.
+    // 2. Every rect in prior columns of the current band has
+    //    `y0 >= band_y_min`, `y1 <= band_y_end`, and `x1 <= col_x_min`.
+    // 3. Every rect in the current column is stored in `col_rects[..col_len]`
+    //    (`col_len <= 4`), pairwise disjoint, with `y0 >= band_y_min`,
+    //    `y1 <= band_y_end`, `x0 >= col_x_min`, and `x1 <= col_x_end`.
+    // 4. `band_y_min <= band_y_end` and `col_x_min <= col_x_end`.
+    //
+    // `col_x_cell` / `col_y_cell` are alignment-only routing hints for deciding
+    // when to group `<= 4` sub-tiles inside the same `256x256` macro-cell; they
+    // never weaken the geometric disjointness guards above.
+    let mut total_pixels = 0u64;
+    let mut band_y_min = 0u32;
+    let mut band_y_end = 0u32;
+    let mut col_x_min = 0u32;
+    let mut col_x_end = 0u32;
+    let mut col_x_cell = u32::MAX;
+    let mut col_y_cell = u32::MAX;
+    let mut col_rects = [TileRect {
+        x: 0,
+        y: 0,
+        w: 0,
+        h: 0,
+    }; 4];
+    let mut col_len = 0usize;
+
+    for rect in tile_rects {
+        let x0 = rect.x;
+        let y0 = rect.y;
+        let w = u64::from(rect.w);
+        let h = u64::from(rect.h);
+        let px = w * h;
+        let x1_u64 = u64::from(x0) + w;
+        let y1_u64 = u64::from(y0) + h;
+        if (px.wrapping_sub(1) >= TILE_PIXELS as u64) | (x1_u64 > width_u64) | (y1_u64 > height_u64)
+        {
+            return validate_rect_bounds_cold(rect, width, height);
+        }
+        total_pixels += px;
+
+        let x1 = x1_u64 as u32;
+        let y1 = y1_u64 as u32;
+        let x_cell = x0 & MACRO_TILE_MASK;
+        let y_cell = y0 & MACRO_TILE_MASK;
+
+        if y0 >= band_y_min && x0 >= col_x_end {
+            // Disjoint from prior bands (`y0 >= band_y_min`) and every rect in
+            // the current band (`x0 >= col_x_end`).
+            if y0 >= band_y_end && y_cell != col_y_cell {
+                band_y_min = band_y_end;
+                band_y_end = y1;
+                col_x_min = 0;
+                col_x_end = x1;
+                col_x_cell = x_cell;
+                col_y_cell = y_cell;
+                col_rects[0] = *rect;
+                col_len = 1;
+            } else {
+                if x_cell == col_x_cell
+                    && y_cell == col_y_cell
+                    && col_len < 4
+                    && col_x_end <= x_cell.saturating_add(MACRO_TILE_DIM)
+                {
+                    col_rects[col_len] = *rect;
+                    col_len += 1;
+                } else {
+                    col_x_min = col_x_end;
+                    col_x_cell = x_cell;
+                    col_y_cell = y_cell;
+                    col_rects[0] = *rect;
+                    col_len = 1;
+                }
+                col_x_end = x1;
+                band_y_end = band_y_end.max(y1);
+            }
+        } else if y0 >= band_y_end
+            && !(x_cell == col_x_cell
+                && y_cell == col_y_cell
+                && col_len < 4
+                && x0 >= col_x_min
+                && col_x_end <= x_cell.saturating_add(MACRO_TILE_DIM))
+        {
+            // Disjoint from every prior rect (`y0 >= band_y_end`): open a new
+            // outer row-band.
+            band_y_min = band_y_end;
+            band_y_end = y1;
+            col_x_min = 0;
+            col_x_end = x1;
+            col_x_cell = x_cell;
+            col_y_cell = y_cell;
+            col_rects[0] = *rect;
+            col_len = 1;
+        } else if y0 >= band_y_min && x0 >= col_x_min && col_len < 4 {
+            // Disjoint from prior bands (`y0 >= band_y_min`) and prior columns
+            // (`x0 >= col_x_min`): check pairwise against the `<= 3` rects in
+            // the current column.
+            for prev in &col_rects[..col_len] {
+                if x0 < prev.x + prev.w && prev.x < x1 && y0 < prev.y + prev.h && prev.y < y1 {
+                    return validate_tile_rects_fallback(tile_rects, width, height);
+                }
+            }
+            col_rects[col_len] = *rect;
+            col_len += 1;
+            col_x_end = col_x_end.max(x1);
+            band_y_end = band_y_end.max(y1);
+        } else {
+            return validate_tile_rects_fallback(tile_rects, width, height);
+        }
     }
 
     Ok(total_pixels)
@@ -11712,6 +11896,25 @@ mod tests {
         );
     }
 
+    fn oracle_validate_tile_rects(tile_rects: &[TileRect], width: u32, height: u32) -> Result<u64> {
+        let mut total_pixels = 0u64;
+        for &rect in tile_rects {
+            total_pixels += rect.validate_in_bounds(width, height)? as u64;
+        }
+        for i in 0..tile_rects.len() {
+            for j in (i + 1)..tile_rects.len() {
+                if tile_rects[i].overlaps(tile_rects[j]) {
+                    bail!(
+                        "overlap between {:?} and {:?}",
+                        tile_rects[i],
+                        tile_rects[j]
+                    );
+                }
+            }
+        }
+        Ok(total_pixels)
+    }
+
     #[test]
     fn test_validate_tile_rects_sweep_line() {
         let tr = |x, y, w, h| TileRect { x, y, w, h };
@@ -11731,14 +11934,61 @@ mod tests {
         assert_eq!(validate_tile_rects(&rev, 448, 300).unwrap(), 448 * 300);
         assert_eq!(validate_tile_rects(&[], 448, 300).unwrap(), 0);
 
+        // Vertically-merged macro-tile quadrants (both TL+BL and TR+BR) plus
+        // stacked narrow 1D strips (> 4 rects within y < 256).
+        let vert_left = [
+            tr(0, 0, 256, 256),
+            tr(300, 60, 84, 150),
+            tr(384, 0, 128, 128),
+            tr(384, 128, 128, 128),
+        ];
+        assert_eq!(
+            validate_tile_rects(&vert_left, 512, 256).unwrap(),
+            oracle_validate_tile_rects(&vert_left, 512, 256).unwrap()
+        );
+        let vert_right = [
+            tr(0, 0, 128, 128),
+            tr(130, 100, 70, 60),
+            tr(0, 128, 128, 128),
+        ];
+        assert_eq!(
+            validate_tile_rects(&vert_right, 256, 256).unwrap(),
+            oracle_validate_tile_rects(&vert_right, 256, 256).unwrap()
+        );
+        let stacked_1d: Vec<TileRect> = (0..10u32).map(|i| tr(0, i * 4, 200, 4)).collect();
+        assert_eq!(validate_tile_rects(&stacked_1d, 200, 40).unwrap(), 200 * 40);
+
         // Overlaps: partial corner, contained, enclosing arriving later, duplicate,
-        // and horizontal overlap with a tall earlier strip.
+        // horizontal overlap with a tall earlier strip, and fast-path boundary traps
+        // (1px incursion into prior band, prior column, and each cell slot 0..=3).
         for bad in [
             vec![tr(0, 0, 40, 40), tr(39, 39, 25, 25)],
             vec![tr(0, 0, 128, 128), tr(10, 10, 20, 20)],
             vec![tr(20, 0, 20, 60), tr(0, 30, 60, 10)],
             vec![tr(0, 0, 32, 32), tr(0, 0, 32, 32)],
             vec![tr(100, 0, 10, 200), tr(0, 50, 101, 10)],
+            // 1px overlap into previous row-band despite x0 >= col_x_end.
+            vec![tr(0, 0, 256, 100), tr(0, 100, 50, 50), tr(50, 99, 50, 50)],
+            // 1px overlap into previous macro-column despite y0 >= band_y_min.
+            vec![tr(0, 0, 100, 100), tr(100, 0, 50, 50), tr(99, 50, 50, 50)],
+            // 1px overlap against 1st/2nd/3rd entry in current 4-rect cell.
+            vec![
+                tr(0, 0, 128, 128),
+                tr(128, 0, 128, 128),
+                tr(0, 127, 128, 128),
+            ],
+            vec![
+                tr(0, 0, 128, 128),
+                tr(128, 0, 128, 128),
+                tr(0, 128, 128, 128),
+                tr(127, 128, 128, 128),
+            ],
+            vec![
+                tr(0, 0, 128, 128),
+                tr(128, 0, 128, 128),
+                tr(0, 128, 128, 128),
+                tr(128, 127, 128, 128),
+            ],
         ] {
             assert!(
                 validate_tile_rects(&bad, 256, 256).is_err(),
@@ -11746,14 +11996,264 @@ mod tests {
             );
         }
 
-        // Out-of-bounds and zero-dim rects.
+        // Out-of-bounds, oversized (> TILE_PIXELS), zero-dim, and u32::MAX overflow rects.
         for bad in [
             tr(32, 0, 33, 64),
             tr(0, 32, 64, 33),
             tr(0, 0, 0, 10),
             tr(0, 0, 10, 0),
+            tr(0, 0, 257, 256),
+            tr(u32::MAX, 0, 1, 1),
+            tr(0, u32::MAX, 1, 1),
+            tr(u32::MAX - 5, 0, 10, 1),
+            tr(0, u32::MAX - 5, 1, 10),
         ] {
             assert!(validate_tile_rects(&[bad], 64, 64).is_err());
+            assert!(
+                validate_tile_rects(&[tr(0, 0, 1, 1), bad], u32::MAX, u32::MAX).is_err()
+                    || bad.validate_in_bounds(u32::MAX, u32::MAX).is_ok()
+            );
+        }
+        // Valid near-u32::MAX coordinates (exercises saturating macro-cell boundary math).
+        let hi_rects = [
+            tr(u32::MAX - 20, u32::MAX - 20, 10, 10),
+            tr(u32::MAX - 10, u32::MAX - 20, 10, 10),
+            tr(u32::MAX - 20, u32::MAX - 10, 10, 10),
+            tr(u32::MAX - 10, u32::MAX - 10, 10, 10),
+        ];
+        assert_eq!(
+            validate_tile_rects(&hi_rects, u32::MAX, u32::MAX).unwrap(),
+            400
+        );
+        // Overlap followed by out-of-bounds must still error.
+        assert!(
+            validate_tile_rects(
+                &[tr(0, 0, 16, 16), tr(8, 8, 16, 16), tr(60, 0, 10, 10)],
+                64,
+                64,
+            )
+            .is_err()
+        );
+
+        // Adversarial tall-strip & reverse-X staircase inputs (`O(N log N)` worst-case).
+        let n_strips = 512u32;
+        let vstrips_fwd: Vec<TileRect> = (0..n_strips).map(|i| tr(i, 0, 1, 1024)).collect();
+        let mut vstrips_rev = vstrips_fwd.clone();
+        vstrips_rev.reverse();
+        assert_eq!(
+            validate_tile_rects(&vstrips_fwd, n_strips, 1024).unwrap(),
+            u64::from(n_strips) * 1024
+        );
+        assert_eq!(
+            validate_tile_rects(&vstrips_rev, n_strips, 1024).unwrap(),
+            u64::from(n_strips) * 1024
+        );
+        let mut staircase: Vec<TileRect> = (0..n_strips)
+            .map(|i| tr(n_strips - 1 - i, i, 1, n_strips))
+            .collect();
+        assert_eq!(
+            validate_tile_rects(&staircase, n_strips, n_strips * 2).unwrap(),
+            u64::from(n_strips) * u64::from(n_strips)
+        );
+        // Inject 1-pixel overlap at the very end of the staircase.
+        staircase.push(tr(0, n_strips - 1, 1, 1));
+        assert!(validate_tile_rects(&staircase, n_strips, n_strips * 2).is_err());
+
+        // Deterministic randomized equivalence against the exact O(N^2) oracle
+        // (Miri-safe, runs across valid raster, mixed 256+128+crop, shuffled,
+        // and overlapping sets).
+        let mut rng = 0x9E37_79B9_7F4A_7C15u64;
+        let next_u32 = |s: &mut u64| -> u32 {
+            let mut x = *s;
+            x ^= x << 13;
+            x ^= x >> 7;
+            x ^= x << 17;
+            *s = x;
+            (x >> 32) as u32
+        };
+        for case in 0..300usize {
+            let w = 64 + (next_u32(&mut rng) % 700);
+            let h = 64 + (next_u32(&mut rng) % 700);
+            let mut rects = Vec::new();
+            if case % 3 == 0 {
+                // Arbitrary random rects (mix of disjoint, overlapping, touching, OOB).
+                let n = (next_u32(&mut rng) % 24) as usize;
+                for _ in 0..n {
+                    let rx = next_u32(&mut rng) % (w + 16);
+                    let ry = next_u32(&mut rng) % (h + 16);
+                    let rw = next_u32(&mut rng) % 140;
+                    let rh = next_u32(&mut rng) % 140;
+                    rects.push(tr(rx, ry, rw, rh));
+                }
+            } else {
+                // Macro-tile 256x256 / 128x128 / cropped layout with optional shuffle or overlap.
+                let mut by = 0u32;
+                while by < h {
+                    let bh = (h - by).min(256);
+                    let mut bx = 0u32;
+                    while bx < w {
+                        let bw = (w - bx).min(256);
+                        match next_u32(&mut rng) % 5 {
+                            0 => {},
+                            1 => rects.push(tr(bx, by, bw, bh)),
+                            _ => {
+                                let (quads, nq) = tile_quadrants(tr(bx, by, bw, bh));
+                                for &q in &quads[..nq] {
+                                    match next_u32(&mut rng) % 3 {
+                                        0 => {},
+                                        1 => rects.push(q),
+                                        _ => {
+                                            let ox = next_u32(&mut rng) % q.w;
+                                            let oy = next_u32(&mut rng) % q.h;
+                                            let cw = 1 + (next_u32(&mut rng) % (q.w - ox));
+                                            let ch = 1 + (next_u32(&mut rng) % (q.h - oy));
+                                            rects.push(tr(q.x + ox, q.y + oy, cw, ch));
+                                        },
+                                    }
+                                }
+                            },
+                        }
+                        bx += bw;
+                    }
+                    by += bh;
+                }
+                if case % 3 == 2 && !rects.is_empty() {
+                    // Perturb one rect or shuffle to exercise fallback + overlap detection.
+                    if next_u32(&mut rng).is_multiple_of(2) {
+                        for i in (1..rects.len()).rev() {
+                            let j = (next_u32(&mut rng) as usize) % (i + 1);
+                            rects.swap(i, j);
+                        }
+                    } else {
+                        let idx = (next_u32(&mut rng) as usize) % rects.len();
+                        let r = rects[idx];
+                        rects.push(tr(r.x + r.w / 2, r.y + r.h / 2, 1, 1));
+                    }
+                }
+            }
+            let got = validate_tile_rects(&rects, w, h);
+            let exp = oracle_validate_tile_rects(&rects, w, h);
+            assert_eq!(
+                got.ok(),
+                exp.ok(),
+                "mismatch on case {case} ({w}x{h}): rects={rects:?}"
+            );
+        }
+    }
+
+    proptest! {
+        #![proptest_config(ProptestConfig::with_cases(1000))]
+
+        #[test]
+        #[cfg_attr(miri, ignore)]
+        fn proptest_validate_tile_rects_matches_oracle(
+            width in 1u32..=1024,
+            height in 1u32..=1024,
+            raw_rects in prop::collection::vec(
+                (0u32..=1050, 0u32..=1050, 0u32..=260, 0u32..=260),
+                0..=32,
+            ),
+            sort_mode in 0u8..=3,
+        ) {
+            let mut rects: Vec<TileRect> = raw_rects
+                .into_iter()
+                .map(|(x, y, w, h)| TileRect { x, y, w, h })
+                .collect();
+            match sort_mode {
+                1 => rects.sort_by_key(|r| (r.y, r.x)),
+                2 => rects.sort_by_key(|r| (r.y & !255, r.x & !255, r.y, r.x)),
+                3 => rects.reverse(),
+                _ => {},
+            }
+            let got = validate_tile_rects(&rects, width, height).ok();
+            let exp = oracle_validate_tile_rects(&rects, width, height).ok();
+            prop_assert_eq!(got, exp);
+        }
+
+        #[test]
+        #[cfg_attr(miri, ignore)]
+        fn proptest_validate_tile_rects_dense_grid_and_perturbations(
+            cols in 1usize..=5,
+            rows in 1usize..=5,
+            seed in any::<u64>(),
+            perturb_mode in 0u8..=4,
+        ) {
+            let width = (cols as u32) * 256;
+            let height = (rows as u32) * 256;
+            let mut rng = seed.wrapping_add(1);
+            let mut next_u32 = || -> u32 {
+                rng ^= rng << 13;
+                rng ^= rng >> 7;
+                rng ^= rng << 17;
+                (rng >> 32) as u32
+            };
+            let mut rects = Vec::new();
+            for by in (0..height).step_by(256) {
+                for bx in (0..width).step_by(256) {
+                    let parent = TileRect { x: bx, y: by, w: 256, h: 256 };
+                    match next_u32() % 6 {
+                        0 => {},
+                        1 => rects.push(parent),
+                        2 => {
+                            // Vertical merge left (TL+BL) + TR + BR.
+                            let ly = by + (next_u32() % 64);
+                            let lh = 129 + (next_u32() % (256 - (ly - by) - 128));
+                            let lw = 1 + (next_u32() % 128);
+                            rects.push(TileRect { x: bx + (128 - lw), y: ly, w: lw, h: lh });
+                            rects.push(TileRect { x: bx + 128, y: by, w: 128, h: 128 });
+                            rects.push(TileRect { x: bx + 128, y: by + 128, w: 128, h: 128 });
+                        },
+                        3 => {
+                            // Vertical merge right (TR+BR) + TL + BL.
+                            rects.push(TileRect { x: bx, y: by, w: 128, h: 128 });
+                            let ry = by + (next_u32() % 64);
+                            let rh = 129 + (next_u32() % (256 - (ry - by) - 128));
+                            let rw = 1 + (next_u32() % 128);
+                            rects.push(TileRect { x: bx + 128, y: ry, w: rw, h: rh });
+                            rects.push(TileRect { x: bx, y: by + 128, w: 128, h: 128 });
+                        },
+                        _ => {
+                            let (quads, nq) = tile_quadrants(parent);
+                            for &q in &quads[..nq] {
+                                match next_u32() % 3 {
+                                    0 => {},
+                                    1 => rects.push(q),
+                                    _ => {
+                                        let ox = next_u32() % q.w;
+                                        let oy = next_u32() % q.h;
+                                        let cw = 1 + (next_u32() % (q.w - ox));
+                                        let ch = 1 + (next_u32() % (q.h - oy));
+                                        rects.push(TileRect {
+                                            x: q.x + ox,
+                                            y: q.y + oy,
+                                            w: cw,
+                                            h: ch,
+                                        });
+                                    },
+                                }
+                            }
+                        },
+                    }
+                }
+            }
+            if !rects.is_empty() {
+                let idx = (next_u32() as usize) % rects.len();
+                match perturb_mode {
+                    1 => rects[idx].x = rects[idx].x.saturating_sub(1),
+                    2 => rects[idx].y = rects[idx].y.saturating_sub(1),
+                    3 => rects[idx].w = rects[idx].w.saturating_add(1),
+                    4 => {
+                        for i in (1..rects.len()).rev() {
+                            let j = (next_u32() as usize) % (i + 1);
+                            rects.swap(i, j);
+                        }
+                    },
+                    _ => {},
+                }
+            }
+            let got = validate_tile_rects(&rects, width, height).ok();
+            let exp = oracle_validate_tile_rects(&rects, width, height).ok();
+            prop_assert_eq!(got, exp);
         }
     }
 
