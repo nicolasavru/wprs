@@ -722,11 +722,12 @@ pub struct RemoteBuffer {
 
 impl RemoteBuffer {
     pub fn new(metadata: BufferMetadata, pool: &mut SlotPool) -> Result<Self> {
+        let local_stride = filtering::padded_shm_stride(metadata);
         let active_buffer = pool
             .create_buffer(
                 metadata.width,
                 metadata.height,
-                metadata.stride,
+                local_stride,
                 metadata.format.into(),
             )
             .location(loc!())?
@@ -747,9 +748,10 @@ impl RemoteBuffer {
         pool: &'a mut SlotPool,
         copy_scratch: &mut Vec<u8>,
         decompressor: &mut ShardingDecompressor,
-    ) -> Result<&'a mut [u8]> {
+    ) -> Result<(&'a mut [u8], usize)> {
         let metadata = self.metadata;
-        let stride = metadata.stride as usize;
+        let local_stride = self.active_buffer.stride();
+        let stride = local_stride as usize;
         let byte_len = metadata.height as usize * stride;
         let reused_active = prepare_remote_swapchain(
             pool,
@@ -768,13 +770,14 @@ impl RemoteBuffer {
                     tiles = incremental_rects.map_or(0, <[_]>::len),
                     width = metadata.width,
                     height = metadata.height,
+                    local_stride,
                     "creating new buffer",
                 );
                 Ok(pool
                     .create_buffer(
                         metadata.width,
                         metadata.height,
-                        metadata.stride,
+                        local_stride,
                         metadata.format.into(),
                     )
                     .location(loc!())?
@@ -796,7 +799,7 @@ impl RemoteBuffer {
         if reused_active && let Some(sr) = scroll_rect {
             filtering::apply_scroll_rect_in_place_parallel(canvas, stride, sr, decompressor);
         }
-        Ok(canvas)
+        Ok((canvas, stride))
     }
 }
 
@@ -1029,7 +1032,7 @@ impl RemoteSurface {
         pool: &'a mut SlotPool,
         copy_scratch: &mut Vec<u8>,
         decompressor: &mut ShardingDecompressor,
-    ) -> Result<&'a mut [u8]> {
+    ) -> Result<(&'a mut [u8], usize)> {
         let buffer = if let Some(buffer) = &mut self.buffer
             && buffer.metadata == metadata
         {
@@ -1046,7 +1049,7 @@ impl RemoteSurface {
             self.buffer
                 .insert(RemoteBuffer::new(metadata, pool).location(loc!())?)
         };
-        let canvas = buffer
+        let (canvas, stride) = buffer
             .canvas(
                 incremental_rects,
                 scroll_rect,
@@ -1056,7 +1059,7 @@ impl RemoteSurface {
             )
             .location(loc!())?;
         self.pending_scroll_damage = scroll_rect.map(ScrollRect::dst_damage_rect);
-        Ok(canvas)
+        Ok((canvas, stride))
     }
 
     pub(crate) fn drop_buffer(&mut self) {
@@ -2057,5 +2060,208 @@ mod tests {
             ClientHeartbeatTick::SendHeartbeat(4)
         );
         assert_eq!(hb.on_tick(t1 + timeout), ClientHeartbeatTick::TimedOut);
+    }
+
+    #[test]
+    fn test_padded_shm_stride_swapchain_scroll_and_tile_decode() {
+        use std::num::NonZeroUsize;
+
+        use crate::buffer_pointer::BufferPointer;
+        use crate::filtering::ClientTileCache;
+        use crate::filtering::ServerTileCache;
+        use crate::filtering::ShadowBuffer;
+        use crate::filtering::ValidatedTileStream;
+        use crate::serialization::framing::CompressedTileStream;
+        use crate::serialization::framing::CompressionMode;
+        use crate::serialization::wayland::BufferFormat;
+        use crate::sharding_compression::ShardingCompressor;
+        use crate::sharding_compression::ShardingDecompressor;
+
+        let w = 517usize;
+        let h = 320usize;
+        let wire_stride = w * 4;
+        let meta = BufferMetadata {
+            width: w as i32,
+            height: h as i32,
+            stride: wire_stride as i32,
+            format: BufferFormat::Xrgb8888,
+        };
+        let local_stride = filtering::padded_shm_stride(meta) as usize;
+        assert_eq!(local_stride, 2112);
+        let byte_len = h * local_stride;
+
+        let make_frame = |scroll_y: usize, salt: u8| -> Vec<u8> {
+            let mut out = vec![0u8; h * wire_stride];
+            for y in 0..h {
+                let wy = y + scroll_y;
+                for x in 0..w {
+                    let off = y * wire_stride + x * 4;
+                    out[off] = ((x.wrapping_mul(5) ^ wy.wrapping_mul(9)) as u8).wrapping_add(salt);
+                    out[off + 1] = ((x.wrapping_add(wy.wrapping_mul(3))) & 0xFF) as u8;
+                    out[off + 2] = ((wy.wrapping_mul(7)) & 0xFF) as u8;
+                    out[off + 3] = 0xFF;
+                }
+            }
+            out
+        };
+
+        let f0 = make_frame(0, 0);
+        let mut f1 = f0.clone();
+        // Edit a small rect inside the right-edge tile.
+        for y in 20..84 {
+            for x in 460..w {
+                let off = y * wire_stride + x * 4;
+                f1[off] ^= 0x77;
+                f1[off + 1] ^= 0x33;
+            }
+        }
+        let f2 = make_frame(64, 0);
+        let f3 = make_frame(128, 0);
+
+        let mut comp = ShardingCompressor::new(NonZeroUsize::new(2).unwrap(), 1).unwrap();
+        let mut decomp = ShardingDecompressor::new(NonZeroUsize::new(2).unwrap()).unwrap();
+        let mut srv = ServerTileCache::new();
+        let mut cli = ClientTileCache::new();
+        let mut shadow = ShadowBuffer::new();
+
+        let encode_full = |frame: &[u8],
+                           shadow: &mut ShadowBuffer,
+                           srv: &mut ServerTileCache,
+                           comp: &mut ShardingCompressor|
+         -> Vec<u8> {
+            let p = frame.as_ptr();
+            let bp = unsafe { BufferPointer::new(&p, frame.len()) };
+            let mut st = None;
+            filtering::filter_and_compress_full_streaming(
+                bp,
+                ClientId(1),
+                WlSurfaceId(1),
+                meta,
+                CompressionMode::Lossless,
+                Some(shadow),
+                Some(srv),
+                comp,
+                |s| st = Some(s),
+            );
+            let mut wire = Vec::new();
+            st.unwrap().framed_write(&mut wire).unwrap();
+            wire
+        };
+
+        let encode_inc = |frame: &[u8],
+                          shadow: &mut ShadowBuffer,
+                          srv: &mut ServerTileCache,
+                          comp: &mut ShardingCompressor|
+         -> Vec<u8> {
+            let p = frame.as_ptr();
+            let bp = unsafe { BufferPointer::new(&p, frame.len()) };
+            let mut st = None;
+            filtering::filter_and_compress_incremental_streaming(
+                bp,
+                ClientId(1),
+                WlSurfaceId(1),
+                meta,
+                CompressionMode::Lossless,
+                None,
+                shadow,
+                Some(srv),
+                comp,
+                |s| st = Some(s),
+            );
+            let mut wire = Vec::new();
+            st.unwrap().framed_write(&mut wire).unwrap();
+            wire
+        };
+
+        let mut slots: Vec<Vec<u8>> = vec![vec![0x5Au8; byte_len]];
+        let mut active = 0usize;
+        let mut back: Option<(usize, Option<Vec<TileRect>>)> = None;
+        let mut scratch = Vec::new();
+
+        let mut apply_wire = |wire: &[u8], released: &[bool], expected: &[u8]| -> (usize, usize) {
+            let mut rdr = wire;
+            let mut parsed = None;
+            CompressedTileStream::read_from_stream(&mut rdr, |s| {
+                parsed = Some(s);
+                Ok(())
+            })
+            .unwrap();
+            let val = ValidatedTileStream::new(parsed.unwrap()).unwrap();
+            let inc_rects = val.incremental_tile_rects().map(<[TileRect]>::to_vec);
+            let sr = val.scroll_rect();
+            let reused_active = prepare_remote_swapchain(
+                &mut slots,
+                &mut active,
+                &mut back,
+                w as u32,
+                h as u32,
+                inc_rects.as_deref(),
+                sr,
+                |_, &idx| released[idx],
+                |slots, _| {
+                    let idx = slots.len();
+                    slots.push(vec![0xAAu8; byte_len]);
+                    Ok(idx)
+                },
+                |slots, &src_idx, &dst_idx, region| {
+                    copy_slot_region_with(
+                        slots,
+                        &src_idx,
+                        &dst_idx,
+                        byte_len,
+                        local_stride,
+                        region,
+                        &mut scratch,
+                        |slots, &idx| &mut slots[idx],
+                    );
+                },
+            )
+            .unwrap();
+            let canvas = &mut slots[active];
+            if reused_active && let Some(sr) = sr {
+                filtering::apply_scroll_rect_in_place_parallel(
+                    canvas,
+                    local_stride,
+                    sr,
+                    &mut decomp,
+                );
+            }
+            filtering::decompress_and_unfilter_streaming_with_stride(
+                val,
+                &mut decomp,
+                canvas,
+                local_stride,
+                Some(&mut cli),
+            )
+            .unwrap();
+            for y in 0..h {
+                assert_eq!(
+                    &canvas[y * local_stride..y * local_stride + wire_stride],
+                    &expected[y * wire_stride..(y + 1) * wire_stride],
+                    "swapchain pixel mismatch on row {y}"
+                );
+            }
+            (active, slots.len())
+        };
+
+        // Frame 0: full decode into slot 0.
+        let w0 = encode_full(&f0, &mut shadow, &mut srv, &mut comp);
+        assert_eq!(apply_wire(&w0, &[true], &f0), (0, 1));
+
+        // Frame 1: incremental edit while slot 0 is busy -> allocates slot 1 + copies slot 0.
+        let w1 = encode_inc(&f1, &mut shadow, &mut srv, &mut comp);
+        assert_eq!(apply_wire(&w1, &[false], &f1), (1, 2));
+
+        // Frame 2: scroll while slot 1 is busy and slot 0 is released -> cross-slot scroll copy.
+        let w2 = encode_inc(&f2, &mut shadow, &mut srv, &mut comp);
+        assert_eq!(apply_wire(&w2, &[true, false], &f2), (0, 2));
+
+        // Frame 3: scroll while slot 0 is released -> in-place parallel scroll + dirty decode.
+        let w3 = encode_inc(&f3, &mut shadow, &mut srv, &mut comp);
+        assert_eq!(apply_wire(&w3, &[true, true], &f3), (0, 2));
+
+        // Frame 4: return to f0 -> tile-cache hits blitted onto padded swapchain slot.
+        let w4 = encode_inc(&f0, &mut shadow, &mut srv, &mut comp);
+        assert_eq!(apply_wire(&w4, &[false, true], &f0), (1, 2));
     }
 }

@@ -735,7 +735,7 @@ impl WprsClientState {
                 })
                 .location(loc!())?;
 
-            let canvas = match remote_surface.prepare_buffer_canvas(
+            let (canvas, canvas_stride) = match remote_surface.prepare_buffer_canvas(
                 metadata,
                 validated.incremental_tile_rects(),
                 validated.scroll_rect(),
@@ -758,10 +758,11 @@ impl WprsClientState {
                     return Err(err).location(loc!());
                 },
             };
-            filtering::decompress_and_unfilter_streaming(
+            filtering::decompress_and_unfilter_streaming_with_stride(
                 validated,
                 &mut self.decompressor,
                 canvas,
+                canvas_stride,
                 Some(&mut self.tile_cache),
             )
             .location(loc!())

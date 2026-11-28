@@ -8239,19 +8239,54 @@ pub fn filter_and_compress(
     }
 }
 
+/// Returns a 64-byte-aligned row stride (in bytes) for `width_px` 4-byte
+/// pixels so odd window widths (e.g., `1366`/`1921`/`3839` px) satisfy
+/// non-temporal `vmovntdq` row alignment on `wprsc` `SlotPool` canvases.
+///
+/// Widths whose packed row width is already a multiple of 64 bytes (such as
+/// `1024`, `1920`, `2048`, `2560`, `3072`, `3840`, and `4096` px) return their
+/// exact packed stride unchanged.
+#[inline]
+pub fn padded_stride_bytes(width_px: usize) -> Option<usize> {
+    width_px.checked_mul(4)?.checked_next_multiple_of(64)
+}
+
+/// Returns the local `wl_shm` row stride (bytes) for a validated
+/// [`BufferMetadata`], preferring [`padded_stride_bytes`] whenever
+/// `height * padded_stride` fits within the signed 32-bit `wl_shm` buffer limit
+/// (`i32::MAX - 63`), and falling back to `metadata.stride` otherwise.
+#[inline]
+pub fn padded_shm_stride(metadata: BufferMetadata) -> i32 {
+    const MAX_SHM_BUFFER_BYTES: usize = (i32::MAX - 63) as usize;
+    if metadata.width <= 0 || metadata.height <= 0 {
+        return metadata.stride;
+    }
+    let width = metadata.width as usize;
+    let height = metadata.height as usize;
+    if let Some(padded) = padded_stride_bytes(width)
+        && let Ok(padded_i32) = i32::try_from(padded)
+        && let Some(bytes) = height.checked_mul(padded)
+        && bytes <= MAX_SHM_BUFFER_BYTES
+    {
+        padded_i32
+    } else {
+        metadata.stride
+    }
+}
+
 /// Decodes a validated set of pairwise-disjoint `tile_rects` in parallel using
 /// `tier`. When `output_buf` is `None`, runs in puts-only lockstep mode
 /// applying cache resets, evictions, and `CachePut` tiles directly into
 /// `tile_cache` without touching any surface buffer.
 ///
 /// # Safety
-/// Caller must have validated `metadata` (`byte_len = total_pixels * 4`) and
-/// verified every rect in `tile_rects` via [`validate_tile_rects`].
+/// Caller must have validated `metadata` and verified every rect in `tile_rects`
+/// via [`validate_tile_rects`].
 unsafe fn unfilter_tiles_parallel_with_tier<'a>(
     tier: arch::Tier,
     decompressor: &mut ShardingDecompressor,
     metadata: BufferMetadata,
-    byte_len: usize,
+    output_stride: usize,
     reset_tile_cache: bool,
     evict_slots: &[u16],
     tile_rects: &[TileRect],
@@ -8273,11 +8308,23 @@ unsafe fn unfilter_tiles_parallel_with_tier<'a>(
 
     let frame = match output_buf {
         Some(buf) => {
-            if buf.len() < byte_len {
-                bail!("output_buf len {} < {byte_len}", buf.len());
+            let min_stride = (metadata.width as usize)
+                .checked_mul(4)
+                .context(loc!(), "output row width overflow")?;
+            if !output_stride.is_multiple_of(4) || output_stride < min_stride {
+                bail!(
+                    "invalid output_stride {output_stride} for width {}",
+                    metadata.width
+                );
             }
-            let stride_px = (metadata.stride as usize) / 4;
-            let aos: &mut [Vec4u8] = bytemuck::cast_slice_mut(&mut buf[..byte_len]);
+            let output_byte_len = (metadata.height as usize)
+                .checked_mul(output_stride)
+                .context(loc!(), "output buffer size overflow")?;
+            if buf.len() < output_byte_len {
+                bail!("output_buf len {} < {output_byte_len}", buf.len());
+            }
+            let stride_px = output_stride / 4;
+            let aos: &mut [Vec4u8] = bytemuck::cast_slice_mut(&mut buf[..output_byte_len]);
             FrameRows {
                 base: aos.as_mut_ptr().cast(),
                 stride_px,
@@ -8405,12 +8452,12 @@ unsafe fn unfilter_tiles_parallel_with_tier<'a>(
 /// Decodes a validated set of pairwise-disjoint `tile_rects` in parallel.
 ///
 /// # Safety
-/// Caller must have validated `metadata` (`byte_len = total_pixels * 4`) and
-/// verified every rect in `tile_rects` via [`validate_tile_rects`].
+/// Caller must have validated `metadata` and verified every rect in `tile_rects`
+/// via [`validate_tile_rects`].
 unsafe fn unfilter_tiles_parallel<'a>(
     decompressor: &mut ShardingDecompressor,
     metadata: BufferMetadata,
-    byte_len: usize,
+    output_stride: usize,
     reset_tile_cache: bool,
     evict_slots: &[u16],
     tile_rects: &[TileRect],
@@ -8424,7 +8471,7 @@ unsafe fn unfilter_tiles_parallel<'a>(
             arch::Tier::detect(),
             decompressor,
             metadata,
-            byte_len,
+            output_stride,
             reset_tile_cache,
             evict_slots,
             tile_rects,
@@ -8437,14 +8484,13 @@ unsafe fn unfilter_tiles_parallel<'a>(
 
 pub struct ValidatedTileStream {
     stream: CompressedTileStream,
-    byte_len: usize,
 }
 
 impl ValidatedTileStream {
     pub fn new(stream: CompressedTileStream) -> Result<Self> {
         let header = &stream.header;
         let total_pixels = header.metadata.validate().location(loc!())?;
-        let byte_len = total_pixels
+        total_pixels
             .checked_mul(4)
             .context(loc!(), "pixel count overflow")?;
         let width = header.metadata.width as u32;
@@ -8491,7 +8537,7 @@ impl ValidatedTileStream {
                 "non-incremental frame covers {covered_pixels} pixels, expected {width}x{height}",
             );
         }
-        Ok(Self { stream, byte_len })
+        Ok(Self { stream })
     }
 
     pub fn metadata(&self) -> BufferMetadata {
@@ -8511,21 +8557,22 @@ impl ValidatedTileStream {
 }
 
 #[instrument(skip_all, level = "debug")]
-pub fn decompress_and_unfilter_streaming(
+pub fn decompress_and_unfilter_streaming_with_stride(
     validated: ValidatedTileStream,
     decompressor: &mut ShardingDecompressor,
     output_buf: &mut [u8],
+    output_stride: usize,
     tile_cache: Option<&mut ClientTileCache>,
 ) -> Result<()> {
     let header = &validated.stream.header;
     let tiles_rx = &validated.stream.tiles;
-    // SAFETY: `ValidatedTileStream::new` validated `metadata`, `byte_len`, and
+    // SAFETY: `ValidatedTileStream::new` validated `metadata` and
     // `validate_tile_rects(tile_rects, width, height)`.
     unsafe {
         unfilter_tiles_parallel(
             decompressor,
             header.metadata,
-            validated.byte_len,
+            output_stride,
             header.reset_tile_cache,
             &header.evict_slots,
             &header.tile_rects,
@@ -8534,6 +8581,23 @@ pub fn decompress_and_unfilter_streaming(
             || tiles_rx.recv().ok().map(|r| r.map(Cow::Owned)),
         )
     }
+}
+
+#[instrument(skip_all, level = "debug")]
+pub fn decompress_and_unfilter_streaming(
+    validated: ValidatedTileStream,
+    decompressor: &mut ShardingDecompressor,
+    output_buf: &mut [u8],
+    tile_cache: Option<&mut ClientTileCache>,
+) -> Result<()> {
+    let output_stride = validated.stream.header.metadata.stride as usize;
+    decompress_and_unfilter_streaming_with_stride(
+        validated,
+        decompressor,
+        output_buf,
+        output_stride,
+        tile_cache,
+    )
 }
 
 /// Applies header cache operations (`reset_tile_cache`, `evict_slots`) and
@@ -8549,13 +8613,13 @@ pub fn decompress_cache_puts_only(
 ) -> Result<()> {
     let header = &validated.stream.header;
     let tiles_rx = &validated.stream.tiles;
-    // SAFETY: `ValidatedTileStream::new` validated `metadata`, `byte_len`, and
+    // SAFETY: `ValidatedTileStream::new` validated `metadata` and
     // `validate_tile_rects(tile_rects, width, height)`.
     unsafe {
         unfilter_tiles_parallel(
             decompressor,
             header.metadata,
-            validated.byte_len,
+            header.metadata.stride as usize,
             header.reset_tile_cache,
             &header.evict_slots,
             &header.tile_rects,
@@ -8573,7 +8637,7 @@ pub fn decompress_and_unfilter(
     output_buf: &mut [u8],
 ) -> Result<()> {
     let total_pixels = tiles.metadata.validate().location(loc!())?;
-    let byte_len = total_pixels
+    total_pixels
         .checked_mul(4)
         .context(loc!(), "pixel count overflow")?;
     let width = tiles.metadata.width as u32;
@@ -8594,7 +8658,7 @@ pub fn decompress_and_unfilter(
         unfilter_tiles_parallel(
             decompressor,
             tiles.metadata,
-            byte_len,
+            tiles.metadata.stride as usize,
             false,
             &[],
             &tiles.tile_rects,
@@ -11156,7 +11220,7 @@ mod tests {
         output_buf: &mut [u8],
     ) -> Result<()> {
         let total_pixels = tiles.metadata.validate().location(loc!())?;
-        let byte_len = total_pixels
+        total_pixels
             .checked_mul(4)
             .context(loc!(), "pixel count overflow")?;
         validate_tile_rects(
@@ -11173,7 +11237,7 @@ mod tests {
                 tier,
                 decompressor,
                 tiles.metadata,
-                byte_len,
+                tiles.metadata.stride as usize,
                 false,
                 &[],
                 &tiles.tile_rects,
@@ -19000,7 +19064,7 @@ mod tests {
                         tier,
                         &mut decomp,
                         meta,
-                        canvas.len(),
+                        meta.stride as usize,
                         false,
                         &[],
                         &tile_rects,
@@ -19155,7 +19219,7 @@ mod tests {
                                 tier,
                                 &mut decomp,
                                 meta,
-                                canvas.len(),
+                                meta.stride as usize,
                                 false,
                                 &[],
                                 &tile_rects,
@@ -20888,5 +20952,420 @@ mod tests {
             assert!(!shadow.is_compressed());
             assert_eq!(shadow.pixels(), f_small.as_slice());
         }
+    }
+
+    #[test]
+    fn test_padded_stride_bytes_and_shm_stride() {
+        assert_eq!(padded_stride_bytes(0), Some(0));
+        assert_eq!(padded_stride_bytes(1), Some(64));
+        assert_eq!(padded_stride_bytes(15), Some(64));
+        assert_eq!(padded_stride_bytes(16), Some(64));
+        assert_eq!(padded_stride_bytes(17), Some(128));
+        assert_eq!(padded_stride_bytes(1366), Some(5504));
+        assert_eq!(padded_stride_bytes(1921), Some(7744));
+        assert_eq!(padded_stride_bytes(3839), Some(15360));
+        // Already 64-byte multiples (standard & power-of-2 widths) stay unchanged.
+        for w in [1024usize, 1920, 2048, 2560, 3072, 3840, 4096] {
+            assert_eq!(padded_stride_bytes(w), Some(w * 4), "width={w}");
+        }
+        assert_eq!(padded_stride_bytes(usize::MAX), None);
+
+        let meta_for = |w: i32, h: i32, stride: i32| BufferMetadata {
+            width: w,
+            height: h,
+            stride,
+            format: BufferFormat::Xrgb8888,
+        };
+        assert_eq!(padded_shm_stride(meta_for(1366, 768, 1366 * 4)), 5504);
+        assert_eq!(padded_shm_stride(meta_for(1921, 1080, 1921 * 4)), 7744);
+        assert_eq!(padded_shm_stride(meta_for(3839, 2160, 3839 * 4)), 15360);
+        assert_eq!(padded_shm_stride(meta_for(1920, 1080, 1920 * 4)), 7680);
+        assert_eq!(padded_shm_stride(meta_for(3840, 2160, 3840 * 4)), 15360);
+        assert_eq!(padded_shm_stride(meta_for(4096, 2160, 4096 * 4)), 16384);
+        // Non-positive dimensions fall back to wire stride.
+        assert_eq!(padded_shm_stride(meta_for(0, 100, 0)), 0);
+        assert_eq!(padded_shm_stride(meta_for(100, 0, 400)), 400);
+        // Overflowing `i32::MAX - 63` total buffer size falls back to wire stride.
+        let huge = meta_for(1_048_577, 512, 1_048_577 * 4);
+        assert_eq!(padded_shm_stride(huge), huge.stride);
+    }
+
+    #[test]
+    fn test_padded_stride_decode_roundtrip_scroll_cache_and_validation() {
+        #[repr(C, align(64))]
+        #[derive(Copy, Clone)]
+        struct Align64([u8; 64]);
+
+        let make_aligned_canvas = |byte_len: usize, fill: u8| -> Vec<Align64> {
+            vec![Align64([fill; 64]); byte_len.div_ceil(64)]
+        };
+        let as_bytes_mut = |backing: &mut [Align64], byte_len: usize| -> &mut [u8] {
+            // SAFETY: `Align64` is a transparent 64-byte array of `u8`.
+            unsafe { slice::from_raw_parts_mut(backing.as_mut_ptr().cast::<u8>(), byte_len) }
+        };
+
+        let mut comp = ShardingCompressor::new(NonZeroUsize::new(2).unwrap(), 1).unwrap();
+        let mut decomp = ShardingDecompressor::new(NonZeroUsize::new(2).unwrap()).unwrap();
+
+        let make_rich_frame = |w: usize, h: usize, scroll_y: usize, has_alpha: bool| -> Vec<u8> {
+            let stride = w * 4;
+            let mut out = vec![0u8; h * stride];
+            for y in 0..h {
+                let wy = y + scroll_y;
+                for x in 0..w {
+                    let off = y * stride + x * 4;
+                    let tx = x / 256;
+                    let (b, g, r) = if tx == 0 && (wy / 256).is_multiple_of(2) {
+                        // High-entropy AoS gradient tile.
+                        (
+                            ((x.wrapping_mul(7) ^ wy.wrapping_mul(13)) & 0xFF) as u8,
+                            ((x.wrapping_mul(3).wrapping_add(wy.wrapping_mul(5))) & 0xFF) as u8,
+                            ((x.wrapping_add(wy.wrapping_mul(11))) & 0xFF) as u8,
+                        )
+                    } else if tx == 1 {
+                        // Low-color Palette tile.
+                        let idx = ((x >> 2) ^ (wy >> 1)) & 15;
+                        (
+                            (idx * 17) as u8,
+                            (idx * 11 + 20) as u8,
+                            (240 - idx * 9) as u8,
+                        )
+                    } else {
+                        // Solid / right-edge partial tile mix.
+                        if x + 16 >= w {
+                            (((x + wy) & 0xFF) as u8, 0x44, 0xCC)
+                        } else {
+                            (0x20, 0x60, 0xA0)
+                        }
+                    };
+                    let a = if has_alpha {
+                        0x80u8.wrapping_add(((x ^ wy) & 0x7F) as u8)
+                    } else {
+                        0xFF
+                    };
+                    out[off..off + 4].copy_from_slice(&[b, g, r, a]);
+                }
+            }
+            out
+        };
+
+        let check_canvas = |canvas: &[u8],
+                            expected: &[u8],
+                            w: usize,
+                            h: usize,
+                            local_stride: usize| {
+            let vis = w * 4;
+            for y in 0..h {
+                let c_off = y * local_stride;
+                let e_off = y * vis;
+                assert_eq!(
+                    &canvas[c_off..c_off + vis],
+                    &expected[e_off..e_off + vis],
+                    "visible pixel mismatch row {y} (w={w}, local_stride={local_stride})"
+                );
+                assert!(
+                    canvas[c_off + vis..c_off + local_stride]
+                        .iter()
+                        .all(|&b| b == 0xA5),
+                    "trailing row padding overwritten on row {y} (w={w}, local_stride={local_stride})"
+                );
+            }
+        };
+
+        for &(w, h) in &[(517usize, 320usize), (1024, 320), (1366, 320)] {
+            for format in [BufferFormat::Xrgb8888, BufferFormat::Argb8888] {
+                let has_alpha = format == BufferFormat::Argb8888;
+                let wire_stride = w * 4;
+                let meta = BufferMetadata {
+                    width: w as i32,
+                    height: h as i32,
+                    stride: wire_stride as i32,
+                    format,
+                };
+                let local_stride = padded_shm_stride(meta) as usize;
+                assert!(local_stride.is_multiple_of(64));
+                assert!(local_stride >= wire_stride);
+                if !wire_stride.is_multiple_of(64) {
+                    assert!(local_stride > wire_stride);
+                }
+
+                let f0 = make_rich_frame(w, h, 0, has_alpha);
+                let f1 = make_rich_frame(w, h, 64, has_alpha);
+                let mut srv = ServerTileCache::new();
+                let mut cli = ClientTileCache::new();
+                let mut shadow = ShadowBuffer::new();
+
+                let dec_len = h * local_stride;
+                let mut backing = make_aligned_canvas(dec_len, 0xA5);
+                let canvas = as_bytes_mut(&mut backing, dec_len);
+                assert_eq!((canvas.as_ptr() as usize) % 64, 0);
+
+                // Frame 0: full cold frame (AoS + Palette + Solid + right edge).
+                let mut wire0 = Vec::new();
+                let p0 = f0.as_ptr();
+                let bp0 = unsafe { BufferPointer::new(&p0, f0.len()) };
+                let mut st0 = None;
+                filter_and_compress_full_streaming(
+                    bp0,
+                    ClientId(1),
+                    WlSurfaceId(1),
+                    meta,
+                    CompressionMode::Lossless,
+                    Some(&mut shadow),
+                    Some(&mut srv),
+                    &mut comp,
+                    |s| st0 = Some(s),
+                );
+                st0.unwrap().framed_write(&mut wire0).unwrap();
+                let mut rdr = wire0.as_slice();
+                let mut parsed = None;
+                CompressedTileStream::read_from_stream(&mut rdr, |s| {
+                    parsed = Some(s);
+                    Ok(())
+                })
+                .unwrap();
+                let val0 = ValidatedTileStream::new(parsed.unwrap()).unwrap();
+                decompress_and_unfilter_streaming_with_stride(
+                    val0,
+                    &mut decomp,
+                    canvas,
+                    local_stride,
+                    Some(&mut cli),
+                )
+                .unwrap();
+                check_canvas(canvas, &f0, w, h, local_stride);
+
+                // Frame 1: vertical scroll (`dy = -64`) + newly exposed dirty strip.
+                let mut wire1 = Vec::new();
+                let p1 = f1.as_ptr();
+                let bp1 = unsafe { BufferPointer::new(&p1, f1.len()) };
+                let mut st1 = None;
+                let diff1 = filter_and_compress_incremental_streaming(
+                    bp1,
+                    ClientId(1),
+                    WlSurfaceId(1),
+                    meta,
+                    CompressionMode::Lossless,
+                    None,
+                    &mut shadow,
+                    Some(&mut srv),
+                    &mut comp,
+                    |s| st1 = Some(s),
+                );
+                assert!(
+                    diff1.scroll_rect.is_some(),
+                    "expected scroll rect for {w}x{h}"
+                );
+                st1.unwrap().framed_write(&mut wire1).unwrap();
+                let mut rdr1 = wire1.as_slice();
+                let mut parsed1 = None;
+                CompressedTileStream::read_from_stream(&mut rdr1, |s| {
+                    parsed1 = Some(s);
+                    Ok(())
+                })
+                .unwrap();
+                let val1 = ValidatedTileStream::new(parsed1.unwrap()).unwrap();
+                if let Some(sr) = val1.scroll_rect() {
+                    apply_scroll_rect_in_place_parallel(canvas, local_stride, sr, &mut decomp);
+                }
+                decompress_and_unfilter_streaming_with_stride(
+                    val1,
+                    &mut decomp,
+                    canvas,
+                    local_stride,
+                    Some(&mut cli),
+                )
+                .unwrap();
+                check_canvas(canvas, &f1, w, h, local_stride);
+
+                // Frame 2: return to `f0` exercising `ClientTileCache` `CacheHit` blits.
+                let mut wire2 = Vec::new();
+                let p2 = f0.as_ptr();
+                let bp2 = unsafe { BufferPointer::new(&p2, f0.len()) };
+                let mut st2 = None;
+                filter_and_compress_incremental_streaming(
+                    bp2,
+                    ClientId(1),
+                    WlSurfaceId(1),
+                    meta,
+                    CompressionMode::Lossless,
+                    None,
+                    &mut shadow,
+                    Some(&mut srv),
+                    &mut comp,
+                    |s| st2 = Some(s),
+                );
+                st2.unwrap().framed_write(&mut wire2).unwrap();
+                let mut rdr2 = wire2.as_slice();
+                let mut parsed2 = None;
+                CompressedTileStream::read_from_stream(&mut rdr2, |s| {
+                    parsed2 = Some(s);
+                    Ok(())
+                })
+                .unwrap();
+                let val2 = ValidatedTileStream::new(parsed2.unwrap()).unwrap();
+                if let Some(sr) = val2.scroll_rect() {
+                    apply_scroll_rect_in_place_parallel(canvas, local_stride, sr, &mut decomp);
+                }
+                decompress_and_unfilter_streaming_with_stride(
+                    val2,
+                    &mut decomp,
+                    canvas,
+                    local_stride,
+                    Some(&mut cli),
+                )
+                .unwrap();
+                check_canvas(canvas, &f0, w, h, local_stride);
+            }
+        }
+
+        // Hybrid (JPEG + alpha) decode onto a padded odd-width canvas keeps padding intact.
+        {
+            let (w, h) = (517usize, 320usize);
+            let meta = BufferMetadata {
+                width: w as i32,
+                height: h as i32,
+                stride: (w * 4) as i32,
+                format: BufferFormat::Argb8888,
+            };
+            let local_stride = padded_shm_stride(meta) as usize;
+            let frame = make_rich_frame(w, h, 0, true);
+            let mut wire = Vec::new();
+            let p = frame.as_ptr();
+            let bp = unsafe { BufferPointer::new(&p, frame.len()) };
+            let mut st = None;
+            filter_and_compress_full_streaming(
+                bp,
+                ClientId(1),
+                WlSurfaceId(1),
+                meta,
+                CompressionMode::Hybrid {
+                    quality: 85,
+                    subsamp: JpegSubsamp::Sub420,
+                },
+                None,
+                None,
+                &mut comp,
+                |s| st = Some(s),
+            );
+            st.unwrap().framed_write(&mut wire).unwrap();
+            let dec_len = h * local_stride;
+            let mut backing = make_aligned_canvas(dec_len, 0xA5);
+            let canvas = as_bytes_mut(&mut backing, dec_len);
+            let mut rdr = wire.as_slice();
+            let mut parsed = None;
+            CompressedTileStream::read_from_stream(&mut rdr, |s| {
+                parsed = Some(s);
+                Ok(())
+            })
+            .unwrap();
+            let val = ValidatedTileStream::new(parsed.unwrap()).unwrap();
+            decompress_and_unfilter_streaming_with_stride(
+                val,
+                &mut decomp,
+                canvas,
+                local_stride,
+                None,
+            )
+            .unwrap();
+            let vis = w * 4;
+            for y in 0..h {
+                let c_off = y * local_stride;
+                let e_off = y * vis;
+                for x in 0..w {
+                    assert_eq!(canvas[c_off + x * 4 + 3], frame[e_off + x * 4 + 3]);
+                }
+                assert!(
+                    canvas[c_off + vis..c_off + local_stride]
+                        .iter()
+                        .all(|&b| b == 0xA5)
+                );
+            }
+        }
+
+        // Validation errors on invalid `output_stride` / short `output_buf`.
+        let meta = BufferMetadata {
+            width: 33,
+            height: 16,
+            stride: 33 * 4,
+            format: BufferFormat::Xrgb8888,
+        };
+        let frame = vec![0x42u8; 33 * 16 * 4];
+        let mut wire = Vec::new();
+        let p = frame.as_ptr();
+        let bp = unsafe { BufferPointer::new(&p, frame.len()) };
+        let mut st = None;
+        filter_and_compress_full_streaming(
+            bp,
+            ClientId(1),
+            WlSurfaceId(1),
+            meta,
+            CompressionMode::Lossless,
+            None,
+            None,
+            &mut comp,
+            |s| st = Some(s),
+        );
+        st.unwrap().framed_write(&mut wire).unwrap();
+
+        let parse_val = || {
+            let mut rdr = wire.as_slice();
+            let mut parsed = None;
+            CompressedTileStream::read_from_stream(&mut rdr, |s| {
+                parsed = Some(s);
+                Ok(())
+            })
+            .unwrap();
+            ValidatedTileStream::new(parsed.unwrap()).unwrap()
+        };
+
+        let mut big = vec![0u8; 4096];
+        // Non-multiple-of-4 stride rejected.
+        assert!(
+            decompress_and_unfilter_streaming_with_stride(
+                parse_val(),
+                &mut decomp,
+                &mut big,
+                134,
+                None
+            )
+            .is_err()
+        );
+        // Stride narrower than `width * 4` rejected.
+        assert!(
+            decompress_and_unfilter_streaming_with_stride(
+                parse_val(),
+                &mut decomp,
+                &mut big,
+                128,
+                None
+            )
+            .is_err()
+        );
+        // Overflowing `height * output_stride` rejected.
+        assert!(
+            decompress_and_unfilter_streaming_with_stride(
+                parse_val(),
+                &mut decomp,
+                &mut big,
+                usize::MAX & !3,
+                None,
+            )
+            .is_err()
+        );
+        // Output slice shorter than `height * output_stride` rejected.
+        let padded = padded_shm_stride(meta) as usize;
+        assert_eq!(padded, 192);
+        let mut short = vec![0u8; 16 * padded - 4];
+        assert!(
+            decompress_and_unfilter_streaming_with_stride(
+                parse_val(),
+                &mut decomp,
+                &mut short,
+                padded,
+                None,
+            )
+            .is_err()
+        );
     }
 }
