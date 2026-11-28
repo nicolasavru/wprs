@@ -242,6 +242,11 @@ impl TileHashKey {
         }
     }
 
+    #[inline]
+    pub(crate) fn fingerprint(&self) -> ([u64; 2], [u64; 2]) {
+        (self.round_key, self.iv[0])
+    }
+
     #[cfg(test)]
     pub(crate) fn from_seed(mut state: u64) -> Self {
         let mut next_u64 = || {
@@ -268,7 +273,7 @@ impl TileHashKey {
 }
 
 #[inline(always)]
-fn leaf_meta(w: u32, h: u32) -> (u64, u64) {
+pub(crate) fn leaf_meta(w: u32, h: u32) -> (u64, u64) {
     ((u64::from(w) << 32) | u64::from(h), DOMAIN_LEAF)
 }
 
@@ -295,7 +300,7 @@ pub(crate) fn has_hw_aes() -> bool {
 
 #[cfg(all(target_arch = "aarch64", not(miri)))]
 #[inline(always)]
-fn has_hw_aes() -> bool {
+pub(crate) fn has_hw_aes() -> bool {
     #[cfg(target_feature = "aes")]
     {
         true
@@ -304,6 +309,12 @@ fn has_hw_aes() -> bool {
     {
         std::arch::is_aarch64_feature_detected!("aes")
     }
+}
+
+#[cfg(not(all(any(target_arch = "x86_64", target_arch = "aarch64"), not(miri))))]
+#[inline(always)]
+pub(crate) fn has_hw_aes() -> bool {
+    false
 }
 
 #[cfg(all(target_arch = "x86_64", not(miri)))]
@@ -349,7 +360,11 @@ pub(crate) mod x86_aes {
 
     #[inline]
     #[target_feature(enable = "aes")]
-    fn init_lanes(key: &TileHashKey, meta_lo: u64, meta_hi: u64) -> ([__m128i; 4], __m128i) {
+    pub(crate) fn init_lanes(
+        key: &TileHashKey,
+        meta_lo: u64,
+        meta_hi: u64,
+    ) -> ([__m128i; 4], __m128i) {
         let meta = _mm_set_epi64x(meta_hi as i64, meta_lo as i64);
         let lanes = [
             _mm_xor_si128(load_key_block(&key.iv[0]), meta),
@@ -362,7 +377,7 @@ pub(crate) mod x86_aes {
 
     #[inline]
     #[target_feature(enable = "aes")]
-    fn finalize(key: &TileHashKey, lanes: [__m128i; 4], meta: __m128i) -> TileHash {
+    pub(crate) fn finalize(key: &TileHashKey, lanes: [__m128i; 4], meta: __m128i) -> TileHash {
         let fk0 = load_key_block(&key.final_keys[0]);
         let fk1 = load_key_block(&key.final_keys[1]);
         let fk2 = load_key_block(&key.final_keys[2]);
@@ -1672,6 +1687,60 @@ pub(crate) mod x86_aes {
             // SAFETY: `slot_base + qx` is exclusively owned by this worker.
             unsafe { scans.write(slot_base + qx, res) };
         }
+    }
+
+    /// Pure keyed 128-bit digest of `rect` without solid/opaque metadata
+    /// tracking or 3-point probing.
+    ///
+    /// # Safety
+    /// Caller must verify CPU AES-NI support and uphold
+    /// [`super::hash_rect_only_from_shadow`] bounds invariants.
+    #[target_feature(enable = "aes")]
+    pub(crate) unsafe fn hash_rect_only_raw<const HAS_ALPHA: bool>(
+        key: &TileHashKey,
+        base: *const u8,
+        stride: usize,
+        rect: TileRect,
+    ) -> TileHash {
+        let tw = rect.w as usize;
+        let th = rect.h as usize;
+        let (meta_lo, meta_hi) = leaf_meta(rect.w, rect.h);
+        let (mut lanes, meta) = init_lanes(key, meta_lo, meta_hi);
+        let row_bytes = tw * 4;
+        if th == 0 || row_bytes == 0 {
+            return finalize(key, lanes, meta);
+        }
+        let rk = load_key_block(&key.round_key);
+        let alpha_mask = _mm_set1_epi32(XRGB_ALPHA_MASK_U32 as i32);
+        let full64 = row_bytes & !63;
+        let rem = row_bytes & 63;
+        let mut dummy0 = _mm_setzero_si128();
+        let mut dummy1 = _mm_setzero_si128();
+        let mut dummy2 = _mm_setzero_si128();
+        let zero_px = _mm_setzero_si128();
+        // SAFETY: Caller guarantees `(rect.y + ry, rect.x * 4 .. rect.x * 4 + row_bytes)` is readable.
+        let mut row_ptr = unsafe { base.add(rect.y as usize * stride + rect.x as usize * 4) };
+        for _ in 0..th {
+            // SAFETY: `row_ptr` is readable for `full64 + rem` bytes.
+            unsafe {
+                absorb_row::<HAS_ALPHA, false, false, false>(
+                    row_ptr,
+                    ptr::null_mut(),
+                    full64,
+                    rem,
+                    rk,
+                    alpha_mask,
+                    0,
+                    zero_px,
+                    &mut lanes,
+                    &mut dummy0,
+                    &mut dummy1,
+                    &mut dummy2,
+                );
+                row_ptr = row_ptr.add(stride);
+            }
+        }
+        finalize(key, lanes, meta)
     }
 
     /// # Safety
@@ -3033,6 +3102,57 @@ mod aarch64_aes {
     }
 
     /// # Safety
+    /// Caller must verify CPU ARMv8 AES support and uphold
+    /// [`super::hash_rect_only_from_shadow`] bounds invariants.
+    #[target_feature(enable = "aes")]
+    pub(super) unsafe fn hash_rect_only_raw<const HAS_ALPHA: bool>(
+        key: &TileHashKey,
+        base: *const u8,
+        stride: usize,
+        rect: TileRect,
+    ) -> TileHash {
+        let tw = rect.w as usize;
+        let th = rect.h as usize;
+        let (meta_lo, meta_hi) = leaf_meta(rect.w, rect.h);
+        let (mut lanes, meta) = init_lanes(key, meta_lo, meta_hi);
+        let row_bytes = tw * 4;
+        if th == 0 || row_bytes == 0 {
+            return finalize(key, lanes, meta);
+        }
+        let rk = load_key_block(&key.round_key);
+        let alpha_mask = vreinterpretq_u8_u32(vdupq_n_u32(XRGB_ALPHA_MASK_U32));
+        let full64 = row_bytes & !63;
+        let rem = row_bytes & 63;
+        let mut dummy0 = vdupq_n_u8(0);
+        let mut dummy1 = vdupq_n_u8(0);
+        let mut dummy2 = vdupq_n_u8(0);
+        let zero_px = vdupq_n_u8(0);
+        // SAFETY: Caller guarantees `(rect.y + ry, rect.x * 4 .. rect.x * 4 + row_bytes)` is readable.
+        let mut row_ptr = unsafe { base.add(rect.y as usize * stride + rect.x as usize * 4) };
+        for _ in 0..th {
+            // SAFETY: `row_ptr` is readable for `full64 + rem` bytes.
+            unsafe {
+                absorb_row::<HAS_ALPHA, false, false, false>(
+                    row_ptr,
+                    ptr::null_mut(),
+                    full64,
+                    rem,
+                    rk,
+                    alpha_mask,
+                    0,
+                    zero_px,
+                    &mut lanes,
+                    &mut dummy0,
+                    &mut dummy1,
+                    &mut dummy2,
+                );
+                row_ptr = row_ptr.add(stride);
+            }
+        }
+        finalize(key, lanes, meta)
+    }
+
+    /// # Safety
     /// Caller must verify CPU ARMv8 AES support.
     #[target_feature(enable = "aes")]
     pub(super) unsafe fn combine_quad_hashes(
@@ -3916,6 +4036,50 @@ mod portable {
         }
     }
 
+    #[inline(never)]
+    pub(super) unsafe fn hash_rect_only_raw<const HAS_ALPHA: bool>(
+        key: &TileHashKey,
+        base: *const u8,
+        stride: usize,
+        rect: TileRect,
+    ) -> TileHash {
+        let (meta_lo, meta_hi) = leaf_meta(rect.w, rect.h);
+        let mut lanes = init_lanes(key, meta_lo, meta_hi);
+        let tw = rect.w as usize;
+        let th = rect.h as usize;
+        let row_bytes = tw * 4;
+        if th == 0 || row_bytes == 0 {
+            return finalize(key, lanes, meta_lo, meta_hi);
+        }
+        let [rk0, rk1] = key.round_key;
+        let full64 = row_bytes & !63;
+        let rem = row_bytes & 63;
+        let mut dummy_diff = 0u64;
+        let mut dummy_alpha = u64::MAX;
+        // SAFETY: Caller guarantees `(rect.y + ry, rect.x * 4 .. rect.x * 4 + row_bytes)` is readable.
+        let mut row_ptr = unsafe { base.add(rect.y as usize * stride + rect.x as usize * 4) };
+        for _ in 0..th {
+            // SAFETY: `row_ptr` is readable for `full64 + rem` bytes.
+            unsafe {
+                absorb_row::<HAS_ALPHA, false, false, false>(
+                    row_ptr,
+                    ptr::null_mut(),
+                    full64,
+                    rem,
+                    rk0,
+                    rk1,
+                    0,
+                    0,
+                    &mut lanes,
+                    &mut dummy_diff,
+                    &mut dummy_alpha,
+                );
+                row_ptr = row_ptr.add(stride);
+            }
+        }
+        finalize(key, lanes, meta_lo, meta_hi)
+    }
+
     pub(super) fn combine_quad_hashes(
         key: &TileHashKey,
         w: u32,
@@ -3932,6 +4096,67 @@ mod portable {
         }
         finalize(key, lanes, meta_lo, meta_hi)
     }
+}
+
+/// Computes only the keyed 128-bit digest of `rect` inside `shadow_base` (no
+/// solid/opaque tracking or 3-point probing).
+///
+/// # Safety
+/// `shadow_base` must be readable for `(rect.y + rect.h) * stride` bytes and
+/// `(rect.x + rect.w) * 4 <= stride`, with no concurrent mutable writes to
+/// `rect`'s pixels.
+#[inline]
+pub(crate) unsafe fn hash_rect_only_from_shadow<const HAS_ALPHA: bool>(
+    key: &TileHashKey,
+    shadow_base: *const u8,
+    stride: usize,
+    rect: TileRect,
+) -> TileHash {
+    #[cfg(all(target_arch = "x86_64", not(miri)))]
+    if has_hw_aes() {
+        // SAFETY: `has_hw_aes()` verified AES-NI; caller upholds bounds invariants.
+        return unsafe { x86_aes::hash_rect_only_raw::<HAS_ALPHA>(key, shadow_base, stride, rect) };
+    }
+    #[cfg(all(target_arch = "aarch64", not(miri)))]
+    if has_hw_aes() {
+        // SAFETY: `has_hw_aes()` verified ARMv8 AES; caller upholds bounds invariants.
+        return unsafe {
+            aarch64_aes::hash_rect_only_raw::<HAS_ALPHA>(key, shadow_base, stride, rect)
+        };
+    }
+    // SAFETY: Caller upholds bounds invariants.
+    unsafe { portable::hash_rect_only_raw::<HAS_ALPHA>(key, shadow_base, stride, rect) }
+}
+
+/// Computes only the keyed 128-bit digest of `rect` read through
+/// [`BufferPointer`] via raw loads (no solid/opaque tracking or 3-point probe).
+#[inline]
+pub(crate) fn hash_rect_only_from_ptr<const HAS_ALPHA: bool>(
+    key: &TileHashKey,
+    src: BufferPointer<u8>,
+    stride: usize,
+    rect: TileRect,
+) -> TileHash {
+    let tw = rect.w as usize;
+    let th = rect.h as usize;
+    let row_bytes = tw * 4;
+    if th > 0 && row_bytes > 0 {
+        let last_end = (rect.y as usize + th - 1) * stride + rect.x as usize * 4 + row_bytes;
+        assert!(last_end <= src.len());
+    }
+    let base = src.ptr();
+    #[cfg(all(target_arch = "x86_64", not(miri)))]
+    if has_hw_aes() {
+        // SAFETY: `has_hw_aes()` verified AES-NI; `src` bounds checked above.
+        return unsafe { x86_aes::hash_rect_only_raw::<HAS_ALPHA>(key, base, stride, rect) };
+    }
+    #[cfg(all(target_arch = "aarch64", not(miri)))]
+    if has_hw_aes() {
+        // SAFETY: `has_hw_aes()` verified ARMv8 AES; `src` bounds checked above.
+        return unsafe { aarch64_aes::hash_rect_only_raw::<HAS_ALPHA>(key, base, stride, rect) };
+    }
+    // SAFETY: `src` bounds checked above.
+    unsafe { portable::hash_rect_only_raw::<HAS_ALPHA>(key, base, stride, rect) }
 }
 
 /// Computes the keyed 128-bit digest and in-register pixel scan metadata of

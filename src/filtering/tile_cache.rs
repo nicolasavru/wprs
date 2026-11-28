@@ -239,6 +239,15 @@ impl SlotScans {
         unsafe { *self.slots[slot_idx].get() = scan };
     }
 
+    /// # Safety
+    /// Caller must guarantee exclusive ownership of `slot_idx < self.slots.len()`
+    /// and that `slot_idx` was already written.
+    #[inline]
+    pub(crate) unsafe fn read(&self, slot_idx: usize) -> TileHashResult {
+        // SAFETY: Caller upholds exclusive ownership of `slot_idx`.
+        unsafe { *self.slots[slot_idx].get() }
+    }
+
     /// Returns an immutable view over all populated scans once Phase-A workers
     /// have joined (`&mut self` guarantees no concurrent writers remain).
     #[inline]

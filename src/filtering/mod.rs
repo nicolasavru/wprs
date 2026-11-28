@@ -65,6 +65,7 @@ mod arch {
     use crate::filtering::ClientTileCache;
     use crate::filtering::DecodeCacheCtx;
     use crate::filtering::FrameRows;
+    use crate::filtering::PhaseAQuadHashes;
     use crate::filtering::PhaseASchedule;
     use crate::filtering::RowKernel;
     use crate::filtering::ScalarKernel;
@@ -354,6 +355,7 @@ mod arch {
             dirty_slots: &[AtomicU32],
             slot_scans: Option<&SlotScans>,
             cache_non_empty: bool,
+            quad_hashes: Option<&PhaseAQuadHashes>,
             schedule: &PhaseASchedule<'_>,
             worker_idx: usize,
         ) {
@@ -373,6 +375,7 @@ mod arch {
                         dirty_slots,
                         slot_scans,
                         cache_non_empty,
+                        quad_hashes,
                         schedule,
                         worker_idx,
                     );
@@ -390,6 +393,7 @@ mod arch {
                         dirty_slots,
                         slot_scans,
                         cache_non_empty,
+                        quad_hashes,
                         schedule,
                         worker_idx,
                     );
@@ -522,7 +526,7 @@ mod arch {
             stride_px: usize,
             band_y0: usize,
             band_y1: usize,
-        ) -> Option<(ScrollRect, u64)> {
+        ) -> (Option<(ScrollRect, u64)>, u64) {
             // SAFETY: Caller upholds band and buffer bounds invariants.
             unsafe {
                 super::scroll::detect_scroll_in_band_with::<ScalarKernel, HAS_ALPHA>(
@@ -814,6 +818,24 @@ const STACK_QX_CAP: usize = 64;
 /// on the stack inside an active `RowBand2D` (`32 * 128 = 4096` px covers up to
 /// 4K with zero heap allocation while keeping the stack frame under 4 KiB).
 const STACK_HASH_CAP: usize = 32;
+
+/// Maximum mismatched quadrants tolerated inside a hash-screened `RowBand2D`
+/// before bailing out to row-major `diff_and_update_row_band_2d` for the
+/// remaining columns.
+pub(crate) const SCREEN_MAX_MISMATCHES: usize = 2;
+
+/// Minimum frame byte size to enable single-threaded (`p == 1`) hash screening.
+/// Below `16 MiB` (e.g. 1080p `8.3 MiB`), `shadow` stays L3-resident while
+/// single-core strided reads on rotating `wl_shm` buffers lose to contiguous
+/// row-major `diff_and_update`; at `>= 16 MiB` (4K `33.2 MiB`), `wl_shm + shadow`
+/// spills 32 MiB L3 and screening wins even on 1 thread. Multi-threaded frames
+/// (`p > 1`) benefit at all 2D sizes.
+const SCREEN_1T_MIN_BYTES: usize = 16 * 1024 * 1024;
+
+/// Maximum tiny (`< CROP_CACHE_LOOKUP_MIN_PIXELS`) cropped quadrants inside a
+/// `diff_and_update_row_band_2d` band that [`sync_band_quad_hashes`] will
+/// re-hash from L2-hot `shadow` to keep the band's cached hashes valid.
+const MAX_RESEED_CROPPED_QUADS: usize = 4;
 
 /// Architecture-specific row kernels operating on exact-length slices (no slack
 /// bytes required).
@@ -1205,6 +1227,29 @@ pub(crate) trait RowKernel: Copy {
             finish_active_row_band_2d_with::<Self, HAS_ALPHA>(
                 self, ctx, qx_bboxes, trigger_y, full_count,
             );
+        }
+    }
+
+    /// Screens a grid-aligned `RowBand2D` against `prev_hashes` by hashing only
+    /// `ctx.data` (`wl_shm`), diffing mismatched quadrants immediately while
+    /// L2-hot and bailing out to [`Self::diff_and_update_row_band_2d`] once
+    /// more than [`SCREEN_MAX_MISMATCHES`] quadrants differ. Returns `true` iff
+    /// every entry in `prev_hashes` matches finalized `ctx.shadow` upon return.
+    ///
+    /// # Safety
+    /// Rows `[ctx.y0, ctx.y1)` must be strictly in-bounds within `ctx.shadow`
+    /// and exclusively owned by this worker, `ctx.slot_scans` must match
+    /// `scans`, and `prev_hashes.len() == ctx.dirty_slots.len()`.
+    #[inline(always)]
+    unsafe fn screen_and_diff_row_band_2d<const HAS_ALPHA: bool>(
+        self,
+        ctx: &ActiveRowBandCtx<'_>,
+        scans: &SlotScans,
+        prev_hashes: &mut [tile_hash::TileHash],
+    ) -> bool {
+        // SAFETY: Caller upholds disjoint-row shadow bounds and hash-slice invariants.
+        unsafe {
+            screen_and_diff_row_band_2d_with::<Self, HAS_ALPHA>(self, ctx, scans, prev_hashes)
         }
     }
 }
@@ -3624,6 +3669,268 @@ pub fn compute_partial_row_bands(
     merge_row_bands(bands, height)
 }
 
+/// Per-surface cached `<= 128x128` quadrant keyed 128-bit hashes synchronized
+/// with [`ShadowBuffer`] pixels.
+///
+/// Each `128`-row grid band is padded to a multiple of 4 hashes (`64 B`
+/// cache-line boundary) so parallel Phase-A workers updating disjoint bands
+/// never share cache lines.
+#[derive(Clone, Default)]
+struct ShadowQuadHashes {
+    width: usize,
+    height: usize,
+    stride: usize,
+    has_alpha: bool,
+    key_fp: ([u64; 2], [u64; 2]),
+    n_qx: usize,
+    n_qy: usize,
+    stride_quads: usize,
+    hashes: Vec<tile_hash::TileHash>,
+    band_valid: Vec<u8>,
+}
+
+impl ShadowQuadHashes {
+    #[inline]
+    fn invalidate_all(&mut self) {
+        self.band_valid.fill(0);
+        self.n_qy = 0;
+    }
+
+    #[inline]
+    fn invalidate_y_range(&mut self, y0: usize, y1: usize) {
+        if self.n_qy == 0 || y0 >= y1 {
+            return;
+        }
+        let qy0 = y0 / SUBTILE_H;
+        let qy1 = y1.div_ceil(SUBTILE_H).min(self.n_qy);
+        if qy0 < qy1 {
+            self.band_valid[qy0..qy1].fill(0);
+        }
+    }
+
+    #[inline]
+    fn matches(
+        &self,
+        width: usize,
+        height: usize,
+        stride: usize,
+        has_alpha: bool,
+        key: &tile_hash::TileHashKey,
+    ) -> bool {
+        self.n_qy > 0
+            && self.width == width
+            && self.height == height
+            && self.stride == stride
+            && self.has_alpha == has_alpha
+            && self.key_fp == key.fingerprint()
+    }
+
+    fn prepare_for(
+        &mut self,
+        width: usize,
+        height: usize,
+        stride: usize,
+        has_alpha: bool,
+        key: &tile_hash::TileHashKey,
+    ) {
+        let n_qx = width.div_ceil(SUBTILE_W);
+        let n_qy = height.div_ceil(SUBTILE_H);
+        let stride_quads = (n_qx + 3) & !3;
+        self.width = width;
+        self.height = height;
+        self.stride = stride;
+        self.has_alpha = has_alpha;
+        self.key_fp = key.fingerprint();
+        self.n_qx = n_qx;
+        self.n_qy = n_qy;
+        self.stride_quads = stride_quads;
+        let needed = n_qy * stride_quads;
+        if self.hashes.len() < needed {
+            self.hashes.resize(needed, [0u8; 16]);
+        }
+        self.band_valid.clear();
+        self.band_valid.resize(n_qy, 0);
+    }
+
+    #[inline]
+    fn mark_all_valid(&mut self) {
+        self.band_valid.fill(1);
+    }
+
+    #[inline]
+    fn sync_view(&mut self) -> SyncQuadHashes {
+        SyncQuadHashes {
+            hashes_base: self.hashes.as_mut_ptr(),
+            band_valid_base: self.band_valid.as_mut_ptr(),
+            n_qx: self.n_qx,
+            n_qy: self.n_qy,
+            stride_quads: self.stride_quads,
+        }
+    }
+}
+
+/// Raw pointer handle into [`ShadowQuadHashes`] for parallel workers writing
+/// strictly disjoint `(qy, qx)` quadrant slots or disjoint `qy` bands.
+#[derive(Copy, Clone)]
+pub(crate) struct SyncQuadHashes {
+    hashes_base: *mut tile_hash::TileHash,
+    band_valid_base: *mut u8,
+    n_qx: usize,
+    n_qy: usize,
+    stride_quads: usize,
+}
+
+// SAFETY: Callers guarantee every parallel worker owns strictly disjoint
+// `(qy, qx)` slots (during full-frame seeding) or strictly disjoint `qy` bands
+// (during Phase-A incremental scanning).
+unsafe impl Send for SyncQuadHashes {}
+unsafe impl Sync for SyncQuadHashes {}
+
+impl SyncQuadHashes {
+    /// # Safety
+    /// `qy < self.n_qy`, `qx < self.n_qx`, and no other thread may access
+    /// `(qy, qx)` concurrently.
+    #[inline]
+    unsafe fn write_hash(&self, qy: usize, qx: usize, hash: tile_hash::TileHash) {
+        debug_assert!(qy < self.n_qy && qx < self.n_qx);
+        // SAFETY: Caller guarantees in-bounds exclusive access to `(qy, qx)`.
+        unsafe {
+            self.hashes_base
+                .add(qy * self.stride_quads + qx)
+                .write(hash);
+        }
+    }
+
+    /// # Safety
+    /// `qy < self.n_qy`, and no other thread may access band `qy` concurrently.
+    #[inline]
+    unsafe fn band_valid(&self, qy: usize) -> bool {
+        debug_assert!(qy < self.n_qy);
+        // SAFETY: Caller guarantees exclusive access to band `qy`.
+        unsafe { self.band_valid_base.add(qy).read() != 0 }
+    }
+
+    /// # Safety
+    /// `qy < self.n_qy`, and no other thread may access band `qy` concurrently.
+    #[inline]
+    unsafe fn set_band_valid(&self, qy: usize, valid: bool) {
+        debug_assert!(qy < self.n_qy);
+        // SAFETY: Caller guarantees exclusive access to band `qy`.
+        unsafe {
+            self.band_valid_base.add(qy).write(u8::from(valid));
+        }
+    }
+
+    /// # Safety
+    /// `qy < self.n_qy`, and no other thread may access band `qy` concurrently.
+    #[inline]
+    #[allow(clippy::mut_from_ref)]
+    unsafe fn band_hashes_mut(&self, qy: usize) -> &mut [tile_hash::TileHash] {
+        debug_assert!(qy < self.n_qy);
+        // SAFETY: Caller guarantees exclusive access to disjoint band `qy` of
+        // length `self.n_qx <= self.stride_quads`.
+        unsafe {
+            slice::from_raw_parts_mut(self.hashes_base.add(qy * self.stride_quads), self.n_qx)
+        }
+    }
+}
+
+/// Borrowed Phase-A quadrant-hash screening context passed to non-scroll
+/// workers.
+#[derive(Copy, Clone)]
+pub(crate) struct PhaseAQuadHashes {
+    sync: SyncQuadHashes,
+    height: usize,
+    dense_dirty_bands: u64,
+}
+
+/// Per-surface server shadow pixel buffer paired with synchronized per-quadrant
+/// keyed 128-bit hashes for half-DRAM Phase-A change screening.
+///
+/// Mutating raw pixels via [`Self::pixels_mut`] automatically invalidates all
+/// cached quadrant hashes so hashes can never desync from pixel contents.
+#[derive(Clone, Default)]
+pub struct ShadowBuffer {
+    pixels: Vec<u8>,
+    quad_hashes: ShadowQuadHashes,
+}
+
+impl ShadowBuffer {
+    #[inline]
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    #[inline]
+    pub fn from_pixels(pixels: Vec<u8>) -> Self {
+        Self {
+            pixels,
+            quad_hashes: ShadowQuadHashes::default(),
+        }
+    }
+
+    #[inline]
+    pub fn pixels(&self) -> &[u8] {
+        &self.pixels
+    }
+
+    #[inline]
+    pub fn as_slice(&self) -> &[u8] {
+        &self.pixels
+    }
+
+    #[inline]
+    pub fn pixels_mut(&mut self) -> &mut [u8] {
+        self.quad_hashes.invalidate_all();
+        &mut self.pixels
+    }
+
+    #[inline]
+    pub fn len(&self) -> usize {
+        self.pixels.len()
+    }
+
+    #[inline]
+    pub fn is_empty(&self) -> bool {
+        self.pixels.is_empty()
+    }
+
+    #[inline]
+    pub fn clear(&mut self) {
+        self.pixels.clear();
+        self.quad_hashes.invalidate_all();
+    }
+
+    #[inline]
+    pub fn copy_from(&mut self, other: &Self) {
+        self.pixels.clear();
+        self.pixels.extend_from_slice(&other.pixels);
+        self.quad_hashes.clone_from(&other.quad_hashes);
+    }
+
+    #[inline]
+    pub fn into_pixels(self) -> Vec<u8> {
+        self.pixels
+    }
+
+    #[cfg(test)]
+    pub(crate) fn capacity(&self) -> usize {
+        self.pixels.capacity()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn valid_band_count(&self) -> usize {
+        if self.quad_hashes.n_qy == 0 {
+            return 0;
+        }
+        self.quad_hashes
+            .band_valid
+            .iter()
+            .filter(|&&v| v != 0)
+            .count()
+    }
+}
+
 /// Raw pointer handle to the server's per-surface shadow pixel buffer
 /// preserving provenance for disjoint per-tile mutable writes across workers.
 pub(crate) struct ShadowRows {
@@ -4707,6 +5014,321 @@ pub(crate) unsafe fn diff_and_update_row_band_2d_with<K: RowKernel, const HAS_AL
     }
 }
 
+/// Diffs a single `<= 128x128` quadrant `qx` inside `ctx` against `shadow`
+/// (preserving exact tight dirty bbox cropping and `finish_full_quadrant`
+/// escalation), updates `ctx.dirty_slots[qx]` and `scans` (when full or
+/// `>= CROP_CACHE_LOOKUP_MIN_PIXELS`), and refreshes `prev_hash` strictly from
+/// finalized `shadow` (TOCTOU-safe). Returns `true` iff any pixel differed.
+///
+/// # Safety
+/// Quadrant `qx` over `[ctx.y0, ctx.y1)` must be strictly in-bounds within
+/// `ctx.shadow` and exclusively owned by this worker.
+#[inline(always)]
+pub(crate) unsafe fn diff_and_update_single_quad_with<K: RowKernel, const HAS_ALPHA: bool>(
+    kernel: K,
+    ctx: &ActiveRowBandCtx<'_>,
+    scans: &SlotScans,
+    qx: usize,
+    prev_hash: &mut tile_hash::TileHash,
+) -> bool {
+    let x0 = qx * SUBTILE_W;
+    let cw = (ctx.width - x0).min(SUBTILE_W);
+    let y0 = ctx.y0;
+    let y1 = ctx.y1;
+    let ch = y1 - y0;
+    let stride = ctx.stride;
+    let stride_px = stride / 4;
+    let x_bytes = x0 * 4;
+    let max_crop_area = (cw * ch * CROP_MAX_AREA_PCT) / 100;
+    let qrect = TileRect {
+        x: x0 as u32,
+        y: y0 as u32,
+        w: cw as u32,
+        h: ch as u32,
+    };
+    let slot_idx = ctx.slot_base + qx;
+    let mut bbox = QuadBbox::CLEAN;
+
+    for y in y0..y1 {
+        let (_, row_after) = ctx.aos.split_at(y * stride_px + x0);
+        let (src_chunk, _) = row_after.split_at(cw);
+        // SAFETY: Quadrant `qx` over `[y0, y1)` is exclusively owned by this worker.
+        let dst_chunk = unsafe {
+            slice::from_raw_parts_mut(ctx.shadow.row_ptr(y, x_bytes).cast::<Vec4u8>(), cw)
+        };
+        if let Some((fx, lx)) = kernel.diff_and_update_row::<HAS_ALPHA>(src_chunk, dst_chunk)
+            && bbox.record_row(y - y0, fx, lx, max_crop_area)
+        {
+            // SAFETY: Rows `0..=(y - y0)` are finalized in `shadow`, and `slot_idx`
+            // is exclusively owned by this worker.
+            unsafe {
+                finish_full_quadrant::<HAS_ALPHA>(
+                    ctx.data,
+                    ctx.shadow,
+                    stride,
+                    qrect,
+                    (y - y0) + 1,
+                    slot_idx,
+                    &ctx.dirty_slots[qx],
+                    Some(scans),
+                );
+                *prev_hash = scans.read(slot_idx).hash;
+            }
+            return true;
+        }
+    }
+
+    if !bbox.is_dirty() {
+        return false;
+    }
+
+    let crop_area = usize::from(bbox.max_x - bbox.min_x) * usize::from(bbox.max_y - bbox.min_y);
+    let has_quad_hash = ctx.cache_non_empty && crop_area >= CROP_CACHE_LOOKUP_MIN_PIXELS;
+    if has_quad_hash {
+        // SAFETY: `qrect` is finalized in `shadow` and exclusively owned.
+        let scan = unsafe {
+            tile_hash::hash_rect_from_shadow::<HAS_ALPHA>(
+                scans.key(),
+                ctx.shadow.base.cast_const(),
+                stride,
+                qrect,
+            )
+        };
+        // SAFETY: `slot_idx` is exclusively owned by this worker.
+        unsafe { scans.write(slot_idx, scan) };
+        *prev_hash = scan.hash;
+    } else {
+        // SAFETY: `qrect` is finalized in `shadow` (L2-hot from the diff above)
+        // and exclusively owned.
+        *prev_hash = unsafe {
+            tile_hash::hash_rect_only_from_shadow::<HAS_ALPHA>(
+                scans.key(),
+                ctx.shadow.base.cast_const(),
+                stride,
+                qrect,
+            )
+        };
+    }
+    ctx.dirty_slots[qx].store(
+        SlotDirty::encode_cropped(
+            bbox.min_x,
+            bbox.max_x,
+            bbox.min_y,
+            bbox.max_y,
+            has_quad_hash,
+        ),
+        Ordering::Relaxed,
+    );
+    true
+}
+
+/// Synchronizes `prev_hashes[start_qx..]` after `diff_and_update_row_band_2d`
+/// finished columns `start_qx..n_qx` of `ctx`.
+///
+/// Copies already-computed hashes from `ctx.slot_scans` for `Full` and
+/// `Cropped { has_quad_hash: true }` slots and, when `was_valid && allow_reseed`,
+/// re-hashes at most [`MAX_RESEED_CROPPED_QUADS`] tiny cropped quadrants from
+/// L2-hot `shadow` (pre-counting first so bands exceeding the cap return
+/// `false` with zero wasted hashing). Dense bands pass `allow_reseed = false`
+/// so full-redraw / tab-return frames never pay extra re-hashing on tiny
+/// border crops. Returns `true` iff every entry in `prev_hashes` matches
+/// finalized `ctx.shadow`.
+///
+/// # Safety
+/// Rows `[ctx.y0, ctx.y1)` must be finalized in `ctx.shadow` and exclusively
+/// owned by this worker, and `prev_hashes.len() == ctx.dirty_slots.len()`.
+#[inline(never)]
+pub(crate) unsafe fn sync_band_quad_hashes<const HAS_ALPHA: bool>(
+    ctx: &ActiveRowBandCtx<'_>,
+    scans: &SlotScans,
+    start_qx: usize,
+    prev_hashes: &mut [tile_hash::TileHash],
+    was_valid: bool,
+    allow_reseed: bool,
+) -> bool {
+    let n_qx = ctx.dirty_slots.len();
+    debug_assert_eq!(prev_hashes.len(), n_qx);
+    if !was_valid {
+        // Only recover band validity for free when every quadrant in the band
+        // already has a fresh hash in `scans` (e.g. a full redraw after scroll).
+        debug_assert_eq!(start_qx, 0);
+        for slot in ctx.dirty_slots {
+            match SlotDirty::decode(slot.load(Ordering::Relaxed)) {
+                SlotDirty::Full
+                | SlotDirty::Cropped {
+                    has_quad_hash: true,
+                    ..
+                } => {},
+                SlotDirty::Clean
+                | SlotDirty::Cropped {
+                    has_quad_hash: false,
+                    ..
+                } => return false,
+            }
+        }
+        for (qx, dst_h) in prev_hashes.iter_mut().enumerate() {
+            // SAFETY: Checked above that `ctx.slot_base + qx` was written to `scans`.
+            *dst_h = unsafe { scans.read(ctx.slot_base + qx).hash };
+        }
+        return true;
+    }
+
+    // Pre-check tiny cropped (`has_quad_hash: false`) count before doing any
+    // re-hashing so dense bands (`!allow_reseed`) or bands above the cap bail
+    // out immediately with zero wasted hashing.
+    let max_reseed = if allow_reseed {
+        MAX_RESEED_CROPPED_QUADS
+    } else {
+        0
+    };
+    let mut tiny_count = 0usize;
+    for slot in &ctx.dirty_slots[start_qx..n_qx] {
+        if matches!(
+            SlotDirty::decode(slot.load(Ordering::Relaxed)),
+            SlotDirty::Cropped {
+                has_quad_hash: false,
+                ..
+            }
+        ) {
+            tiny_count += 1;
+            if tiny_count > max_reseed {
+                return false;
+            }
+        }
+    }
+
+    let ch = (ctx.y1 - ctx.y0) as u32;
+    for (offset, (slot, prev_hash)) in ctx.dirty_slots[start_qx..n_qx]
+        .iter()
+        .zip(&mut prev_hashes[start_qx..n_qx])
+        .enumerate()
+    {
+        let qx = start_qx + offset;
+        match SlotDirty::decode(slot.load(Ordering::Relaxed)) {
+            SlotDirty::Clean => {},
+            SlotDirty::Full
+            | SlotDirty::Cropped {
+                has_quad_hash: true,
+                ..
+            } => {
+                // SAFETY: `ctx.slot_base + qx` was written to `scans` by Phase A.
+                *prev_hash = unsafe { scans.read(ctx.slot_base + qx).hash };
+            },
+            SlotDirty::Cropped {
+                has_quad_hash: false,
+                ..
+            } => {
+                let x0 = qx * SUBTILE_W;
+                let cw = (ctx.width - x0).min(SUBTILE_W);
+                let qrect = TileRect {
+                    x: x0 as u32,
+                    y: ctx.y0 as u32,
+                    w: cw as u32,
+                    h: ch,
+                };
+                // SAFETY: `qrect` is finalized in `shadow` and exclusively owned.
+                *prev_hash = unsafe {
+                    tile_hash::hash_rect_only_from_shadow::<HAS_ALPHA>(
+                        scans.key(),
+                        ctx.shadow.base.cast_const(),
+                        ctx.stride,
+                        qrect,
+                    )
+                };
+            },
+        }
+    }
+    true
+}
+
+/// Portable implementation of [`RowKernel::screen_and_diff_row_band_2d`] (also
+/// used on AArch64 with hardware ARMv8 AES and under Miri tests).
+///
+/// # Safety
+/// Caller must uphold [`RowKernel::screen_and_diff_row_band_2d`] invariants.
+#[inline(always)]
+pub(crate) unsafe fn screen_and_diff_row_band_2d_with<K: RowKernel, const HAS_ALPHA: bool>(
+    kernel: K,
+    ctx: &ActiveRowBandCtx<'_>,
+    scans: &SlotScans,
+    prev_hashes: &mut [tile_hash::TileHash],
+) -> bool {
+    let width = ctx.width;
+    let y0 = ctx.y0;
+    let y1 = ctx.y1;
+    let ch = (y1 - y0) as u32;
+    let n_qx = ctx.dirty_slots.len();
+    debug_assert_eq!(prev_hashes.len(), n_qx);
+    let key = scans.key();
+    let mut mismatches = 0usize;
+
+    for qx in 0..n_qx {
+        let x0 = qx * SUBTILE_W;
+        let cw = (width - x0).min(SUBTILE_W);
+        let qrect = TileRect {
+            x: x0 as u32,
+            y: y0 as u32,
+            w: cw as u32,
+            h: ch,
+        };
+        let q_hash =
+            tile_hash::hash_rect_only_from_ptr::<HAS_ALPHA>(key, ctx.data, ctx.stride, qrect);
+        if q_hash != prev_hashes[qx] {
+            // SAFETY: Quadrant `qx` over `[y0, y1)` is exclusively owned.
+            let dirty = unsafe {
+                diff_and_update_single_quad_with::<K, HAS_ALPHA>(
+                    kernel,
+                    ctx,
+                    scans,
+                    qx,
+                    &mut prev_hashes[qx],
+                )
+            };
+            if dirty {
+                mismatches += 1;
+                if mismatches > SCREEN_MAX_MISMATCHES && qx + 1 < n_qx {
+                    let start_qx = qx + 1;
+                    let x_start = start_qx * SUBTILE_W;
+                    let (_, shifted_data) = ctx.data.split_at(x_start * 4);
+                    let (_, shifted_aos) = ctx.aos.split_at(x_start);
+                    // SAFETY: `x_start < width`, so `x_start * 4` lies within `shadow`.
+                    let shifted_shadow = ShadowRows {
+                        base: unsafe { ctx.shadow.base.add(x_start * 4) },
+                        stride: ctx.stride,
+                    };
+                    let rem_ctx = ActiveRowBandCtx {
+                        data: shifted_data,
+                        aos: shifted_aos,
+                        shadow: &shifted_shadow,
+                        width: width - x_start,
+                        stride: ctx.stride,
+                        y0,
+                        y1,
+                        slot_base: ctx.slot_base + start_qx,
+                        dirty_slots: &ctx.dirty_slots[start_qx..],
+                        slot_scans: ctx.slot_scans,
+                        cache_non_empty: ctx.cache_non_empty,
+                    };
+                    // SAFETY: Shifted `rem_ctx` covers `[x_start, width) x [y0, y1)`
+                    // exclusively owned by this worker.
+                    unsafe {
+                        kernel.diff_and_update_row_band_2d::<HAS_ALPHA>(&rem_ctx);
+                        return sync_band_quad_hashes::<HAS_ALPHA>(
+                            ctx,
+                            scans,
+                            start_qx,
+                            prev_hashes,
+                            true,
+                            true,
+                        );
+                    }
+                }
+            }
+        }
+    }
+    true
+}
+
 /// Processes a single `RowBand2D` inside one `SUBTILE_W`-wide vertical scroll
 /// column stripe without nested closure indirection, fusing in-place overlap-safe
 /// shadow scrolling, tight dirty bbox tracking, and (for `move_up`) immediate
@@ -5189,6 +5811,7 @@ unsafe fn diff_and_update_worker_with<K: RowKernel, const HAS_ALPHA: bool>(
     dirty_slots: &[AtomicU32],
     slot_scans: Option<&SlotScans>,
     cache_non_empty: bool,
+    quad_hashes: Option<&PhaseAQuadHashes>,
     schedule: &PhaseASchedule<'_>,
     worker_idx: usize,
 ) {
@@ -5213,22 +5836,65 @@ unsafe fn diff_and_update_worker_with<K: RowKernel, const HAS_ALPHA: bool>(
                 }
             },
             ScanSubBand::RowBand2D { y0, y1, slot_base } => {
+                let y0 = y0 as usize;
+                let y1 = y1 as usize;
                 let ctx = ActiveRowBandCtx {
                     data,
                     aos,
                     shadow,
                     width,
                     stride,
-                    y0: y0 as usize,
-                    y1: y1 as usize,
+                    y0,
+                    y1,
                     slot_base,
                     dirty_slots: &dirty_slots[slot_base..slot_base + n_qx],
                     slot_scans,
                     cache_non_empty,
                 };
-                // SAFETY: `sub_bands` cover disjoint row ranges in `shadow`.
-                unsafe {
-                    kernel.diff_and_update_row_band_2d::<HAS_ALPHA>(&ctx);
+                if let Some(qh) = quad_hashes
+                    && let Some(scans) = slot_scans
+                    && y0.is_multiple_of(SUBTILE_H)
+                    && y1 == (y0 + SUBTILE_H).min(qh.height)
+                {
+                    let qy = y0 / SUBTILE_H;
+                    // SAFETY: Grid-aligned `RowBand2D`s are strictly y-disjoint, so
+                    // band `qy` is exclusively owned by this worker.
+                    let (was_valid, band_hashes) =
+                        unsafe { (qh.sync.band_valid(qy), qh.sync.band_hashes_mut(qy)) };
+                    let dense_hint = qy < 64 && ((qh.dense_dirty_bands >> qy) & 1) != 0;
+                    let now_valid = if was_valid && !dense_hint {
+                        // SAFETY: Disjoint band `qy` is exclusively owned by this worker.
+                        unsafe {
+                            kernel.screen_and_diff_row_band_2d::<HAS_ALPHA>(
+                                &ctx,
+                                scans,
+                                band_hashes,
+                            )
+                        }
+                    } else {
+                        // SAFETY: Disjoint band `qy` is exclusively owned by this worker.
+                        unsafe {
+                            kernel.diff_and_update_row_band_2d::<HAS_ALPHA>(&ctx);
+                            sync_band_quad_hashes::<HAS_ALPHA>(
+                                &ctx,
+                                scans,
+                                0,
+                                band_hashes,
+                                was_valid,
+                                !dense_hint,
+                            )
+                        }
+                    };
+                    if now_valid != was_valid {
+                        // SAFETY: Band `qy` is exclusively owned by this worker;
+                        // guarding writes keeps `band_valid` read-only on steady frames.
+                        unsafe { qh.sync.set_band_valid(qy, now_valid) };
+                    }
+                } else {
+                    // SAFETY: `sub_bands` cover disjoint row ranges in `shadow`.
+                    unsafe {
+                        kernel.diff_and_update_row_band_2d::<HAS_ALPHA>(&ctx);
+                    }
                 }
             },
         }
@@ -5408,7 +6074,7 @@ fn filter_and_compress_full_streaming_with_tier(
     surface: WlSurfaceId,
     metadata: BufferMetadata,
     mode: CompressionMode,
-    shadow_out: Option<&mut Vec<u8>>,
+    shadow_out: Option<&mut ShadowBuffer>,
     tile_cache: Option<&mut ServerTileCache>,
     compressor: &mut ShardingCompressor,
     on_stream_ready: impl FnOnce(StreamingCompressedTiles),
@@ -5422,20 +6088,24 @@ fn filter_and_compress_full_streaming_with_tier(
     let byte_len = total_pixels * 4;
     assert!(data.len() >= byte_len);
 
-    let width_bytes = metadata.width as usize * 4;
+    let width = metadata.width as usize;
+    let height = metadata.height as usize;
+    let width_bytes = width * 4;
     let stride = metadata.stride as usize;
     let stride_px = stride / 4;
     let has_alpha = metadata.format == BufferFormat::Argb8888;
+    let seed_quad_hashes = height >= MIN_2D_BAND_HEIGHT as usize;
     let (_, base_entries, total_slots) =
         plan_incremental_scan(&metadata, None).expect("full-frame tile plan cannot fail");
 
     let mut shadow_opt = shadow_out;
     if let Some(shadow) = shadow_opt.as_deref_mut() {
-        shadow.clear();
-        if shadow.capacity() < byte_len {
-            shadow.reserve_exact(byte_len);
-        } else if shadow.capacity() > byte_len.saturating_mul(2) {
-            shadow.shrink_to(byte_len);
+        shadow.quad_hashes.invalidate_all();
+        shadow.pixels.clear();
+        if shadow.pixels.capacity() < byte_len {
+            shadow.pixels.reserve_exact(byte_len);
+        } else if shadow.pixels.capacity() > byte_len.saturating_mul(2) {
+            shadow.pixels.shrink_to(byte_len);
         }
     }
 
@@ -5477,10 +6147,23 @@ fn filter_and_compress_full_streaming_with_tier(
                 tiles: tiles_rx,
             });
 
-            let shadow_rows = shadow_opt.as_deref_mut().map(|shadow| ShadowRows {
-                base: shadow.as_mut_ptr(),
-                stride,
-            });
+            let (shadow_rows, sync_qh) = if let Some(shadow) = shadow_opt.as_deref_mut() {
+                let rows = ShadowRows {
+                    base: shadow.pixels.as_mut_ptr(),
+                    stride,
+                };
+                let qh = if seed_quad_hashes {
+                    shadow
+                        .quad_hashes
+                        .prepare_for(width, height, stride, has_alpha, &hash_key);
+                    Some(shadow.quad_hashes.sync_view())
+                } else {
+                    None
+                };
+                (Some(rows), qh)
+            } else {
+                (None, None)
+            };
             let initial_quality = TileQuality::initial_for_mode(mode);
             let is_hybrid = matches!(mode, CompressionMode::Hybrid { .. });
             let promotions: Vec<AtomicU8> = if is_hybrid {
@@ -5603,6 +6286,16 @@ fn filter_and_compress_full_streaming_with_tier(
                                 };
                                 quad_hashes[q] = scan.hash;
                                 quad_metas[q] = scan.meta;
+                                if let Some(qh) = &sync_qh {
+                                    // SAFETY: `Tile2D` entries own strictly disjoint `(qy, qx)` quadrants.
+                                    unsafe {
+                                        qh.write_hash(
+                                            quads[q].y as usize / SUBTILE_H,
+                                            quads[q].x as usize / SUBTILE_W,
+                                            scan.hash,
+                                        );
+                                    }
+                                }
                             }
                             if let Some(shadow) = &shadow_rows {
                                 // SAFETY: `rect` is exclusively owned by this worker and
@@ -5747,15 +6440,21 @@ fn filter_and_compress_full_streaming_with_tier(
             });
 
             let cache = cache_lock.into_inner().unwrap();
+            let was_disconnected = disconnected.load(Ordering::Relaxed);
             if let Some(shadow) = shadow_opt {
                 // SAFETY: `base_entries` partitions `[0, width) x [0, height)`,
                 // every tile was written (even on early stream disconnect), and
                 // right-edge tiles zeroed trailing row-stride padding, so all
                 // `byte_len` bytes are initialized.
-                unsafe { shadow.set_len(byte_len) };
+                unsafe { shadow.pixels.set_len(byte_len) };
+                if seed_quad_hashes && !was_disconnected {
+                    shadow.quad_hashes.mark_all_valid();
+                } else {
+                    shadow.quad_hashes.invalidate_all();
+                }
             }
 
-            if disconnected.load(Ordering::Relaxed) {
+            if was_disconnected {
                 cache.reset_for_peer();
             } else {
                 cache.finish_cold_fill();
@@ -5777,10 +6476,27 @@ fn filter_and_compress_full_streaming_with_tier(
         let mut slot_scans = SlotScans::new(total_slots, *cache.hash_key());
         {
             let _hash_span = debug_span!("tile_cache_hash_full").entered();
-            let shadow_rows = shadow_opt.as_deref_mut().map(|shadow| ShadowRows {
-                base: shadow.as_mut_ptr(),
-                stride,
-            });
+            let (shadow_rows, sync_qh) = if let Some(shadow) = shadow_opt.as_deref_mut() {
+                let rows = ShadowRows {
+                    base: shadow.pixels.as_mut_ptr(),
+                    stride,
+                };
+                let qh = if seed_quad_hashes {
+                    shadow.quad_hashes.prepare_for(
+                        width,
+                        height,
+                        stride,
+                        has_alpha,
+                        slot_scans.key(),
+                    );
+                    Some(shadow.quad_hashes.sync_view())
+                } else {
+                    None
+                };
+                (Some(rows), qh)
+            } else {
+                (None, None)
+            };
             let n_entries = base_entries.len();
             let next_entry = AtomicUsize::new(0);
             compressor.pool.execute(n_entries, |_state| {
@@ -5852,6 +6568,16 @@ fn filter_and_compress_full_streaming_with_tier(
                                     };
                                     // SAFETY: `quad_slots[q]` is exclusively owned by this entry.
                                     unsafe { slot_scans.write(quad_slots[q], scan) };
+                                    if let Some(qh) = &sync_qh {
+                                        // SAFETY: `Tile2D` entries own strictly disjoint `(qy, qx)` quadrants.
+                                        unsafe {
+                                            qh.write_hash(
+                                                quads[q].y as usize / SUBTILE_H,
+                                                quads[q].x as usize / SUBTILE_W,
+                                                scan.hash,
+                                            );
+                                        }
+                                    }
                                 }
                                 // SAFETY: `rect` is exclusively owned by this worker and
                                 // disjoint from all other `base_entries`.
@@ -5914,7 +6640,10 @@ fn filter_and_compress_full_streaming_with_tier(
             // SAFETY: Phase A workers have joined after writing every base tile
             // and zeroing trailing row-stride padding, initializing all
             // `byte_len` bytes.
-            unsafe { shadow.set_len(byte_len) };
+            unsafe { shadow.pixels.set_len(byte_len) };
+            if seed_quad_hashes {
+                shadow.quad_hashes.mark_all_valid();
+            }
         }
 
         let plan = cache.plan_frame(&base_entries, None, slot_scans.as_slice(), has_alpha, mode);
@@ -5938,8 +6667,8 @@ fn filter_and_compress_full_streaming_with_tier(
 
         let shadow_ptr_storage;
         let encode_aos = if let Some(shadow) = shadow_opt.as_deref() {
-            shadow_ptr_storage = shadow.as_ptr().cast::<Vec4u8>();
-            // SAFETY: Phase A workers have joined, `shadow.len() == total_pixels * 4`,
+            shadow_ptr_storage = shadow.pixels.as_ptr().cast::<Vec4u8>();
+            // SAFETY: Phase A workers have joined, `shadow.pixels.len() == total_pixels * 4`,
             // and `Vec4u8` has alignment 1.
             unsafe { BufferPointer::new(&shadow_ptr_storage, total_pixels) }
         } else {
@@ -6063,7 +6792,7 @@ fn filter_and_compress_full_streaming_with_tier(
     let n_tiles = tile_rects.len();
     let rects_for_workers = tile_rects.clone();
     let shadow_rows = shadow_opt.as_deref_mut().map(|shadow| ShadowRows {
-        base: shadow.as_mut_ptr(),
+        base: shadow.pixels.as_mut_ptr(),
         stride,
     });
 
@@ -6171,7 +6900,7 @@ fn filter_and_compress_full_streaming_with_tier(
         // SAFETY: Every tile in `rects_for_workers` was copied into `shadow`
         // (even on early stream disconnect) and right-edge tiles zeroed
         // trailing row-stride padding, initializing all `byte_len` bytes.
-        unsafe { shadow.set_len(byte_len) };
+        unsafe { shadow.pixels.set_len(byte_len) };
     }
 }
 
@@ -6186,7 +6915,7 @@ pub fn filter_and_compress_full_streaming(
     surface: WlSurfaceId,
     metadata: BufferMetadata,
     mode: CompressionMode,
-    shadow_out: Option<&mut Vec<u8>>,
+    shadow_out: Option<&mut ShadowBuffer>,
     tile_cache: Option<&mut ServerTileCache>,
     compressor: &mut ShardingCompressor,
     on_stream_ready: impl FnOnce(StreamingCompressedTiles),
@@ -6382,7 +7111,7 @@ where
     run(&schedule);
 }
 
-fn filter_and_compress_incremental_streaming_with_tier(
+fn filter_and_compress_incremental_streaming_impl(
     tier: arch::Tier,
     data: BufferPointer<u8>,
     client: ClientId,
@@ -6390,9 +7119,10 @@ fn filter_and_compress_incremental_streaming_with_tier(
     metadata: BufferMetadata,
     mode: CompressionMode,
     bands: Option<&[RowBand]>,
-    shadow: &mut [u8],
+    shadow: &mut ShadowBuffer,
     mut tile_cache: Option<&mut ServerTileCache>,
     compressor: &mut ShardingCompressor,
+    enable_screening: bool,
     on_stream_ready: impl FnOnce(StreamingCompressedTiles),
 ) -> IncrementalFrameResult {
     assert!(data.len().is_multiple_of(4));
@@ -6403,7 +7133,7 @@ fn filter_and_compress_incremental_streaming_with_tier(
         .expect("server passed invalid CompressionMode");
     let byte_len = total_pixels * 4;
     assert!(data.len() >= byte_len);
-    assert!(shadow.len() >= byte_len);
+    assert!(shadow.pixels.len() >= byte_len);
 
     let (sub_bands, base_entries, total_slots) =
         plan_incremental_scan(&metadata, bands).expect("server generated invalid row bands");
@@ -6415,6 +7145,7 @@ fn filter_and_compress_incremental_streaming_with_tier(
     }
 
     let width = metadata.width as usize;
+    let height = metadata.height as usize;
     let stride = metadata.stride as usize;
     let stride_px = stride / 4;
     let has_alpha = metadata.format == BufferFormat::Argb8888;
@@ -6432,10 +7163,14 @@ fn filter_and_compress_incremental_streaming_with_tier(
     // SAFETY: Vec4u8 is a repr(C, packed) wrapper around [u8; 4].
     let aos = unsafe { data.cast::<Vec4u8>() };
 
-    // Detect vertical scroll blit and fuse overlap-safe parallel column-stripe
-    // shadow scrolling into Phase A when present, leaving the non-scroll Phase
-    // A worker loop untouched for zero codegen overhead on non-scroll frames.
-    let scroll_rect = scroll::detect_scroll_rect(data, shadow, metadata, bands);
+    // Detect vertical scroll blit (plus coarse Tier-0 dense-dirty band mask
+    // with zero extra memory reads) and fuse overlap-safe parallel
+    // column-stripe shadow scrolling into Phase A when present, leaving the
+    // non-scroll Phase A worker loop untouched for zero codegen overhead on
+    // non-scroll frames.
+    let scroll_outcome =
+        scroll::detect_scroll_and_activity_with_tier(data, &shadow.pixels, metadata, bands, tier);
+    let scroll_rect = scroll_outcome.scroll_rect;
 
     // Phase A: parallel dirty scan + tight bbox tracking + shadow update (+
     // dirty quadrant hashing and pixel-property scan when `tile_cache` is
@@ -6460,11 +7195,11 @@ fn filter_and_compress_incremental_streaming_with_tier(
         None
     };
     {
-        let shadow_rows = ShadowRows {
-            base: shadow.as_mut_ptr(),
-            stride,
-        };
         if let Some(sr) = scroll_rect {
+            let shadow_rows = ShadowRows {
+                base: shadow.pixels.as_mut_ptr(),
+                stride,
+            };
             let (sb_start, sb_end) = scroll_sub_band_range(&sub_bands, sr);
             let total_tasks = (n_sub - (sb_end - sb_start)) + n_qx;
             let next_task = AtomicUsize::new(0);
@@ -6490,7 +7225,90 @@ fn filter_and_compress_incremental_streaming_with_tier(
                     );
                 }
             });
+            if tile_cache.as_deref().is_some_and(|c| {
+                shadow
+                    .quad_hashes
+                    .matches(width, height, stride, has_alpha, c.hash_key())
+            }) {
+                for sb in &sub_bands[sb_start..sb_end] {
+                    match *sb {
+                        ScanSubBand::RowBand2D { y0, y1, .. } => {
+                            shadow
+                                .quad_hashes
+                                .invalidate_y_range(y0 as usize, y1 as usize);
+                        },
+                        ScanSubBand::Strip1D { rect, .. } => {
+                            shadow
+                                .quad_hashes
+                                .invalidate_y_range(rect.y as usize, (rect.y + rect.h) as usize);
+                        },
+                    }
+                }
+                for sb in sub_bands[..sb_start].iter().chain(&sub_bands[sb_end..]) {
+                    match *sb {
+                        ScanSubBand::Strip1D { rect, slot_idx } => {
+                            if dirty_slots[slot_idx].load(Ordering::Relaxed) != SlotDirty::CLEAN_RAW
+                            {
+                                shadow.quad_hashes.invalidate_y_range(
+                                    rect.y as usize,
+                                    (rect.y + rect.h) as usize,
+                                );
+                            }
+                        },
+                        ScanSubBand::RowBand2D { y0, y1, slot_base } => {
+                            if dirty_slots[slot_base..slot_base + n_qx]
+                                .iter()
+                                .any(|s| s.load(Ordering::Relaxed) != SlotDirty::CLEAN_RAW)
+                            {
+                                shadow
+                                    .quad_hashes
+                                    .invalidate_y_range(y0 as usize, y1 as usize);
+                            }
+                        },
+                    }
+                }
+            } else {
+                shadow.quad_hashes.invalidate_all();
+            }
         } else {
+            let phase_a_qh = if enable_screening
+                && let Some(cache) = tile_cache.as_deref()
+                && shadow
+                    .quad_hashes
+                    .matches(width, height, stride, has_alpha, cache.hash_key())
+            {
+                // Invalidate any grid band overlapping a non-grid-aligned
+                // sub-band before launching workers so workers touch strictly
+                // disjoint grid-aligned `qy` bands.
+                for sb in &sub_bands {
+                    match *sb {
+                        ScanSubBand::Strip1D { rect, .. } => {
+                            shadow
+                                .quad_hashes
+                                .invalidate_y_range(rect.y as usize, (rect.y + rect.h) as usize);
+                        },
+                        ScanSubBand::RowBand2D { y0, y1, .. } => {
+                            let y0 = y0 as usize;
+                            let y1 = y1 as usize;
+                            if !y0.is_multiple_of(SUBTILE_H) || y1 != (y0 + SUBTILE_H).min(height) {
+                                shadow.quad_hashes.invalidate_y_range(y0, y1);
+                            }
+                        },
+                    }
+                }
+                Some(PhaseAQuadHashes {
+                    sync: shadow.quad_hashes.sync_view(),
+                    height,
+                    dense_dirty_bands: scroll_outcome.dense_dirty_bands,
+                })
+            } else {
+                shadow.quad_hashes.invalidate_all();
+                None
+            };
+            let shadow_rows = ShadowRows {
+                base: shadow.pixels.as_mut_ptr(),
+                stride,
+            };
             let mut run_non_scroll = |schedule: &PhaseASchedule<'_>| {
                 compressor.pool.execute(n_sub, |state| {
                     // SAFETY: `sub_bands` cover disjoint regions in `shadow`.
@@ -6508,6 +7326,7 @@ fn filter_and_compress_incremental_streaming_with_tier(
                             &dirty_slots,
                             slot_scans.as_ref(),
                             cache_non_empty,
+                            phase_a_qh.as_ref(),
                             schedule,
                             state.worker_idx,
                         );
@@ -6642,8 +7461,8 @@ fn filter_and_compress_incremental_streaming_with_tier(
         tiles: tiles_rx,
     });
 
-    let shadow_ptr = shadow.as_ptr().cast::<Vec4u8>();
-    // SAFETY: `shadow` has length `>= total_pixels * 4`, Phase A workers have
+    let shadow_ptr = shadow.pixels.as_ptr().cast::<Vec4u8>();
+    // SAFETY: `shadow.pixels` has length `>= total_pixels * 4`, Phase A workers have
     // joined, and `Vec4u8` is `repr(C, packed)` with alignment 1.
     let shadow_aos = unsafe { BufferPointer::new(&shadow_ptr, total_pixels) };
     let is_hybrid = actions.is_some() && matches!(mode, CompressionMode::Hybrid { .. });
@@ -6740,6 +7559,38 @@ fn filter_and_compress_incremental_streaming_with_tier(
     }
 }
 
+fn filter_and_compress_incremental_streaming_with_tier(
+    tier: arch::Tier,
+    data: BufferPointer<u8>,
+    client: ClientId,
+    surface: WlSurfaceId,
+    metadata: BufferMetadata,
+    mode: CompressionMode,
+    bands: Option<&[RowBand]>,
+    shadow: &mut ShadowBuffer,
+    tile_cache: Option<&mut ServerTileCache>,
+    compressor: &mut ShardingCompressor,
+    on_stream_ready: impl FnOnce(StreamingCompressedTiles),
+) -> IncrementalFrameResult {
+    let frame_bytes = (metadata.height as usize).saturating_mul(metadata.stride as usize);
+    let enable_screening = tile_hash::has_hw_aes()
+        && (compressor.pool.parallelism() > 1 || frame_bytes >= SCREEN_1T_MIN_BYTES);
+    filter_and_compress_incremental_streaming_impl(
+        tier,
+        data,
+        client,
+        surface,
+        metadata,
+        mode,
+        bands,
+        shadow,
+        tile_cache,
+        compressor,
+        enable_screening,
+        on_stream_ready,
+    )
+}
+
 /// Diffs `data` against `shadow` across `bands` (or the full frame when `bands`
 /// is `None`), optionally detects and applies a vertical [`ScrollRect`], updates
 /// `shadow` for every changed `128x128` quadrant or `< 8`-row 1D strip, and
@@ -6756,7 +7607,7 @@ pub fn filter_and_compress_incremental_streaming(
     metadata: BufferMetadata,
     mode: CompressionMode,
     bands: Option<&[RowBand]>,
-    shadow: &mut [u8],
+    shadow: &mut ShadowBuffer,
     tile_cache: Option<&mut ServerTileCache>,
     compressor: &mut ShardingCompressor,
     on_stream_ready: impl FnOnce(StreamingCompressedTiles),
@@ -9239,6 +10090,7 @@ mod tests {
                         &dirty_slots,
                         with_scans.then_some(&scans),
                         cache_non_empty,
+                        None,
                         &schedule,
                         0,
                     );
@@ -9924,7 +10776,7 @@ mod tests {
             let mut ref_dirty = None;
             let mut ref_shadow = None;
             for &tier in &tiers {
-                let mut shadow = lossless_frame.clone();
+                let mut shadow = ShadowBuffer::from_pixels(lossless_frame.clone());
                 let mut streaming = None;
                 let dirty = filter_and_compress_incremental_streaming_with_tier(
                     tier,
@@ -9941,16 +10793,24 @@ mod tests {
                 )
                 .dirty_tiles;
                 assert!(streaming.is_some());
-                assert_eq!(shadow, edited, "shadow sync mismatch for {tier:?}");
+                assert_eq!(
+                    shadow.pixels(),
+                    edited.as_slice(),
+                    "shadow sync mismatch for {tier:?}"
+                );
                 if let Some(prev_dirty) = &ref_dirty {
                     assert_eq!(&dirty, prev_dirty, "dirty rects mismatch for {tier:?}");
                 } else {
                     ref_dirty = Some(dirty);
                 }
                 if let Some(prev_shadow) = &ref_shadow {
-                    assert_eq!(&shadow, prev_shadow, "shadow parity mismatch for {tier:?}");
+                    assert_eq!(
+                        shadow.pixels(),
+                        prev_shadow,
+                        "shadow parity mismatch for {tier:?}"
+                    );
                 } else {
-                    ref_shadow = Some(shadow);
+                    ref_shadow = Some(shadow.into_pixels());
                 }
             }
         });
@@ -10748,7 +11608,7 @@ mod tests {
                     };
 
                     let mut frame = test_vec(len);
-                    let mut shadow = Vec::new();
+                    let mut shadow = ShadowBuffer::new();
                     let mut client_canvas = AlignedVec::<64>::with_capacity(len);
                     client_canvas.resize(len, 0xCC);
 
@@ -11278,7 +12138,7 @@ mod tests {
                 compressor,
                 drop,
             );
-            let mut shadow_dropped = Vec::new();
+            let mut shadow_dropped = ShadowBuffer::new();
             filter_and_compress_full_streaming(
                 bp_2,
                 ClientId(1),
@@ -11291,7 +12151,7 @@ mod tests {
                 drop,
             );
             // Shadow must still be fully populated even when stream receiver dropped early.
-            assert_eq!(shadow_dropped, data_2);
+            assert_eq!(shadow_dropped.pixels(), data_2.as_slice());
 
             let mut two_tiles =
                 filter_and_compress(bp_2, meta_2, CompressionMode::Lossless, compressor);
@@ -11896,7 +12756,7 @@ mod tests {
             };
             let mut frame = vec![0u8; 256 * 256 * 4];
             fill_smooth_photo(&mut frame, 256, tr(0, 0, 256, 256), 0xFF);
-            let mut shadow = Vec::new();
+            let mut shadow = ShadowBuffer::new();
             let mut canvas = vec![0u8; frame.len()];
 
             // Initial full sync encodes JPEG and snapshots raw `wl_shm` into `shadow`.
@@ -12297,7 +13157,7 @@ mod tests {
                 let mut frame = vec![0xBBu8; len];
                 blit_doc_window(&mut frame, &doc, stride, full_rect, scroll_y);
 
-                let mut shadow = Vec::new();
+                let mut shadow = ShadowBuffer::new();
                 let mut canvas = vec![0xCCu8; len];
 
                 // Initial full frame.
@@ -12463,7 +13323,7 @@ mod tests {
 
             let mut scroll_y = 100usize;
             let frame0 = render_split_frame(scroll_y);
-            let mut shadow = Vec::new();
+            let mut shadow = ShadowBuffer::new();
             let mut canvas = vec![0xEEu8; len];
             {
                 let ptr = frame0.as_ptr();
@@ -12581,7 +13441,7 @@ mod tests {
             };
             let mut frame = vec![0u8; len];
             blit_doc_window(&mut frame, &doc, stride, full_rect, 0);
-            let mut shadow = Vec::new();
+            let mut shadow = ShadowBuffer::new();
             let mut canvas = vec![0u8; len];
 
             // Frame 1: full Hybrid encode.
@@ -12788,7 +13648,7 @@ mod tests {
             // (matching rows 448..512 in z_prev!).
             z_curr[32 * stride..416 * stride].copy_from_slice(&doc[0..384 * stride]);
 
-            let mut shadow = Vec::new();
+            let mut shadow = ShadowBuffer::new();
             let mut canvas = vec![0xFFu8; len];
             {
                 let ptr = z_prev.as_ptr();
@@ -12913,7 +13773,7 @@ mod tests {
             };
             let doc = make_textured_document(width, height + 300, stride0, BufferFormat::Argb8888);
             let mut frame = doc[..len0].to_vec();
-            let mut shadow = Vec::new();
+            let mut shadow = ShadowBuffer::new();
             let mut canvas = vec![0u8; len0];
             {
                 let ptr = frame.as_ptr();
@@ -13079,7 +13939,7 @@ mod tests {
 
                 let mut server_cache = ServerTileCache::new();
                 let mut client_cache = ClientTileCache::new();
-                let mut shadow = Vec::new();
+                let mut shadow = ShadowBuffer::new();
                 let mut canvas = vec![0xCCu8; len];
 
                 // Frame A (initial full sync populates cache).
@@ -13257,7 +14117,7 @@ mod tests {
             }
             let mut srv4k = ServerTileCache::new();
             let mut cli4k = ClientTileCache::new();
-            let mut shadow4k = Vec::new();
+            let mut shadow4k = ShadowBuffer::new();
             let mut canvas4k = vec![0u8; len4k];
             {
                 let p = tab_a.as_ptr();
@@ -13348,7 +14208,7 @@ mod tests {
 
             let mut srv = ServerTileCache::new();
             let mut cli = ClientTileCache::new();
-            let mut shadow = Vec::new();
+            let mut shadow = ShadowBuffer::new();
             let mut canvas = vec![0u8; len];
 
             let apply = |streaming: StreamingCompressedTiles,
@@ -13843,13 +14703,13 @@ mod tests {
 
             let mut srv = ServerTileCache::new();
             let mut cli = ClientTileCache::new();
-            let mut shadow = Vec::new();
+            let mut shadow = ShadowBuffer::new();
             let mut canvas = vec![0u8; len];
 
             let run_step = |frame: &[u8],
                             full: bool,
                             mode: CompressionMode,
-                            shadow: &mut Vec<u8>,
+                            shadow: &mut ShadowBuffer,
                             srv: &mut ServerTileCache,
                             cli: &mut ClientTileCache,
                             canvas: &mut [u8],
@@ -14088,7 +14948,7 @@ mod tests {
 
             let mut srv = ServerTileCache::new();
             let mut cli = ClientTileCache::new();
-            let mut shadow = Vec::new();
+            let mut shadow = ShadowBuffer::new();
             let mut canvas = vec![0u8; len];
 
             let apply_scroll = |streaming: StreamingCompressedTiles,
@@ -14603,7 +15463,7 @@ mod tests {
 
                     let mut ref_shadow = None;
                     for &tier in &tiers {
-                        let mut shadow = Vec::new();
+                        let mut shadow = ShadowBuffer::new();
                         let mut canvas = AlignedVec::<64>::with_capacity(len);
                         canvas.resize(len, 0xCC);
                         {
@@ -14679,11 +15539,12 @@ mod tests {
                         assert_canvas_matches_frame(&canvas, &edited, meta, 0xCC);
                         if let Some(prev) = &ref_shadow {
                             assert_eq!(
-                                &shadow, prev,
+                                shadow.pixels(),
+                                prev,
                                 "shadow mismatch across tiers ({tier:?}, {format:?})"
                             );
                         } else {
-                            ref_shadow = Some(shadow);
+                            ref_shadow = Some(shadow.into_pixels());
                         }
                     }
                 }
@@ -14704,7 +15565,7 @@ mod tests {
             fill_smooth_photo(&mut f1, 256, tr(13, 11, 17, 19), 0x80);
             fill_smooth_photo(&mut f1, 256, tr(141, 17, 11, 13), 0xC0);
 
-            let mut shadow = Vec::new();
+            let mut shadow = ShadowBuffer::new();
             let mut canvas = vec![0u8; h_len];
             {
                 let p = f0.as_ptr();
@@ -14800,7 +15661,7 @@ mod tests {
             let base = test_vec(len);
             let mut srv = ServerTileCache::new();
             let mut cli = ClientTileCache::new();
-            let mut shadow = Vec::new();
+            let mut shadow = ShadowBuffer::new();
             let mut canvas = vec![0u8; len];
 
             let apply = |st: StreamingCompressedTiles,
@@ -15049,7 +15910,7 @@ mod tests {
 
                 let mut srv = ServerTileCache::new();
                 let mut cli = ClientTileCache::new();
-                let mut shadow = Vec::new();
+                let mut shadow = ShadowBuffer::new();
                 let mut canvas = AlignedVec::<64>::with_capacity(len);
                 canvas.resize(len, 0xCC);
 
@@ -15434,7 +16295,7 @@ mod tests {
                         // (a) `tile_cache = Some` cold-fill (fresh empty shadow).
                         let mut srv = ServerTileCache::new();
                         let mut cli = ClientTileCache::new();
-                        let mut shadow = Vec::new();
+                        let mut shadow = ShadowBuffer::new();
                         {
                             let ptr = frame_a.as_ptr();
                             let bp = unsafe { BufferPointer::new(&ptr, byte_len) };
@@ -15452,13 +16313,21 @@ mod tests {
                             );
                             decode_stream(st.unwrap(), decompressor, &mut canvas, Some(&mut cli));
                         }
-                        assert_shadow_exact(&shadow, &frame_a, width, height, stride, "cold_fill");
+                        assert_shadow_exact(
+                            shadow.pixels(),
+                            &frame_a,
+                            width,
+                            height,
+                            stride,
+                            "cold_fill",
+                        );
                         assert_canvas_matches_frame(&canvas, &frame_a, meta, 0xCC);
                         assert!(srv.occupied_slots() > 0);
 
                         // (b) `tile_cache = Some` warm 2-pass with oversized sentinel shadow
                         //     (verifies shrink + zeroed padding with no stale `0xDD` bytes).
-                        let mut oversized_shadow = vec![0xDDu8; byte_len * 3];
+                        let mut oversized_shadow =
+                            ShadowBuffer::from_pixels(vec![0xDDu8; byte_len * 3]);
                         {
                             let ptr = frame_b.as_ptr();
                             let bp = unsafe { BufferPointer::new(&ptr, byte_len) };
@@ -15477,7 +16346,7 @@ mod tests {
                             decode_stream(st.unwrap(), decompressor, &mut canvas, Some(&mut cli));
                         }
                         assert_shadow_exact(
-                            &oversized_shadow,
+                            oversized_shadow.pixels(),
                             &frame_b,
                             width,
                             height,
@@ -15493,7 +16362,7 @@ mod tests {
                         // (c) `tile_cache = Some` cold-fill with early receiver drop
                         //     (`disconnected = true`).
                         let mut srv_drop = ServerTileCache::new();
-                        let mut shadow_cold_drop = Vec::new();
+                        let mut shadow_cold_drop = ShadowBuffer::new();
                         {
                             let ptr = frame_a.as_ptr();
                             let bp = unsafe { BufferPointer::new(&ptr, byte_len) };
@@ -15510,7 +16379,7 @@ mod tests {
                             );
                         }
                         assert_shadow_exact(
-                            &shadow_cold_drop,
+                            shadow_cold_drop.pixels(),
                             &frame_a,
                             width,
                             height,
@@ -15519,7 +16388,7 @@ mod tests {
                         );
 
                         // (d) `tile_cache = None` normal.
-                        let mut shadow_nc = Vec::new();
+                        let mut shadow_nc = ShadowBuffer::new();
                         {
                             let ptr = frame_a.as_ptr();
                             let bp = unsafe { BufferPointer::new(&ptr, byte_len) };
@@ -15537,11 +16406,18 @@ mod tests {
                             );
                             decode_stream(st.unwrap(), decompressor, &mut canvas, None);
                         }
-                        assert_shadow_exact(&shadow_nc, &frame_a, width, height, stride, "nocache");
+                        assert_shadow_exact(
+                            shadow_nc.pixels(),
+                            &frame_a,
+                            width,
+                            height,
+                            stride,
+                            "nocache",
+                        );
                         assert_canvas_matches_frame(&canvas, &frame_a, meta, 0xCC);
 
                         // (e) `tile_cache = None` early receiver drop (`disconnected = true`).
-                        let mut shadow_nc_drop = Vec::new();
+                        let mut shadow_nc_drop = ShadowBuffer::new();
                         {
                             let ptr = frame_b.as_ptr();
                             let bp = unsafe { BufferPointer::new(&ptr, byte_len) };
@@ -15558,7 +16434,7 @@ mod tests {
                             );
                         }
                         assert_shadow_exact(
-                            &shadow_nc_drop,
+                            shadow_nc_drop.pixels(),
                             &frame_b,
                             width,
                             height,
@@ -15583,7 +16459,7 @@ mod tests {
             };
             let frame = make_textured_document(width, height, stride, BufferFormat::Xrgb8888);
             let mut srv = ServerTileCache::new();
-            let mut shadow = Vec::new();
+            let mut shadow = ShadowBuffer::new();
             let mut wire_puts = Vec::new();
             {
                 let ptr = frame.as_ptr();
@@ -15902,7 +16778,7 @@ mod tests {
             let run_full = |frame: &[u8],
                             meta: BufferMetadata,
                             mode: CompressionMode,
-                            shadow: Option<&mut Vec<u8>>,
+                            shadow: Option<&mut ShadowBuffer>,
                             srv: Option<&mut ServerTileCache>,
                             cli: Option<&mut ClientTileCache>,
                             comp: &mut ShardingCompressor,
@@ -15952,7 +16828,7 @@ mod tests {
             let run_inc = |frame: &[u8],
                            meta: BufferMetadata,
                            mode: CompressionMode,
-                           shadow: &mut [u8],
+                           shadow: &mut ShadowBuffer,
                            srv: Option<&mut ServerTileCache>,
                            cli: Option<&mut ClientTileCache>,
                            canvas: &mut [u8],
@@ -16014,7 +16890,7 @@ mod tests {
             let len = height * stride;
             let mut srv = ServerTileCache::new();
             let mut cli = ClientTileCache::new();
-            let mut shadow = Vec::new();
+            let mut shadow = ShadowBuffer::new();
 
             for (fmt, px, garbage_x) in [
                 (BufferFormat::Xrgb8888, [0x11, 0x22, 0x33, 0xFF], true),
@@ -16226,7 +17102,7 @@ mod tests {
             for mode in [CompressionMode::Lossless, hybrid] {
                 let mut srv_a = ServerTileCache::new();
                 let mut cli_a = ClientTileCache::new();
-                let mut sh_a = Vec::new();
+                let mut sh_a = ShadowBuffer::new();
 
                 // (a) Cold-fill opaque Argb8888: verify omitted alpha on wire + exact alpha=0xFF decode.
                 let (t_opq, out_opq) = run_full(
@@ -16331,7 +17207,7 @@ mod tests {
                 }
 
                 // (d) No-cache with shadow (`copy_and_scan_rect_to_shadow`) and without shadow.
-                let mut sh_nc = Vec::new();
+                let mut sh_nc = ShadowBuffer::new();
                 let (_, out_nc_sh) = run_full(
                     &argb_opaque,
                     meta_argb,
@@ -16687,13 +17563,13 @@ mod tests {
             };
             let mut srv = ServerTileCache::new();
             let mut cli = ClientTileCache::new();
-            let mut shadow = Vec::new();
+            let mut shadow = ShadowBuffer::new();
             let mut canvas = vec![0xAAu8; len];
 
             let send_recv = |f: &[u8],
                              full: bool,
                              mode: CompressionMode,
-                             sh: &mut Vec<u8>,
+                             sh: &mut ShadowBuffer,
                              srv: &mut ServerTileCache,
                              cli: &mut ClientTileCache,
                              canv: &mut [u8],
@@ -16830,7 +17706,7 @@ mod tests {
             //    marks `reset_tile_cache = true` on the next frame while still
             //    completely initializing `shadow`.
             let mut srv_disc = ServerTileCache::new();
-            let mut sh_disc = Vec::new();
+            let mut sh_disc = ShadowBuffer::new();
             {
                 let p = frame.as_ptr();
                 let bp = unsafe { BufferPointer::new(&p, len) };
@@ -18285,7 +19161,7 @@ mod tests {
             // 2. Owned-shadow cold-fill + cached decode must produce bit-identical
             //    wire tiles AND bit-identical decoded pixels (and exact lossless alpha!).
             for use_cache in [false, true] {
-                let mut shadow = Vec::new();
+                let mut shadow = ShadowBuffer::new();
                 let mut srv_cache = ServerTileCache::new();
                 let mut cli_cache = ClientTileCache::new();
                 let mut stream_opt = None;
@@ -18644,7 +19520,7 @@ mod tests {
                 }
 
                 let mut run = |comp: &mut ShardingCompressor| {
-                    let mut shadow = Vec::new();
+                    let mut shadow = ShadowBuffer::new();
                     let mut srv = ServerTileCache::new();
                     let mut cli = ClientTileCache::new();
                     let mut out = vec![0u8; base.len()];
@@ -18696,7 +19572,7 @@ mod tests {
                         Some(&mut cli),
                     )
                     .unwrap();
-                    assert_eq!(shadow, f1);
+                    assert_eq!(shadow.pixels(), f1.as_slice());
                     if mode == CompressionMode::Lossless {
                         assert_eq!(out, f1);
                     }
@@ -18731,8 +19607,8 @@ mod tests {
             stride: tall_stride as i32,
             format: BufferFormat::Xrgb8888,
         };
-        let mut shadow = vec![0u8; tall_h * tall_stride];
-        let mut tall_f1 = shadow.clone();
+        let mut shadow = ShadowBuffer::from_pixels(vec![0u8; tall_h * tall_stride]);
+        let mut tall_f1 = shadow.pixels().to_vec();
         // Flip one pixel per quadrant so all 528 quadrants emit cropped tiles
         // (`528 > STACK_HOME_TILES_CAP = 512`), forcing both heap spills.
         for qy in 0..(tall_h / SUBTILE_H) {
@@ -18769,7 +19645,341 @@ mod tests {
         stream.unwrap().framed_write(&mut wire).unwrap();
         let mut out = vec![0u8; tall_f1.len()];
         decompress_and_unfilter_streaming(read_stream(&wire), &mut decomp, &mut out, None).unwrap();
-        assert_eq!(shadow, tall_f1);
+        assert_eq!(shadow.pixels(), tall_f1.as_slice());
         assert_eq!(out, tall_f1);
+    }
+
+    #[test]
+    fn test_half_dram_hash_screening_correctness_and_invalidation() {
+        let mut comp = ShardingCompressor::new(
+            NonZeroUsize::new(if cfg!(miri) { 1 } else { 4 }).unwrap(),
+            1,
+        )
+        .unwrap();
+        let mut decomp =
+            ShardingDecompressor::new(NonZeroUsize::new(if cfg!(miri) { 1 } else { 2 }).unwrap())
+                .unwrap();
+
+        // Non-128-multiple width & height (`5 * 128 + 29 = 669`, `2 * 128 + 20 = 276`)
+        // with non-tight row stride (`+ 16` bytes padding) to cover interior, right-edge,
+        // and bottom-edge quadrants across both `Xrgb8888` and `Argb8888`.
+        let w = if cfg!(miri) {
+            3 * SUBTILE_W + 13
+        } else {
+            5 * SUBTILE_W + 29
+        };
+        let h = if cfg!(miri) {
+            SUBTILE_H + 16
+        } else {
+            2 * SUBTILE_H + 20
+        };
+        let stride = (w + 4) * 4;
+        let len = h * stride;
+        let n_qy = h.div_ceil(SUBTILE_H);
+
+        let make_frame = |seed: u8, has_alpha: bool| -> Vec<u8> {
+            let mut out = vec![0u8; len];
+            for y in 0..h {
+                for x in 0..w {
+                    let off = y * stride + x * 4;
+                    out[off] = seed.wrapping_add(((x * 13 + y * 7) & 0xFF) as u8);
+                    out[off + 1] = seed.wrapping_add(((x * 5 + y * 11) & 0xFF) as u8);
+                    out[off + 2] = seed.wrapping_add(((x * 17 + y * 3) & 0xFF) as u8);
+                    out[off + 3] = if has_alpha {
+                        0x80u8.wrapping_add(((x + y * 3) & 0x7F) as u8)
+                    } else {
+                        ((x * 19 + y) & 0xFF) as u8
+                    };
+                }
+            }
+            out
+        };
+
+        let run_pair_and_assert_exact =
+            |tier: arch::Tier,
+             meta: BufferMetadata,
+             frames: &[(&[u8], Option<&[RowBand]>)],
+             comp: &mut ShardingCompressor,
+             decomp: &mut ShardingDecompressor| {
+                let mut sh_screen = ShadowBuffer::new();
+                let mut sh_plain = ShadowBuffer::new();
+                let mut srv_screen = ServerTileCache::new();
+                let mut srv_plain = ServerTileCache::new();
+                let mut cli_screen = ClientTileCache::new();
+                let mut cli_plain = ClientTileCache::new();
+                let mut out_screen = vec![0u8; len];
+                let mut out_plain = vec![0u8; len];
+
+                // Frame 0: full sync seeds `quad_hashes`.
+                let (f0, _) = frames[0];
+                let p0 = f0.as_ptr();
+                let bp0 = unsafe { BufferPointer::new(&p0, len) };
+                let mut s_scr = None;
+                let mut s_pln = None;
+                filter_and_compress_full_streaming_with_tier(
+                    tier,
+                    bp0,
+                    ClientId(1),
+                    WlSurfaceId(1),
+                    meta,
+                    CompressionMode::Lossless,
+                    Some(&mut sh_screen),
+                    Some(&mut srv_screen),
+                    comp,
+                    |s| s_scr = Some(s),
+                );
+                filter_and_compress_full_streaming_with_tier(
+                    tier,
+                    bp0,
+                    ClientId(1),
+                    WlSurfaceId(1),
+                    meta,
+                    CompressionMode::Lossless,
+                    Some(&mut sh_plain),
+                    Some(&mut srv_plain),
+                    comp,
+                    |s| s_pln = Some(s),
+                );
+                assert_eq!(sh_screen.valid_band_count(), n_qy);
+                let mut w_scr = Vec::new();
+                let mut w_pln = Vec::new();
+                s_scr.unwrap().framed_write(&mut w_scr).unwrap();
+                s_pln.unwrap().framed_write(&mut w_pln).unwrap();
+                let decode = |wire: &[u8],
+                              out: &mut [u8],
+                              cli: &mut ClientTileCache,
+                              decomp: &mut ShardingDecompressor| {
+                    if wire.is_empty() {
+                        return;
+                    }
+                    let mut rx = None;
+                    let mut cursor = wire;
+                    CompressedTileStream::read_from_stream(&mut cursor, |s| {
+                        rx = Some(s);
+                        Ok(())
+                    })
+                    .unwrap();
+                    let val = ValidatedTileStream::new(rx.unwrap()).unwrap();
+                    if let Some(sr) = val.scroll_rect() {
+                        apply_scroll_rect_in_place(out, stride, sr);
+                    }
+                    decompress_and_unfilter_streaming(val, decomp, out, Some(cli)).unwrap();
+                };
+                decode(&w_scr, &mut out_screen, &mut cli_screen, decomp);
+                decode(&w_pln, &mut out_plain, &mut cli_plain, decomp);
+                assert_eq!(out_screen, out_plain);
+
+                for (step, &(frame, bands)) in frames[1..].iter().enumerate() {
+                    let p = frame.as_ptr();
+                    let bp = unsafe { BufferPointer::new(&p, len) };
+                    let mut st_scr = None;
+                    let mut st_pln = None;
+                    let res_scr = filter_and_compress_incremental_streaming_impl(
+                        tier,
+                        bp,
+                        ClientId(1),
+                        WlSurfaceId(1),
+                        meta,
+                        CompressionMode::Lossless,
+                        bands,
+                        &mut sh_screen,
+                        Some(&mut srv_screen),
+                        comp,
+                        true,
+                        |s| st_scr = Some(s),
+                    );
+                    let res_pln = filter_and_compress_incremental_streaming_impl(
+                        tier,
+                        bp,
+                        ClientId(1),
+                        WlSurfaceId(1),
+                        meta,
+                        CompressionMode::Lossless,
+                        bands,
+                        &mut sh_plain,
+                        Some(&mut srv_plain),
+                        comp,
+                        false,
+                        |s| st_pln = Some(s),
+                    );
+                    assert_eq!(
+                        res_scr, res_pln,
+                        "step {step}: IncrementalFrameResult mismatch"
+                    );
+                    let mut wb_scr = Vec::new();
+                    let mut wb_pln = Vec::new();
+                    if let Some(s) = st_scr {
+                        s.framed_write(&mut wb_scr).unwrap();
+                    }
+                    if let Some(s) = st_pln {
+                        s.framed_write(&mut wb_pln).unwrap();
+                    }
+                    assert_eq!(wb_scr.len(), wb_pln.len(), "step {step}: wire len mismatch");
+                    decode(&wb_scr, &mut out_screen, &mut cli_screen, decomp);
+                    decode(&wb_pln, &mut out_plain, &mut cli_plain, decomp);
+                    assert_eq!(out_screen, out_plain, "step {step}: decoded pixel mismatch");
+                    assert_eq!(
+                        srv_screen.occupied_slots(),
+                        srv_plain.occupied_slots(),
+                        "step {step}: cache slot count mismatch"
+                    );
+                }
+                sh_screen
+            };
+
+        let tiers = arch::Tier::supported_tiers();
+        for format in [BufferFormat::Xrgb8888, BufferFormat::Argb8888] {
+            let has_alpha = format == BufferFormat::Argb8888;
+            let meta = BufferMetadata {
+                width: w as i32,
+                height: h as i32,
+                stride: stride as i32,
+                format,
+            };
+            let f0 = make_frame(1, has_alpha);
+            // Step 1: exact same pixels (plus X-byte perturbation on Xrgb8888 -> MUST stay Clean!).
+            let mut f1 = f0.clone();
+            if !has_alpha {
+                for y in 0..h {
+                    f1[y * stride + 5 * 4 + 3] ^= 0x77;
+                }
+            }
+            // Step 2: 1 small cropped edit (< 1024 px) in Q0 + 1 alpha-only edit in right edge.
+            let mut f2 = f1.clone();
+            for y in 10..20 {
+                for x in 10..20 {
+                    f2[y * stride + x * 4] ^= 0x55;
+                }
+            }
+            f2[(15 * stride) + (w - 3) * 4 + 3] ^= 0x40;
+            // Step 3: identical to Step 2 (verifies prev_quad_hashes updated on small crop & edge!).
+            let f3 = f2.clone();
+            // Step 4: trigger mid-band bailout (`> SCREEN_MAX_MISMATCHES` dirty quads in band 0,
+            // mixing small crop, large crop >= 1024 px, and `bbox.full` + right edge).
+            let mut f4 = f3.clone();
+            for y in 0..16 {
+                for x in 0..8 {
+                    f4[y * stride + x * 4 + 1] ^= 0x33;
+                }
+            }
+            for y in 4..44 {
+                for x in SUBTILE_W..(SUBTILE_W + 40) {
+                    f4[y * stride + x * 4 + 2] ^= 0x44;
+                }
+            }
+            for y in 0..SUBTILE_H {
+                for x in (2 * SUBTILE_W)..(3 * SUBTILE_W) {
+                    f4[y * stride + x * 4] ^= 0x66;
+                }
+            }
+            for y in 0..SUBTILE_H {
+                for x in (3 * SUBTILE_W)..w {
+                    f4[y * stride + x * 4 + 1] ^= 0x22;
+                }
+            }
+            // Step 5: full-frame redraw (triggers Tier-0 dense_dirty_bands skip + free re-seed).
+            let f5 = make_frame(99, has_alpha);
+            // Step 6: identical to Step 5 (must be Clean with valid bands).
+            let f6 = f5.clone();
+            // Step 7: unaligned partial band (`y = 4..8` Strip1D + `y = 10..40` unaligned RowBand2D).
+            let mut f7 = f6.clone();
+            for y in 4..40 {
+                for x in 0..32 {
+                    f7[y * stride + x * 4] ^= 0x19;
+                }
+            }
+            let partial_bands = [RowBand { y0: 4, y1: 8 }, RowBand { y0: 10, y1: 40 }];
+            // Step 8: follow-up full-frame incremental commit after unaligned partial invalidation.
+            let f8 = f7.clone();
+
+            let seq: [(&[u8], Option<&[RowBand]>); 9] = [
+                (&f0, None),
+                (&f1, None),
+                (&f2, None),
+                (&f3, None),
+                (&f4, None),
+                (&f5, None),
+                (&f6, None),
+                (&f7, Some(&partial_bands)),
+                (&f8, None),
+            ];
+            for &tier in &tiers {
+                let mut sh = run_pair_and_assert_exact(tier, meta, &seq, &mut comp, &mut decomp);
+                // Band 0 was invalidated by unaligned `partial_bands`, while untouched bands stay valid.
+                assert_eq!(sh.valid_band_count(), n_qy - 1);
+                // Mutating via `pixels_mut()` invalidates all cached bands.
+                sh.pixels_mut()[0] ^= 1;
+                assert_eq!(sh.valid_band_count(), 0);
+            }
+        }
+
+        // Verify key-change invalidation & early-disconnect invalidation.
+        let meta = BufferMetadata {
+            width: w as i32,
+            height: h as i32,
+            stride: stride as i32,
+            format: BufferFormat::Xrgb8888,
+        };
+        let f0 = make_frame(7, false);
+        let p0 = f0.as_ptr();
+        let bp0 = unsafe { BufferPointer::new(&p0, len) };
+        let mut sh = ShadowBuffer::new();
+        let mut srv1 = ServerTileCache::new();
+        filter_and_compress_full_streaming(
+            bp0,
+            ClientId(1),
+            WlSurfaceId(1),
+            meta,
+            CompressionMode::Lossless,
+            Some(&mut sh),
+            Some(&mut srv1),
+            &mut comp,
+            drop,
+        );
+        assert_eq!(
+            sh.valid_band_count(),
+            0,
+            "early disconnect cold-fill must invalidate quad hashes"
+        );
+
+        let mut srv2 = ServerTileCache::new();
+        let mut st = None;
+        filter_and_compress_full_streaming(
+            bp0,
+            ClientId(1),
+            WlSurfaceId(1),
+            meta,
+            CompressionMode::Lossless,
+            Some(&mut sh),
+            Some(&mut srv2),
+            &mut comp,
+            |s| st = Some(s),
+        );
+        drop(st);
+        assert_eq!(sh.valid_band_count(), n_qy);
+
+        // Swapping to a different `ServerTileCache` (different random `TileHashKey`)
+        // must cleanly invalidate and still detect a 1-pixel edit.
+        let mut srv3 = ServerTileCache::new();
+        let mut f_edit = f0;
+        f_edit[4] ^= 0xFF;
+        let pe = f_edit.as_ptr();
+        let bpe = unsafe { BufferPointer::new(&pe, len) };
+        let mut st_edit = None;
+        let res = filter_and_compress_incremental_streaming(
+            bpe,
+            ClientId(1),
+            WlSurfaceId(1),
+            meta,
+            CompressionMode::Lossless,
+            None,
+            &mut sh,
+            Some(&mut srv3),
+            &mut comp,
+            |s| st_edit = Some(s),
+        );
+        assert_eq!(res.dirty_tiles.len(), 1);
+        assert_eq!(sh.valid_band_count(), 0);
+        assert_eq!(sh.pixels(), f_edit.as_slice());
     }
 }

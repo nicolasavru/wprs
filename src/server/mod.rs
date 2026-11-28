@@ -49,6 +49,7 @@ use smithay::wayland::viewporter::ViewporterState;
 
 use crate::constants;
 use crate::filtering::ServerTileCache;
+use crate::filtering::ShadowBuffer;
 use crate::prelude::*;
 use crate::serialization::CompressionMode;
 use crate::serialization::Event;
@@ -287,11 +288,11 @@ impl ServerHeartbeatState {
 }
 
 /// Last buffer transmitted to the currently connected client for a surface,
-/// retaining a local shadow copy of its pixels so subsequent commits skip
-/// unchanged `128x128` quadrants and identical frames.
+/// retaining a local shadow copy of its pixels (plus per-quadrant hashes) so
+/// subsequent commits skip unchanged `128x128` quadrants and identical frames.
 pub struct SyncedSurfaceBuffer {
     pub metadata: BufferMetadata,
-    pub pixels: Vec<u8>,
+    pub shadow: ShadowBuffer,
 }
 
 fn surface_destruction_callback(state: &mut WprsServerState, surface: &WlSurface) {

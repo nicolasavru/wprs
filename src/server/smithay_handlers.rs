@@ -210,7 +210,7 @@ impl WprsServerState {
                             metadata,
                             compression_mode,
                             scan_bands.as_deref(),
-                            &mut synced.pixels,
+                            &mut synced.shadow,
                             Some(tile_cache),
                             compressor,
                             |mut raw_buffer_to_send| {
@@ -242,7 +242,8 @@ impl WprsServerState {
                         })
                     },
                     other => {
-                        let mut pixels = other.map_or_else(Vec::new, |old| old.pixels);
+                        let mut shadow =
+                            other.map_or_else(filtering::ShadowBuffer::new, |old| old.shadow);
                         compositor_utils::fault_probe_buffer(data, metadata.stride as usize, None);
                         filtering::filter_and_compress_full_streaming(
                             data,
@@ -250,7 +251,7 @@ impl WprsServerState {
                             surface_state.id,
                             metadata,
                             compression_mode,
-                            Some(&mut pixels),
+                            Some(&mut shadow),
                             Some(tile_cache),
                             compressor,
                             |mut raw_buffer_to_send| {
@@ -261,7 +262,7 @@ impl WprsServerState {
                             },
                         );
                         Ok(InnerOutcome::Sent {
-                            synced: SyncedSurfaceBuffer { metadata, pixels },
+                            synced: SyncedSurfaceBuffer { metadata, shadow },
                             metadata,
                             damage: None,
                         })

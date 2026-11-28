@@ -114,6 +114,7 @@ use crate::buffer_pointer::BufferPointer;
 use crate::filtering::ClientTileCache;
 use crate::filtering::DecodeCacheCtx;
 use crate::filtering::FrameRows;
+use crate::filtering::PhaseAQuadHashes;
 use crate::filtering::PhaseASchedule;
 use crate::filtering::RowKernel;
 use crate::filtering::ScanSubBand;
@@ -1795,6 +1796,7 @@ impl Tier {
         dirty_slots: &[AtomicU32],
         slot_scans: Option<&SlotScans>,
         cache_non_empty: bool,
+        quad_hashes: Option<&PhaseAQuadHashes>,
         schedule: &PhaseASchedule<'_>,
         worker_idx: usize,
     ) {
@@ -1814,6 +1816,7 @@ impl Tier {
                     dirty_slots,
                     slot_scans,
                     cache_non_empty,
+                    quad_hashes,
                     schedule,
                     worker_idx,
                 );
@@ -1831,6 +1834,7 @@ impl Tier {
                     dirty_slots,
                     slot_scans,
                     cache_non_empty,
+                    quad_hashes,
                     schedule,
                     worker_idx,
                 );
@@ -1954,7 +1958,7 @@ impl Tier {
         stride_px: usize,
         band_y0: usize,
         band_y1: usize,
-    ) -> Option<(ScrollRect, u64)> {
+    ) -> (Option<(ScrollRect, u64)>, u64) {
         // SAFETY: Caller upholds band and buffer bounds invariants.
         unsafe {
             super::scroll::detect_scroll_in_band_with::<Kernel, HAS_ALPHA>(

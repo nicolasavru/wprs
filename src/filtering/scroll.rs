@@ -37,6 +37,7 @@ use crate::buffer_pointer::BufferPointer;
 use crate::filtering::RowKernel;
 use crate::filtering::arch;
 use crate::serialization::framing::RowBand;
+use crate::serialization::framing::SUBTILE_H;
 use crate::serialization::framing::ScrollRect;
 use crate::serialization::wayland::BufferFormat;
 use crate::serialization::wayland::BufferMetadata;
@@ -1628,9 +1629,25 @@ pub(super) unsafe fn detect_scroll_phase1b_with<K: RowKernel, const HAS_ALPHA: b
     best_result
 }
 
+/// Combined outcome of vertical scroll detection and Tier-0 coarse dirty-band
+/// activity probing (zero extra memory reads).
+#[derive(Debug, Copy, Clone, Default)]
+pub(super) struct ScrollDetectOutcome {
+    pub(super) scroll_rect: Option<ScrollRect>,
+    /// Bit `qy` (`0..64`) is set when at least `2` Tier-0 probe strips on a
+    /// probed row inside `128`-row grid band `qy` changed relative to
+    /// `prev_shadow`. Because `STRIP_STEP_X = 240 > SUBTILE_W = 128`, two
+    /// changed strips span `>= 256` px across distinct quadrants, signaling
+    /// Phase A to skip hash-screening on band `qy` and run `diff_and_update`
+    /// directly without affecting local `< 240` px edits (typing, cursors).
+    pub(super) dense_dirty_bands: u64,
+}
+
 /// Detects the dominant vertical [`ScrollRect`] within a single contiguous
 /// band `[band_y0, band_y1)`, keeping the Tier-0 clean-frame fast path tiny and
 /// stack-probe-free before handing off to [`RowKernel::detect_scroll_phase1b`].
+/// Also returns a `u64` bitmask of `128`-row grid bands where Tier-0 already
+/// observed dense horizontal changes.
 ///
 /// # Safety
 /// `aos` and `prev` must be valid for `height * stride_px` pixels,
@@ -1644,24 +1661,26 @@ pub(super) unsafe fn detect_scroll_in_band_with<K: RowKernel, const HAS_ALPHA: b
     stride_px: usize,
     band_y0: usize,
     band_y1: usize,
-) -> Option<(ScrollRect, u64)> {
+) -> (Option<(ScrollRect, u64)>, u64) {
     let band_h = band_y1.saturating_sub(band_y0);
     if width < MIN_SCROLL_DIM as usize || band_h < MIN_SCROLL_DIM as usize {
-        return None;
+        return (None, 0);
     }
 
     let n_strips = strip_count(width);
     if n_strips == 0 {
-        return None;
+        return (None, 0);
     }
 
     // Tier 0: zero-hash coarse SIMD activity grid (72 probes on 1080p, 352 on 4K).
     let tier0_step_y = (band_h / 4).clamp(32, TIER0_MAX_STEP_Y);
+    const DENSE_STRIP_THRESHOLD: usize = 2;
     let mut changed_rows = [0u16; MAX_STRIPS];
     let mut changed_non_uniform = [0u16; MAX_STRIPS];
     let mut min_y = [0u32; MAX_STRIPS];
     let mut max_y = [0u32; MAX_STRIPS];
     let mut any_changed = false;
+    let mut dense_dirty_bands = 0u64;
 
     let curr_base = aos.ptr();
     let prev_base = prev.as_ptr();
@@ -1672,6 +1691,7 @@ pub(super) unsafe fn detect_scroll_in_band_with<K: RowKernel, const HAS_ALPHA: b
         // SAFETY: `ry < band_y1 <= height` and `strip_x(n_strips - 1) + STRIP_W <= width <= stride_px`.
         let row_curr = unsafe { curr_base.add(row_start) };
         let row_prev = unsafe { prev_base.add(row_start) };
+        let mut row_dirty = 0usize;
         for si in 0..n_strips {
             let off_x = si * STRIP_STEP_X;
             // SAFETY: `STRIP_START_X + off_x + STRIP_W <= width <= stride_px`, so both
@@ -1680,6 +1700,7 @@ pub(super) unsafe fn detect_scroll_in_band_with<K: RowKernel, const HAS_ALPHA: b
                 kernel.probe_strip_activity::<HAS_ALPHA>(row_curr.add(off_x), row_prev.add(off_x))
             } {
                 any_changed = true;
+                row_dirty += 1;
                 let prev_rows = changed_rows[si];
                 changed_rows[si] = prev_rows + 1;
                 if non_uniform {
@@ -1691,14 +1712,20 @@ pub(super) unsafe fn detect_scroll_in_band_with<K: RowKernel, const HAS_ALPHA: b
                 max_y[si] = ry_u32;
             }
         }
+        if row_dirty >= DENSE_STRIP_THRESHOLD {
+            let qy = ry / SUBTILE_H;
+            if qy < 64 {
+                dense_dirty_bands |= 1u64 << qy;
+            }
+        }
         ry += tier0_step_y;
     }
     if !any_changed {
-        return None;
+        return (None, 0);
     }
 
     // SAFETY: Band bounds and `n_strips == strip_count(width)` were verified above.
-    unsafe {
+    let cand = unsafe {
         kernel.detect_scroll_phase1b::<HAS_ALPHA>(
             aos,
             prev,
@@ -1713,26 +1740,32 @@ pub(super) unsafe fn detect_scroll_in_band_with<K: RowKernel, const HAS_ALPHA: b
             &min_y,
             &max_y,
         )
-    }
+    };
+    (cand, dense_dirty_bands)
 }
 
-/// Detects a profitable vertical scroll blit using an explicit SIMD `tier`.
-pub(super) fn detect_scroll_rect_with_tier(
+/// Detects a profitable vertical scroll blit and coarse dense-dirty band mask
+/// using an explicit SIMD `tier`.
+pub(super) fn detect_scroll_and_activity_with_tier(
     curr: BufferPointer<u8>,
     prev_shadow: &[u8],
     metadata: BufferMetadata,
     bands: Option<&[RowBand]>,
     tier: arch::Tier,
-) -> Option<ScrollRect> {
-    let total_pixels = metadata.validate().ok()?;
-    let byte_len = total_pixels.checked_mul(4)?;
+) -> ScrollDetectOutcome {
+    let Ok(total_pixels) = metadata.validate() else {
+        return ScrollDetectOutcome::default();
+    };
+    let Some(byte_len) = total_pixels.checked_mul(4) else {
+        return ScrollDetectOutcome::default();
+    };
     if curr.len() < byte_len || prev_shadow.len() < byte_len {
-        return None;
+        return ScrollDetectOutcome::default();
     }
     let width = metadata.width as usize;
     let height = metadata.height as usize;
     if width < MIN_SCROLL_DIM as usize || height < MIN_SCROLL_DIM as usize {
-        return None;
+        return ScrollDetectOutcome::default();
     }
     let stride_px = (metadata.stride as usize) / 4;
     let has_alpha = metadata.format == BufferFormat::Argb8888;
@@ -1749,6 +1782,7 @@ pub(super) fn detect_scroll_rect_with_tier(
     let active_bands = bands.unwrap_or(&full_band);
 
     let mut best: Option<(ScrollRect, u64)> = None;
+    let mut dense_dirty_bands = 0u64;
     for band in active_bands {
         let y0 = band.y0 as usize;
         let y1 = band.y1 as usize;
@@ -1757,13 +1791,14 @@ pub(super) fn detect_scroll_rect_with_tier(
         }
         // SAFETY: `aos` and `prev` both cover `total_pixels = height * stride_px`,
         // `y1 <= height`, and `width <= stride_px`.
-        let cand = unsafe {
+        let (cand, band_dense) = unsafe {
             if has_alpha {
                 tier.detect_scroll_in_band::<true>(aos, prev, width, stride_px, y0, y1)
             } else {
                 tier.detect_scroll_in_band::<false>(aos, prev, width, stride_px, y0, y1)
             }
         };
+        dense_dirty_bands |= band_dense;
         if let Some((sr, area)) = cand
             && best.is_none_or(|(_, best_area)| area > best_area)
         {
@@ -1771,13 +1806,29 @@ pub(super) fn detect_scroll_rect_with_tier(
         }
     }
 
-    best.map(|(sr, _)| {
+    let scroll_rect = best.map(|(sr, _)| {
         debug_assert!(
             sr.validate_in_bounds(metadata.width as u32, metadata.height as u32)
                 .is_ok()
         );
         sr
-    })
+    });
+    ScrollDetectOutcome {
+        scroll_rect,
+        dense_dirty_bands,
+    }
+}
+
+/// Detects a profitable vertical scroll blit using an explicit SIMD `tier`.
+#[cfg(test)]
+pub(super) fn detect_scroll_rect_with_tier(
+    curr: BufferPointer<u8>,
+    prev_shadow: &[u8],
+    metadata: BufferMetadata,
+    bands: Option<&[RowBand]>,
+    tier: arch::Tier,
+) -> Option<ScrollRect> {
+    detect_scroll_and_activity_with_tier(curr, prev_shadow, metadata, bands, tier).scroll_rect
 }
 
 /// Detects a profitable vertical scroll blit between `prev_shadow` and `curr`
@@ -1793,5 +1844,6 @@ pub fn detect_scroll_rect(
     metadata: BufferMetadata,
     bands: Option<&[RowBand]>,
 ) -> Option<ScrollRect> {
-    detect_scroll_rect_with_tier(curr, prev_shadow, metadata, bands, arch::Tier::detect())
+    detect_scroll_and_activity_with_tier(curr, prev_shadow, metadata, bands, arch::Tier::detect())
+        .scroll_rect
 }

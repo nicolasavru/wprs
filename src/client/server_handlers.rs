@@ -3135,7 +3135,7 @@ mod tests {
         }
 
         let mut compressor = ShardingCompressor::new(NonZeroUsize::new(4).unwrap(), 1).unwrap();
-        let mut shadow = Vec::new();
+        let mut shadow = filtering::ShadowBuffer::new();
         let mut next_seq = 1u64;
 
         let send_wire_stream =
@@ -3417,7 +3417,7 @@ mod tests {
 
         let mut compressor = ShardingCompressor::new(NonZeroUsize::new(4).unwrap(), 1).unwrap();
         let mut server_cache = ServerTileCache::new();
-        let mut shadow_a = Vec::new();
+        let mut shadow_a = filtering::ShadowBuffer::new();
 
         let send_wire_stream =
             |h: &mut ClientDndHarness,
@@ -3871,7 +3871,7 @@ mod tests {
 
         let mut compressor = ShardingCompressor::new(NonZeroUsize::new(4).unwrap(), 1).unwrap();
         let mut srv_cache = ServerTileCache::new();
-        let mut shadow = Vec::new();
+        let mut shadow = filtering::ShadowBuffer::new();
         let mut next_seq = 1u64;
 
         let send_wire_stream =

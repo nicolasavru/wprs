@@ -45,6 +45,7 @@ use crate::buffer_pointer::BufferPointer;
 use crate::filtering::ClientTileCache;
 use crate::filtering::DecodeCacheCtx;
 use crate::filtering::FrameRows;
+use crate::filtering::PhaseAQuadHashes;
 use crate::filtering::PhaseASchedule;
 #[cfg(all(
     not(target_feature = "ssse3"),
@@ -466,6 +467,213 @@ macro_rules! impl_finish_active_row_band_aes {
                     );
                 }
             }
+        }
+
+        #[cold]
+        #[inline(never)]
+        #[target_feature(enable = $base_feat)]
+        unsafe fn diff_and_update_single_quad_impl<const HAS_ALPHA: bool>(
+            kernel: Kernel,
+            ctx: &crate::filtering::ActiveRowBandCtx<'_>,
+            scans: &crate::filtering::SlotScans,
+            qx: usize,
+            prev_hash: &mut crate::filtering::tile_hash::TileHash,
+        ) -> bool {
+            // SAFETY: Caller upholds disjoint-row shadow bounds and exclusive `qx` ownership.
+            unsafe {
+                crate::filtering::diff_and_update_single_quad_with::<Kernel, HAS_ALPHA>(
+                    kernel, ctx, scans, qx, prev_hash,
+                )
+            }
+        }
+
+        #[cold]
+        #[inline(never)]
+        #[target_feature(enable = $base_feat)]
+        unsafe fn screen_and_diff_row_band_fallback<const HAS_ALPHA: bool>(
+            kernel: Kernel,
+            ctx: &crate::filtering::ActiveRowBandCtx<'_>,
+            scans: &crate::filtering::SlotScans,
+            prev_hashes: &mut [crate::filtering::tile_hash::TileHash],
+        ) -> bool {
+            // SAFETY: Caller upholds disjoint-row shadow bounds and hash-slice invariants.
+            unsafe {
+                crate::filtering::screen_and_diff_row_band_2d_with::<Kernel, HAS_ALPHA>(
+                    kernel,
+                    ctx,
+                    scans,
+                    prev_hashes,
+                )
+            }
+        }
+
+        #[cold]
+        #[inline(never)]
+        #[target_feature(enable = $base_feat)]
+        unsafe fn finish_screen_bailout_impl<const HAS_ALPHA: bool>(
+            kernel: Kernel,
+            ctx: &crate::filtering::ActiveRowBandCtx<'_>,
+            scans: &crate::filtering::SlotScans,
+            start_qx: usize,
+            prev_hashes: &mut [crate::filtering::tile_hash::TileHash],
+        ) -> bool {
+            use crate::filtering::ActiveRowBandCtx;
+            use crate::filtering::SUBTILE_W;
+            use crate::filtering::ShadowRows;
+
+            let x_start = start_qx * SUBTILE_W;
+            let (_, shifted_data) = ctx.data.split_at(x_start * 4);
+            let (_, shifted_aos) = ctx.aos.split_at(x_start);
+            // SAFETY: Caller guarantees `start_qx < n_qx`, so `x_start < ctx.width`.
+            let shifted_shadow = ShadowRows {
+                base: unsafe { ctx.shadow.base.add(x_start * 4) },
+                stride: ctx.stride,
+            };
+            let rem_ctx = ActiveRowBandCtx {
+                data: shifted_data,
+                aos: shifted_aos,
+                shadow: &shifted_shadow,
+                width: ctx.width - x_start,
+                stride: ctx.stride,
+                y0: ctx.y0,
+                y1: ctx.y1,
+                slot_base: ctx.slot_base + start_qx,
+                dirty_slots: &ctx.dirty_slots[start_qx..],
+                slot_scans: ctx.slot_scans,
+                cache_non_empty: ctx.cache_non_empty,
+            };
+            // SAFETY: Shifted `rem_ctx` covers `[x_start, ctx.width) x [ctx.y0, ctx.y1)`
+            // exclusively owned by this worker.
+            unsafe {
+                diff_and_update_row_band_2d_impl::<HAS_ALPHA>(kernel, &rem_ctx);
+                crate::filtering::sync_band_quad_hashes::<HAS_ALPHA>(
+                    ctx,
+                    scans,
+                    start_qx,
+                    prev_hashes,
+                    true,
+                    true,
+                )
+            }
+        }
+
+        #[inline(never)]
+        #[target_feature(enable = $aes_feat)]
+        unsafe fn screen_and_diff_row_band_aes<const HAS_ALPHA: bool>(
+            kernel: Kernel,
+            ctx: &crate::filtering::ActiveRowBandCtx<'_>,
+            scans: &crate::filtering::SlotScans,
+            prev_hashes: &mut [crate::filtering::tile_hash::TileHash],
+        ) -> bool {
+            use std::arch::x86_64::_mm_aesenc_si128;
+            use std::arch::x86_64::_mm_loadu_si128;
+            use std::arch::x86_64::_mm_or_si128;
+            use std::arch::x86_64::_mm_set1_epi32;
+            use std::arch::x86_64::_mm_xor_si128;
+
+            use crate::filtering::SCREEN_MAX_MISMATCHES;
+            use crate::filtering::SUBTILE_W;
+            use crate::filtering::tile_hash::XRGB_ALPHA_MASK_U32;
+            use crate::filtering::tile_hash::leaf_meta;
+            use crate::filtering::tile_hash::x86_aes;
+            use crate::serialization::framing::TileRect;
+
+            let width = ctx.width;
+            let stride = ctx.stride;
+            let y0 = ctx.y0;
+            let y1 = ctx.y1;
+            let ch = y1 - y0;
+            let n_qx = ctx.dirty_slots.len();
+            debug_assert_eq!(prev_hashes.len(), n_qx);
+            if width == 0 || ch == 0 {
+                return true;
+            }
+            let last_end = (y1 - 1) * stride + width * 4;
+            assert!(last_end <= ctx.data.len());
+
+            let key = scans.key();
+            let rk = x86_aes::load_key_block(&key.round_key);
+            let alpha_mask = _mm_set1_epi32(XRGB_ALPHA_MASK_U32 as i32);
+            let src_base = ctx.data.ptr();
+            let (full_meta_lo, full_meta_hi) = leaf_meta(SUBTILE_W as u32, ch as u32);
+            let mut mismatches = 0usize;
+
+            // Screen one `<= 128x128` quadrant at a time (`64 KiB` L2-hot working
+            // set, 4 accumulator lanes + `rk`/`alpha_mask` with zero XMM spills
+            // and no software prefetch so hardware L2 stride/stream prefetchers
+            // run uncontended across 1T..16C and avoid PC-alignment cliffs).
+            for qx in 0..n_qx {
+                let x0 = qx * SUBTILE_W;
+                let cw = (width - x0).min(SUBTILE_W);
+                let q_hash = if cw == SUBTILE_W {
+                    let (mut lanes, meta) = x86_aes::init_lanes(key, full_meta_lo, full_meta_hi);
+                    // SAFETY: Validated `last_end <= ctx.data.len()` above.
+                    let mut row_ptr = unsafe { src_base.add(y0 * stride + x0 * 4) };
+                    for _ in 0..ch {
+                        // SAFETY: `cw == SUBTILE_W == 128` (`512` bytes) is strictly in bounds.
+                        unsafe {
+                            for off in [0usize, 64, 128, 192, 256, 320, 384, 448] {
+                                let mut v0 = _mm_loadu_si128(row_ptr.add(off).cast());
+                                let mut v1 = _mm_loadu_si128(row_ptr.add(off + 16).cast());
+                                let mut v2 = _mm_loadu_si128(row_ptr.add(off + 32).cast());
+                                let mut v3 = _mm_loadu_si128(row_ptr.add(off + 48).cast());
+                                if !HAS_ALPHA {
+                                    v0 = _mm_or_si128(v0, alpha_mask);
+                                    v1 = _mm_or_si128(v1, alpha_mask);
+                                    v2 = _mm_or_si128(v2, alpha_mask);
+                                    v3 = _mm_or_si128(v3, alpha_mask);
+                                }
+                                lanes[0] = _mm_aesenc_si128(_mm_xor_si128(lanes[0], v0), rk);
+                                lanes[1] = _mm_aesenc_si128(_mm_xor_si128(lanes[1], v1), rk);
+                                lanes[2] = _mm_aesenc_si128(_mm_xor_si128(lanes[2], v2), rk);
+                                lanes[3] = _mm_aesenc_si128(_mm_xor_si128(lanes[3], v3), rk);
+                            }
+                            row_ptr = row_ptr.add(stride);
+                        }
+                    }
+                    x86_aes::finalize(key, lanes, meta)
+                } else {
+                    let qrect = TileRect {
+                        x: x0 as u32,
+                        y: y0 as u32,
+                        w: cw as u32,
+                        h: ch as u32,
+                    };
+                    // SAFETY: Validated `last_end <= ctx.data.len()` above.
+                    unsafe {
+                        x86_aes::hash_rect_only_raw::<HAS_ALPHA>(key, src_base, stride, qrect)
+                    }
+                };
+
+                if q_hash != prev_hashes[qx] {
+                    // SAFETY: Quadrant `qx` over `[y0, y1)` is exclusively owned.
+                    let dirty = unsafe {
+                        diff_and_update_single_quad_impl::<HAS_ALPHA>(
+                            kernel,
+                            ctx,
+                            scans,
+                            qx,
+                            &mut prev_hashes[qx],
+                        )
+                    };
+                    if dirty {
+                        mismatches += 1;
+                        if mismatches > SCREEN_MAX_MISMATCHES && qx + 1 < n_qx {
+                            // SAFETY: `qx + 1 < n_qx` and band is exclusively owned.
+                            return unsafe {
+                                finish_screen_bailout_impl::<HAS_ALPHA>(
+                                    kernel,
+                                    ctx,
+                                    scans,
+                                    qx + 1,
+                                    prev_hashes,
+                                )
+                            };
+                        }
+                    }
+                }
+            }
+            true
         }
 
         #[inline(never)]
@@ -2707,6 +2915,24 @@ mod avx512 {
                     self, ctx, qx_bboxes, trigger_y, full_count,
                 );
             }
+        }
+
+        #[inline(always)]
+        unsafe fn screen_and_diff_row_band_2d<const HAS_ALPHA: bool>(
+            self,
+            ctx: &ActiveRowBandCtx<'_>,
+            scans: &crate::filtering::SlotScans,
+            prev_hashes: &mut [tile_hash::TileHash],
+        ) -> bool {
+            if tile_hash::has_hw_aes() {
+                // SAFETY: `self` witnesses this tier's SIMD support, `has_hw_aes()`
+                // verified `aes`, and caller upholds disjoint-row shadow bounds.
+                return unsafe {
+                    screen_and_diff_row_band_aes::<HAS_ALPHA>(self, ctx, scans, prev_hashes)
+                };
+            }
+            // SAFETY: Caller upholds disjoint-row shadow bounds and hash-slice invariants.
+            unsafe { screen_and_diff_row_band_fallback::<HAS_ALPHA>(self, ctx, scans, prev_hashes) }
         }
     }
 
@@ -5524,6 +5750,24 @@ mod avx2 {
                 );
             }
         }
+
+        #[inline(always)]
+        unsafe fn screen_and_diff_row_band_2d<const HAS_ALPHA: bool>(
+            self,
+            ctx: &ActiveRowBandCtx<'_>,
+            scans: &crate::filtering::SlotScans,
+            prev_hashes: &mut [tile_hash::TileHash],
+        ) -> bool {
+            if tile_hash::has_hw_aes() {
+                // SAFETY: `self` witnesses this tier's SIMD support, `has_hw_aes()`
+                // verified `aes`, and caller upholds disjoint-row shadow bounds.
+                return unsafe {
+                    screen_and_diff_row_band_aes::<HAS_ALPHA>(self, ctx, scans, prev_hashes)
+                };
+            }
+            // SAFETY: Caller upholds disjoint-row shadow bounds and hash-slice invariants.
+            unsafe { screen_and_diff_row_band_fallback::<HAS_ALPHA>(self, ctx, scans, prev_hashes) }
+        }
     }
 
     impl_finish_active_row_band_aes!("avx2", "avx2,aes");
@@ -7825,6 +8069,24 @@ mod ssse3 {
                 );
             }
         }
+
+        #[inline(always)]
+        unsafe fn screen_and_diff_row_band_2d<const HAS_ALPHA: bool>(
+            self,
+            ctx: &ActiveRowBandCtx<'_>,
+            scans: &crate::filtering::SlotScans,
+            prev_hashes: &mut [tile_hash::TileHash],
+        ) -> bool {
+            if tile_hash::has_hw_aes() {
+                // SAFETY: `self` witnesses this tier's SIMD support, `has_hw_aes()`
+                // verified `aes`, and caller upholds disjoint-row shadow bounds.
+                return unsafe {
+                    screen_and_diff_row_band_aes::<HAS_ALPHA>(self, ctx, scans, prev_hashes)
+                };
+            }
+            // SAFETY: Caller upholds disjoint-row shadow bounds and hash-slice invariants.
+            unsafe { screen_and_diff_row_band_fallback::<HAS_ALPHA>(self, ctx, scans, prev_hashes) }
+        }
     }
 
     impl_finish_active_row_band_aes!("ssse3", "ssse3,aes");
@@ -7850,6 +8112,7 @@ macro_rules! define_tier_wrappers {
             use crate::filtering::ClientTileCache;
             use crate::filtering::DecodeCacheCtx;
             use crate::filtering::FrameRows;
+            use crate::filtering::PhaseAQuadHashes;
             use crate::filtering::PhaseASchedule;
             use crate::filtering::RowKernel;
             use crate::filtering::ScanSubBand;
@@ -8118,6 +8381,7 @@ macro_rules! define_tier_wrappers {
                 dirty_slots: &[AtomicU32],
                 slot_scans: Option<&SlotScans>,
                 cache_non_empty: bool,
+                quad_hashes: Option<&PhaseAQuadHashes>,
                 schedule: &PhaseASchedule<'_>,
                 worker_idx: usize,
             ) {
@@ -8141,6 +8405,7 @@ macro_rules! define_tier_wrappers {
                         dirty_slots,
                         slot_scans,
                         cache_non_empty,
+                        quad_hashes,
                         schedule,
                         worker_idx,
                     );
@@ -8251,7 +8516,7 @@ macro_rules! define_tier_wrappers {
                 stride_px: usize,
                 band_y0: usize,
                 band_y1: usize,
-            ) -> Option<(ScrollRect, u64)> {
+            ) -> (Option<(ScrollRect, u64)>, u64) {
                 // SAFETY: Caller verified CPU feature support and band bounds invariants.
                 unsafe {
                     let kernel = super::$tier_mod::Kernel::new_unchecked();
@@ -9090,6 +9355,7 @@ impl X86Tier {
         dirty_slots: &[AtomicU32],
         slot_scans: Option<&SlotScans>,
         cache_non_empty: bool,
+        quad_hashes: Option<&PhaseAQuadHashes>,
         schedule: &PhaseASchedule<'_>,
         worker_idx: usize,
     ) {
@@ -9121,6 +9387,7 @@ impl X86Tier {
                             dirty_slots,
                             slot_scans,
                             cache_non_empty,
+                            quad_hashes,
                             schedule,
                             worker_idx,
                         );
@@ -9138,6 +9405,7 @@ impl X86Tier {
                             dirty_slots,
                             slot_scans,
                             cache_non_empty,
+                            quad_hashes,
                             schedule,
                             worker_idx,
                         );
@@ -9165,6 +9433,7 @@ impl X86Tier {
                             dirty_slots,
                             slot_scans,
                             cache_non_empty,
+                            quad_hashes,
                             schedule,
                             worker_idx,
                         );
@@ -9181,6 +9450,7 @@ impl X86Tier {
                             dirty_slots,
                             slot_scans,
                             cache_non_empty,
+                            quad_hashes,
                             schedule,
                             worker_idx,
                         );
@@ -9205,6 +9475,7 @@ impl X86Tier {
                             dirty_slots,
                             slot_scans,
                             cache_non_empty,
+                            quad_hashes,
                             schedule,
                             worker_idx,
                         );
@@ -9221,6 +9492,7 @@ impl X86Tier {
                             dirty_slots,
                             slot_scans,
                             cache_non_empty,
+                            quad_hashes,
                             schedule,
                             worker_idx,
                         );
@@ -9240,6 +9512,7 @@ impl X86Tier {
                             dirty_slots,
                             slot_scans,
                             cache_non_empty,
+                            quad_hashes,
                             schedule,
                             worker_idx,
                         );
@@ -9256,6 +9529,7 @@ impl X86Tier {
                             dirty_slots,
                             slot_scans,
                             cache_non_empty,
+                            quad_hashes,
                             schedule,
                             worker_idx,
                         );
@@ -9611,7 +9885,7 @@ impl X86Tier {
         stride_px: usize,
         band_y0: usize,
         band_y1: usize,
-    ) -> Option<(ScrollRect, u64)> {
+    ) -> (Option<(ScrollRect, u64)>, u64) {
         // SAFETY: Each arm's tier witness verifies required CPU features, and
         // caller upholds band and buffer bounds invariants.
         unsafe {
