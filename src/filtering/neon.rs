@@ -642,6 +642,52 @@ impl RowKernel for Kernel {
     }
 
     #[inline(always)]
+    unsafe fn merge_bgrx_alpha_row<const STREAM: bool, const CONST_ALPHA: bool>(
+        self,
+        src: &[Vec4u8],
+        alpha_row: &[u8],
+        const_alpha: u8,
+        dst: &mut [MaybeUninit<Vec4u8>],
+    ) {
+        let tw = dst.len();
+        debug_assert_eq!(src.len(), tw);
+        debug_assert!(CONST_ALPHA || alpha_row.len() == tw);
+        // SAFETY: NEON is mandatory on AArch64; `src` and `dst` have `tw` pixels
+        // and `alpha_row` has `tw` bytes when `!CONST_ALPHA`.
+        unsafe {
+            merge_bgrx_alpha_row_ptr::<CONST_ALPHA>(
+                src.as_ptr(),
+                alpha_row.as_ptr(),
+                const_alpha,
+                dst.as_mut_ptr(),
+                tw,
+            );
+        }
+    }
+
+    #[inline(always)]
+    fn merge_bgrx_alpha_row_in_place<const CONST_ALPHA: bool>(
+        self,
+        pixels: &mut [Vec4u8],
+        alpha_row: &[u8],
+        const_alpha: u8,
+    ) {
+        let tw = pixels.len();
+        debug_assert!(CONST_ALPHA || alpha_row.len() == tw);
+        // SAFETY: NEON is mandatory on AArch64; `merge_bgrx_alpha_row_ptr` loads
+        // each chunk completely before writing back to the exact same pixels.
+        unsafe {
+            merge_bgrx_alpha_row_ptr::<CONST_ALPHA>(
+                pixels.as_ptr(),
+                alpha_row.as_ptr(),
+                const_alpha,
+                pixels.as_mut_ptr().cast::<MaybeUninit<Vec4u8>>(),
+                tw,
+            );
+        }
+    }
+
+    #[inline(always)]
     fn is_constant_plane(self, data: &[u8]) -> Option<u8> {
         let first = *data.first()?;
         let lim = (data.len() / 16) * 16;
@@ -1408,6 +1454,58 @@ impl RowKernel for Kernel {
 }
 
 #[inline(always)]
+unsafe fn merge_bgrx_alpha_row_ptr<const CONST_ALPHA: bool>(
+    src: *const Vec4u8,
+    alpha_p: *const u8,
+    const_alpha: u8,
+    dst: *mut MaybeUninit<Vec4u8>,
+    tw: usize,
+) {
+    let lim16 = (tw / 16) * 16;
+    let lim8 = (tw / 8) * 8;
+    // SAFETY: NEON is mandatory on AArch64; caller guarantees `src` readable and
+    // `dst` writable for `tw` pixels (identical pointers allowed) and `alpha_p`
+    // readable for `tw` bytes when `!CONST_ALPHA`.
+    unsafe {
+        let src_b = src.cast::<u8>();
+        let dst_b = dst.cast::<u8>();
+        let const_a16 = vdupq_n_u8(const_alpha);
+        let mut x = 0usize;
+        while x < lim16 {
+            let mut px = vld4q_u8(src_b.add(x * 4));
+            px.3 = if CONST_ALPHA {
+                const_a16
+            } else {
+                vld1q_u8(alpha_p.add(x))
+            };
+            vst4q_u8(dst_b.add(x * 4), px);
+            x += 16;
+        }
+        if x < lim8 {
+            let mut px = vld4_u8(src_b.add(x * 4));
+            px.3 = if CONST_ALPHA {
+                vdup_n_u8(const_alpha)
+            } else {
+                vld1_u8(alpha_p.add(x))
+            };
+            vst4_u8(dst_b.add(x * 4), px);
+            x += 8;
+        }
+        while x < tw {
+            let px = src.add(x).read();
+            let a = if CONST_ALPHA {
+                const_alpha
+            } else {
+                *alpha_p.add(x)
+            };
+            dst.add(x)
+                .write(MaybeUninit::new(Vec4u8(px.0, px.1, px.2, a)));
+            x += 1;
+        }
+    }
+}
+
+#[inline(always)]
 unsafe fn hash_strip_neon<const HAS_ALPHA: bool>(
     v0: uint32x4_t,
     v1: uint32x4_t,
@@ -1596,10 +1694,11 @@ impl Tier {
 
     /// # Safety
     /// Caller must uphold [`super::decode_jpeg_alpha_rows_with`] invariants.
-    #[inline(always)]
-    pub(super) unsafe fn decode_jpeg_alpha_rows(
+    #[inline(never)]
+    pub(super) unsafe fn decode_jpeg_alpha_rows<const STREAM: bool, const CONST_ALPHA: bool>(
         self,
         a_filt: &[u8],
+        const_alpha: u8,
         jpeg_rows: &[Vec4u8],
         frame: &FrameRows,
         x0: usize,
@@ -1609,12 +1708,46 @@ impl Tier {
         alpha_row_a: &mut Vec<u8>,
         alpha_row_b: &mut Vec<u8>,
     ) {
-        // SAFETY: Caller upholds validated-frame and disjoint-rect invariants.
+        // SAFETY: Caller upholds validated-frame and disjoint-rect invariants;
+        // `Kernel::STREAM_ALIGN == 1` never issues streaming stores.
         unsafe {
-            super::decode_jpeg_alpha_rows_with(
+            super::decode_jpeg_alpha_rows_with::<Kernel, false, CONST_ALPHA>(
                 Kernel,
                 a_filt,
+                const_alpha,
                 jpeg_rows,
+                frame,
+                x0,
+                y0,
+                tw,
+                th,
+                alpha_row_a,
+                alpha_row_b,
+            );
+        }
+    }
+
+    /// # Safety
+    /// Caller must uphold [`super::decode_jpeg_alpha_rows_in_place_with`] invariants.
+    #[inline(never)]
+    pub(super) unsafe fn decode_jpeg_alpha_rows_in_place<const CONST_ALPHA: bool>(
+        self,
+        a_filt: &[u8],
+        const_alpha: u8,
+        frame: &FrameRows,
+        x0: usize,
+        y0: usize,
+        tw: usize,
+        th: usize,
+        alpha_row_a: &mut Vec<u8>,
+        alpha_row_b: &mut Vec<u8>,
+    ) {
+        // SAFETY: Caller upholds validated-frame, initialized-BGRX, and disjoint-rect invariants.
+        unsafe {
+            super::decode_jpeg_alpha_rows_in_place_with::<Kernel, CONST_ALPHA>(
+                Kernel,
+                a_filt,
+                const_alpha,
                 frame,
                 x0,
                 y0,

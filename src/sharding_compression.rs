@@ -14,6 +14,8 @@
 
 use std::any::Any;
 use std::cell::UnsafeCell;
+use std::ffi::CStr;
+use std::ffi::c_int;
 use std::hint;
 use std::num::NonZeroUsize;
 use std::panic;
@@ -849,6 +851,90 @@ impl<S> Drop for WorkerPool<S> {
     }
 }
 
+fn tj_error(handle: turbojpeg::raw::tjhandle) -> anyhow::Error {
+    // SAFETY: `tj3GetErrorStr` returns a valid NUL-terminated error string for
+    // either a live handle or `NULL`.
+    let msg = unsafe { CStr::from_ptr(turbojpeg::raw::tj3GetErrorStr(handle)) };
+    anyhow!("turbojpeg: {}", msg.to_string_lossy())
+}
+
+struct RawJpegCompressor {
+    handle: turbojpeg::raw::tjhandle,
+}
+
+// SAFETY: Each libjpeg-turbo handle owns independent compression state and is
+// moved into a single worker thread slot (never shared concurrently).
+unsafe impl Send for RawJpegCompressor {}
+
+impl Drop for RawJpegCompressor {
+    fn drop(&mut self) {
+        // SAFETY: `self.handle` was created by `tj3Init` and is destroyed once.
+        unsafe { turbojpeg::raw::tj3Destroy(self.handle) };
+    }
+}
+
+impl RawJpegCompressor {
+    fn new() -> Result<Self> {
+        // SAFETY: `tj3Init` takes a valid `TJINIT` enum value.
+        let handle =
+            unsafe { turbojpeg::raw::tj3Init(turbojpeg::raw::TJINIT_TJINIT_COMPRESS as c_int) };
+        if handle.is_null() {
+            return Err(tj_error(ptr::null_mut()));
+        }
+        let mut this = Self { handle };
+        this.set(turbojpeg::raw::TJPARAM_TJPARAM_NOREALLOC, 1)?;
+        Ok(this)
+    }
+
+    fn set(&mut self, param: turbojpeg::raw::TJPARAM, value: c_int) -> Result<()> {
+        // SAFETY: `self.handle` is a valid live compressor handle.
+        let res = unsafe { turbojpeg::raw::tj3Set(self.handle, param as c_int, value) };
+        if res != 0 {
+            return Err(tj_error(self.handle));
+        }
+        Ok(())
+    }
+}
+
+struct RawJpegDecompressor {
+    handle: turbojpeg::raw::tjhandle,
+}
+
+// SAFETY: Each libjpeg-turbo handle owns independent decompression state and is
+// moved into a single worker thread slot (never shared concurrently).
+unsafe impl Send for RawJpegDecompressor {}
+
+impl Drop for RawJpegDecompressor {
+    fn drop(&mut self) {
+        // SAFETY: `self.handle` was created by `tj3Init` and is destroyed once.
+        unsafe { turbojpeg::raw::tj3Destroy(self.handle) };
+    }
+}
+
+impl RawJpegDecompressor {
+    fn new() -> Result<Self> {
+        // SAFETY: `tj3Init` takes a valid `TJINIT` enum value.
+        let handle =
+            unsafe { turbojpeg::raw::tj3Init(turbojpeg::raw::TJINIT_TJINIT_DECOMPRESS as c_int) };
+        if handle.is_null() {
+            return Err(tj_error(ptr::null_mut()));
+        }
+        let this = Self { handle };
+        // SAFETY: `self.handle` is a valid live decompressor handle.
+        let res = unsafe {
+            turbojpeg::raw::tj3Set(
+                this.handle,
+                turbojpeg::raw::TJPARAM_TJPARAM_SCANLIMIT as c_int,
+                MAX_JPEG_PROGRESSIVE_SCANS as c_int,
+            )
+        };
+        if res != 0 {
+            return Err(tj_error(this.handle));
+        }
+        Ok(this)
+    }
+}
+
 pub(crate) struct CompressorWorkerState {
     pub(crate) compressor: Compressor<'static>,
     pub(crate) zstd_scratch: Vec<u8>,
@@ -858,7 +944,7 @@ pub(crate) struct CompressorWorkerState {
     pub(crate) raw_alpha: Vec<u8>,
     pub(crate) filt_alpha: Vec<u8>,
     pub(crate) palette: PaletteScratch,
-    jpeg_compressor: Option<turbojpeg::Compressor>,
+    jpeg_compressor: Option<RawJpegCompressor>,
     jpeg_quality: u8,
     jpeg_subsamp: JpegSubsamp,
     pub(crate) jpeg_pixels: Vec<u8>,
@@ -893,16 +979,39 @@ impl CompressorWorkerState {
         })
     }
 
-    /// Compresses the `width * height * 4`-byte BGRX tile stored in
-    /// `self.jpeg_pixels` into a JPEG byte vector, lazily initializing
-    /// `turbojpeg::Compressor` and reusing `self.jpeg_out` across tiles.
-    pub(crate) fn compress_jpeg(
+    /// Compresses a `width x height` BGRX rectangle starting at `src` with row
+    /// stride `pitch` bytes directly via `tj3Compress8`, lazily initializing
+    /// `RawJpegCompressor` and reusing `self.jpeg_out` across tiles.
+    ///
+    /// # Safety
+    /// `src` must point to `height` readable, initialized rows of `width * 4`
+    /// bytes separated by `pitch >= width * 4` bytes, and no other thread may
+    /// concurrently mutate bytes within `[row * pitch .. row * pitch + width * 4)`.
+    /// Sibling workers mutating disjoint columns in the same `shadow` rows are
+    /// safe because libjpeg-turbo strictly reads `[0..width * 4]` per row and
+    /// no spanning Rust `&[u8]` slice is created.
+    pub(crate) unsafe fn compress_jpeg_strided_raw(
         &mut self,
+        src: *const u8,
         width: usize,
+        pitch: usize,
         height: usize,
         quality: u8,
         subsamp: JpegSubsamp,
     ) -> Result<Vec<u8>> {
+        if width == 0 || height == 0 || pitch < width * 4 {
+            bail!("invalid JPEG encode geometry {width}x{height} pitch={pitch}");
+        }
+        let width_i: c_int = width
+            .try_into()
+            .context(loc!(), "JPEG width exceeds c_int")?;
+        let pitch_i: c_int = pitch
+            .try_into()
+            .context(loc!(), "JPEG pitch exceeds c_int")?;
+        let height_i: c_int = height
+            .try_into()
+            .context(loc!(), "JPEG height exceeds c_int")?;
+
         let tj_subsamp: turbojpeg::Subsamp = subsamp.into();
         let needed = turbojpeg::compressed_buf_len(width, height, tj_subsamp).location(loc!())?;
         if self.jpeg_out.len() < needed {
@@ -913,27 +1022,65 @@ impl CompressorWorkerState {
             Some(c) => c,
             None => self
                 .jpeg_compressor
-                .insert(turbojpeg::Compressor::new().location(loc!())?),
+                .insert(RawJpegCompressor::new().location(loc!())?),
         };
         if newly_created || self.jpeg_quality != quality {
-            comp.set_quality(i32::from(quality)).location(loc!())?;
+            comp.set(
+                turbojpeg::raw::TJPARAM_TJPARAM_QUALITY,
+                c_int::from(quality),
+            )
+            .location(loc!())?;
             self.jpeg_quality = quality;
         }
         if newly_created || self.jpeg_subsamp != subsamp {
-            comp.set_subsamp(tj_subsamp).location(loc!())?;
+            comp.set(turbojpeg::raw::TJPARAM_TJPARAM_SUBSAMP, tj_subsamp as c_int)
+                .location(loc!())?;
             self.jpeg_subsamp = subsamp;
         }
-        let img = turbojpeg::Image {
-            pixels: &self.jpeg_pixels[..width * height * 4],
-            width,
-            pitch: width * 4,
-            height,
-            format: turbojpeg::PixelFormat::BGRX,
+        let mut out_ptr = self.jpeg_out.as_mut_ptr();
+        let mut out_len: turbojpeg::raw::size_t = needed
+            .try_into()
+            .context(loc!(), "JPEG output buffer len exceeds size_t")?;
+        // SAFETY: Caller guarantees `src` is valid for `height` rows of
+        // `width * 4` bytes at stride `pitch`, `comp.handle` has
+        // `TJPARAM_NOREALLOC = 1`, and `out_ptr` has `needed` writable bytes.
+        let res = unsafe {
+            turbojpeg::raw::tj3Compress8(
+                comp.handle,
+                src,
+                width_i,
+                pitch_i,
+                height_i,
+                turbojpeg::raw::TJPF_TJPF_BGRX,
+                &mut out_ptr,
+                &mut out_len,
+            )
         };
-        let written = comp
-            .compress_to_slice(img, &mut self.jpeg_out[..needed])
-            .location(loc!())?;
+        if res != 0 {
+            return Err(tj_error(comp.handle)).location(loc!());
+        }
+        let written = out_len as usize;
+        if out_ptr.is_null() || written > needed {
+            bail!("turbojpeg returned invalid output size {written} (cap {needed})");
+        }
         Ok(self.jpeg_out[..written].to_vec())
+    }
+
+    /// Compresses the tightly packed `width * height * 4`-byte BGRX tile stored
+    /// in `self.jpeg_pixels` into a JPEG byte vector.
+    pub(crate) fn compress_jpeg_from_scratch(
+        &mut self,
+        width: usize,
+        height: usize,
+        quality: u8,
+        subsamp: JpegSubsamp,
+    ) -> Result<Vec<u8>> {
+        let byte_len = width * height * 4;
+        assert!(self.jpeg_pixels.len() >= byte_len);
+        let src = self.jpeg_pixels.as_ptr();
+        // SAFETY: `self.jpeg_pixels` owns at least `width * height * 4`
+        // initialized bytes and is not mutated during `compress_jpeg_strided_raw`.
+        unsafe { self.compress_jpeg_strided_raw(src, width, width * 4, height, quality, subsamp) }
     }
 }
 
@@ -960,7 +1107,7 @@ pub(crate) fn compress_bytes(
     EncodedBytes::Uncompressed(data.to_vec())
 }
 
-/// Progressive scan limit for [`turbojpeg::Decompressor`] (baseline JPEGs use 1
+/// Progressive scan limit for [`RawJpegDecompressor`] (baseline JPEGs use 1
 /// scan; capping prevents crafted multi-scan progressive DoS bombs).
 const MAX_JPEG_PROGRESSIVE_SCANS: u32 = 100;
 
@@ -973,7 +1120,7 @@ pub(crate) struct DecompressorWorkerState {
     pub(crate) alpha_filt: Vec<u8>,
     pub(crate) alpha_row_a: Vec<u8>,
     pub(crate) alpha_row_b: Vec<u8>,
-    jpeg_decompressor: Option<turbojpeg::Decompressor>,
+    jpeg_decompressor: Option<RawJpegDecompressor>,
     pub(crate) jpeg_pixels: Vec<u8>,
 }
 
@@ -993,45 +1140,103 @@ impl DecompressorWorkerState {
         })
     }
 
+    /// Validates the JPEG header matches `expected_w x expected_h` in a single
+    /// `tj3DecompressHeader` call and decodes `data` directly into `dst` (with
+    /// row stride `pitch >= expected_w * 4` bytes) as `TJPF_BGRA` (guaranteeing
+    /// byte 3 is `0xFF` for every decoded pixel).
+    ///
+    /// # Safety
+    /// `dst` must be writable (may be uninitialized) for `expected_h` rows of
+    /// `expected_w * 4` bytes at stride `pitch`, and no other thread may
+    /// concurrently read or write bytes within
+    /// `[row * pitch .. row * pitch + expected_w * 4)`. Sibling workers writing
+    /// disjoint columns on the same frame rows are safe because libjpeg-turbo
+    /// strictly writes `[0..expected_w * 4]` per row and no spanning Rust
+    /// `&mut [u8]` slice is created.
+    pub(crate) unsafe fn decompress_jpeg_into_raw(
+        &mut self,
+        data: &[u8],
+        expected_w: usize,
+        expected_h: usize,
+        dst: *mut u8,
+        pitch: usize,
+    ) -> Result<()> {
+        if expected_w == 0 || expected_h == 0 || pitch < expected_w * 4 {
+            bail!("invalid JPEG decode geometry {expected_w}x{expected_h} pitch={pitch}");
+        }
+        let pitch_i: c_int = pitch
+            .try_into()
+            .context(loc!(), "JPEG decode pitch exceeds c_int")?;
+        let data_len: turbojpeg::raw::size_t = data
+            .len()
+            .try_into()
+            .context(loc!(), "JPEG payload len exceeds size_t")?;
+
+        let decomp = match &mut self.jpeg_decompressor {
+            Some(d) => d,
+            None => self
+                .jpeg_decompressor
+                .insert(RawJpegDecompressor::new().location(loc!())?),
+        };
+        // SAFETY: `decomp.handle` is a valid decompressor handle and `data` is
+        // readable for `data_len` bytes.
+        let hdr_res =
+            unsafe { turbojpeg::raw::tj3DecompressHeader(decomp.handle, data.as_ptr(), data_len) };
+        if hdr_res != 0 {
+            return Err(tj_error(decomp.handle)).location(loc!());
+        }
+        // SAFETY: `tj3DecompressHeader` succeeded on `decomp.handle`.
+        let (w, h) = unsafe {
+            (
+                turbojpeg::raw::tj3Get(
+                    decomp.handle,
+                    turbojpeg::raw::TJPARAM_TJPARAM_JPEGWIDTH as c_int,
+                ),
+                turbojpeg::raw::tj3Get(
+                    decomp.handle,
+                    turbojpeg::raw::TJPARAM_TJPARAM_JPEGHEIGHT as c_int,
+                ),
+            )
+        };
+        if w < 0 || h < 0 || w as usize != expected_w || h as usize != expected_h {
+            bail!("JPEG dimensions {w}x{h} do not match tile rect {expected_w}x{expected_h}",);
+        }
+        // SAFETY: Header dimensions equal `expected_w x expected_h`, and caller
+        // guarantees `dst` is writable for `expected_h` rows of `expected_w * 4`
+        // bytes at stride `pitch`.
+        let res = unsafe {
+            turbojpeg::raw::tj3Decompress8(
+                decomp.handle,
+                data.as_ptr(),
+                data_len,
+                dst,
+                pitch_i,
+                turbojpeg::raw::TJPF_TJPF_BGRA,
+            )
+        };
+        if res != 0 {
+            return Err(tj_error(decomp.handle)).location(loc!());
+        }
+        Ok(())
+    }
+
     /// Validates the JPEG header matches `expected_w x expected_h` and decodes
     /// `data` into `self.jpeg_pixels[..expected_w * expected_h * 4]` as BGRA
     /// (byte 3 guaranteed `0xFF`).
-    pub(crate) fn decompress_jpeg(
+    pub(crate) fn decompress_jpeg_to_scratch(
         &mut self,
         data: &[u8],
         expected_w: usize,
         expected_h: usize,
     ) -> Result<()> {
-        let decomp = match &mut self.jpeg_decompressor {
-            Some(d) => d,
-            None => {
-                let mut d = turbojpeg::Decompressor::new().location(loc!())?;
-                d.set_scan_limit(MAX_JPEG_PROGRESSIVE_SCANS)
-                    .location(loc!())?;
-                self.jpeg_decompressor.insert(d)
-            },
-        };
-        let header = decomp.read_header(data).location(loc!())?;
-        if header.width != expected_w || header.height != expected_h {
-            bail!(
-                "JPEG dimensions {}x{} do not match tile rect {expected_w}x{expected_h}",
-                header.width,
-                header.height
-            );
-        }
         let byte_len = expected_w * expected_h * 4;
         if self.jpeg_pixels.len() < byte_len {
             self.jpeg_pixels.resize(byte_len, 0);
         }
-        let out_img = turbojpeg::Image {
-            pixels: &mut self.jpeg_pixels[..byte_len],
-            width: expected_w,
-            pitch: expected_w * 4,
-            height: expected_h,
-            format: turbojpeg::PixelFormat::BGRA,
-        };
-        decomp.decompress(data, out_img).location(loc!())?;
-        Ok(())
+        let dst = self.jpeg_pixels.as_mut_ptr();
+        // SAFETY: `self.jpeg_pixels` owns at least `expected_w * expected_h * 4`
+        // writable bytes and is not accessed by `decompress_jpeg_into_raw`.
+        unsafe { self.decompress_jpeg_into_raw(data, expected_w, expected_h, dst, expected_w * 4) }
     }
 }
 

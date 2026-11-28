@@ -569,6 +569,7 @@ mod avx512 {
     use std::arch::x86_64::_mm512_loadu_si512;
     use std::arch::x86_64::_mm512_madd_epi16;
     use std::arch::x86_64::_mm512_maddubs_epi16;
+    use std::arch::x86_64::_mm512_mask_blend_epi8;
     use std::arch::x86_64::_mm512_mask_blend_epi32;
     use std::arch::x86_64::_mm512_mask_cmpneq_epi32_mask;
     use std::arch::x86_64::_mm512_mask_storeu_epi8;
@@ -626,6 +627,9 @@ mod avx512 {
     /// Opmask selecting B, G, R bytes (`0, 1, 2`) of every 4-byte pixel while ignoring byte `3`.
     const MASK_RGB: u64 = 0x7777_7777_7777_7777;
 
+    /// Opmask selecting byte `3` (alpha) of every 4-byte pixel in a 64-byte ZMM register.
+    const MASK_ALPHA_BYTE: u64 = 0x8888_8888_8888_8888;
+
     /// In-lane `vpshufb` mask replicating each BGRA pixel's green channel into its
     /// B and R slots while zeroing G and A (`0x80`).
     const SHUF_G: [u8; 64] = {
@@ -681,6 +685,22 @@ mod avx512 {
             t[p * 4] = (p * 3) as u8;
             t[p * 4 + 1] = (p * 3 + 1) as u8;
             t[p * 4 + 2] = (p * 3 + 2) as u8;
+            t[p * 4 + 3] = (64 + p) as u8;
+            p += 1;
+        }
+        t
+    };
+
+    /// Cross-lane `vpermt2b` indices keeping B, G, R bytes (`4*p..4*p+3` from
+    /// source `a`) and replacing byte `3` of each pixel with `alpha[p]`
+    /// (`64 + p` from source `b`).
+    const MERGE_BGRX_ALPHA_IDX: [u8; 64] = {
+        let mut t = [0u8; 64];
+        let mut p = 0;
+        while p < 16 {
+            t[p * 4] = (p * 4) as u8;
+            t[p * 4 + 1] = (p * 4 + 1) as u8;
+            t[p * 4 + 2] = (p * 4 + 2) as u8;
             t[p * 4 + 3] = (64 + p) as u8;
             p += 1;
         }
@@ -1319,6 +1339,57 @@ mod avx512 {
                 let v = _mm512_loadu_si512(src.as_ptr().add(x).cast());
                 _mm512_stream_si512(dst.as_mut_ptr().add(x).cast::<__m512i>(), v);
                 x += 16;
+            }
+        }
+    }
+
+    #[target_feature(enable = "avx512bw,avx512vl,avx512vbmi")]
+    #[inline]
+    unsafe fn merge_bgrx_alpha_row_ptr<const STREAM: bool, const CONST_ALPHA: bool>(
+        src: *const Vec4u8,
+        alpha_p: *const u8,
+        const_alpha: u8,
+        dst: *mut MaybeUninit<Vec4u8>,
+        tw: usize,
+    ) {
+        debug_assert!(!STREAM || (dst as usize).is_multiple_of(64));
+        let lim = (tw / 16) * 16;
+        // SAFETY: Caller guarantees AVX-512BW/VL/VBMI, `src` readable and `dst`
+        // writable for `tw` pixels (identical pointers permitted when `!STREAM`),
+        // `alpha_p` readable for `tw` bytes when `!CONST_ALPHA`, and 64-byte
+        // alignment on `dst` when `STREAM` is `true`.
+        unsafe {
+            let const_alpha_vec = _mm512_set1_epi8(const_alpha as i8);
+            let merge_idx = load_table(&MERGE_BGRX_ALPHA_IDX);
+            let mut x = 0usize;
+            while x < lim {
+                let v = _mm512_loadu_si512(src.add(x).cast());
+                let out = if CONST_ALPHA {
+                    _mm512_mask_blend_epi8(MASK_ALPHA_BYTE, v, const_alpha_vec)
+                } else {
+                    let a128 = _mm_loadu_si128(alpha_p.add(x).cast::<__m128i>());
+                    _mm512_permutex2var_epi8(v, merge_idx, _mm512_zextsi128_si512(a128))
+                };
+                let p = dst.add(x).cast::<__m512i>();
+                if STREAM {
+                    _mm512_stream_si512(p, out);
+                } else {
+                    _mm512_storeu_si512(p.cast(), out);
+                }
+                x += 16;
+            }
+            let rem = tw - lim;
+            if rem != 0 {
+                let px_mask = (1u64 << (rem * 4)) - 1;
+                let v = _mm512_maskz_loadu_epi8(px_mask, src.add(lim).cast());
+                let out = if CONST_ALPHA {
+                    _mm512_mask_blend_epi8(MASK_ALPHA_BYTE, v, const_alpha_vec)
+                } else {
+                    let alpha_mask = (1u64 << rem) - 1;
+                    let a = _mm512_maskz_loadu_epi8(alpha_mask, alpha_p.add(lim).cast());
+                    _mm512_permutex2var_epi8(v, merge_idx, a)
+                };
+                _mm512_mask_storeu_epi8(dst.add(lim).cast(), px_mask, out);
             }
         }
     }
@@ -2333,6 +2404,52 @@ mod avx512 {
         }
 
         #[inline(always)]
+        unsafe fn merge_bgrx_alpha_row<const STREAM: bool, const CONST_ALPHA: bool>(
+            self,
+            src: &[Vec4u8],
+            alpha_row: &[u8],
+            const_alpha: u8,
+            dst: &mut [MaybeUninit<Vec4u8>],
+        ) {
+            let tw = dst.len();
+            debug_assert_eq!(src.len(), tw);
+            debug_assert!(CONST_ALPHA || alpha_row.len() == tw);
+            // SAFETY: `self` witnesses `avx512bw + avx512vl + avx512vbmi` support,
+            // and caller upholds 64-byte alignment on `dst` when `STREAM` is `true`.
+            unsafe {
+                merge_bgrx_alpha_row_ptr::<STREAM, CONST_ALPHA>(
+                    src.as_ptr(),
+                    alpha_row.as_ptr(),
+                    const_alpha,
+                    dst.as_mut_ptr(),
+                    tw,
+                );
+            }
+        }
+
+        #[inline(always)]
+        fn merge_bgrx_alpha_row_in_place<const CONST_ALPHA: bool>(
+            self,
+            pixels: &mut [Vec4u8],
+            alpha_row: &[u8],
+            const_alpha: u8,
+        ) {
+            let tw = pixels.len();
+            debug_assert!(CONST_ALPHA || alpha_row.len() == tw);
+            // SAFETY: `self` witnesses `avx512bw + avx512vl + avx512vbmi` support,
+            // and `merge_bgrx_alpha_row_ptr` loads each vector before storing back.
+            unsafe {
+                merge_bgrx_alpha_row_ptr::<false, CONST_ALPHA>(
+                    pixels.as_ptr(),
+                    alpha_row.as_ptr(),
+                    const_alpha,
+                    pixels.as_mut_ptr().cast::<MaybeUninit<Vec4u8>>(),
+                    tw,
+                );
+            }
+        }
+
+        #[inline(always)]
         fn is_constant_plane(self, data: &[u8]) -> Option<u8> {
             // SAFETY: `self` witnesses `avx512bw + avx512vl + avx512vbmi` support.
             unsafe { is_constant_plane_impl(data) }
@@ -2648,6 +2765,7 @@ mod avx2 {
     use std::arch::x86_64::_mm256_castsi256_si128;
     use std::arch::x86_64::_mm256_cmpeq_epi8;
     use std::arch::x86_64::_mm256_cmpeq_epi32;
+    use std::arch::x86_64::_mm256_cvtepu8_epi32;
     use std::arch::x86_64::_mm256_extracti128_si256;
     use std::arch::x86_64::_mm256_loadu_si256;
     use std::arch::x86_64::_mm256_madd_epi16;
@@ -2673,6 +2791,7 @@ mod avx2 {
     use std::arch::x86_64::_mm256_setzero_si256;
     use std::arch::x86_64::_mm256_shuffle_epi8;
     use std::arch::x86_64::_mm256_slli_epi16;
+    use std::arch::x86_64::_mm256_slli_epi32;
     use std::arch::x86_64::_mm256_slli_si256;
     use std::arch::x86_64::_mm256_sllv_epi32;
     use std::arch::x86_64::_mm256_srli_epi16;
@@ -3811,6 +3930,56 @@ mod avx2 {
                 _mm256_stream_si256(dst.as_mut_ptr().add(x).cast::<__m256i>(), v0);
                 _mm256_stream_si256(dst.as_mut_ptr().add(x + 8).cast::<__m256i>(), v1);
                 x += 16;
+            }
+        }
+    }
+
+    #[target_feature(enable = "avx2")]
+    #[inline]
+    unsafe fn merge_bgrx_alpha_row_ptr<const STREAM: bool, const CONST_ALPHA: bool>(
+        src: *const Vec4u8,
+        alpha_p: *const u8,
+        const_alpha: u8,
+        dst: *mut MaybeUninit<Vec4u8>,
+        tw: usize,
+    ) {
+        debug_assert!(!STREAM || (dst as usize).is_multiple_of(32));
+        let lim = (tw / 8) * 8;
+        // SAFETY: Caller guarantees AVX2, `src` readable and `dst` writable for
+        // `tw` pixels (identical pointers permitted when `!STREAM`), `alpha_p`
+        // readable for `tw` bytes when `!CONST_ALPHA`, and 32-byte alignment on
+        // `dst` when `STREAM` is `true`.
+        unsafe {
+            let rgb_mask = _mm256_set1_epi32(0x00FF_FFFFu32 as i32);
+            let const_alpha_vec = _mm256_set1_epi32((u32::from(const_alpha) << 24) as i32);
+            let mut x = 0usize;
+            while x < lim {
+                let v = _mm256_loadu_si256(src.add(x).cast::<__m256i>());
+                let alpha_vec = if CONST_ALPHA {
+                    const_alpha_vec
+                } else {
+                    let a64 = _mm_loadl_epi64(alpha_p.add(x).cast::<__m128i>());
+                    _mm256_slli_epi32::<24>(_mm256_cvtepu8_epi32(a64))
+                };
+                let out = _mm256_or_si256(_mm256_and_si256(v, rgb_mask), alpha_vec);
+                let p = dst.add(x).cast::<__m256i>();
+                if STREAM {
+                    _mm256_stream_si256(p, out);
+                } else {
+                    _mm256_storeu_si256(p, out);
+                }
+                x += 8;
+            }
+            while x < tw {
+                let px = src.add(x).read();
+                let a = if CONST_ALPHA {
+                    const_alpha
+                } else {
+                    *alpha_p.add(x)
+                };
+                dst.add(x)
+                    .write(MaybeUninit::new(Vec4u8(px.0, px.1, px.2, a)));
+                x += 1;
             }
         }
     }
@@ -5050,6 +5219,52 @@ mod avx2 {
         }
 
         #[inline(always)]
+        unsafe fn merge_bgrx_alpha_row<const STREAM: bool, const CONST_ALPHA: bool>(
+            self,
+            src: &[Vec4u8],
+            alpha_row: &[u8],
+            const_alpha: u8,
+            dst: &mut [MaybeUninit<Vec4u8>],
+        ) {
+            let tw = dst.len();
+            debug_assert_eq!(src.len(), tw);
+            debug_assert!(CONST_ALPHA || alpha_row.len() == tw);
+            // SAFETY: `self` witnesses `avx2` support, and caller upholds
+            // 32-byte alignment on `dst` when `STREAM` is `true`.
+            unsafe {
+                merge_bgrx_alpha_row_ptr::<STREAM, CONST_ALPHA>(
+                    src.as_ptr(),
+                    alpha_row.as_ptr(),
+                    const_alpha,
+                    dst.as_mut_ptr(),
+                    tw,
+                );
+            }
+        }
+
+        #[inline(always)]
+        fn merge_bgrx_alpha_row_in_place<const CONST_ALPHA: bool>(
+            self,
+            pixels: &mut [Vec4u8],
+            alpha_row: &[u8],
+            const_alpha: u8,
+        ) {
+            let tw = pixels.len();
+            debug_assert!(CONST_ALPHA || alpha_row.len() == tw);
+            // SAFETY: `self` witnesses `avx2` support, and
+            // `merge_bgrx_alpha_row_ptr` loads each vector before storing back.
+            unsafe {
+                merge_bgrx_alpha_row_ptr::<false, CONST_ALPHA>(
+                    pixels.as_ptr(),
+                    alpha_row.as_ptr(),
+                    const_alpha,
+                    pixels.as_mut_ptr().cast::<MaybeUninit<Vec4u8>>(),
+                    tw,
+                );
+            }
+        }
+
+        #[inline(always)]
         fn is_constant_plane(self, data: &[u8]) -> Option<u8> {
             // SAFETY: `self` witnesses `avx2` support.
             unsafe { is_constant_plane_impl(data) }
@@ -6047,6 +6262,57 @@ mod ssse3 {
                 _mm_stream_si128(dst.as_mut_ptr().add(x + 8).cast::<__m128i>(), v2);
                 _mm_stream_si128(dst.as_mut_ptr().add(x + 12).cast::<__m128i>(), v3);
                 x += 16;
+            }
+        }
+    }
+
+    #[target_feature(enable = "ssse3")]
+    #[inline]
+    unsafe fn merge_bgrx_alpha_row_ptr<const STREAM: bool, const CONST_ALPHA: bool>(
+        src: *const Vec4u8,
+        alpha_p: *const u8,
+        const_alpha: u8,
+        dst: *mut MaybeUninit<Vec4u8>,
+        tw: usize,
+    ) {
+        debug_assert!(!STREAM || (dst as usize).is_multiple_of(16));
+        let lim = (tw / 4) * 4;
+        // SAFETY: Caller guarantees SSSE3, `src` readable and `dst` writable for
+        // `tw` pixels (identical pointers permitted when `!STREAM`), `alpha_p`
+        // readable for `tw` bytes when `!CONST_ALPHA`, and 16-byte alignment on
+        // `dst` when `STREAM` is `true`.
+        unsafe {
+            let rgb_mask = _mm_set1_epi32(0x00FF_FFFFu32 as i32);
+            let const_alpha_vec = _mm_set1_epi32((u32::from(const_alpha) << 24) as i32);
+            let shuf_a = _mm_set_epi8(3, -1, -1, -1, 2, -1, -1, -1, 1, -1, -1, -1, 0, -1, -1, -1);
+            let mut x = 0usize;
+            while x < lim {
+                let v = _mm_loadu_si128(src.add(x).cast::<__m128i>());
+                let alpha_vec = if CONST_ALPHA {
+                    const_alpha_vec
+                } else {
+                    let a32 = _mm_cvtsi32_si128(alpha_p.add(x).cast::<i32>().read_unaligned());
+                    _mm_shuffle_epi8(a32, shuf_a)
+                };
+                let out = _mm_or_si128(_mm_and_si128(v, rgb_mask), alpha_vec);
+                let p = dst.add(x).cast::<__m128i>();
+                if STREAM {
+                    _mm_stream_si128(p, out);
+                } else {
+                    _mm_storeu_si128(p, out);
+                }
+                x += 4;
+            }
+            while x < tw {
+                let px = src.add(x).read();
+                let a = if CONST_ALPHA {
+                    const_alpha
+                } else {
+                    *alpha_p.add(x)
+                };
+                dst.add(x)
+                    .write(MaybeUninit::new(Vec4u8(px.0, px.1, px.2, a)));
+                x += 1;
             }
         }
     }
@@ -7253,6 +7519,52 @@ mod ssse3 {
         }
 
         #[inline(always)]
+        unsafe fn merge_bgrx_alpha_row<const STREAM: bool, const CONST_ALPHA: bool>(
+            self,
+            src: &[Vec4u8],
+            alpha_row: &[u8],
+            const_alpha: u8,
+            dst: &mut [MaybeUninit<Vec4u8>],
+        ) {
+            let tw = dst.len();
+            debug_assert_eq!(src.len(), tw);
+            debug_assert!(CONST_ALPHA || alpha_row.len() == tw);
+            // SAFETY: `self` witnesses `ssse3` support, and caller upholds
+            // 16-byte alignment on `dst` when `STREAM` is `true`.
+            unsafe {
+                merge_bgrx_alpha_row_ptr::<STREAM, CONST_ALPHA>(
+                    src.as_ptr(),
+                    alpha_row.as_ptr(),
+                    const_alpha,
+                    dst.as_mut_ptr(),
+                    tw,
+                );
+            }
+        }
+
+        #[inline(always)]
+        fn merge_bgrx_alpha_row_in_place<const CONST_ALPHA: bool>(
+            self,
+            pixels: &mut [Vec4u8],
+            alpha_row: &[u8],
+            const_alpha: u8,
+        ) {
+            let tw = pixels.len();
+            debug_assert!(CONST_ALPHA || alpha_row.len() == tw);
+            // SAFETY: `self` witnesses `ssse3` support, and
+            // `merge_bgrx_alpha_row_ptr` loads each vector before storing back.
+            unsafe {
+                merge_bgrx_alpha_row_ptr::<false, CONST_ALPHA>(
+                    pixels.as_ptr(),
+                    alpha_row.as_ptr(),
+                    const_alpha,
+                    pixels.as_mut_ptr().cast::<MaybeUninit<Vec4u8>>(),
+                    tw,
+                );
+            }
+        }
+
+        #[inline(always)]
         fn is_constant_plane(self, data: &[u8]) -> Option<u8> {
             // SAFETY: `self` witnesses `ssse3` support.
             unsafe { is_constant_plane_impl(data) }
@@ -7694,9 +8006,13 @@ macro_rules! define_tier_wrappers {
             }
 
             #[target_feature(enable = $feat)]
-            #[inline]
-            pub(super) unsafe fn decode_jpeg_alpha_rows(
+            #[inline(never)]
+            pub(super) unsafe fn decode_jpeg_alpha_rows<
+                const STREAM: bool,
+                const CONST_ALPHA: bool,
+            >(
                 a_filt: &[u8],
+                const_alpha: u8,
                 jpeg_rows: &[Vec4u8],
                 frame: &FrameRows,
                 x0: usize,
@@ -7707,13 +8023,53 @@ macro_rules! define_tier_wrappers {
                 alpha_row_b: &mut Vec<u8>,
             ) {
                 // SAFETY: Caller verified CPU feature support via `X86Tier::detect()`
-                // and upheld validated-frame/disjoint-rect invariants.
+                // and upheld validated-frame/disjoint-rect/alignment invariants.
                 unsafe {
                     let kernel = super::$tier_mod::Kernel::new_unchecked();
-                    crate::filtering::decode_jpeg_alpha_rows_with(
+                    crate::filtering::decode_jpeg_alpha_rows_with::<
+                        super::$tier_mod::Kernel,
+                        STREAM,
+                        CONST_ALPHA,
+                    >(
                         kernel,
                         a_filt,
+                        const_alpha,
                         jpeg_rows,
+                        frame,
+                        x0,
+                        y0,
+                        tw,
+                        th,
+                        alpha_row_a,
+                        alpha_row_b,
+                    );
+                }
+            }
+
+            #[target_feature(enable = $feat)]
+            #[inline(never)]
+            pub(super) unsafe fn decode_jpeg_alpha_rows_in_place<const CONST_ALPHA: bool>(
+                a_filt: &[u8],
+                const_alpha: u8,
+                frame: &FrameRows,
+                x0: usize,
+                y0: usize,
+                tw: usize,
+                th: usize,
+                alpha_row_a: &mut Vec<u8>,
+                alpha_row_b: &mut Vec<u8>,
+            ) {
+                // SAFETY: Caller verified CPU feature support via `X86Tier::detect()`
+                // and upheld validated-frame/initialized-BGRX/disjoint-rect invariants.
+                unsafe {
+                    let kernel = super::$tier_mod::Kernel::new_unchecked();
+                    crate::filtering::decode_jpeg_alpha_rows_in_place_with::<
+                        super::$tier_mod::Kernel,
+                        CONST_ALPHA,
+                    >(
+                        kernel,
+                        a_filt,
+                        const_alpha,
                         frame,
                         x0,
                         y0,
@@ -8466,9 +8822,10 @@ impl X86Tier {
     /// # Safety
     /// Caller must uphold [`super::decode_jpeg_alpha_rows_with`] invariants.
     #[inline(always)]
-    pub(super) unsafe fn decode_jpeg_alpha_rows(
+    pub(super) unsafe fn decode_jpeg_alpha_rows<const STREAM: bool, const CONST_ALPHA: bool>(
         self,
         a_filt: &[u8],
+        const_alpha: u8,
         jpeg_rows: &[Vec4u8],
         frame: &FrameRows,
         x0: usize,
@@ -8479,7 +8836,7 @@ impl X86Tier {
         alpha_row_b: &mut Vec<u8>,
     ) {
         // SAFETY: Each arm's tier witness verifies required CPU features, and
-        // caller upholds validated-frame/disjoint-rect invariants.
+        // caller upholds validated-frame/disjoint-rect/alignment invariants.
         unsafe {
             match self {
                 #[cfg(all(
@@ -8491,18 +8848,21 @@ impl X86Tier {
                         target_feature = "avx512vbmi",
                     )),
                 ))]
-                Self::Scalar => super::decode_jpeg_alpha_rows_with(
-                    ScalarKernel,
-                    a_filt,
-                    jpeg_rows,
-                    frame,
-                    x0,
-                    y0,
-                    tw,
-                    th,
-                    alpha_row_a,
-                    alpha_row_b,
-                ),
+                Self::Scalar => {
+                    super::decode_jpeg_alpha_rows_with::<ScalarKernel, false, CONST_ALPHA>(
+                        ScalarKernel,
+                        a_filt,
+                        const_alpha,
+                        jpeg_rows,
+                        frame,
+                        x0,
+                        y0,
+                        tw,
+                        th,
+                        alpha_row_a,
+                        alpha_row_b,
+                    )
+                },
                 #[cfg(all(
                     not(target_feature = "avx2"),
                     not(all(
@@ -8511,8 +8871,9 @@ impl X86Tier {
                         target_feature = "avx512vbmi",
                     )),
                 ))]
-                Self::Ssse3 => dispatch_ssse3::decode_jpeg_alpha_rows(
+                Self::Ssse3 => dispatch_ssse3::decode_jpeg_alpha_rows::<STREAM, CONST_ALPHA>(
                     a_filt,
+                    const_alpha,
                     jpeg_rows,
                     frame,
                     x0,
@@ -8527,8 +8888,9 @@ impl X86Tier {
                     target_feature = "avx512vl",
                     target_feature = "avx512vbmi",
                 )))]
-                Self::Avx2 => dispatch_avx2::decode_jpeg_alpha_rows(
+                Self::Avx2 => dispatch_avx2::decode_jpeg_alpha_rows::<STREAM, CONST_ALPHA>(
                     a_filt,
+                    const_alpha,
                     jpeg_rows,
                     frame,
                     x0,
@@ -8538,9 +8900,102 @@ impl X86Tier {
                     alpha_row_a,
                     alpha_row_b,
                 ),
-                Self::Avx512 => dispatch_avx512::decode_jpeg_alpha_rows(
+                Self::Avx512 => dispatch_avx512::decode_jpeg_alpha_rows::<STREAM, CONST_ALPHA>(
                     a_filt,
+                    const_alpha,
                     jpeg_rows,
+                    frame,
+                    x0,
+                    y0,
+                    tw,
+                    th,
+                    alpha_row_a,
+                    alpha_row_b,
+                ),
+            }
+        }
+    }
+
+    /// # Safety
+    /// Caller must uphold [`super::decode_jpeg_alpha_rows_in_place_with`] invariants.
+    #[inline(always)]
+    pub(super) unsafe fn decode_jpeg_alpha_rows_in_place<const CONST_ALPHA: bool>(
+        self,
+        a_filt: &[u8],
+        const_alpha: u8,
+        frame: &FrameRows,
+        x0: usize,
+        y0: usize,
+        tw: usize,
+        th: usize,
+        alpha_row_a: &mut Vec<u8>,
+        alpha_row_b: &mut Vec<u8>,
+    ) {
+        // SAFETY: Each arm's tier witness verifies required CPU features, and
+        // caller upholds validated-frame/initialized-BGRX/disjoint-rect invariants.
+        unsafe {
+            match self {
+                #[cfg(all(
+                    not(target_feature = "ssse3"),
+                    not(target_feature = "avx2"),
+                    not(all(
+                        target_feature = "avx512bw",
+                        target_feature = "avx512vl",
+                        target_feature = "avx512vbmi",
+                    )),
+                ))]
+                Self::Scalar => {
+                    super::decode_jpeg_alpha_rows_in_place_with::<ScalarKernel, CONST_ALPHA>(
+                        ScalarKernel,
+                        a_filt,
+                        const_alpha,
+                        frame,
+                        x0,
+                        y0,
+                        tw,
+                        th,
+                        alpha_row_a,
+                        alpha_row_b,
+                    )
+                },
+                #[cfg(all(
+                    not(target_feature = "avx2"),
+                    not(all(
+                        target_feature = "avx512bw",
+                        target_feature = "avx512vl",
+                        target_feature = "avx512vbmi",
+                    )),
+                ))]
+                Self::Ssse3 => dispatch_ssse3::decode_jpeg_alpha_rows_in_place::<CONST_ALPHA>(
+                    a_filt,
+                    const_alpha,
+                    frame,
+                    x0,
+                    y0,
+                    tw,
+                    th,
+                    alpha_row_a,
+                    alpha_row_b,
+                ),
+                #[cfg(not(all(
+                    target_feature = "avx512bw",
+                    target_feature = "avx512vl",
+                    target_feature = "avx512vbmi",
+                )))]
+                Self::Avx2 => dispatch_avx2::decode_jpeg_alpha_rows_in_place::<CONST_ALPHA>(
+                    a_filt,
+                    const_alpha,
+                    frame,
+                    x0,
+                    y0,
+                    tw,
+                    th,
+                    alpha_row_a,
+                    alpha_row_b,
+                ),
+                Self::Avx512 => dispatch_avx512::decode_jpeg_alpha_rows_in_place::<CONST_ALPHA>(
+                    a_filt,
+                    const_alpha,
                     frame,
                     x0,
                     y0,

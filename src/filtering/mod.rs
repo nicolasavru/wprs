@@ -249,10 +249,11 @@ mod arch {
 
         /// # Safety
         /// Caller must uphold [`super::decode_jpeg_alpha_rows_with`] invariants.
-        #[inline(always)]
-        pub(super) unsafe fn decode_jpeg_alpha_rows(
+        #[inline(never)]
+        pub(super) unsafe fn decode_jpeg_alpha_rows<const STREAM: bool, const CONST_ALPHA: bool>(
             self,
             a_filt: &[u8],
+            const_alpha: u8,
             jpeg_rows: &[Vec4u8],
             frame: &FrameRows,
             x0: usize,
@@ -262,12 +263,46 @@ mod arch {
             alpha_row_a: &mut Vec<u8>,
             alpha_row_b: &mut Vec<u8>,
         ) {
-            // SAFETY: Caller upholds validated-frame and disjoint-rect invariants.
+            // SAFETY: Caller upholds validated-frame and disjoint-rect invariants;
+            // `ScalarKernel::STREAM_ALIGN == 1` never issues streaming stores.
             unsafe {
-                super::decode_jpeg_alpha_rows_with(
+                super::decode_jpeg_alpha_rows_with::<ScalarKernel, false, CONST_ALPHA>(
                     ScalarKernel,
                     a_filt,
+                    const_alpha,
                     jpeg_rows,
+                    frame,
+                    x0,
+                    y0,
+                    tw,
+                    th,
+                    alpha_row_a,
+                    alpha_row_b,
+                );
+            }
+        }
+
+        /// # Safety
+        /// Caller must uphold [`super::decode_jpeg_alpha_rows_in_place_with`] invariants.
+        #[inline(never)]
+        pub(super) unsafe fn decode_jpeg_alpha_rows_in_place<const CONST_ALPHA: bool>(
+            self,
+            a_filt: &[u8],
+            const_alpha: u8,
+            frame: &FrameRows,
+            x0: usize,
+            y0: usize,
+            tw: usize,
+            th: usize,
+            alpha_row_a: &mut Vec<u8>,
+            alpha_row_b: &mut Vec<u8>,
+        ) {
+            // SAFETY: Caller upholds validated-frame, initialized-BGRX, and disjoint-rect invariants.
+            unsafe {
+                super::decode_jpeg_alpha_rows_in_place_with::<ScalarKernel, CONST_ALPHA>(
+                    ScalarKernel,
+                    a_filt,
+                    const_alpha,
                     frame,
                     x0,
                     y0,
@@ -766,6 +801,32 @@ pub(crate) trait RowKernel: Copy {
     /// `(dst.as_mut_ptr() as usize).is_multiple_of(Self::STREAM_ALIGN)` and
     /// `dst.len().is_multiple_of(16)` must hold.
     unsafe fn copy_row_stream(self, src: &[Vec4u8], dst: &mut [MaybeUninit<Vec4u8>]);
+
+    /// Replaces byte 3 of each `BGRX` pixel in `src` with either `const_alpha`
+    /// (when `CONST_ALPHA` is `true`) or `alpha_row[i]` (when `CONST_ALPHA` is
+    /// `false`), writing the resulting `BGRA` pixels into `dst`.
+    ///
+    /// # Safety
+    /// Caller must guarantee `src.len() == dst.len()` and
+    /// `CONST_ALPHA || alpha_row.len() == dst.len()`. When `STREAM` is `true`,
+    /// `(dst.as_mut_ptr() as usize).is_multiple_of(Self::STREAM_ALIGN)` must hold.
+    unsafe fn merge_bgrx_alpha_row<const STREAM: bool, const CONST_ALPHA: bool>(
+        self,
+        src: &[Vec4u8],
+        alpha_row: &[u8],
+        const_alpha: u8,
+        dst: &mut [MaybeUninit<Vec4u8>],
+    );
+
+    /// Replaces byte 3 of each initialized `BGRX` pixel in `pixels` in place
+    /// with either `const_alpha` (when `CONST_ALPHA` is `true`) or
+    /// `alpha_row[i]` (when `CONST_ALPHA` is `false`).
+    fn merge_bgrx_alpha_row_in_place<const CONST_ALPHA: bool>(
+        self,
+        pixels: &mut [Vec4u8],
+        alpha_row: &[u8],
+        const_alpha: u8,
+    );
 
     fn is_constant_plane(self, data: &[u8]) -> Option<u8>;
 
@@ -1274,6 +1335,46 @@ impl RowKernel for ScalarKernel {
         // SAFETY: `src` and `dst` have equal lengths and cannot overlap.
         unsafe {
             ptr::copy_nonoverlapping(src.as_ptr(), dst.as_mut_ptr().cast::<Vec4u8>(), src.len());
+        }
+    }
+
+    #[inline(always)]
+    unsafe fn merge_bgrx_alpha_row<const STREAM: bool, const CONST_ALPHA: bool>(
+        self,
+        src: &[Vec4u8],
+        alpha_row: &[u8],
+        const_alpha: u8,
+        dst: &mut [MaybeUninit<Vec4u8>],
+    ) {
+        let tw = dst.len();
+        debug_assert_eq!(src.len(), tw);
+        debug_assert!(CONST_ALPHA || alpha_row.len() == tw);
+        for (i, (out, &px)) in dst.iter_mut().zip(src).enumerate() {
+            let a = if CONST_ALPHA {
+                const_alpha
+            } else {
+                alpha_row[i]
+            };
+            out.write(Vec4u8(px.0, px.1, px.2, a));
+        }
+    }
+
+    #[inline(always)]
+    fn merge_bgrx_alpha_row_in_place<const CONST_ALPHA: bool>(
+        self,
+        pixels: &mut [Vec4u8],
+        alpha_row: &[u8],
+        const_alpha: u8,
+    ) {
+        debug_assert!(CONST_ALPHA || alpha_row.len() == pixels.len());
+        if CONST_ALPHA {
+            for px in pixels {
+                px.3 = const_alpha;
+            }
+        } else {
+            for (px, &a) in pixels.iter_mut().zip(alpha_row) {
+                px.3 = a;
+            }
         }
     }
 
@@ -1873,6 +1974,7 @@ fn filter_lossless_leaf<const HAS_ALPHA: bool>(
 fn encode_jpeg_leaf<const HAS_ALPHA: bool>(
     tier: arch::Tier,
     aos: BufferPointer<Vec4u8>,
+    aos_is_owned_shadow: bool,
     stride_px: usize,
     rect: TileRect,
     quality: u8,
@@ -1886,30 +1988,61 @@ fn encode_jpeg_leaf<const HAS_ALPHA: bool>(
     let n_px = tw * th;
     debug_assert!(n_px > 0 && n_px <= TILE_PIXELS);
 
-    // Copy out of `wl_shm` via `BufferPointer` into owned L2-hot worker memory
-    // before passing `&[u8]` to TurboJPEG (preserves SIGBUS / aliasing safety).
-    ensure_len(&mut state.jpeg_pixels, n_px * 4);
     if HAS_ALPHA {
         ensure_len(&mut state.raw_alpha, TILE_PIXELS);
     }
-    for ry in 0..th {
-        let row_start = (y0 + ry) * stride_px + x0;
-        let (_, after_start) = aos.split_at(row_start);
-        let (row_ptr, _) = after_start.split_at(tw);
-        let dst_row: &mut [Vec4u8] =
-            bytemuck::cast_slice_mut(&mut state.jpeg_pixels[ry * tw * 4..(ry + 1) * tw * 4]);
-        row_ptr.copy_to_nonoverlapping(dst_row);
+
+    let data = if aos_is_owned_shadow {
+        let last_end = (y0 + th - 1) * stride_px + x0 + tw;
+        assert!(last_end <= aos.len());
         if HAS_ALPHA {
-            let alpha_row = &mut state.raw_alpha[ry * tw..(ry + 1) * tw];
-            for (dst_a, px) in alpha_row.iter_mut().zip(dst_row.iter()) {
-                *dst_a = px.3;
+            for ry in 0..th {
+                let row_start = (y0 + ry) * stride_px + x0;
+                // SAFETY: `aos` points to owned `shadow` memory (`last_end <= aos.len()`),
+                // and `[x0..x0 + tw)` on each row of `rect` is initialized and never
+                // concurrently mutated by sibling workers.
+                let src_row = unsafe { slice::from_raw_parts(aos.ptr().add(row_start), tw) };
+                let alpha_row = &mut state.raw_alpha[ry * tw..(ry + 1) * tw];
+                for (dst_a, px) in alpha_row.iter_mut().zip(src_row.iter()) {
+                    *dst_a = px.3;
+                }
             }
         }
-    }
+        // SAFETY: `aos` points to owned `shadow` memory with `rect` initialized
+        // and exclusively owned by this worker (or globally immutable post-Phase-A),
+        // `last_end <= aos.len()`, and `compress_jpeg_strided_raw` passes `*const u8`
+        // directly to `tj3Compress8` (no spanning `&[u8]`), which strictly reads
+        // `[0..tw * 4]` per row.
+        unsafe {
+            let src = aos.ptr().add(y0 * stride_px + x0).cast::<u8>();
+            state
+                .compress_jpeg_strided_raw(src, tw, stride_px * 4, th, quality, subsamp)
+                .expect("turbojpeg compression failed for valid tile")
+        }
+    } else {
+        // Stateless / raw `wl_shm` caller: bounce out of shared memory via
+        // `BufferPointer` into lazily allocated owned worker scratch before
+        // calling TurboJPEG (preserves SIGBUS / TOCTOU safety).
+        ensure_len(&mut state.jpeg_pixels, n_px * 4);
+        for ry in 0..th {
+            let row_start = (y0 + ry) * stride_px + x0;
+            let (_, after_start) = aos.split_at(row_start);
+            let (row_ptr, _) = after_start.split_at(tw);
+            let dst_row: &mut [Vec4u8] =
+                bytemuck::cast_slice_mut(&mut state.jpeg_pixels[ry * tw * 4..(ry + 1) * tw * 4]);
+            row_ptr.copy_to_nonoverlapping(dst_row);
+            if HAS_ALPHA {
+                let alpha_row = &mut state.raw_alpha[ry * tw..(ry + 1) * tw];
+                for (dst_a, px) in alpha_row.iter_mut().zip(dst_row.iter()) {
+                    *dst_a = px.3;
+                }
+            }
+        }
+        state
+            .compress_jpeg_from_scratch(tw, th, quality, subsamp)
+            .expect("turbojpeg compression failed for valid tile")
+    };
 
-    let data = state
-        .compress_jpeg(tw, th, quality, subsamp)
-        .expect("turbojpeg compression failed for valid tile");
     let alpha = if HAS_ALPHA {
         tier.encode_alpha_plane(state, tw, th)
     } else {
@@ -1921,6 +2054,7 @@ fn encode_jpeg_leaf<const HAS_ALPHA: bool>(
 fn filter_hybrid_tile<const HAS_ALPHA: bool>(
     tier: arch::Tier,
     aos: BufferPointer<Vec4u8>,
+    aos_is_owned_shadow: bool,
     stride_px: usize,
     rect: TileRect,
     quality: u8,
@@ -1975,9 +2109,27 @@ fn filter_hybrid_tile<const HAS_ALPHA: bool>(
             },
             HybridScan::Photo => {
                 if HAS_ALPHA && !meta.tile.all_opaque {
-                    encode_jpeg_leaf::<true>(tier, aos, stride_px, rect, quality, subsamp, state)
+                    encode_jpeg_leaf::<true>(
+                        tier,
+                        aos,
+                        aos_is_owned_shadow,
+                        stride_px,
+                        rect,
+                        quality,
+                        subsamp,
+                        state,
+                    )
                 } else {
-                    encode_jpeg_leaf::<false>(tier, aos, stride_px, rect, quality, subsamp, state)
+                    encode_jpeg_leaf::<false>(
+                        tier,
+                        aos,
+                        aos_is_owned_shadow,
+                        stride_px,
+                        rect,
+                        quality,
+                        subsamp,
+                        state,
+                    )
                 }
             },
         });
@@ -2056,9 +2208,27 @@ fn filter_hybrid_tile<const HAS_ALPHA: bool>(
         })
     } else if text_safe_count == 0 {
         TilePayload::Leaf(if HAS_ALPHA && !meta.tile.all_opaque {
-            encode_jpeg_leaf::<true>(tier, aos, stride_px, rect, quality, subsamp, state)
+            encode_jpeg_leaf::<true>(
+                tier,
+                aos,
+                aos_is_owned_shadow,
+                stride_px,
+                rect,
+                quality,
+                subsamp,
+                state,
+            )
         } else {
-            encode_jpeg_leaf::<false>(tier, aos, stride_px, rect, quality, subsamp, state)
+            encode_jpeg_leaf::<false>(
+                tier,
+                aos,
+                aos_is_owned_shadow,
+                stride_px,
+                rect,
+                quality,
+                subsamp,
+                state,
+            )
         })
     } else {
         let mut sub_tiles = Vec::with_capacity(n_quads);
@@ -2105,11 +2275,25 @@ fn filter_hybrid_tile<const HAS_ALPHA: bool>(
                             }
                         } else if HAS_ALPHA && !qmeta.all_opaque {
                             encode_jpeg_leaf::<true>(
-                                tier, aos, stride_px, qrect, quality, subsamp, state,
+                                tier,
+                                aos,
+                                aos_is_owned_shadow,
+                                stride_px,
+                                qrect,
+                                quality,
+                                subsamp,
+                                state,
                             )
                         } else {
                             encode_jpeg_leaf::<false>(
-                                tier, aos, stride_px, qrect, quality, subsamp, state,
+                                tier,
+                                aos,
+                                aos_is_owned_shadow,
+                                stride_px,
+                                qrect,
+                                quality,
+                                subsamp,
+                                state,
                             )
                         }
                     },
@@ -2127,6 +2311,7 @@ fn filter_hybrid_tile<const HAS_ALPHA: bool>(
 fn filter_tile<const HAS_ALPHA: bool>(
     tier: arch::Tier,
     aos: BufferPointer<Vec4u8>,
+    aos_is_owned_shadow: bool,
     stride_px: usize,
     rect: TileRect,
     mode: CompressionMode,
@@ -2138,7 +2323,15 @@ fn filter_tile<const HAS_ALPHA: bool>(
             tier, aos, stride_px, rect, meta.tile, state,
         )),
         CompressionMode::Hybrid { quality, subsamp } => filter_hybrid_tile::<HAS_ALPHA>(
-            tier, aos, stride_px, rect, quality, subsamp, meta, state,
+            tier,
+            aos,
+            aos_is_owned_shadow,
+            stride_px,
+            rect,
+            quality,
+            subsamp,
+            meta,
+            state,
         ),
     }
 }
@@ -2241,11 +2434,14 @@ fn prepare_alpha_decode<'a, const HAS_ALPHA: bool>(
 
 /// # Safety
 /// `(x0, y0, tw, th)` must be validated in-bounds within `frame` and disjoint
-/// from all other tiles being decoded concurrently.
+/// from all other tiles being decoded concurrently; when `STREAM` is `true`,
+/// every row pointer `frame.row_ptr(y0 + ry, x0)` must be aligned to
+/// `K::STREAM_ALIGN`.
 #[inline(always)]
-unsafe fn decode_jpeg_alpha_rows_with<K: RowKernel>(
+unsafe fn decode_jpeg_alpha_rows_with<K: RowKernel, const STREAM: bool, const CONST_ALPHA: bool>(
     kernel: K,
     a_filt: &[u8],
+    const_alpha: u8,
     jpeg_rows: &[Vec4u8],
     frame: &FrameRows,
     x0: usize,
@@ -2255,31 +2451,96 @@ unsafe fn decode_jpeg_alpha_rows_with<K: RowKernel>(
     alpha_row_a: &mut Vec<u8>,
     alpha_row_b: &mut Vec<u8>,
 ) {
-    ensure_len(alpha_row_a, tw);
-    if th > 1 {
-        ensure_len(alpha_row_b, tw);
+    if !CONST_ALPHA {
+        ensure_len(alpha_row_a, tw);
+        if th > 1 {
+            ensure_len(alpha_row_b, tw);
+        }
     }
     let mut use_a = true;
     for ry in 0..th {
-        let (a_cur, a_prev): (&mut [u8], &[u8]) = if use_a {
-            (
-                &mut alpha_row_a[..tw],
-                &alpha_row_b[..if ry > 0 { tw } else { 0 }],
-            )
+        let alpha_row: &[u8] = if CONST_ALPHA {
+            &[]
         } else {
-            (&mut alpha_row_b[..tw], &alpha_row_a[..tw])
+            let (a_cur, a_prev): (&mut [u8], &[u8]) = if use_a {
+                (
+                    &mut alpha_row_a[..tw],
+                    &alpha_row_b[..if ry > 0 { tw } else { 0 }],
+                )
+            } else {
+                (&mut alpha_row_b[..tw], &alpha_row_a[..tw])
+            };
+            if ry == 0 {
+                kernel.row_sub1_inverse(&a_filt[..tw], a_cur);
+            } else {
+                kernel.row_up_inverse(&a_filt[ry * tw..(ry + 1) * tw], a_prev, a_cur);
+            }
+            a_cur
         };
-        if ry == 0 {
-            kernel.row_sub1_inverse(&a_filt[..tw], a_cur);
-        } else {
-            kernel.row_up_inverse(&a_filt[ry * tw..(ry + 1) * tw], a_prev, a_cur);
-        }
         let src_row = &jpeg_rows[ry * tw..(ry + 1) * tw];
-        // SAFETY: Caller guarantees `(x0, y0, tw, th)` is in-bounds and disjoint.
+        // SAFETY: Caller guarantees `(x0, y0, tw, th)` is in-bounds and disjoint,
+        // and aligned to `K::STREAM_ALIGN` when `STREAM` is `true`.
         let dst_row = unsafe { slice::from_raw_parts_mut(frame.row_ptr(y0 + ry, x0), tw) };
-        for ((dst, &px), &a) in dst_row.iter_mut().zip(src_row).zip(a_cur.iter()) {
-            dst.write(Vec4u8(px.0, px.1, px.2, a));
+        unsafe {
+            kernel.merge_bgrx_alpha_row::<STREAM, CONST_ALPHA>(
+                src_row,
+                alpha_row,
+                const_alpha,
+                dst_row,
+            );
         }
+        use_a = !use_a;
+    }
+}
+
+/// # Safety
+/// `(x0, y0, tw, th)` must be validated in-bounds within `frame`, already
+/// initialized with decoded `BGRX` pixels, and disjoint from all other tiles
+/// being decoded concurrently.
+#[inline(always)]
+unsafe fn decode_jpeg_alpha_rows_in_place_with<K: RowKernel, const CONST_ALPHA: bool>(
+    kernel: K,
+    a_filt: &[u8],
+    const_alpha: u8,
+    frame: &FrameRows,
+    x0: usize,
+    y0: usize,
+    tw: usize,
+    th: usize,
+    alpha_row_a: &mut Vec<u8>,
+    alpha_row_b: &mut Vec<u8>,
+) {
+    if !CONST_ALPHA {
+        ensure_len(alpha_row_a, tw);
+        if th > 1 {
+            ensure_len(alpha_row_b, tw);
+        }
+    }
+    let mut use_a = true;
+    for ry in 0..th {
+        let alpha_row: &[u8] = if CONST_ALPHA {
+            &[]
+        } else {
+            let (a_cur, a_prev): (&mut [u8], &[u8]) = if use_a {
+                (
+                    &mut alpha_row_a[..tw],
+                    &alpha_row_b[..if ry > 0 { tw } else { 0 }],
+                )
+            } else {
+                (&mut alpha_row_b[..tw], &alpha_row_a[..tw])
+            };
+            if ry == 0 {
+                kernel.row_sub1_inverse(&a_filt[..tw], a_cur);
+            } else {
+                kernel.row_up_inverse(&a_filt[ry * tw..(ry + 1) * tw], a_prev, a_cur);
+            }
+            a_cur
+        };
+        // SAFETY: Caller guarantees `(x0, y0, tw, th)` is in-bounds, disjoint,
+        // and already initialized with `Vec4u8` BGRX pixels by TurboJPEG.
+        let dst_row =
+            unsafe { slice::from_raw_parts_mut(frame.row_ptr(y0 + ry, x0).cast::<Vec4u8>(), tw) };
+        kernel.merge_bgrx_alpha_row_in_place::<CONST_ALPHA>(dst_row, alpha_row, const_alpha);
         use_a = !use_a;
     }
 }
@@ -2292,6 +2553,7 @@ unsafe fn unfilter_jpeg_leaf<const HAS_ALPHA: bool>(
     tier: arch::Tier,
     rect: TileRect,
     dst_origin: (usize, usize),
+    allow_stream: bool,
     data: &[u8],
     alpha: &AlphaChannel,
     frame: &FrameRows,
@@ -2308,7 +2570,86 @@ unsafe fn unfilter_jpeg_leaf<const HAS_ALPHA: bool>(
     if !HAS_ALPHA && !matches!(alpha, AlphaChannel::Omitted) {
         bail!("non-omitted AlphaChannel on Xrgb8888 JPEG tile");
     }
-    state.decompress_jpeg(data, tw, th).location(loc!())?;
+    let is_opaque = matches!(alpha, AlphaChannel::Omitted)
+        || (HAS_ALPHA && matches!(alpha, AlphaChannel::Constant(0xFF)));
+    if is_opaque {
+        // Zero-copy strided decode directly into `frame` (owned `ClientTileCache`
+        // slot or disjoint rect of shared `wl_shm` output) using `TJPF_BGRA`,
+        // which unconditionally sets byte 3 to `0xFF` and issues its own `sfence`
+        // after any internal streaming stores.
+        // SAFETY: Caller guarantees `(x0, y0, tw, th)` is in-bounds and disjoint
+        // within `frame`; `decompress_jpeg_into_raw` uses `*mut u8` (no spanning
+        // `&mut [u8]`) and libjpeg-turbo strictly writes `[0..tw * 4]` per row.
+        unsafe {
+            let dst = frame.row_ptr(y0, x0).cast::<u8>();
+            state
+                .decompress_jpeg_into_raw(data, tw, th, dst, frame.stride_px * 4)
+                .location(loc!())?;
+        }
+        return Ok(false);
+    }
+
+    if !allow_stream {
+        // Cached `ClientTileCache` slot target with non-0xFF or varying alpha:
+        // decode straight into the exclusively owned slot and merge alpha
+        // in-place with SIMD, avoiding `state.jpeg_pixels` allocation/copy and
+        // leaving the slot L2-hot for the subsequent `frame` streaming blit.
+        // SAFETY: Caller guarantees `(x0, y0, tw, th)` is in-bounds and
+        // exclusively owned inside `frame` (cache slot); `decompress_jpeg_into_raw`
+        // initializes all `tw * th` pixels before in-place alpha merge reads them.
+        unsafe {
+            let dst = frame.row_ptr(y0, x0).cast::<u8>();
+            state
+                .decompress_jpeg_into_raw(data, tw, th, dst, frame.stride_px * 4)
+                .location(loc!())?;
+        }
+        let (const_alpha, alpha_filt_slice) = prepare_alpha_decode::<HAS_ALPHA>(
+            alpha,
+            n_px,
+            &mut state.alpha_filt,
+            &mut state.decompressor,
+        )
+        .location(loc!())?;
+        // SAFETY: `decompress_jpeg_into_raw` initialized all `tw * th` pixels
+        // in `(x0, y0, tw, th)` inside exclusively owned `frame`.
+        unsafe {
+            if let Some(a) = const_alpha {
+                tier.decode_jpeg_alpha_rows_in_place::<true>(
+                    &[],
+                    a,
+                    frame,
+                    x0,
+                    y0,
+                    tw,
+                    th,
+                    &mut state.alpha_row_a,
+                    &mut state.alpha_row_b,
+                );
+            } else if HAS_ALPHA {
+                let a_filt = alpha_filt_slice.unwrap();
+                tier.decode_jpeg_alpha_rows_in_place::<false>(
+                    a_filt,
+                    0,
+                    frame,
+                    x0,
+                    y0,
+                    tw,
+                    th,
+                    &mut state.alpha_row_a,
+                    &mut state.alpha_row_b,
+                );
+            }
+        }
+        return Ok(false);
+    }
+
+    // Uncached direct `wl_shm` target with non-0xFF or varying alpha: decode
+    // BGRX into worker scratch and merge alpha in a single SIMD pass using
+    // non-temporal streaming stores (`vmovntdq`) when aligned, avoiding RFO
+    // read-modify-write traffic against `wl_shm`.
+    state
+        .decompress_jpeg_to_scratch(data, tw, th)
+        .location(loc!())?;
     let (const_alpha, alpha_filt_slice) = prepare_alpha_decode::<HAS_ALPHA>(
         alpha,
         n_px,
@@ -2316,49 +2657,77 @@ unsafe fn unfilter_jpeg_leaf<const HAS_ALPHA: bool>(
         &mut state.decompressor,
     )
     .location(loc!())?;
-
     let jpeg_rows: &[Vec4u8] = bytemuck::cast_slice(&state.jpeg_pixels[..n_px * 4]);
-    if const_alpha == Some(0xFF) {
-        // `PixelFormat::BGRA` already sets byte 3 to `0xFF`.
-        for ry in 0..th {
-            let src_row = &jpeg_rows[ry * tw..(ry + 1) * tw];
-            // SAFETY: Caller guarantees `rect` is in-bounds and disjoint and
-            // `src_row` does not overlap `frame`.
-            unsafe {
-                ptr::copy_nonoverlapping(
-                    src_row.as_ptr(),
-                    frame.row_ptr(y0 + ry, x0).cast::<Vec4u8>(),
+    let stream_align = tier.stream_align();
+    let stream_rows = stream_align > 1
+        && tw.is_multiple_of(16)
+        // SAFETY: Caller guarantees `(x0, y0)` is in-bounds within `frame`.
+        && (unsafe { frame.row_ptr(y0, x0) } as usize).is_multiple_of(stream_align)
+        && (frame.stride_px * 4).is_multiple_of(stream_align);
+
+    // SAFETY: Caller guarantees `(x0, y0, tw, th)` is in-bounds and disjoint
+    // within `frame`, and `stream_rows` verified alignment of every row.
+    unsafe {
+        if let Some(a) = const_alpha {
+            if stream_rows {
+                tier.decode_jpeg_alpha_rows::<true, true>(
+                    &[],
+                    a,
+                    jpeg_rows,
+                    frame,
+                    x0,
+                    y0,
                     tw,
+                    th,
+                    &mut state.alpha_row_a,
+                    &mut state.alpha_row_b,
+                );
+            } else {
+                tier.decode_jpeg_alpha_rows::<false, true>(
+                    &[],
+                    a,
+                    jpeg_rows,
+                    frame,
+                    x0,
+                    y0,
+                    tw,
+                    th,
+                    &mut state.alpha_row_a,
+                    &mut state.alpha_row_b,
+                );
+            }
+        } else if HAS_ALPHA {
+            let a_filt = alpha_filt_slice.unwrap();
+            if stream_rows {
+                tier.decode_jpeg_alpha_rows::<true, false>(
+                    a_filt,
+                    0,
+                    jpeg_rows,
+                    frame,
+                    x0,
+                    y0,
+                    tw,
+                    th,
+                    &mut state.alpha_row_a,
+                    &mut state.alpha_row_b,
+                );
+            } else {
+                tier.decode_jpeg_alpha_rows::<false, false>(
+                    a_filt,
+                    0,
+                    jpeg_rows,
+                    frame,
+                    x0,
+                    y0,
+                    tw,
+                    th,
+                    &mut state.alpha_row_a,
+                    &mut state.alpha_row_b,
                 );
             }
         }
-    } else if let Some(a) = const_alpha {
-        for ry in 0..th {
-            let src_row = &jpeg_rows[ry * tw..(ry + 1) * tw];
-            // SAFETY: Caller guarantees `rect` is in-bounds and disjoint.
-            let dst_row = unsafe { slice::from_raw_parts_mut(frame.row_ptr(y0 + ry, x0), tw) };
-            for (dst, &px) in dst_row.iter_mut().zip(src_row) {
-                dst.write(Vec4u8(px.0, px.1, px.2, a));
-            }
-        }
-    } else if HAS_ALPHA {
-        let a_filt = alpha_filt_slice.unwrap();
-        // SAFETY: Caller guarantees `rect` is in-bounds and disjoint.
-        unsafe {
-            tier.decode_jpeg_alpha_rows(
-                a_filt,
-                jpeg_rows,
-                frame,
-                x0,
-                y0,
-                tw,
-                th,
-                &mut state.alpha_row_a,
-                &mut state.alpha_row_b,
-            );
-        }
     }
-    Ok(false)
+    Ok(stream_rows)
 }
 
 /// # Safety
@@ -2733,7 +3102,16 @@ unsafe fn unfilter_leaf<K: RowKernel, const HAS_ALPHA: bool>(
         LeafPayload::Jpeg { data, alpha } => {
             // SAFETY: Caller guarantees `rect` shifted by `dst_origin` is in-bounds and disjoint.
             unsafe {
-                unfilter_jpeg_leaf::<HAS_ALPHA>(tier, rect, dst_origin, data, alpha, frame, state)
+                unfilter_jpeg_leaf::<HAS_ALPHA>(
+                    tier,
+                    rect,
+                    dst_origin,
+                    allow_stream,
+                    data,
+                    alpha,
+                    frame,
+                    state,
+                )
             }
         },
     }
@@ -4997,11 +5375,25 @@ fn filter_and_compress_full_streaming_with_tier(
                                 };
                                 let payload = if has_alpha {
                                     filter_tile::<true>(
-                                        tier, encode_aos, stride_px, rect, mode, &enc_meta, state,
+                                        tier,
+                                        encode_aos,
+                                        shadow_rows.is_some(),
+                                        stride_px,
+                                        rect,
+                                        mode,
+                                        &enc_meta,
+                                        state,
                                     )
                                 } else {
                                     filter_tile::<false>(
-                                        tier, encode_aos, stride_px, rect, mode, &enc_meta, state,
+                                        tier,
+                                        encode_aos,
+                                        shadow_rows.is_some(),
+                                        stride_px,
+                                        rect,
+                                        mode,
+                                        &enc_meta,
+                                        state,
                                     )
                                 };
                                 if is_hybrid {
@@ -5024,11 +5416,25 @@ fn filter_and_compress_full_streaming_with_tier(
                                 };
                                 let payload = if has_alpha {
                                     filter_tile::<true>(
-                                        tier, encode_aos, stride_px, rect, mode, &enc_meta, state,
+                                        tier,
+                                        encode_aos,
+                                        shadow_rows.is_some(),
+                                        stride_px,
+                                        rect,
+                                        mode,
+                                        &enc_meta,
+                                        state,
                                     )
                                 } else {
                                     filter_tile::<false>(
-                                        tier, encode_aos, stride_px, rect, mode, &enc_meta, state,
+                                        tier,
+                                        encode_aos,
+                                        shadow_rows.is_some(),
+                                        stride_px,
+                                        rect,
+                                        mode,
+                                        &enc_meta,
+                                        state,
                                     )
                                 };
                                 CompressedTile {
@@ -5245,6 +5651,7 @@ fn filter_and_compress_full_streaming_with_tier(
             aos
         };
 
+        let encode_aos_is_shadow = shadow_opt.is_some();
         let is_hybrid = matches!(mode, CompressionMode::Hybrid { .. });
         let promotions: Vec<AtomicU8> = if is_hybrid {
             (0..n_tiles).map(|_| AtomicU8::new(0)).collect()
@@ -5274,11 +5681,25 @@ fn filter_and_compress_full_streaming_with_tier(
                     TileCacheAction::Put(slot_id) => {
                         let payload = if has_alpha {
                             filter_tile::<true>(
-                                tier, encode_aos, stride_px, rect, mode, meta, state,
+                                tier,
+                                encode_aos,
+                                encode_aos_is_shadow,
+                                stride_px,
+                                rect,
+                                mode,
+                                meta,
+                                state,
                             )
                         } else {
                             filter_tile::<false>(
-                                tier, encode_aos, stride_px, rect, mode, meta, state,
+                                tier,
+                                encode_aos,
+                                encode_aos_is_shadow,
+                                stride_px,
+                                rect,
+                                mode,
+                                meta,
+                                state,
                             )
                         };
                         if is_hybrid {
@@ -5296,11 +5717,25 @@ fn filter_and_compress_full_streaming_with_tier(
                     TileCacheAction::Uncached => {
                         let payload = if has_alpha {
                             filter_tile::<true>(
-                                tier, encode_aos, stride_px, rect, mode, meta, state,
+                                tier,
+                                encode_aos,
+                                encode_aos_is_shadow,
+                                stride_px,
+                                rect,
+                                mode,
+                                meta,
+                                state,
                             )
                         } else {
                             filter_tile::<false>(
-                                tier, encode_aos, stride_px, rect, mode, meta, state,
+                                tier,
+                                encode_aos,
+                                encode_aos_is_shadow,
+                                stride_px,
+                                rect,
+                                mode,
+                                meta,
+                                state,
                             )
                         };
                         CompressedTile {
@@ -5397,9 +5832,27 @@ fn filter_and_compress_full_streaming_with_tier(
                 (aos, TileEncodeMeta::UNKNOWN)
             };
             let payload = if has_alpha {
-                filter_tile::<true>(tier, encode_aos, stride_px, rect, mode, &meta, state)
+                filter_tile::<true>(
+                    tier,
+                    encode_aos,
+                    shadow_rows.is_some(),
+                    stride_px,
+                    rect,
+                    mode,
+                    &meta,
+                    state,
+                )
             } else {
-                filter_tile::<false>(tier, encode_aos, stride_px, rect, mode, &meta, state)
+                filter_tile::<false>(
+                    tier,
+                    encode_aos,
+                    shadow_rows.is_some(),
+                    stride_px,
+                    rect,
+                    mode,
+                    &meta,
+                    state,
+                )
             };
 
             if tiles_tx
@@ -5741,9 +6194,13 @@ fn filter_and_compress_incremental_streaming_with_tier(
                 },
                 TileCacheAction::Put(slot_id) => {
                     let payload = if has_alpha {
-                        filter_tile::<true>(tier, shadow_aos, stride_px, rect, mode, meta, state)
+                        filter_tile::<true>(
+                            tier, shadow_aos, true, stride_px, rect, mode, meta, state,
+                        )
                     } else {
-                        filter_tile::<false>(tier, shadow_aos, stride_px, rect, mode, meta, state)
+                        filter_tile::<false>(
+                            tier, shadow_aos, true, stride_px, rect, mode, meta, state,
+                        )
                     };
                     if is_hybrid {
                         promotions[tile_idx].store(
@@ -5759,9 +6216,13 @@ fn filter_and_compress_incremental_streaming_with_tier(
                 },
                 TileCacheAction::Uncached => {
                     let payload = if has_alpha {
-                        filter_tile::<true>(tier, shadow_aos, stride_px, rect, mode, meta, state)
+                        filter_tile::<true>(
+                            tier, shadow_aos, true, stride_px, rect, mode, meta, state,
+                        )
                     } else {
-                        filter_tile::<false>(tier, shadow_aos, stride_px, rect, mode, meta, state)
+                        filter_tile::<false>(
+                            tier, shadow_aos, true, stride_px, rect, mode, meta, state,
+                        )
                     };
                     CompressedTile {
                         tile_idx: tile_idx as u32,
@@ -6333,6 +6794,117 @@ mod tests {
     /// primitive.
     #[inline(always)]
     pub(super) fn verify_kernel_matches_scalar<K: RowKernel>(kernel: K, tier_name: &str) {
+        // Exhaustive `tw = 0..=256, 300` parity for `merge_bgrx_alpha_row`
+        // (varying & constant alpha, aligned STREAM=true & unaligned STREAM=false)
+        // and `merge_bgrx_alpha_row_in_place` against `ScalarKernel`.
+        let merge_widths: Vec<usize> = if cfg!(miri) {
+            (0..=33)
+                .chain([63, 64, 65, 127, 128, 129, 255, 256, 300])
+                .collect()
+        } else {
+            (0..=256).chain([300]).collect()
+        };
+        let mut merge_dst_bytes = vec![0xAAu8; (300 + 17) * 4];
+        let merge_aligned_off = (64 - (merge_dst_bytes.as_ptr() as usize & 63)) & 63;
+        for tw in merge_widths {
+            let bgrx_src: Vec<Vec4u8> = (0..tw)
+                .map(|i| {
+                    let k = (i * 19 + tw * 7) as u32;
+                    Vec4u8(
+                        ((k * k + 13) & 0xFF) as u8,
+                        ((k * 31 + 5) & 0xFF) as u8,
+                        ((k * 17 + 201) & 0xFF) as u8,
+                        ((i * 13 + 7) & 0xFF) as u8,
+                    )
+                })
+                .collect();
+            let merge_alpha: Vec<u8> = (0..tw).map(|i| ((i * 37 + tw * 5) & 0xFF) as u8).collect();
+            let mut ref_var = vec![Vec4u8(0, 0, 0, 0); tw];
+            let mut ref_const = vec![Vec4u8(0, 0, 0, 0); tw];
+            unsafe {
+                ScalarKernel.merge_bgrx_alpha_row::<false, false>(
+                    &bgrx_src,
+                    &merge_alpha,
+                    0,
+                    slice::from_raw_parts_mut(ref_var.as_mut_ptr().cast(), tw),
+                );
+                ScalarKernel.merge_bgrx_alpha_row::<false, true>(
+                    &bgrx_src,
+                    &[],
+                    0x7E,
+                    slice::from_raw_parts_mut(ref_const.as_mut_ptr().cast(), tw),
+                );
+            }
+            for (stream, byte_off) in [(true, merge_aligned_off), (false, merge_aligned_off + 4)] {
+                let dst: &mut [Vec4u8] =
+                    bytemuck::cast_slice_mut(&mut merge_dst_bytes[byte_off..byte_off + tw * 4]);
+                dst.fill(Vec4u8(0, 0, 0, 0));
+                let dst_uninit: &mut [MaybeUninit<Vec4u8>] =
+                    unsafe { slice::from_raw_parts_mut(dst.as_mut_ptr().cast(), tw) };
+                unsafe {
+                    if stream && K::STREAM_ALIGN > 1 {
+                        kernel.merge_bgrx_alpha_row::<true, false>(
+                            &bgrx_src,
+                            &merge_alpha,
+                            0,
+                            dst_uninit,
+                        );
+                    } else {
+                        kernel.merge_bgrx_alpha_row::<false, false>(
+                            &bgrx_src,
+                            &merge_alpha,
+                            0,
+                            dst_uninit,
+                        );
+                    }
+                }
+                kernel.fence_stream();
+                assert_eq!(
+                    dst,
+                    &ref_var[..],
+                    "[{tier_name}] merge_bgrx_alpha_row varying tw={tw} stream={stream}"
+                );
+
+                dst.fill(Vec4u8(0, 0, 0, 0));
+                let dst_uninit: &mut [MaybeUninit<Vec4u8>] =
+                    unsafe { slice::from_raw_parts_mut(dst.as_mut_ptr().cast(), tw) };
+                unsafe {
+                    if stream && K::STREAM_ALIGN > 1 {
+                        kernel.merge_bgrx_alpha_row::<true, true>(&bgrx_src, &[], 0x7E, dst_uninit);
+                    } else {
+                        kernel.merge_bgrx_alpha_row::<false, true>(
+                            &bgrx_src,
+                            &[],
+                            0x7E,
+                            dst_uninit,
+                        );
+                    }
+                }
+                kernel.fence_stream();
+                assert_eq!(
+                    dst,
+                    &ref_const[..],
+                    "[{tier_name}] merge_bgrx_alpha_row const tw={tw} stream={stream}"
+                );
+
+                dst.copy_from_slice(&bgrx_src);
+                kernel.merge_bgrx_alpha_row_in_place::<false>(dst, &merge_alpha, 0);
+                assert_eq!(
+                    dst,
+                    &ref_var[..],
+                    "[{tier_name}] merge_bgrx_alpha_row_in_place varying tw={tw}"
+                );
+
+                dst.copy_from_slice(&bgrx_src);
+                kernel.merge_bgrx_alpha_row_in_place::<true>(dst, &[], 0x7E);
+                assert_eq!(
+                    dst,
+                    &ref_const[..],
+                    "[{tier_name}] merge_bgrx_alpha_row_in_place const tw={tw}"
+                );
+            }
+        }
+
         let widths: Vec<usize> = (1..=65).chain([127, 128, 129, 255, 256, 300]).collect();
         for tw in widths {
             let row_b = tw * 3;
@@ -15913,9 +16485,13 @@ mod tests {
                         tier.filter_aos_zstd_leaf::<false>(aos, stride_px, rect, state)
                     }
                 } else if HAS_ALPHA && !meta.tile.all_opaque {
-                    encode_jpeg_leaf::<true>(tier, aos, stride_px, rect, quality, subsamp, state)
+                    encode_jpeg_leaf::<true>(
+                        tier, aos, false, stride_px, rect, quality, subsamp, state,
+                    )
                 } else {
-                    encode_jpeg_leaf::<false>(tier, aos, stride_px, rect, quality, subsamp, state)
+                    encode_jpeg_leaf::<false>(
+                        tier, aos, false, stride_px, rect, quality, subsamp, state,
+                    )
                 });
             }
             let (quads, n_quads) = tile_quadrants(rect);
@@ -15934,9 +16510,13 @@ mod tests {
                 })
             } else if text_safe_count == 0 {
                 TilePayload::Leaf(if HAS_ALPHA && !meta.tile.all_opaque {
-                    encode_jpeg_leaf::<true>(tier, aos, stride_px, rect, quality, subsamp, state)
+                    encode_jpeg_leaf::<true>(
+                        tier, aos, false, stride_px, rect, quality, subsamp, state,
+                    )
                 } else {
-                    encode_jpeg_leaf::<false>(tier, aos, stride_px, rect, quality, subsamp, state)
+                    encode_jpeg_leaf::<false>(
+                        tier, aos, false, stride_px, rect, quality, subsamp, state,
+                    )
                 })
             } else {
                 let mut sub_tiles = Vec::with_capacity(n_quads);
@@ -15956,11 +16536,11 @@ mod tests {
                         }
                     } else if HAS_ALPHA && !qmeta.all_opaque {
                         encode_jpeg_leaf::<true>(
-                            tier, aos, stride_px, qrect, quality, subsamp, state,
+                            tier, aos, false, stride_px, qrect, quality, subsamp, state,
                         )
                     } else {
                         encode_jpeg_leaf::<false>(
-                            tier, aos, stride_px, qrect, quality, subsamp, state,
+                            tier, aos, false, stride_px, qrect, quality, subsamp, state,
                         )
                     };
                     sub_tiles.push(SubTile {
@@ -16103,6 +16683,7 @@ mod tests {
                     let gx = filter_hybrid_tile::<false>(
                         tier,
                         aos,
+                        true,
                         stride,
                         rect,
                         85,
@@ -16113,6 +16694,7 @@ mod tests {
                     let ga = filter_hybrid_tile::<true>(
                         tier,
                         aos,
+                        true,
                         stride,
                         rect,
                         85,
@@ -17005,6 +17587,347 @@ mod tests {
                                 "parallel scroll mismatch tier={tier:?} stream={stream} sr={sr:?} stride={stride}"
                             );
                         }
+                    }
+                }
+            }
+        }
+    }
+
+    /// Generates a deterministic high-entropy photographic frame guaranteed to
+    /// exceed `TextSafe` thresholds on every tile (forcing `LeafPayload::Jpeg`).
+    fn make_photo_bgra(
+        w: usize,
+        h: usize,
+        stride: usize,
+        alpha_fn: impl Fn(usize, usize) -> u8,
+    ) -> Vec<u8> {
+        let mut buf = vec![0xA5u8; h * stride];
+        for y in 0..h {
+            for x in 0..w {
+                let mut z = ((x as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15))
+                    ^ ((y as u64).wrapping_mul(0xBF58_476D_1CE4_E5B9));
+                z = (z ^ (z >> 30)).wrapping_mul(0x94D0_49BB_1331_11EB);
+                z ^= z >> 31;
+                let off = y * stride + x * 4;
+                buf[off] = ((x * 5 + y * 3) as u8).wrapping_add((z & 0x3F) as u8);
+                buf[off + 1] = ((x * 2 + y * 7) as u8).wrapping_add(((z >> 8) & 0x3F) as u8);
+                buf[off + 2] = ((x * 9 + y * 4) as u8).wrapping_add(((z >> 16) & 0x3F) as u8);
+                buf[off + 3] = alpha_fn(x, y);
+            }
+        }
+        buf
+    }
+
+    #[test]
+    #[cfg_attr(miri, ignore)]
+    fn test_turbojpeg_bgra_sets_alpha_0xff_strided_and_edges() {
+        let mut comp = ShardingCompressor::new(NonZeroUsize::new(1).unwrap(), 1).unwrap();
+        let mut decomp = ShardingDecompressor::new(NonZeroUsize::new(1).unwrap()).unwrap();
+        for &(tw, th) in &[
+            (16, 16),
+            (17, 19),
+            (31, 33),
+            (64, 48),
+            (128, 128),
+            (255, 19),
+            (256, 256),
+        ] {
+            let stride_px = tw + 13;
+            let src = make_photo_bgra(stride_px, th + 5, stride_px * 4, |x, y| {
+                ((x * 11 + y * 7) & 0xFE) as u8
+            });
+            let jpeg_slot = Mutex::new(Vec::new());
+            comp.pool.execute(1, |state| {
+                let tile_ptr = unsafe { src.as_ptr().add((3 * stride_px + 7) * 4) };
+                let out = unsafe {
+                    state
+                        .compress_jpeg_strided_raw(
+                            tile_ptr,
+                            tw,
+                            stride_px * 4,
+                            th,
+                            85,
+                            JpegSubsamp::Sub420,
+                        )
+                        .unwrap()
+                };
+                *jpeg_slot.lock().unwrap() = out;
+            });
+            let jpeg = jpeg_slot.into_inner().unwrap();
+            // Compare strided encode bit-for-bit against packed encode.
+            let mut packed = vec![0u8; tw * th * 4];
+            for ry in 0..th {
+                let s = ((3 + ry) * stride_px + 7) * 4;
+                packed[ry * tw * 4..(ry + 1) * tw * 4].copy_from_slice(&src[s..s + tw * 4]);
+            }
+            let jpeg_packed_slot = Mutex::new(Vec::new());
+            comp.pool.execute(1, |state| {
+                state.jpeg_pixels.resize(packed.len(), 0);
+                state.jpeg_pixels[..packed.len()].copy_from_slice(&packed);
+                let out = state
+                    .compress_jpeg_from_scratch(tw, th, 85, JpegSubsamp::Sub420)
+                    .unwrap();
+                *jpeg_packed_slot.lock().unwrap() = out;
+            });
+            let jpeg_packed = jpeg_packed_slot.into_inner().unwrap();
+            assert_eq!(
+                jpeg, jpeg_packed,
+                "strided vs packed JPEG mismatch {tw}x{th}"
+            );
+
+            // Decode strided into a poisoned canvas (both aligned and +4 unaligned)
+            // and verify every decoded pixel's byte 3 is 0xFF and surrounding
+            // sentinel bytes are completely untouched.
+            for &x_off in &[8usize, 9usize] {
+                let dst_stride_px = tw + x_off + 11;
+                let dst_h = th + 4;
+                let canvas_cell = Mutex::new(vec![0x5Au8; dst_h * dst_stride_px * 4]);
+                decomp.pool.execute(1, |state| {
+                    let mut canvas = canvas_cell.lock().unwrap();
+                    let dst_ptr =
+                        unsafe { canvas.as_mut_ptr().add((2 * dst_stride_px + x_off) * 4) };
+                    unsafe {
+                        state
+                            .decompress_jpeg_into_raw(&jpeg, tw, th, dst_ptr, dst_stride_px * 4)
+                            .unwrap();
+                    }
+                });
+                let canvas = canvas_cell.into_inner().unwrap();
+                for y in 0..dst_h {
+                    for x in 0..dst_stride_px {
+                        let off = (y * dst_stride_px + x) * 4;
+                        if (2..2 + th).contains(&y) && (x_off..x_off + tw).contains(&x) {
+                            assert_eq!(
+                                canvas[off + 3],
+                                0xFF,
+                                "BGRA byte 3 != 0xFF at ({x},{y}) for {tw}x{th} x_off={x_off}"
+                            );
+                        } else {
+                            assert_eq!(
+                                &canvas[off..off + 4],
+                                &[0x5A; 4],
+                                "strided decode overwrote out-of-rect pixel ({x},{y}) for {tw}x{th}"
+                            );
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    #[cfg_attr(miri, ignore)]
+    fn test_hybrid_strided_jpeg_corners_edges_and_alpha() {
+        let mut comp = ShardingCompressor::new(NonZeroUsize::new(4).unwrap(), 1).unwrap();
+        let mut decomp = ShardingDecompressor::new(NonZeroUsize::new(4).unwrap()).unwrap();
+        let mode = CompressionMode::Hybrid {
+            quality: 85,
+            subsamp: JpegSubsamp::Sub420,
+        };
+
+        // Cover:
+        // - 533x301 with padded stride (`+12` bytes): exercises all 4 corners,
+        //   non-right-edge bottom tile `(0, 256, 256, 45)`, middle bottom tile
+        //   `(256, 256, 256, 45)`, and bottom-right corner `(512, 256, 21, 45)`.
+        // - 512x512 mixed Split tiles (top-left solid, top-right photo,
+        //   bottom-left palette, bottom-right photo) so cached & uncached
+        //   Split JPEG quadrant decoding runs at non-zero quadrant offsets.
+        let cases: &[(usize, usize, usize, BufferFormat, u8)] = &[
+            (533, 301, 533 * 4, BufferFormat::Xrgb8888, 0),
+            (533, 301, 533 * 4 + 12, BufferFormat::Xrgb8888, 0),
+            (533, 301, 533 * 4, BufferFormat::Argb8888, 1), // opaque 0xFF
+            (533, 301, 533 * 4 + 12, BufferFormat::Argb8888, 2), // constant 0x7E
+            (533, 301, 533 * 4 + 12, BufferFormat::Argb8888, 3), // varying alpha
+            (512, 512, 512 * 4, BufferFormat::Xrgb8888, 4), // mixed Split Xrgb
+            (512, 512, 512 * 4, BufferFormat::Argb8888, 5), // mixed Split translucent
+        ];
+
+        for &(w, h, stride, format, kind) in cases {
+            let mut src = match kind {
+                0 => make_photo_bgra(w, h, stride, |x, y| ((x + y) & 0xFF) as u8),
+                1 => make_photo_bgra(w, h, stride, |_, _| 0xFF),
+                2 => make_photo_bgra(w, h, stride, |_, _| 0x7E),
+                3 => make_photo_bgra(w, h, stride, |x, y| {
+                    0x20u8.wrapping_add(((x * 3 + y * 5) & 0xDF) as u8)
+                }),
+                4 | 5 => {
+                    let mut buf = make_photo_bgra(w, h, stride, |x, y| {
+                        if kind == 4 {
+                            0xFF
+                        } else {
+                            0x40u8.wrapping_add(((x + y * 3) & 0xBF) as u8)
+                        }
+                    });
+                    // Make top-left 128x128 quadrant of each 256x256 tile solid
+                    // and bottom-left 128x128 a 4-color palette to force Split!
+                    for ty in (0..h).step_by(256) {
+                        for tx in (0..w).step_by(256) {
+                            for ry in 0..128 {
+                                for rx in 0..128 {
+                                    let off = (ty + ry) * stride + (tx + rx) * 4;
+                                    let a = if kind == 4 { 0xFF } else { 0xE0 };
+                                    buf[off..off + 4].copy_from_slice(&[0xF0, 0xF0, 0xF0, a]);
+                                    let off2 = (ty + 128 + ry) * stride + (tx + rx) * 4;
+                                    let c = ((rx ^ ry) & 3) as u8 * 60;
+                                    buf[off2..off2 + 4].copy_from_slice(&[c, c, 0x20, a]);
+                                }
+                            }
+                        }
+                    }
+                    buf
+                },
+                _ => unreachable!(),
+            };
+            // Zero stride padding bytes so comparison matches zeroed shadow padding.
+            if stride > w * 4 {
+                for y in 0..h {
+                    src[y * stride + w * 4..(y + 1) * stride].fill(0);
+                }
+            }
+            let meta = BufferMetadata {
+                width: w as i32,
+                height: h as i32,
+                stride: stride as i32,
+                format,
+            };
+            let p = src.as_ptr();
+            let bp = unsafe { BufferPointer::new(&p, src.len()) };
+
+            // 1. Stateless bounce path (`shadow_out = None`) produces baseline wire & pixels.
+            let stateless_tiles = filter_and_compress(bp, meta, mode, &mut comp);
+            let mut stateless_out = vec![0xAAu8; src.len()];
+            decompress_and_unfilter(&stateless_tiles, &mut decomp, &mut stateless_out).unwrap();
+
+            // 2. Owned-shadow cold-fill + cached decode must produce bit-identical
+            //    wire tiles AND bit-identical decoded pixels (and exact lossless alpha!).
+            for use_cache in [false, true] {
+                let mut shadow = Vec::new();
+                let mut srv_cache = ServerTileCache::new();
+                let mut cli_cache = ClientTileCache::new();
+                let mut stream_opt = None;
+                filter_and_compress_full_streaming(
+                    bp,
+                    ClientId(1),
+                    WlSurfaceId(1),
+                    meta,
+                    mode,
+                    Some(&mut shadow),
+                    use_cache.then_some(&mut srv_cache),
+                    &mut comp,
+                    |s| stream_opt = Some(s),
+                );
+                let mut wire = Vec::new();
+                stream_opt.unwrap().framed_write(&mut wire).unwrap();
+
+                let read_stream = |wire_bytes: &[u8]| -> ValidatedTileStream {
+                    let mut stream_opt = None;
+                    let mut rdr = wire_bytes;
+                    CompressedTileStream::read_from_stream(&mut rdr, |s| {
+                        stream_opt = Some(s);
+                        Ok(())
+                    })
+                    .unwrap();
+                    ValidatedTileStream::new(stream_opt.unwrap()).unwrap()
+                };
+                let validated = read_stream(&wire);
+
+                // Test at both 64B-aligned and +4 unaligned destination offsets.
+                let mut out_storage = vec![0xCCu8; src.len() + 68];
+                let aligned_off = (64 - (out_storage.as_ptr() as usize & 63)) & 63;
+                for &byte_off in &[aligned_off, aligned_off + 4] {
+                    let mut cc = ClientTileCache::new();
+                    let validated2 = read_stream(&wire);
+                    let out = &mut out_storage[byte_off..byte_off + src.len()];
+                    out.fill(0x55);
+                    decompress_and_unfilter_streaming(
+                        validated2,
+                        &mut decomp,
+                        out,
+                        use_cache.then_some(&mut cc),
+                    )
+                    .unwrap();
+                    for y in 0..h {
+                        for x in 0..w {
+                            let off = y * stride + x * 4;
+                            assert_eq!(
+                                &out[off..off + 4],
+                                &stateless_out[off..off + 4],
+                                "strided vs stateless pixel mismatch ({x},{y}) kind={kind} cache={use_cache} off={byte_off}"
+                            );
+                            let expected_a = if format == BufferFormat::Xrgb8888 {
+                                0xFF
+                            } else {
+                                src[off + 3]
+                            };
+                            assert_eq!(
+                                out[off + 3],
+                                expected_a,
+                                "alpha mismatch ({x},{y}) kind={kind} cache={use_cache}"
+                            );
+                        }
+                    }
+                }
+
+                // Also test incremental Phase-B strided encode/decode after mutating bottom-right.
+                let mut out_main = vec![0u8; src.len()];
+                decompress_and_unfilter_streaming(
+                    validated,
+                    &mut decomp,
+                    &mut out_main,
+                    use_cache.then_some(&mut cli_cache),
+                )
+                .unwrap();
+                let mut src2 = src.clone();
+                for y in (h - 40)..h {
+                    for x in (w - 40)..w {
+                        let off = y * stride + x * 4;
+                        src2[off] ^= 0x33;
+                        src2[off + 1] ^= 0x55;
+                        src2[off + 2] ^= 0x11;
+                        if format == BufferFormat::Argb8888 && matches!(kind, 3 | 5) {
+                            src2[off + 3] ^= 0x22;
+                        }
+                    }
+                }
+                let p2 = src2.as_ptr();
+                let bp2 = unsafe { BufferPointer::new(&p2, src2.len()) };
+                let mut inc_stream = None;
+                let res = filter_and_compress_incremental_streaming(
+                    bp2,
+                    ClientId(1),
+                    WlSurfaceId(1),
+                    meta,
+                    mode,
+                    None,
+                    &mut shadow,
+                    use_cache.then_some(&mut srv_cache),
+                    &mut comp,
+                    |s| inc_stream = Some(s),
+                );
+                assert!(!res.is_unchanged());
+                let mut wire2 = Vec::new();
+                inc_stream.unwrap().framed_write(&mut wire2).unwrap();
+                let val2 = read_stream(&wire2);
+                decompress_and_unfilter_streaming(
+                    val2,
+                    &mut decomp,
+                    &mut out_main,
+                    use_cache.then_some(&mut cli_cache),
+                )
+                .unwrap();
+                for y in 0..h {
+                    for x in 0..w {
+                        let off = y * stride + x * 4;
+                        let expected_a = if format == BufferFormat::Xrgb8888 {
+                            0xFF
+                        } else {
+                            src2[off + 3]
+                        };
+                        assert_eq!(
+                            out_main[off + 3],
+                            expected_a,
+                            "incremental alpha mismatch ({x},{y}) kind={kind} cache={use_cache}"
+                        );
                     }
                 }
             }
