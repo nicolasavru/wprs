@@ -4163,8 +4163,9 @@ mod avx2 {
         }
     }
 
+    #[cold]
+    #[inline(never)]
     #[target_feature(enable = "avx2")]
-    #[inline]
     unsafe fn copy_lt64_avx2(src: *const u8, dst: *mut u8, len: usize) {
         debug_assert!(len > 0 && len < 64);
         // SAFETY: Caller guarantees AVX2, `1 <= len < 64`, and valid non-overlapping ranges.
@@ -6525,8 +6526,9 @@ mod ssse3 {
         }
     }
 
+    #[cold]
+    #[inline(never)]
     #[target_feature(enable = "ssse3")]
-    #[inline]
     unsafe fn copy_lt64_ssse3(src: *const u8, dst: *mut u8, len: usize) {
         debug_assert!(len > 0 && len < 64);
         // SAFETY: SSE2 is mandatory on x86_64; `1 <= len < 64` and non-overlapping.
@@ -8258,7 +8260,7 @@ macro_rules! define_tier_wrappers {
 
             #[target_feature(enable = $feat)]
             #[inline(never)]
-            pub(super) unsafe fn apply_scroll_rows_stream(
+            pub(super) unsafe fn apply_scroll_rows_stream<const PREFETCH_SRC: bool>(
                 base: *mut u8,
                 stride: usize,
                 sx: usize,
@@ -8274,6 +8276,7 @@ macro_rules! define_tier_wrappers {
                     let kernel = super::$tier_mod::Kernel::new_unchecked();
                     crate::filtering::scroll::apply_scroll_rows_stream_with::<
                         super::$tier_mod::Kernel,
+                        PREFETCH_SRC,
                     >(
                         kernel, base, stride, sx, len, src_y0, dst_y0, copy_h, rev, disjoint,
                     );
@@ -9661,6 +9664,7 @@ impl X86Tier {
         rev: bool,
         disjoint: bool,
     ) {
+        let pf_src = super::scroll::should_prefetch_scroll_stripe(stride, len);
         // SAFETY: Each arm's tier witness verifies required CPU features, and
         // caller upholds disjoint-stripe and buffer bounds invariants.
         unsafe {
@@ -9685,20 +9689,44 @@ impl X86Tier {
                         target_feature = "avx512vbmi",
                     )),
                 ))]
-                Self::Ssse3 => dispatch_ssse3::apply_scroll_rows_stream(
-                    base, stride, sx, len, src_y0, dst_y0, copy_h, rev, disjoint,
-                ),
+                Self::Ssse3 => {
+                    if pf_src {
+                        dispatch_ssse3::apply_scroll_rows_stream::<true>(
+                            base, stride, sx, len, src_y0, dst_y0, copy_h, rev, disjoint,
+                        );
+                    } else {
+                        dispatch_ssse3::apply_scroll_rows_stream::<false>(
+                            base, stride, sx, len, src_y0, dst_y0, copy_h, rev, disjoint,
+                        );
+                    }
+                },
                 #[cfg(not(all(
                     target_feature = "avx512bw",
                     target_feature = "avx512vl",
                     target_feature = "avx512vbmi",
                 )))]
-                Self::Avx2 => dispatch_avx2::apply_scroll_rows_stream(
-                    base, stride, sx, len, src_y0, dst_y0, copy_h, rev, disjoint,
-                ),
-                Self::Avx512 => dispatch_avx512::apply_scroll_rows_stream(
-                    base, stride, sx, len, src_y0, dst_y0, copy_h, rev, disjoint,
-                ),
+                Self::Avx2 => {
+                    if pf_src {
+                        dispatch_avx2::apply_scroll_rows_stream::<true>(
+                            base, stride, sx, len, src_y0, dst_y0, copy_h, rev, disjoint,
+                        );
+                    } else {
+                        dispatch_avx2::apply_scroll_rows_stream::<false>(
+                            base, stride, sx, len, src_y0, dst_y0, copy_h, rev, disjoint,
+                        );
+                    }
+                },
+                Self::Avx512 => {
+                    if pf_src {
+                        dispatch_avx512::apply_scroll_rows_stream::<true>(
+                            base, stride, sx, len, src_y0, dst_y0, copy_h, rev, disjoint,
+                        );
+                    } else {
+                        dispatch_avx512::apply_scroll_rows_stream::<false>(
+                            base, stride, sx, len, src_y0, dst_y0, copy_h, rev, disjoint,
+                        );
+                    }
+                },
             }
         }
     }

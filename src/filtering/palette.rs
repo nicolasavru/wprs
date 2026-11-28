@@ -506,11 +506,23 @@ impl ColorTable {
             std::mem::swap(&mut n0, &mut n1);
         }
 
+        let pf_rows = stride_px > tw && stride_px * 4 >= super::prefetch::MIN_PAGE_STRIDE_BYTES;
         for ry in ovf_ry..th {
             let row_start = (y0 + ry) * stride_px + x0;
             debug_assert!(row_start + tw <= aos.len());
             // SAFETY: Caller guarantees `rect` is inside `aos`.
             let row_ptr = unsafe { aos.ptr().add(row_start) };
+            if pf_rows && ry + super::prefetch::PHASE_B_ROW_LOOKAHEAD < th {
+                // SAFETY: Caller guarantees all `th` rows of `rect` lie inside `aos`.
+                unsafe {
+                    super::prefetch::row_t0(
+                        row_ptr
+                            .add(super::prefetch::PHASE_B_ROW_LOOKAHEAD * stride_px)
+                            .cast::<u8>(),
+                        tw * 4,
+                    );
+                }
+            }
             let mut x = if ry == ovf_ry { ovf_x } else { 0 };
 
             // Process 24 pixels at a time as 8 disjoint triples
@@ -579,6 +591,17 @@ impl ColorTable {
             let row_start = (y0 + ry) * stride_px + x0;
             // SAFETY: Caller guarantees `rect` is inside `aos`.
             let row_ptr = unsafe { aos.ptr().add(row_start) };
+            if pf_rows && ry + super::prefetch::PHASE_B_ROW_LOOKAHEAD < th {
+                // SAFETY: Caller guarantees all `th` rows of `rect` lie inside `aos`.
+                unsafe {
+                    super::prefetch::row_t0(
+                        row_ptr
+                            .add(super::prefetch::PHASE_B_ROW_LOOKAHEAD * stride_px)
+                            .cast::<u8>(),
+                        tw * 4,
+                    );
+                }
+            }
             let x_start = if ry == ovf_ry { ovf_x } else { 0 };
             for x in x_start..tw {
                 // SAFETY: `x < tw` and `row_ptr` is valid for `tw` reads.
@@ -655,11 +678,23 @@ impl ColorTable {
         let mut last_idx = 0u8;
         let mut last_run = 0u32;
 
+        let pf_rows = stride_px > tw && stride_px * 4 >= super::prefetch::MIN_PAGE_STRIDE_BYTES;
         for ry in ovf_ry..th {
             let row_start = (y0 + ry) * stride_px + x0;
             debug_assert!(row_start + tw <= aos.len());
             // SAFETY: Caller guarantees `rect` is inside `aos`.
             let row_ptr = unsafe { aos.ptr().add(row_start) };
+            if pf_rows && ry + super::prefetch::PHASE_B_ROW_LOOKAHEAD < th {
+                // SAFETY: Caller guarantees all `th` rows of `rect` lie inside `aos`.
+                unsafe {
+                    super::prefetch::row_t0(
+                        row_ptr
+                            .add(super::prefetch::PHASE_B_ROW_LOOKAHEAD * stride_px)
+                            .cast::<u8>(),
+                        tw * 4,
+                    );
+                }
+            }
             let mut x = if ry == ovf_ry { ovf_x } else { 0 };
             while x < tw {
                 // SAFETY: `x < tw` and `row_ptr` is valid for `tw` reads.
@@ -766,8 +801,20 @@ impl ColorTable {
         let mut last_idx = 0u8;
         let mut last_run = 0u32;
         let mut out_ptr = indices_out[..n_px].as_mut_ptr();
+        let pf_rows = stride_px > tw && stride_px * 4 >= super::prefetch::MIN_PAGE_STRIDE_BYTES;
 
         for ry in 0..th {
+            if pf_rows && ry + super::prefetch::PHASE_B_ROW_LOOKAHEAD < th {
+                // SAFETY: Caller guarantees all `th` rows of `rect` lie inside `aos`.
+                unsafe {
+                    super::prefetch::row_t0(
+                        row_ptr
+                            .add(super::prefetch::PHASE_B_ROW_LOOKAHEAD * stride_px)
+                            .cast::<u8>(),
+                        tw * 4,
+                    );
+                }
+            }
             // SAFETY: `indices_out[..n_px]` bounds-checked `th * tw == n_px` above,
             // so `out_ptr` is valid for `tw` mutable bytes on every row `0..th`.
             let row_out = unsafe { slice::from_raw_parts_mut(out_ptr, tw) };
@@ -965,8 +1012,20 @@ impl PaletteScratch {
         let mut last_color = first_c;
         let mut last_idx = 0u8;
         let mut out_ptr = self.indices[..n_px].as_mut_ptr();
+        let pf_rows = stride_px > tw && stride_px * 4 >= super::prefetch::MIN_PAGE_STRIDE_BYTES;
 
         for ry in 0..th {
+            if pf_rows && ry + super::prefetch::PHASE_B_ROW_LOOKAHEAD < th {
+                // SAFETY: Caller guarantees all `th` rows of `rect` lie inside `aos`.
+                unsafe {
+                    super::prefetch::row_t0(
+                        row_ptr
+                            .add(super::prefetch::PHASE_B_ROW_LOOKAHEAD * stride_px)
+                            .cast::<u8>(),
+                        tw * 4,
+                    );
+                }
+            }
             // SAFETY: `self.indices[..n_px]` bounds-checked `th * tw == n_px` above,
             // so `out_ptr` is valid for `tw` mutable bytes on every row `0..th`.
             let row_out = unsafe { slice::from_raw_parts_mut(out_ptr, tw) };

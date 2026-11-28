@@ -597,6 +597,98 @@ pub(crate) mod scroll;
 pub(crate) mod tile_cache;
 pub(crate) mod tile_hash;
 
+/// Portable software prefetch hints for strided 2D row traversal across 4 KiB
+/// page boundaries.
+pub(crate) mod prefetch {
+    /// Cache line stride (bytes) for per-row software prefetches.
+    const CACHE_LINE_BYTES: usize = 64;
+
+    /// Minimum row stride (bytes) before emitting row-ahead prefetches. Rows
+    /// with a smaller stride share 4 KiB pages across adjacent rows where the
+    /// hardware stride prefetcher tracks them without software hints.
+    pub(crate) const MIN_PAGE_STRIDE_BYTES: usize = 4096;
+
+    /// Row lookahead for Phase B strided shadow-buffer reads (`PREFETCHT0`).
+    pub(crate) const PHASE_B_ROW_LOOKAHEAD: usize = 3;
+
+    /// Row lookahead for cold-fill strided source reads (`PREFETCHNTA`).
+    pub(crate) const COLD_FILL_ROW_LOOKAHEAD: usize = 2;
+
+    /// Row lookahead for narrow vertical-stripe scroll decode reads (`PREFETCHT0`).
+    pub(crate) const SCROLL_DECODE_ROW_LOOKAHEAD: usize = 2;
+
+    #[inline(always)]
+    fn read_t0(ptr: *const u8) {
+        #[cfg(all(target_arch = "x86_64", not(miri)))]
+        // SAFETY: SSE (`prefetcht0`) is baseline on `x86_64`; prefetch never faults or mutates memory.
+        unsafe {
+            std::arch::x86_64::_mm_prefetch::<{ std::arch::x86_64::_MM_HINT_T0 }>(ptr.cast::<i8>());
+        }
+        #[cfg(all(target_arch = "aarch64", not(miri)))]
+        // SAFETY: `prfm pldl1keep` is baseline on AArch64; prefetch never faults, writes memory, or modifies flags.
+        unsafe {
+            std::arch::asm!(
+                "prfm pldl1keep, [{p}]",
+                p = in(reg) ptr,
+                options(readonly, nostack, preserves_flags),
+            );
+        }
+        #[cfg(not(all(any(target_arch = "x86_64", target_arch = "aarch64"), not(miri))))]
+        let _ = ptr;
+    }
+
+    #[inline(always)]
+    fn read_nta(ptr: *const u8) {
+        #[cfg(all(target_arch = "x86_64", not(miri)))]
+        // SAFETY: SSE (`prefetchnta`) is baseline on `x86_64`; prefetch never faults or mutates memory.
+        unsafe {
+            std::arch::x86_64::_mm_prefetch::<{ std::arch::x86_64::_MM_HINT_NTA }>(
+                ptr.cast::<i8>(),
+            );
+        }
+        #[cfg(all(target_arch = "aarch64", not(miri)))]
+        // SAFETY: `prfm pldl1strm` is baseline on AArch64; prefetch never faults, writes memory, or modifies flags.
+        unsafe {
+            std::arch::asm!(
+                "prfm pldl1strm, [{p}]",
+                p = in(reg) ptr,
+                options(readonly, nostack, preserves_flags),
+            );
+        }
+        #[cfg(not(all(any(target_arch = "x86_64", target_arch = "aarch64"), not(miri))))]
+        let _ = ptr;
+    }
+
+    /// Prefetches every cache line of `len_bytes` starting at `ptr` into L1d (`T0`).
+    ///
+    /// # Safety
+    /// `ptr` must be valid for reads of `len_bytes` bytes.
+    #[inline(always)]
+    pub(crate) unsafe fn row_t0(ptr: *const u8, len_bytes: usize) {
+        let mut off = 0usize;
+        while off < len_bytes {
+            // SAFETY: `off < len_bytes`, caller guarantees `ptr` is valid for `len_bytes`.
+            read_t0(unsafe { ptr.add(off) });
+            off += CACHE_LINE_BYTES;
+        }
+    }
+
+    /// Prefetches every cache line of `len_bytes` starting at `ptr` with a
+    /// non-temporal read hint (`NTA`) so single-use source rows avoid polluting L2/L3.
+    ///
+    /// # Safety
+    /// `ptr` must be valid for reads of `len_bytes` bytes.
+    #[inline(always)]
+    pub(crate) unsafe fn row_nta(ptr: *const u8, len_bytes: usize) {
+        let mut off = 0usize;
+        while off < len_bytes {
+            // SAFETY: `off < len_bytes`, caller guarantees `ptr` is valid for `len_bytes`.
+            read_nta(unsafe { ptr.add(off) });
+            off += CACHE_LINE_BYTES;
+        }
+    }
+}
+
 use std::borrow::Cow;
 use std::cmp::Reverse;
 use std::collections::BTreeMap;
@@ -1904,10 +1996,29 @@ fn filter_aos_zstd_leaf_with<K: RowKernel, const HAS_ALPHA: bool>(
 
     let mut predictors = vec![0u8; th.div_ceil(4)];
     let mut use_a = true;
+    let pf_rows = stride_px > tw
+        && stride_px * 4 >= prefetch::MIN_PAGE_STRIDE_BYTES
+        && th > prefetch::PHASE_B_ROW_LOOKAHEAD;
+    if pf_rows {
+        assert!((y0 + th - 1) * stride_px + x0 + tw <= aos.len());
+    }
     for (ry, filt_row) in filt_bgr.chunks_exact_mut(row_b).enumerate() {
         let row_start = (y0 + ry) * stride_px + x0;
         let (_, after_start) = aos.split_at(row_start);
         let (row_ptr, _) = after_start.split_at(tw);
+        if pf_rows && ry + prefetch::PHASE_B_ROW_LOOKAHEAD < th {
+            // SAFETY: Asserted `(y0 + th - 1) * stride_px + x0 + tw <= aos.len()` above
+            // and `ry + PHASE_B_ROW_LOOKAHEAD < th`.
+            unsafe {
+                prefetch::row_t0(
+                    row_ptr
+                        .ptr()
+                        .add(prefetch::PHASE_B_ROW_LOOKAHEAD * stride_px)
+                        .cast::<u8>(),
+                    tw * 4,
+                );
+            }
+        }
 
         let (cur_raw, prev_raw): (&mut [u8], &[u8]) = if use_a {
             (raw_row_a, raw_row_b)
@@ -3617,8 +3728,17 @@ unsafe fn copy_and_scan_rect_to_shadow_with<K: RowKernel, const HAS_ALPHA: bool>
                 .cast::<u32>()
                 .read_unaligned()
         });
+    let pf_rows = stride > row_bytes && stride >= prefetch::MIN_PAGE_STRIDE_BYTES;
     if !solid && (!HAS_ALPHA || !all_opaque) {
         for ry in 0..h {
+            if pf_rows && ry + prefetch::COLD_FILL_ROW_LOOKAHEAD < h {
+                let pf_off = (y0 + ry + prefetch::COLD_FILL_ROW_LOOKAHEAD) * stride + x_bytes;
+                // SAFETY: Validated `last_end <= src.len()` above and
+                // `ry + COLD_FILL_ROW_LOOKAHEAD < h`.
+                unsafe {
+                    prefetch::row_nta(src.ptr().add(pf_off), row_bytes);
+                }
+            }
             let row_off = (y0 + ry) * stride + x_bytes;
             // SAFETY: Validated `last_end <= src.len()` above, and caller
             // guarantees `rect` is in-bounds, non-overlapping with `src`, and
@@ -3638,6 +3758,14 @@ unsafe fn copy_and_scan_rect_to_shadow_with<K: RowKernel, const HAS_ALPHA: bool>
     }
 
     for ry in 0..h {
+        if pf_rows && ry + prefetch::COLD_FILL_ROW_LOOKAHEAD < h {
+            let pf_off = (y0 + ry + prefetch::COLD_FILL_ROW_LOOKAHEAD) * stride + x_bytes;
+            // SAFETY: Validated `last_end <= src.len()` above and
+            // `ry + COLD_FILL_ROW_LOOKAHEAD < h`.
+            unsafe {
+                prefetch::row_nta(src.ptr().add(pf_off), row_bytes);
+            }
+        }
         let row_off = (y0 + ry) * stride + x_bytes;
         if !solid && (!HAS_ALPHA || !all_opaque) {
             // SAFETY: Validated `last_end <= src.len()` above, and caller

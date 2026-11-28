@@ -683,10 +683,22 @@ pub(crate) mod x86_aes {
             let n_rows: usize = $n_rows;
             let mut dummy_dacc = _mm_setzero_si128();
             let zero_px = _mm_setzero_si128();
+            let row_bytes = $full64 + $rem;
+            let pf_rows = $copy
+                && $stride > row_bytes
+                && $stride >= crate::filtering::prefetch::MIN_PAGE_STRIDE_BYTES;
             if $has_alpha && $still_opaque {
                 let mut aand0 = _mm_set1_epi8(-1);
                 let mut aand1 = _mm_set1_epi8(-1);
-                for _ in 0..n_rows {
+                for ry in 0..n_rows {
+                    if pf_rows && ry + crate::filtering::prefetch::COLD_FILL_ROW_LOOKAHEAD < n_rows
+                    {
+                        crate::filtering::prefetch::row_nta(
+                            src_ptr
+                                .add(crate::filtering::prefetch::COLD_FILL_ROW_LOOKAHEAD * $stride),
+                            row_bytes,
+                        );
+                    }
                     absorb_row::<true, $copy, false, true>(
                         src_ptr,
                         dst_ptr,
@@ -710,7 +722,15 @@ pub(crate) mod x86_aes {
             } else {
                 let mut dummy_a0 = _mm_setzero_si128();
                 let mut dummy_a1 = _mm_setzero_si128();
-                for _ in 0..n_rows {
+                for ry in 0..n_rows {
+                    if pf_rows && ry + crate::filtering::prefetch::COLD_FILL_ROW_LOOKAHEAD < n_rows
+                    {
+                        crate::filtering::prefetch::row_nta(
+                            src_ptr
+                                .add(crate::filtering::prefetch::COLD_FILL_ROW_LOOKAHEAD * $stride),
+                            row_bytes,
+                        );
+                    }
                     absorb_row::<$has_alpha, $copy, false, false>(
                         src_ptr,
                         dst_ptr,
@@ -2054,10 +2074,22 @@ mod aarch64_aes {
             let n_rows: usize = $n_rows;
             let mut dummy_dacc = vdupq_n_u8(0);
             let zero_px = vdupq_n_u8(0);
+            let row_bytes = $full64 + $rem;
+            let pf_rows = $copy
+                && $stride > row_bytes
+                && $stride >= crate::filtering::prefetch::MIN_PAGE_STRIDE_BYTES;
             if $has_alpha && $still_opaque {
                 let mut aand0 = vdupq_n_u8(0xFF);
                 let mut aand1 = vdupq_n_u8(0xFF);
-                for _ in 0..n_rows {
+                for ry in 0..n_rows {
+                    if pf_rows && ry + crate::filtering::prefetch::COLD_FILL_ROW_LOOKAHEAD < n_rows
+                    {
+                        crate::filtering::prefetch::row_nta(
+                            src_ptr
+                                .add(crate::filtering::prefetch::COLD_FILL_ROW_LOOKAHEAD * $stride),
+                            row_bytes,
+                        );
+                    }
                     absorb_row::<true, $copy, false, true>(
                         src_ptr,
                         dst_ptr,
@@ -2081,7 +2113,15 @@ mod aarch64_aes {
             } else {
                 let mut dummy_a0 = vdupq_n_u8(0);
                 let mut dummy_a1 = vdupq_n_u8(0);
-                for _ in 0..n_rows {
+                for ry in 0..n_rows {
+                    if pf_rows && ry + crate::filtering::prefetch::COLD_FILL_ROW_LOOKAHEAD < n_rows
+                    {
+                        crate::filtering::prefetch::row_nta(
+                            src_ptr
+                                .add(crate::filtering::prefetch::COLD_FILL_ROW_LOOKAHEAD * $stride),
+                            row_bytes,
+                        );
+                    }
                     absorb_row::<$has_alpha, $copy, false, false>(
                         src_ptr,
                         dst_ptr,

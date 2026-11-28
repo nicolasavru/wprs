@@ -262,6 +262,15 @@ fn scroll_row_plan(
     }
 }
 
+/// Returns `true` when each scroll row stripe jumps across at least one 4 KiB
+/// page boundary (breaking hardware stride prefetching) while remaining small
+/// enough to prefetch 2 rows ahead into L1d without evicting the active row.
+#[inline(always)]
+pub(super) fn should_prefetch_scroll_stripe(stride: usize, row_len: usize) -> bool {
+    stride.saturating_sub(row_len) >= super::prefetch::MIN_PAGE_STRIDE_BYTES
+        && row_len <= super::prefetch::MIN_PAGE_STRIDE_BYTES
+}
+
 /// Copies `copy_h` rows of `len` bytes at horizontal byte offset `sx` within
 /// `base` (`stride` bytes/row) from `src_y0` to `dst_y0` using regular temporal
 /// `memcpy` (`ptr::copy_nonoverlapping`).
@@ -294,10 +303,22 @@ pub(super) unsafe fn apply_scroll_rows_temporal(
     unsafe {
         let mut s = base.add(first_src_row * stride + sx).cast_const();
         let mut d = base.add(first_dst_row * stride + sx);
-        for _ in 0..rows {
-            ptr::copy_nonoverlapping(s, d, row_len);
-            s = s.wrapping_offset(step);
-            d = d.wrapping_offset(step);
+        if should_prefetch_scroll_stripe(stride, row_len) {
+            let pf_step = step * super::prefetch::SCROLL_DECODE_ROW_LOOKAHEAD as isize;
+            for i in 0..rows {
+                if i + super::prefetch::SCROLL_DECODE_ROW_LOOKAHEAD < rows {
+                    super::prefetch::row_t0(s.offset(pf_step), row_len);
+                }
+                ptr::copy_nonoverlapping(s, d, row_len);
+                s = s.wrapping_offset(step);
+                d = d.wrapping_offset(step);
+            }
+        } else {
+            for _ in 0..rows {
+                ptr::copy_nonoverlapping(s, d, row_len);
+                s = s.wrapping_offset(step);
+                d = d.wrapping_offset(step);
+            }
         }
     }
 }
@@ -306,11 +327,14 @@ pub(super) unsafe fn apply_scroll_rows_temporal(
 /// `base` (`stride` bytes/row) from `src_y0` to `dst_y0` using cache-line-aligned
 /// non-temporal streaming stores and a single trailing [`RowKernel::fence_stream`].
 ///
+/// Specialized on `PREFETCH_SRC` so the non-prefetching full-width path stays
+/// single-loop and keeps `K::copy_bytes_stream` inlined in both variants.
+///
 /// # Safety
 /// Caller must uphold [`apply_scroll_rows_temporal`] invariants.
 #[cfg_attr(not(all(target_arch = "x86_64", not(miri))), allow(dead_code))]
 #[inline(always)]
-pub(super) unsafe fn apply_scroll_rows_stream_with<K: RowKernel>(
+pub(super) unsafe fn apply_scroll_rows_stream_with<K: RowKernel, const PREFETCH_SRC: bool>(
     kernel: K,
     base: *mut u8,
     stride: usize,
@@ -333,10 +357,23 @@ pub(super) unsafe fn apply_scroll_rows_stream_with<K: RowKernel>(
     unsafe {
         let mut s = base.add(first_src_row * stride + sx).cast_const();
         let mut d = base.add(first_dst_row * stride + sx);
-        for _ in 0..rows {
-            kernel.copy_bytes_stream(s, d, row_len);
-            s = s.wrapping_offset(step);
-            d = d.wrapping_offset(step);
+        if PREFETCH_SRC {
+            let pf_step = step * super::prefetch::SCROLL_DECODE_ROW_LOOKAHEAD as isize;
+            for i in 0..rows {
+                if i + super::prefetch::SCROLL_DECODE_ROW_LOOKAHEAD < rows {
+                    // Never prefetch `d` on NT streaming stores; only prefetch strided `s`.
+                    super::prefetch::row_t0(s.offset(pf_step), row_len);
+                }
+                kernel.copy_bytes_stream(s, d, row_len);
+                s = s.wrapping_offset(step);
+                d = d.wrapping_offset(step);
+            }
+        } else {
+            for _ in 0..rows {
+                kernel.copy_bytes_stream(s, d, row_len);
+                s = s.wrapping_offset(step);
+                d = d.wrapping_offset(step);
+            }
         }
     }
     kernel.fence_stream();
