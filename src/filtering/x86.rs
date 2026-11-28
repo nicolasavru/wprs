@@ -840,9 +840,6 @@ mod avx512 {
 
     const SHIFTS_2BPP_512: [u32; 16] = [0, 2, 4, 6, 8, 10, 12, 14, 16, 18, 20, 22, 24, 26, 28, 30];
 
-    /// Opmask selecting the lower 48 bytes (`16` 3-byte BGR pixels) of a ZMM register.
-    const MASK_48: u64 = 0x0000_FFFF_FFFF_FFFF;
-
     /// Opmask selecting B, G, R bytes (`0, 1, 2`) of every 4-byte pixel while ignoring byte `3`.
     const MASK_RGB: u64 = 0x7777_7777_7777_7777;
 
@@ -1110,6 +1107,16 @@ mod avx512 {
         pack_4x48_to_192(o0, o1, o2, o3)
     }
 
+    /// Applies `SubGreen` (`B-G, G, R-G, A`) to 16 BGRA pixels and packs the
+    /// 48 BGR bytes into lanes `0..48` and 16 alpha bytes into lanes `48..64`.
+    #[target_feature(enable = "avx512bw,avx512vl,avx512vbmi")]
+    #[inline]
+    fn subgreen_pack_16px(v: __m512i, shuf_g: __m512i, pack_idx: __m512i) -> __m512i {
+        let g = _mm512_shuffle_epi8(v, shuf_g);
+        let sg = _mm512_sub_epi8(v, g);
+        _mm512_permutexvar_epi8(pack_idx, sg)
+    }
+
     #[target_feature(enable = "avx512bw,avx512vl,avx512vbmi")]
     #[inline]
     unsafe fn bgra_to_subgreen_bgr3_impl<const HAS_ALPHA: bool>(
@@ -1121,48 +1128,110 @@ mod avx512 {
         debug_assert_eq!(dst_bgr.len(), tw * 3);
         debug_assert!(!HAS_ALPHA || dst_alpha.len() == tw);
 
-        // Masked 48-byte stores suppress faults and never touch bytes `48..64`,
-        // and the masked tail handles `1..=15` trailing pixels with zero scalar loop.
-        let lim = (tw / 16) * 16;
+        // Main `64 px` (`4 x 64 B BGRA -> 3 x 64 B` unmasked `vmovdqu64` BGR)
+        // loop avoids microcoded 48 B masked byte stores into `raw_row_a`/
+        // `raw_row_b` and matches the 64 B loads of `select_and_filter_row` for
+        // exact STLF. Unmasked `32 B + 16 B` (`store_48`) handles `16..=48 px`
+        // remainders and masked byte ops run strictly on the `< 16 px` tail.
+        let lim64 = tw & !63;
+        let lim16 = tw & !15;
         let mut x = 0usize;
         let mut di = 0usize;
 
-        // SAFETY: Caller guarantees AVX-512BW/VL/VBMI; `x + 16 <= tw`,
-        // `di + 48 <= dst_bgr.len()`, `x + 16 <= dst_alpha.len()` when `HAS_ALPHA`,
-        // and the masked tail accesses strictly `lim..tw` (`rem <= 15`).
+        // SAFETY: Caller guarantees AVX-512BW/VL/VBMI; `x + 64 <= tw` and
+        // `di + 192 <= dst_bgr.len()` in the main loop, `x + 16 <= tw` and
+        // `di + 48 <= dst_bgr.len()` in the 48 B loop, `dst_alpha.len() == tw`
+        // when `HAS_ALPHA`, and the masked tail accesses strictly `lim16..tw`
+        // (`rem <= 15`).
         unsafe {
             let shuf_g = load_table(&SHUF_G);
             let pack_idx = load_table(&PACK_BGR_ALPHA_IDX);
+            let src_p = src.ptr();
+            let bgr_p = dst_bgr.as_mut_ptr();
+            let alpha_p = dst_alpha.as_mut_ptr();
 
-            while x < lim {
-                let v = _mm512_loadu_si512(src.ptr().add(x).cast());
-                let g = _mm512_shuffle_epi8(v, shuf_g);
-                let sg = _mm512_sub_epi8(v, g);
-                let packed = _mm512_permutexvar_epi8(pack_idx, sg);
-                _mm512_mask_storeu_epi8(dst_bgr.as_mut_ptr().add(di).cast(), MASK_48, packed);
+            while x < lim64 {
+                let p0 =
+                    subgreen_pack_16px(_mm512_loadu_si512(src_p.add(x).cast()), shuf_g, pack_idx);
                 if HAS_ALPHA {
                     _mm_storeu_si128(
-                        dst_alpha.as_mut_ptr().add(x).cast::<__m128i>(),
+                        alpha_p.add(x).cast::<__m128i>(),
+                        _mm512_extracti32x4_epi32::<3>(p0),
+                    );
+                }
+
+                let p1 = subgreen_pack_16px(
+                    _mm512_loadu_si512(src_p.add(x + 16).cast()),
+                    shuf_g,
+                    pack_idx,
+                );
+                if HAS_ALPHA {
+                    _mm_storeu_si128(
+                        alpha_p.add(x + 16).cast::<__m128i>(),
+                        _mm512_extracti32x4_epi32::<3>(p1),
+                    );
+                }
+
+                let p2 = subgreen_pack_16px(
+                    _mm512_loadu_si512(src_p.add(x + 32).cast()),
+                    shuf_g,
+                    pack_idx,
+                );
+                if HAS_ALPHA {
+                    _mm_storeu_si128(
+                        alpha_p.add(x + 32).cast::<__m128i>(),
+                        _mm512_extracti32x4_epi32::<3>(p2),
+                    );
+                }
+
+                let p3 = subgreen_pack_16px(
+                    _mm512_loadu_si512(src_p.add(x + 48).cast()),
+                    shuf_g,
+                    pack_idx,
+                );
+                if HAS_ALPHA {
+                    _mm_storeu_si128(
+                        alpha_p.add(x + 48).cast::<__m128i>(),
+                        _mm512_extracti32x4_epi32::<3>(p3),
+                    );
+                }
+
+                let [w0, w1, w2] = pack_4x48_to_192(p0, p1, p2, p3);
+                _mm512_storeu_si512(bgr_p.add(di).cast(), w0);
+                _mm512_storeu_si512(bgr_p.add(di + 64).cast(), w1);
+                _mm512_storeu_si512(bgr_p.add(di + 128).cast(), w2);
+
+                x += 64;
+                di += 192;
+            }
+            while x < lim16 {
+                let packed =
+                    subgreen_pack_16px(_mm512_loadu_si512(src_p.add(x).cast()), shuf_g, pack_idx);
+                store_48(bgr_p.add(di), packed);
+                if HAS_ALPHA {
+                    _mm_storeu_si128(
+                        alpha_p.add(x).cast::<__m128i>(),
                         _mm512_extracti32x4_epi32::<3>(packed),
                     );
                 }
                 x += 16;
                 di += 48;
             }
-            let rem = tw - lim;
+            let rem = tw - lim16;
             if rem != 0 {
                 let src_mask = (1u64 << (rem * 4)) - 1;
                 let bgr_mask = (1u64 << (rem * 3)) - 1;
-                let v = _mm512_maskz_loadu_epi8(src_mask, src.ptr().add(lim).cast());
-                let g = _mm512_shuffle_epi8(v, shuf_g);
-                let sg = _mm512_sub_epi8(v, g);
-                let packed = _mm512_permutexvar_epi8(pack_idx, sg);
-                _mm512_mask_storeu_epi8(dst_bgr.as_mut_ptr().add(di).cast(), bgr_mask, packed);
+                let packed = subgreen_pack_16px(
+                    _mm512_maskz_loadu_epi8(src_mask, src_p.add(lim16).cast()),
+                    shuf_g,
+                    pack_idx,
+                );
+                _mm512_mask_storeu_epi8(bgr_p.add(di).cast(), bgr_mask, packed);
                 if HAS_ALPHA {
                     let alpha_mask = (1u64 << rem) - 1;
                     let a128 = _mm512_extracti32x4_epi32::<3>(packed);
                     _mm512_mask_storeu_epi8(
-                        dst_alpha.as_mut_ptr().add(lim).cast(),
+                        alpha_p.add(lim16).cast(),
                         alpha_mask,
                         _mm512_zextsi128_si512(a128),
                     );

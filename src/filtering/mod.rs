@@ -9794,6 +9794,35 @@ mod tests {
             );
         }
 
+        // Adversarial `bgra_to_subgreen_bgr3` boundary cases across `64 px`
+        // (`192 B`), `16 px` (`48 B`), and `< 16 px` tails: extreme `0x00`/`0xFF`/
+        // `0x80` wraparound and zero-RGB + non-zero-alpha leak probes.
+        for tw in [16usize, 48, 64, 85, 128, 192, 205] {
+            let row_b = tw * 3;
+            let wrap: Vec<Vec4u8> = (0..tw)
+                .map(|i| match i % 4 {
+                    0 => Vec4u8(0x00, 0xFF, 0x01, 0xFE),
+                    1 => Vec4u8(0xFF, 0x00, 0x80, 0x7F),
+                    2 => Vec4u8(0x7F, 0x80, 0x00, 0xFF),
+                    _ => Vec4u8(0x00, 0x00, 0x00, ((i * 29 + 0xA5) & 0xFF) as u8 | 1),
+                })
+                .collect();
+            let pw = wrap.as_ptr();
+            let bpw = unsafe { BufferPointer::new(&pw, tw) };
+            let (mut bgr_s, mut bgr_a, mut bgr_noa) = (
+                vec![0xCCu8; row_b],
+                vec![0xCCu8; row_b],
+                vec![0xCCu8; row_b],
+            );
+            let (mut alp_s, mut alp_a) = (vec![0xDDu8; tw], vec![0xDDu8; tw]);
+            ScalarKernel.bgra_to_subgreen_bgr3::<true>(bpw, &mut bgr_s, &mut alp_s);
+            kernel.bgra_to_subgreen_bgr3::<true>(bpw, &mut bgr_a, &mut alp_a);
+            kernel.bgra_to_subgreen_bgr3::<false>(bpw, &mut bgr_noa, &mut []);
+            assert_eq!(bgr_a, bgr_s, "[{tier_name}] adv subgreen<true> tw={tw}");
+            assert_eq!(alp_a, alp_s, "[{tier_name}] adv alpha<true> tw={tw}");
+            assert_eq!(bgr_noa, bgr_s, "[{tier_name}] adv subgreen<false> tw={tw}");
+        }
+
         // `i8::MIN` (`0x80` = `-128`) unsigned abs must equal `128` across all backends
         // (covers 16B, 32B, and 64B SIMD loops plus scalar tails).
         let min_bytes = [0x80u8; 73];
