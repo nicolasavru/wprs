@@ -45,6 +45,7 @@ use crate::buffer_pointer::BufferPointer;
 use crate::filtering::ClientTileCache;
 use crate::filtering::DecodeCacheCtx;
 use crate::filtering::FrameRows;
+use crate::filtering::PhaseASchedule;
 #[cfg(all(
     not(target_feature = "ssse3"),
     not(target_feature = "avx2"),
@@ -7849,6 +7850,7 @@ macro_rules! define_tier_wrappers {
             use crate::filtering::ClientTileCache;
             use crate::filtering::DecodeCacheCtx;
             use crate::filtering::FrameRows;
+            use crate::filtering::PhaseASchedule;
             use crate::filtering::RowKernel;
             use crate::filtering::ScanSubBand;
             use crate::filtering::ShadowRows;
@@ -8116,7 +8118,8 @@ macro_rules! define_tier_wrappers {
                 dirty_slots: &[AtomicU32],
                 slot_scans: Option<&SlotScans>,
                 cache_non_empty: bool,
-                next_sub: &AtomicUsize,
+                schedule: &PhaseASchedule<'_>,
+                worker_idx: usize,
             ) {
                 // SAFETY: Caller verified CPU feature support via `X86Tier::detect()`
                 // and upheld disjoint-band shadow invariants.
@@ -8138,7 +8141,8 @@ macro_rules! define_tier_wrappers {
                         dirty_slots,
                         slot_scans,
                         cache_non_empty,
-                        next_sub,
+                        schedule,
+                        worker_idx,
                     );
                 }
             }
@@ -9086,7 +9090,8 @@ impl X86Tier {
         dirty_slots: &[AtomicU32],
         slot_scans: Option<&SlotScans>,
         cache_non_empty: bool,
-        next_sub: &AtomicUsize,
+        schedule: &PhaseASchedule<'_>,
+        worker_idx: usize,
     ) {
         // SAFETY: Each arm's tier witness verifies required CPU features, and
         // caller upholds disjoint-band shadow invariants.
@@ -9116,7 +9121,8 @@ impl X86Tier {
                             dirty_slots,
                             slot_scans,
                             cache_non_empty,
-                            next_sub,
+                            schedule,
+                            worker_idx,
                         );
                     } else {
                         super::diff_and_update_worker_with::<ScalarKernel, false>(
@@ -9132,7 +9138,8 @@ impl X86Tier {
                             dirty_slots,
                             slot_scans,
                             cache_non_empty,
-                            next_sub,
+                            schedule,
+                            worker_idx,
                         );
                     }
                 },
@@ -9158,7 +9165,8 @@ impl X86Tier {
                             dirty_slots,
                             slot_scans,
                             cache_non_empty,
-                            next_sub,
+                            schedule,
+                            worker_idx,
                         );
                     } else {
                         dispatch_ssse3::diff_and_update_worker::<false>(
@@ -9173,7 +9181,8 @@ impl X86Tier {
                             dirty_slots,
                             slot_scans,
                             cache_non_empty,
-                            next_sub,
+                            schedule,
+                            worker_idx,
                         );
                     }
                 },
@@ -9196,7 +9205,8 @@ impl X86Tier {
                             dirty_slots,
                             slot_scans,
                             cache_non_empty,
-                            next_sub,
+                            schedule,
+                            worker_idx,
                         );
                     } else {
                         dispatch_avx2::diff_and_update_worker::<false>(
@@ -9211,7 +9221,8 @@ impl X86Tier {
                             dirty_slots,
                             slot_scans,
                             cache_non_empty,
-                            next_sub,
+                            schedule,
+                            worker_idx,
                         );
                     }
                 },
@@ -9229,7 +9240,8 @@ impl X86Tier {
                             dirty_slots,
                             slot_scans,
                             cache_non_empty,
-                            next_sub,
+                            schedule,
+                            worker_idx,
                         );
                     } else {
                         dispatch_avx512::diff_and_update_worker::<false>(
@@ -9244,7 +9256,8 @@ impl X86Tier {
                             dirty_slots,
                             slot_scans,
                             cache_non_empty,
-                            next_sub,
+                            schedule,
+                            worker_idx,
                         );
                     }
                 },

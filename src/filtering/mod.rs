@@ -65,6 +65,7 @@ mod arch {
     use crate::filtering::ClientTileCache;
     use crate::filtering::DecodeCacheCtx;
     use crate::filtering::FrameRows;
+    use crate::filtering::PhaseASchedule;
     use crate::filtering::RowKernel;
     use crate::filtering::ScalarKernel;
     use crate::filtering::ScanSubBand;
@@ -353,7 +354,8 @@ mod arch {
             dirty_slots: &[AtomicU32],
             slot_scans: Option<&SlotScans>,
             cache_non_empty: bool,
-            next_sub: &AtomicUsize,
+            schedule: &PhaseASchedule<'_>,
+            worker_idx: usize,
         ) {
             // SAFETY: Caller upholds disjoint-band shadow invariants.
             unsafe {
@@ -371,7 +373,8 @@ mod arch {
                         dirty_slots,
                         slot_scans,
                         cache_non_empty,
-                        next_sub,
+                        schedule,
+                        worker_idx,
                     );
                 } else {
                     super::diff_and_update_worker_with::<ScalarKernel, false>(
@@ -387,7 +390,8 @@ mod arch {
                         dirty_slots,
                         slot_scans,
                         cache_non_empty,
-                        next_sub,
+                        schedule,
+                        worker_idx,
                     );
                 }
             }
@@ -5003,6 +5007,169 @@ fn scroll_sub_band_range(sub_bands: &[ScanSubBand], sr: ScrollRect) -> (usize, u
     if start > end { (0, 0) } else { (start, end) }
 }
 
+/// Maximum worker count eligible for stack-allocated per-worker Phase A -> B
+/// cache-affinity buckets (larger pools fall back to a single shared counter).
+const MAX_AFFINITY_WORKERS: usize = 64;
+
+/// Maximum Phase-A sub-bands tracked in a stack-allocated `AtomicU8` owner
+/// array (`64` covers up to 8192-px-tall frames with zero heap allocation).
+const MAX_STACK_OWNERS: usize = 64;
+
+/// Maximum dirty tiles bucketed on the stack for Phase B home queues before
+/// spilling to heap (`512` covers 4K full-quadrant cropped frames with zero
+/// heap allocation).
+const STACK_HOME_TILES_CAP: usize = 512;
+
+/// Minimum number of shadow-reading tiles (`Put` or `Uncached`) required to
+/// enable Phase B exact-owner bucketing (tiny edits with `< 8` encoded tiles
+/// wake only a few workers and run faster on a single shared counter).
+const PHASE_B_AFFINITY_MIN_ENCODE: usize = 8;
+
+/// Cache-line-isolated work-stealing bucket covering task range `[next, end)`.
+#[repr(align(64))]
+pub(crate) struct WorkBucket {
+    next: AtomicUsize,
+    end: usize,
+}
+
+impl WorkBucket {
+    #[inline]
+    const fn new(start: usize, end: usize) -> Self {
+        Self {
+            next: AtomicUsize::new(start),
+            end,
+        }
+    }
+}
+
+/// Lock-free work-stealing cursor over a slice of per-worker [`WorkBucket`]s:
+/// worker `worker_idx` drains its own bucket first and then steals circularly
+/// from `(worker_idx + 1) % p`, `(worker_idx + 2) % p`, ..., guaranteeing every
+/// task in all buckets is claimed exactly once even when fewer than `p` workers
+/// wake.
+struct WorkStealIter<'a> {
+    buckets: &'a [WorkBucket],
+    start_w: usize,
+    step: usize,
+}
+
+impl<'a> WorkStealIter<'a> {
+    #[inline(always)]
+    fn new(buckets: &'a [WorkBucket], worker_idx: usize) -> Self {
+        let p = buckets.len();
+        debug_assert!(p <= 1 || worker_idx < p);
+        let start_w = if p <= 1 { 0 } else { worker_idx };
+        Self {
+            buckets,
+            start_w,
+            step: 0,
+        }
+    }
+
+    #[inline(never)]
+    fn next_idx(&mut self) -> Option<usize> {
+        let p = self.buckets.len();
+        while self.step < p {
+            let b = self.start_w + self.step;
+            let b = if b < p { b } else { b - p };
+            let Some(bucket) = self.buckets.get(b) else {
+                break;
+            };
+            if bucket.next.load(Ordering::Relaxed) < bucket.end {
+                let idx = bucket.next.fetch_add(1, Ordering::Relaxed);
+                if idx < bucket.end {
+                    return Some(idx);
+                }
+            }
+            self.step += 1;
+        }
+        None
+    }
+}
+
+/// Borrowed Phase-A task scheduler passed across SIMD dispatch boundaries.
+#[derive(Copy, Clone)]
+pub(crate) struct PhaseASchedule<'a> {
+    pub(crate) buckets: &'a [WorkBucket],
+    pub(crate) task_owners: Option<&'a [AtomicU8]>,
+}
+
+impl<'a> PhaseASchedule<'a> {
+    #[inline]
+    fn single(bucket: &'a WorkBucket, task_owners: Option<&'a [AtomicU8]>) -> Self {
+        Self {
+            buckets: slice::from_ref(bucket),
+            task_owners,
+        }
+    }
+
+    #[inline(always)]
+    fn iter(&self, worker_idx: usize) -> WorkStealIter<'a> {
+        WorkStealIter::new(self.buckets, worker_idx)
+    }
+}
+
+/// Computes worker `w`'s contiguous slice `[start, end)` of `0..total` across
+/// `p` buckets, placing even-sized slices first so `256`-px tile pairs
+/// `(2k, 2k+1)` stay on the same worker whenever `total >= 2` permits.
+#[inline]
+fn contiguous_slice(total: usize, p: usize, w: usize) -> (usize, usize) {
+    let base = total / p;
+    let rem = total % p;
+    if base.is_multiple_of(2) {
+        let even_workers = p - rem;
+        if w < even_workers {
+            let start = w * base;
+            (start, start + base)
+        } else {
+            let extra = w - even_workers;
+            let start = even_workers * base + extra * (base + 1);
+            (start, start + base + 1)
+        }
+    } else if w < rem {
+        let start = w * (base + 1);
+        (start, start + base + 1)
+    } else {
+        let start = rem * (base + 1) + (w - rem) * base;
+        (start, start + base)
+    }
+}
+
+/// Maps `rect` to its owning `sub_bands` index (`0..sub_bands.len()`).
+#[inline]
+fn sub_band_idx_for_rect(sub_bands: &[ScanSubBand], rect: TileRect, full_frame_2d: bool) -> usize {
+    let n_sub = sub_bands.len();
+    if full_frame_2d {
+        ((rect.y as usize) / SUBTILE_H).min(n_sub - 1)
+    } else {
+        sub_bands
+            .partition_point(|sb| match *sb {
+                ScanSubBand::RowBand2D { y1, .. } => y1 <= rect.y,
+                ScanSubBand::Strip1D { rect: r, .. } => (r.y + r.h, r.x + r.w) <= (rect.y, rect.x),
+            })
+            .min(n_sub - 1)
+    }
+}
+
+/// Returns the Phase-A worker index (`0..p`) that wrote `rect` on a non-scroll
+/// frame, alternating coalesced `> 128`-tall tiles evenly between their top and
+/// bottom `128`-row sub-bands so both even- and odd-band workers receive
+/// L2/L3-hot home tiles.
+#[inline]
+fn phase_b_owner_non_scroll(
+    sub_bands: &[ScanSubBand],
+    owners: &[AtomicU8],
+    rect: TileRect,
+    full_frame_2d: bool,
+    p: usize,
+) -> usize {
+    let mut sb = sub_band_idx_for_rect(sub_bands, rect, full_frame_2d);
+    if rect.h > SUBTILE_H as u32 && sb + 1 < owners.len() && ((rect.x as usize / TILE_W) & 1) == 1 {
+        sb += 1;
+    }
+    (owners[sb].load(Ordering::Relaxed) as usize).min(p - 1)
+}
+
 /// Worker loop for Phase A incremental shadow diffing on non-scroll frames.
 ///
 /// # Safety
@@ -5022,14 +5189,11 @@ unsafe fn diff_and_update_worker_with<K: RowKernel, const HAS_ALPHA: bool>(
     dirty_slots: &[AtomicU32],
     slot_scans: Option<&SlotScans>,
     cache_non_empty: bool,
-    next_sub: &AtomicUsize,
+    schedule: &PhaseASchedule<'_>,
+    worker_idx: usize,
 ) {
-    let n_sub = sub_bands.len();
-    loop {
-        let idx = next_sub.fetch_add(1, Ordering::Relaxed);
-        if idx >= n_sub {
-            break;
-        }
+    let mut iter = schedule.iter(worker_idx);
+    while let Some(idx) = iter.next_idx() {
         match sub_bands[idx] {
             ScanSubBand::Strip1D { rect, slot_idx } => {
                 // SAFETY: `sub_bands` cover disjoint regions in `shadow`.
@@ -5067,6 +5231,9 @@ unsafe fn diff_and_update_worker_with<K: RowKernel, const HAS_ALPHA: bool>(
                     kernel.diff_and_update_row_band_2d::<HAS_ALPHA>(&ctx);
                 }
             },
+        }
+        if let Some(owners) = schedule.task_owners {
+            owners[idx].store(worker_idx as u8, Ordering::Relaxed);
         }
     }
 }
@@ -6054,6 +6221,167 @@ impl IncrementalFrameResult {
     }
 }
 
+/// Encodes and returns one Phase-B incremental tile from `shadow_aos`.
+#[inline(always)]
+fn encode_incremental_tile(
+    tier: arch::Tier,
+    shadow_aos: BufferPointer<Vec4u8>,
+    has_alpha: bool,
+    stride_px: usize,
+    mode: CompressionMode,
+    is_hybrid: bool,
+    tile_idx: usize,
+    rect: TileRect,
+    action: TileCacheAction,
+    meta: &TileEncodeMeta,
+    promotions: &[AtomicU8],
+    state: &mut CompressorWorkerState,
+) -> CompressedTile {
+    match action {
+        TileCacheAction::Hit(hit_ref) => CompressedTile {
+            tile_idx: tile_idx as u32,
+            cache_put: None,
+            payload: TilePayload::CacheHit(hit_ref),
+        },
+        TileCacheAction::Solid(px) => CompressedTile {
+            tile_idx: tile_idx as u32,
+            cache_put: None,
+            payload: TilePayload::Leaf(LeafPayload::Solid(px)),
+        },
+        TileCacheAction::Put(slot_id) => {
+            let payload = if has_alpha {
+                filter_tile::<true>(tier, shadow_aos, true, stride_px, rect, mode, meta, state)
+            } else {
+                filter_tile::<false>(tier, shadow_aos, true, stride_px, rect, mode, meta, state)
+            };
+            if is_hybrid {
+                promotions[tile_idx].store(
+                    payload_lossless_promotion_mask(rect, &payload),
+                    Ordering::Relaxed,
+                );
+            }
+            CompressedTile {
+                tile_idx: tile_idx as u32,
+                cache_put: Some(slot_id),
+                payload,
+            }
+        },
+        TileCacheAction::Uncached => {
+            let payload = if has_alpha {
+                filter_tile::<true>(tier, shadow_aos, true, stride_px, rect, mode, meta, state)
+            } else {
+                filter_tile::<false>(tier, shadow_aos, true, stride_px, rect, mode, meta, state)
+            };
+            CompressedTile {
+                tile_idx: tile_idx as u32,
+                cache_put: None,
+                payload,
+            }
+        },
+    }
+}
+
+/// Out-of-line Phase B exact-owner bucketing + work-stealing dispatch so the
+/// stack bucket arrays (`~6.5 KiB`) never trigger stack probes on unchanged,
+/// tiny, scroll, or single-threaded frames.
+#[inline(never)]
+fn run_phase_b_exact_affinity(
+    compressor: &mut ShardingCompressor,
+    tier: arch::Tier,
+    shadow_aos: BufferPointer<Vec4u8>,
+    has_alpha: bool,
+    stride_px: usize,
+    mode: CompressionMode,
+    is_hybrid: bool,
+    sub_bands: &[ScanSubBand],
+    owners: &[AtomicU8],
+    full_frame_2d: bool,
+    p: usize,
+    dirty_tiles: &[TileRect],
+    actions: Option<&[TileCacheAction]>,
+    metas: Option<&[TileEncodeMeta]>,
+    promotions: &[AtomicU8],
+    tiles_tx: &crossbeam_channel::Sender<CompressedTile>,
+) {
+    let n_tiles = dirty_tiles.len();
+    let mut stack_tile_owners = [0u8; STACK_HOME_TILES_CAP];
+    let mut heap_tile_owners;
+    let tile_owners: &mut [u8] = if n_tiles <= STACK_HOME_TILES_CAP {
+        &mut stack_tile_owners[..n_tiles]
+    } else {
+        heap_tile_owners = vec![0u8; n_tiles];
+        &mut heap_tile_owners
+    };
+    let mut counts = [0u32; MAX_AFFINITY_WORKERS];
+    for (rect, slot) in dirty_tiles.iter().zip(tile_owners.iter_mut()) {
+        let w = phase_b_owner_non_scroll(sub_bands, owners, *rect, full_frame_2d, p);
+        *slot = w as u8;
+        counts[w] += 1;
+    }
+    let mut bucket_storage = [const { MaybeUninit::<WorkBucket>::uninit() }; MAX_AFFINITY_WORKERS];
+    let mut write_pos = [0usize; MAX_AFFINITY_WORKERS];
+    let mut cursor = 0usize;
+    for w in 0..p {
+        let start = cursor;
+        cursor += counts[w] as usize;
+        write_pos[w] = start;
+        bucket_storage[w].write(WorkBucket::new(start, cursor));
+    }
+    let mut stack_home_tiles = [0u32; STACK_HOME_TILES_CAP];
+    let mut heap_home_tiles;
+    let home: &mut [u32] = if n_tiles <= STACK_HOME_TILES_CAP {
+        &mut stack_home_tiles[..n_tiles]
+    } else {
+        heap_home_tiles = vec![0u32; n_tiles];
+        &mut heap_home_tiles
+    };
+    for (tile_idx, &w) in tile_owners.iter().enumerate() {
+        let w = usize::from(w);
+        home[write_pos[w]] = tile_idx as u32;
+        write_pos[w] += 1;
+    }
+    // SAFETY: `bucket_storage[..p]` were all initialized above, `WorkBucket`
+    // needs no `Drop`, and `MaybeUninit<WorkBucket>` has identical layout.
+    let buckets = unsafe { slice::from_raw_parts(bucket_storage.as_ptr().cast::<WorkBucket>(), p) };
+    compressor.pool.execute(n_tiles, |state| {
+        let mut iter = WorkStealIter::new(buckets, state.worker_idx);
+        while let Some(pos) = iter.next_idx() {
+            let tile_idx = home[pos] as usize;
+            let rect = dirty_tiles[tile_idx];
+            let action = actions.map_or(TileCacheAction::Uncached, |acts| acts[tile_idx]);
+            let meta = metas.map_or(&TileEncodeMeta::UNKNOWN, |m| &m[tile_idx]);
+            let tile = encode_incremental_tile(
+                tier, shadow_aos, has_alpha, stride_px, mode, is_hybrid, tile_idx, rect, action,
+                meta, promotions, state,
+            );
+            if tiles_tx.send(tile).is_err() {
+                break;
+            }
+        }
+    });
+}
+
+/// Out-of-line Phase A spatial-bucket wrapper so the 4 KiB bucket array never
+/// lives on `filter_and_compress_incremental_streaming_with_tier`'s stack frame.
+#[inline(never)]
+fn execute_phase_a_spatial<F>(total_tasks: usize, p: usize, owners: Option<&[AtomicU8]>, run: F)
+where
+    F: FnOnce(&PhaseASchedule<'_>),
+{
+    let mut bucket_storage = [const { MaybeUninit::<WorkBucket>::uninit() }; MAX_AFFINITY_WORKERS];
+    for (w, slot) in bucket_storage[..p].iter_mut().enumerate() {
+        let (start, end) = contiguous_slice(total_tasks, p, w);
+        slot.write(WorkBucket::new(start, end));
+    }
+    // SAFETY: `bucket_storage[..p]` were all initialized above.
+    let buckets = unsafe { slice::from_raw_parts(bucket_storage.as_ptr().cast::<WorkBucket>(), p) };
+    let schedule = PhaseASchedule {
+        buckets,
+        task_owners: owners,
+    };
+    run(&schedule);
+}
+
 fn filter_and_compress_incremental_streaming_with_tier(
     tier: arch::Tier,
     data: BufferPointer<u8>,
@@ -6111,17 +6439,36 @@ fn filter_and_compress_incremental_streaming_with_tier(
 
     // Phase A: parallel dirty scan + tight bbox tracking + shadow update (+
     // dirty quadrant hashing and pixel-property scan when `tile_cache` is
-    // enabled, with optional fused scroll).
+    // enabled, with optional fused scroll). On non-scroll multi-worker frames,
+    // each worker scans a deterministic contiguous spatial slice of horizontal
+    // sub-bands (keeping the `wl_shm` + `shadow` working set resident in its
+    // local L2/CCX L3 across consecutive frames) and records which worker
+    // scanned each sub-band so Phase B can route dirty tiles back to the same
+    // worker. Scroll frames keep dynamic column stealing unchanged.
+    let p = compressor.pool.parallelism();
+    let use_affinity = scroll_rect.is_none() && p > 1 && p <= MAX_AFFINITY_WORKERS;
+    let stack_owners = [const { AtomicU8::new(0) }; MAX_STACK_OWNERS];
+    let heap_owners;
+    let phase_a_owners: Option<&[AtomicU8]> = if use_affinity {
+        if n_sub <= MAX_STACK_OWNERS {
+            Some(&stack_owners[..n_sub])
+        } else {
+            heap_owners = (0..n_sub).map(|_| AtomicU8::new(0)).collect::<Vec<_>>();
+            Some(&heap_owners)
+        }
+    } else {
+        None
+    };
     {
         let shadow_rows = ShadowRows {
             base: shadow.as_mut_ptr(),
             stride,
         };
-        let next_sub = AtomicUsize::new(0);
         if let Some(sr) = scroll_rect {
             let (sb_start, sb_end) = scroll_sub_band_range(&sub_bands, sr);
-            let phase_a_tasks = (sub_bands.len() - (sb_end - sb_start)) + n_qx;
-            compressor.pool.execute(phase_a_tasks, |_state| {
+            let total_tasks = (n_sub - (sb_end - sb_start)) + n_qx;
+            let next_task = AtomicUsize::new(0);
+            compressor.pool.execute(total_tasks, |_state| {
                 // SAFETY: `sub_bands` cover disjoint regions in `shadow`, and
                 // `sr` lies inside a contiguous `RowBand2D` slice.
                 unsafe {
@@ -6139,31 +6486,41 @@ fn filter_and_compress_incremental_streaming_with_tier(
                         &dirty_slots,
                         slot_scans.as_ref(),
                         cache_non_empty,
-                        &next_sub,
+                        &next_task,
                     );
                 }
             });
         } else {
-            compressor.pool.execute(n_sub, |_state| {
-                // SAFETY: `sub_bands` cover disjoint regions in `shadow`.
-                unsafe {
-                    tier.diff_and_update_worker(
-                        has_alpha,
-                        data,
-                        aos,
-                        &shadow_rows,
-                        width,
-                        stride,
-                        stride_px,
-                        n_qx,
-                        &sub_bands,
-                        &dirty_slots,
-                        slot_scans.as_ref(),
-                        cache_non_empty,
-                        &next_sub,
-                    );
-                }
-            });
+            let mut run_non_scroll = |schedule: &PhaseASchedule<'_>| {
+                compressor.pool.execute(n_sub, |state| {
+                    // SAFETY: `sub_bands` cover disjoint regions in `shadow`.
+                    unsafe {
+                        tier.diff_and_update_worker(
+                            has_alpha,
+                            data,
+                            aos,
+                            &shadow_rows,
+                            width,
+                            stride,
+                            stride_px,
+                            n_qx,
+                            &sub_bands,
+                            &dirty_slots,
+                            slot_scans.as_ref(),
+                            cache_non_empty,
+                            schedule,
+                            state.worker_idx,
+                        );
+                    }
+                });
+            };
+            if use_affinity {
+                execute_phase_a_spatial(n_sub, p, phase_a_owners, run_non_scroll);
+            } else {
+                let single_bucket = WorkBucket::new(0, n_sub);
+                let schedule = PhaseASchedule::single(&single_bucket, None);
+                run_non_scroll(&schedule);
+            }
         }
     }
 
@@ -6295,76 +6652,73 @@ fn filter_and_compress_incremental_streaming_with_tier(
     } else {
         Vec::new()
     };
-    let next_tile = AtomicUsize::new(0);
-    compressor.pool.execute(n_tiles, |state| {
-        loop {
-            let tile_idx = next_tile.fetch_add(1, Ordering::Relaxed);
-            if tile_idx >= n_tiles {
-                break;
+    let use_phase_b_affinity = if let Some(owners) = phase_a_owners {
+        let n_encode_tiles = match actions.as_deref() {
+            None => n_tiles,
+            Some(acts) => acts
+                .iter()
+                .filter(|a| matches!(a, TileCacheAction::Put(_) | TileCacheAction::Uncached))
+                .count(),
+        };
+        (n_encode_tiles >= PHASE_B_AFFINITY_MIN_ENCODE).then_some(owners)
+    } else {
+        None
+    };
+    if let Some(owners) = use_phase_b_affinity {
+        let full_frame_2d = bands.is_none() && metadata.height as u32 >= MIN_2D_BAND_HEIGHT;
+        run_phase_b_exact_affinity(
+            compressor,
+            tier,
+            shadow_aos,
+            has_alpha,
+            stride_px,
+            mode,
+            is_hybrid,
+            &sub_bands,
+            owners,
+            full_frame_2d,
+            p,
+            &dirty_tiles,
+            actions.as_deref(),
+            metas.as_deref(),
+            &promotions,
+            &tiles_tx,
+        );
+    } else {
+        let next_tile = AtomicUsize::new(0);
+        compressor.pool.execute(n_tiles, |state| {
+            loop {
+                let tile_idx = next_tile.fetch_add(1, Ordering::Relaxed);
+                if tile_idx >= n_tiles {
+                    break;
+                }
+                let rect = dirty_tiles[tile_idx];
+                let action = actions
+                    .as_ref()
+                    .map_or(TileCacheAction::Uncached, |acts| acts[tile_idx]);
+                let meta = metas
+                    .as_ref()
+                    .map_or(&TileEncodeMeta::UNKNOWN, |m| &m[tile_idx]);
+                let tile = encode_incremental_tile(
+                    tier,
+                    shadow_aos,
+                    has_alpha,
+                    stride_px,
+                    mode,
+                    is_hybrid,
+                    tile_idx,
+                    rect,
+                    action,
+                    meta,
+                    &promotions,
+                    state,
+                );
+                if tiles_tx.send(tile).is_err() {
+                    break;
+                }
             }
-            let rect = dirty_tiles[tile_idx];
-            let action = actions
-                .as_ref()
-                .map_or(TileCacheAction::Uncached, |acts| acts[tile_idx]);
-            let meta = metas
-                .as_ref()
-                .map_or(&TileEncodeMeta::UNKNOWN, |m| &m[tile_idx]);
-            let tile = match action {
-                TileCacheAction::Hit(hit_ref) => CompressedTile {
-                    tile_idx: tile_idx as u32,
-                    cache_put: None,
-                    payload: TilePayload::CacheHit(hit_ref),
-                },
-                TileCacheAction::Solid(px) => CompressedTile {
-                    tile_idx: tile_idx as u32,
-                    cache_put: None,
-                    payload: TilePayload::Leaf(LeafPayload::Solid(px)),
-                },
-                TileCacheAction::Put(slot_id) => {
-                    let payload = if has_alpha {
-                        filter_tile::<true>(
-                            tier, shadow_aos, true, stride_px, rect, mode, meta, state,
-                        )
-                    } else {
-                        filter_tile::<false>(
-                            tier, shadow_aos, true, stride_px, rect, mode, meta, state,
-                        )
-                    };
-                    if is_hybrid {
-                        promotions[tile_idx].store(
-                            payload_lossless_promotion_mask(rect, &payload),
-                            Ordering::Relaxed,
-                        );
-                    }
-                    CompressedTile {
-                        tile_idx: tile_idx as u32,
-                        cache_put: Some(slot_id),
-                        payload,
-                    }
-                },
-                TileCacheAction::Uncached => {
-                    let payload = if has_alpha {
-                        filter_tile::<true>(
-                            tier, shadow_aos, true, stride_px, rect, mode, meta, state,
-                        )
-                    } else {
-                        filter_tile::<false>(
-                            tier, shadow_aos, true, stride_px, rect, mode, meta, state,
-                        )
-                    };
-                    CompressedTile {
-                        tile_idx: tile_idx as u32,
-                        cache_put: None,
-                        payload,
-                    }
-                },
-            };
-
-            if tiles_tx.send(tile).is_err() {
-                break;
-            }
-        }
-    });
+        });
+    }
 
     if is_hybrid
         && let Some(cache) = tile_cache
@@ -8869,7 +9223,8 @@ mod tests {
                     .map(|_| AtomicU32::new(SlotDirty::CLEAN_RAW))
                     .collect();
                 let mut scans = tile_cache::SlotScans::new(n_qx, key);
-                let next_sub = AtomicUsize::new(0);
+                let bucket = WorkBucket::new(0, sub_bands.len());
+                let schedule = PhaseASchedule::single(&bucket, None);
                 unsafe {
                     tier.diff_and_update_worker(
                         has_alpha,
@@ -8884,7 +9239,8 @@ mod tests {
                         &dirty_slots,
                         with_scans.then_some(&scans),
                         cache_non_empty,
-                        &next_sub,
+                        &schedule,
+                        0,
                     );
                 }
 
@@ -18060,5 +18416,360 @@ mod tests {
                 }
             }
         }
+    }
+
+    #[test]
+    fn test_phase_ab_work_steal_partition_and_partial_wake() {
+        for &p in &[1usize, 2, 3, 4, 8, 16, 64] {
+            for &total in &[0usize, 1, 2, 7, 15, 16, 17, 30, 64, 135, 510, 600] {
+                let mut cursor = 0usize;
+                let mut buckets = Vec::with_capacity(p);
+                for w in 0..p {
+                    let (start, end) = contiguous_slice(total, p, w);
+                    assert_eq!(start, cursor, "gap/overlap for total={total} p={p} w={w}");
+                    assert!(start <= end && end <= total);
+                    let len = end - start;
+                    let base = total / p;
+                    assert!(len == base || len == base + 1);
+                    buckets.push(WorkBucket::new(start, end));
+                    cursor = end;
+                }
+                assert_eq!(cursor, total);
+
+                // Even-sized slices come before odd-sized slices when `base` is
+                // even or when `base` is odd and `rem > 0`, keeping `256`-px
+                // tile pairs `(2k, 2k+1)` together whenever `total >= 2`.
+                if total >= 2 && (total / p) >= 2 && (total / p).is_multiple_of(2) {
+                    let (s0, e0) = contiguous_slice(total, p, 0);
+                    assert!((e0 - s0).is_multiple_of(2));
+                }
+
+                // Partial worker wake subset: only a subset of workers runs
+                // (e.g. inline worker `0` plus at most 2 arbitrary workers),
+                // and every task `0..total` must still be claimed exactly once.
+                let active: Vec<usize> = if p == 1 {
+                    vec![0]
+                } else if p <= 4 {
+                    vec![0, p - 1]
+                } else {
+                    vec![0, p / 3, p - 1]
+                };
+                let mut seen = vec![0u32; total];
+                let mut iters: Vec<WorkStealIter<'_>> = active
+                    .iter()
+                    .map(|&w| WorkStealIter::new(&buckets, w))
+                    .collect();
+                // Interleave claims round-robin across the partial active set.
+                loop {
+                    let mut any = false;
+                    for iter in &mut iters {
+                        if let Some(idx) = iter.next_idx() {
+                            seen[idx] += 1;
+                            any = true;
+                        }
+                    }
+                    if !any {
+                        break;
+                    }
+                }
+                assert!(
+                    seen.iter().all(|&c| c == 1),
+                    "exact-once violated for total={total} p={p}: {seen:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn test_phase_b_owner_non_scroll_full_partial_and_clamping() {
+        let meta = BufferMetadata {
+            width: 512,
+            height: 512,
+            stride: 512 * 4,
+            format: BufferFormat::Xrgb8888,
+        };
+        let (sub_bands, _, _) = plan_incremental_scan(&meta, None).unwrap();
+        assert_eq!(sub_bands.len(), 4);
+        let owners: Vec<AtomicU8> = [0u8, 1, 2, 99].into_iter().map(AtomicU8::new).collect();
+        // `256`-tall tiles alternate top/bottom sub-band across odd/even `x / TILE_W`.
+        let r_even = TileRect {
+            x: 0,
+            y: 0,
+            w: 256,
+            h: 256,
+        };
+        let r_odd = TileRect {
+            x: 256,
+            y: 0,
+            w: 256,
+            h: 256,
+        };
+        assert_eq!(
+            phase_b_owner_non_scroll(&sub_bands, &owners, r_even, true, 4),
+            0
+        );
+        assert_eq!(
+            phase_b_owner_non_scroll(&sub_bands, &owners, r_odd, true, 4),
+            1
+        );
+        // Out-of-range owner clamps cleanly to `p - 1`.
+        let r_bottom = TileRect {
+            x: 0,
+            y: 384,
+            w: 128,
+            h: 128,
+        };
+        assert_eq!(
+            phase_b_owner_non_scroll(&sub_bands, &owners, r_bottom, true, 4),
+            3
+        );
+
+        // Partial `RowBand`s mixing `Strip1D` and `RowBand2D`.
+        let bands = [RowBand { y0: 4, y1: 6 }, RowBand { y0: 128, y1: 260 }];
+        let (p_subs, _, _) = plan_incremental_scan(&meta, Some(&bands)).unwrap();
+        let p_owners: Vec<AtomicU8> = (0..p_subs.len())
+            .map(|i| AtomicU8::new((i % 4) as u8))
+            .collect();
+        assert_eq!(
+            sub_band_idx_for_rect(
+                &p_subs,
+                TileRect {
+                    x: 0,
+                    y: 4,
+                    w: 512,
+                    h: 2,
+                },
+                false,
+            ),
+            0,
+        );
+        let mid_idx = sub_band_idx_for_rect(
+            &p_subs,
+            TileRect {
+                x: 0,
+                y: 256,
+                w: 128,
+                h: 4,
+            },
+            false,
+        );
+        assert_eq!(mid_idx, p_subs.len() - 1);
+        assert_eq!(
+            phase_b_owner_non_scroll(
+                &p_subs,
+                &p_owners,
+                TileRect {
+                    x: 0,
+                    y: 256,
+                    w: 128,
+                    h: 4,
+                },
+                false,
+                4,
+            ),
+            mid_idx % 4,
+        );
+    }
+
+    #[test]
+    #[cfg_attr(miri, ignore)]
+    fn test_phase_ab_affinity_multithreaded_incremental_parity() {
+        // Exercises:
+        // 1) tiny edit (`n_encode < PHASE_B_AFFINITY_MIN_ENCODE`, fallback path),
+        // 2) partial-wake affinity (`PHASE_B_AFFINITY_MIN_ENCODE <= n_tiles < p`),
+        // 3) full multi-band affinity (`n_tiles >= p`, Lossless & Hybrid, with cache),
+        // 4) heap-spilled `home_tiles` (`n_tiles > STACK_HOME_TILES_CAP`) and
+        //    heap-spilled `phase_a_owners` (`n_sub > MAX_STACK_OWNERS`).
+        let mut comp_1t = ShardingCompressor::new(NonZeroUsize::new(1).unwrap(), 1).unwrap();
+        let mut comp_mt = ShardingCompressor::new(NonZeroUsize::new(12).unwrap(), 1).unwrap();
+        let mut decomp = ShardingDecompressor::new(NonZeroUsize::new(4).unwrap()).unwrap();
+
+        let w = 1024usize;
+        let h = 1024usize;
+        let stride = w * 4;
+        let meta = BufferMetadata {
+            width: w as i32,
+            height: h as i32,
+            stride: stride as i32,
+            format: BufferFormat::Xrgb8888,
+        };
+        let mut base = vec![0u8; h * stride];
+        for y in 0..h {
+            for x in 0..w {
+                let off = y * stride + x * 4;
+                base[off] = (x.wrapping_mul(7) ^ y.wrapping_mul(3)) as u8;
+                base[off + 1] = (y.wrapping_mul(11) ^ (x >> 1)) as u8;
+                base[off + 2] = (x.wrapping_add(y).wrapping_mul(5)) as u8;
+                base[off + 3] = 0xFF;
+            }
+        }
+
+        let read_stream = |wire_bytes: &[u8]| -> ValidatedTileStream {
+            let mut stream_opt = None;
+            let mut rdr = wire_bytes;
+            CompressedTileStream::read_from_stream(&mut rdr, |s| {
+                stream_opt = Some(s);
+                Ok(())
+            })
+            .unwrap();
+            ValidatedTileStream::new(stream_opt.unwrap()).unwrap()
+        };
+
+        // Case 1 (2 dirty quadrants -> fallback), Case 2 (10 dirty quadrants ->
+        // partial wake with p=12), Case 3 (all 64 quadrants dirty -> full affinity).
+        let dirty_quad_counts = [2usize, 10, 64];
+        for &mode in &[
+            CompressionMode::Lossless,
+            CompressionMode::Hybrid {
+                quality: 85,
+                subsamp: JpegSubsamp::Sub420,
+            },
+        ] {
+            for &n_dirty in &dirty_quad_counts {
+                let mut f1 = base.clone();
+                let n_qx = w / SUBTILE_W;
+                for q in 0..n_dirty {
+                    let qx = q % n_qx;
+                    let qy = q / n_qx;
+                    for dy in 0..16 {
+                        for dx in 0..16 {
+                            let y = qy * SUBTILE_H + dy * 4;
+                            let x = qx * SUBTILE_W + dx * 4;
+                            let off = y * stride + x * 4;
+                            f1[off] ^= 0x5A;
+                            f1[off + 1] ^= 0xA5;
+                            f1[off + 2] ^= 0x3C;
+                        }
+                    }
+                }
+
+                let mut run = |comp: &mut ShardingCompressor| {
+                    let mut shadow = Vec::new();
+                    let mut srv = ServerTileCache::new();
+                    let mut cli = ClientTileCache::new();
+                    let mut out = vec![0u8; base.len()];
+                    let p0 = base.as_ptr();
+                    let bp0 = unsafe { BufferPointer::new(&p0, base.len()) };
+                    let mut s0 = None;
+                    filter_and_compress_full_streaming(
+                        bp0,
+                        ClientId(1),
+                        WlSurfaceId(1),
+                        meta,
+                        mode,
+                        Some(&mut shadow),
+                        Some(&mut srv),
+                        comp,
+                        |s| s0 = Some(s),
+                    );
+                    let mut w0 = Vec::new();
+                    s0.unwrap().framed_write(&mut w0).unwrap();
+                    decompress_and_unfilter_streaming(
+                        read_stream(&w0),
+                        &mut decomp,
+                        &mut out,
+                        Some(&mut cli),
+                    )
+                    .unwrap();
+
+                    let p1 = f1.as_ptr();
+                    let bp1 = unsafe { BufferPointer::new(&p1, f1.len()) };
+                    let mut s1 = None;
+                    let res = filter_and_compress_incremental_streaming(
+                        bp1,
+                        ClientId(1),
+                        WlSurfaceId(1),
+                        meta,
+                        mode,
+                        None,
+                        &mut shadow,
+                        Some(&mut srv),
+                        comp,
+                        |s| s1 = Some(s),
+                    );
+                    let mut w1 = Vec::new();
+                    s1.unwrap().framed_write(&mut w1).unwrap();
+                    decompress_and_unfilter_streaming(
+                        read_stream(&w1),
+                        &mut decomp,
+                        &mut out,
+                        Some(&mut cli),
+                    )
+                    .unwrap();
+                    assert_eq!(shadow, f1);
+                    if mode == CompressionMode::Lossless {
+                        assert_eq!(out, f1);
+                    }
+                    (res.dirty_tiles, out, srv.occupied_slots())
+                };
+
+                let (rects_1t, out_1t, slots_1t) = run(&mut comp_1t);
+                let (rects_mt, out_mt, slots_mt) = run(&mut comp_mt);
+                assert_eq!(
+                    rects_mt, rects_1t,
+                    "rects mismatch n_dirty={n_dirty} {mode:?}"
+                );
+                assert_eq!(
+                    out_mt, out_1t,
+                    "decoded pixels mismatch n_dirty={n_dirty} {mode:?}"
+                );
+                assert_eq!(
+                    slots_mt, slots_1t,
+                    "slots mismatch n_dirty={n_dirty} {mode:?}"
+                );
+            }
+        }
+
+        // Case 4: heap-spill paths (`n_sub > MAX_STACK_OWNERS` AND
+        // `dirty_tiles.len() > STACK_HOME_TILES_CAP`).
+        let tall_w = 1024usize;
+        let tall_h = (MAX_STACK_OWNERS + 2) * SUBTILE_H; // 66 sub-bands, 66*8 = 528 quadrants
+        let tall_stride = tall_w * 4;
+        let tall_meta = BufferMetadata {
+            width: tall_w as i32,
+            height: tall_h as i32,
+            stride: tall_stride as i32,
+            format: BufferFormat::Xrgb8888,
+        };
+        let mut shadow = vec![0u8; tall_h * tall_stride];
+        let mut tall_f1 = shadow.clone();
+        // Flip one pixel per quadrant so all 528 quadrants emit cropped tiles
+        // (`528 > STACK_HOME_TILES_CAP = 512`), forcing both heap spills.
+        for qy in 0..(tall_h / SUBTILE_H) {
+            for qx in 0..(tall_w / SUBTILE_W) {
+                let y = qy * SUBTILE_H + 10;
+                let x = qx * SUBTILE_W + 10;
+                let off = y * tall_stride + x * 4;
+                tall_f1[off] = 0x77;
+                tall_f1[off + 3] = 0xFF;
+            }
+        }
+        let p_tall = tall_f1.as_ptr();
+        let bp_tall = unsafe { BufferPointer::new(&p_tall, tall_f1.len()) };
+        let mut stream = None;
+        let res = filter_and_compress_incremental_streaming(
+            bp_tall,
+            ClientId(1),
+            WlSurfaceId(2),
+            tall_meta,
+            CompressionMode::Lossless,
+            None,
+            &mut shadow,
+            None,
+            &mut comp_mt,
+            |s| stream = Some(s),
+        );
+        assert!(
+            res.dirty_tiles.len() > STACK_HOME_TILES_CAP,
+            "expected > {} cropped tiles, got {}",
+            STACK_HOME_TILES_CAP,
+            res.dirty_tiles.len(),
+        );
+        let mut wire = Vec::new();
+        stream.unwrap().framed_write(&mut wire).unwrap();
+        let mut out = vec![0u8; tall_f1.len()];
+        decompress_and_unfilter_streaming(read_stream(&wire), &mut decomp, &mut out, None).unwrap();
+        assert_eq!(shadow, tall_f1);
+        assert_eq!(out, tall_f1);
     }
 }

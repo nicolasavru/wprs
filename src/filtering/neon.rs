@@ -114,6 +114,7 @@ use crate::buffer_pointer::BufferPointer;
 use crate::filtering::ClientTileCache;
 use crate::filtering::DecodeCacheCtx;
 use crate::filtering::FrameRows;
+use crate::filtering::PhaseASchedule;
 use crate::filtering::RowKernel;
 use crate::filtering::ScanSubBand;
 use crate::filtering::ShadowRows;
@@ -1794,7 +1795,8 @@ impl Tier {
         dirty_slots: &[AtomicU32],
         slot_scans: Option<&SlotScans>,
         cache_non_empty: bool,
-        next_sub: &AtomicUsize,
+        schedule: &PhaseASchedule<'_>,
+        worker_idx: usize,
     ) {
         // SAFETY: Caller upholds disjoint-band shadow invariants.
         unsafe {
@@ -1812,7 +1814,8 @@ impl Tier {
                     dirty_slots,
                     slot_scans,
                     cache_non_empty,
-                    next_sub,
+                    schedule,
+                    worker_idx,
                 );
             } else {
                 super::diff_and_update_worker_with::<Kernel, false>(
@@ -1828,7 +1831,8 @@ impl Tier {
                     dirty_slots,
                     slot_scans,
                     cache_non_empty,
-                    next_sub,
+                    schedule,
+                    worker_idx,
                 );
             }
         }

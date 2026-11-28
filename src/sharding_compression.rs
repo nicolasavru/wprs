@@ -949,10 +949,11 @@ pub(crate) struct CompressorWorkerState {
     jpeg_subsamp: JpegSubsamp,
     pub(crate) jpeg_pixels: Vec<u8>,
     jpeg_out: Vec<u8>,
+    pub(crate) worker_idx: usize,
 }
 
 impl CompressorWorkerState {
-    fn new(compression_level: i32) -> Result<Self> {
+    fn new(worker_idx: usize, compression_level: i32) -> Result<Self> {
         let mut compressor = Compressor::new(compression_level).location(loc!())?;
         if compression_level == 1 {
             // Raising minMatch from Zstd L1's default 6 to 7 avoids short hash
@@ -976,6 +977,7 @@ impl CompressorWorkerState {
             jpeg_subsamp: JpegSubsamp::Sub444,
             jpeg_pixels: Vec::new(),
             jpeg_out: Vec::new(),
+            worker_idx,
         })
     }
 
@@ -1246,8 +1248,11 @@ pub struct ShardingCompressor {
 
 impl ShardingCompressor {
     pub fn new(n_compressors: NonZeroUsize, compression_level: i32) -> Result<Self> {
+        let mut next_worker_idx = 0usize;
         let pool = WorkerPool::new(n_compressors, || {
-            CompressorWorkerState::new(compression_level)
+            let worker_idx = next_worker_idx;
+            next_worker_idx += 1;
+            CompressorWorkerState::new(worker_idx, compression_level)
         })
         .location(loc!())?;
         Ok(Self { pool })
@@ -1283,7 +1288,7 @@ mod tests {
     #[test]
     #[cfg_attr(miri, ignore)]
     fn test_compress_bytes_selects_codec() {
-        let mut state = CompressorWorkerState::new(1).unwrap();
+        let mut state = CompressorWorkerState::new(0, 1).unwrap();
         let mut noise = vec![0u8; TILE_PIXELS];
         let mut prng = 0x9E37_79B9_7F4A_7C15u64;
         for chunk in noise.as_chunks_mut::<8>().0 {
