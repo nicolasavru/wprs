@@ -23,6 +23,10 @@
 //!
 //! Backends (digests are strictly server-local to one [`TileHashKey`] and never
 //! cross the wire):
+//! - `x86_64` 512-bit VAES (`avx512f + avx512bw + avx512vl + vaes + aes`): maps
+//!   the 4 × 128-bit state lanes 1:1 onto a single `__m512i` register using
+//!   `_mm512_aesenc_epi128(_mm512_xor_si512(state, msg), rk)` (`vaesenc zmm`),
+//!   producing bit-identical digests and [`RectScanMeta`] to `x86_aes`.
 //! - `x86_64` AES-NI (`is_x86_feature_detected!("aes")`, `#[target_feature(enable = "aes")]`):
 //!   4-lane `_mm_aesenc_si128(_mm_xor_si128(s_i, m_i), round_key)` with a
 //!   multi-round key-separated AES finalizer.
@@ -107,7 +111,7 @@ impl TileHashResult {
 /// aligned so `30` quadrants across a 4K band fit in `< 2.4 KiB` of L1d).
 ///
 /// Produces bit-identical [`TileHashResult`] to [`hash_rect_from_shadow`] and
-/// [`copy_and_hash_rect_to_shadow`] across all backends (`x86_aes`,
+/// [`copy_and_hash_rect_to_shadow`] across all backends (`x86_vaes`, `x86_aes`,
 /// `aarch64_aes`, `portable`) while keeping `RowBand2D` scanning strictly
 /// linear row-major with zero vertical-stride re-reads.
 #[repr(C, align(16))]
@@ -286,6 +290,90 @@ fn parent_meta(w: u32, h: u32, n_quads: usize) -> (u64, u64) {
 }
 
 #[cfg(all(target_arch = "x86_64", not(miri)))]
+mod x86_detect {
+    #[cfg(not(all(
+        target_feature = "avx512f",
+        target_feature = "avx512bw",
+        target_feature = "avx512vl",
+        target_feature = "vaes",
+    )))]
+    use std::sync::atomic::AtomicU8;
+    #[cfg(not(all(
+        target_feature = "avx512f",
+        target_feature = "avx512bw",
+        target_feature = "avx512vl",
+        target_feature = "vaes",
+    )))]
+    use std::sync::atomic::Ordering;
+
+    #[cfg(not(all(
+        target_feature = "avx512f",
+        target_feature = "avx512bw",
+        target_feature = "avx512vl",
+        target_feature = "vaes",
+    )))]
+    const TIER_PORTABLE: u8 = 1;
+    pub(super) const TIER_AES: u8 = 2;
+    pub(super) const TIER_VAES512: u8 = 3;
+
+    #[cfg(not(all(
+        target_feature = "avx512f",
+        target_feature = "avx512bw",
+        target_feature = "avx512vl",
+        target_feature = "vaes",
+    )))]
+    static CACHED_TIER: AtomicU8 = AtomicU8::new(0);
+
+    #[cfg(not(all(
+        target_feature = "avx512f",
+        target_feature = "avx512bw",
+        target_feature = "avx512vl",
+        target_feature = "vaes",
+    )))]
+    #[cold]
+    #[inline(never)]
+    fn detect_uncached() -> u8 {
+        let tier = if std::arch::is_x86_feature_detected!("avx512f")
+            && std::arch::is_x86_feature_detected!("avx512bw")
+            && std::arch::is_x86_feature_detected!("avx512vl")
+            && std::arch::is_x86_feature_detected!("vaes")
+            && std::arch::is_x86_feature_detected!("aes")
+        {
+            TIER_VAES512
+        } else if std::arch::is_x86_feature_detected!("aes") {
+            TIER_AES
+        } else {
+            TIER_PORTABLE
+        };
+        CACHED_TIER.store(tier, Ordering::Relaxed);
+        tier
+    }
+
+    #[inline(always)]
+    pub(super) fn detect_tier() -> u8 {
+        #[cfg(all(
+            target_feature = "avx512f",
+            target_feature = "avx512bw",
+            target_feature = "avx512vl",
+            target_feature = "vaes",
+        ))]
+        {
+            TIER_VAES512
+        }
+        #[cfg(not(all(
+            target_feature = "avx512f",
+            target_feature = "avx512bw",
+            target_feature = "avx512vl",
+            target_feature = "vaes",
+        )))]
+        {
+            let t = CACHED_TIER.load(Ordering::Relaxed);
+            if t != 0 { t } else { detect_uncached() }
+        }
+    }
+}
+
+#[cfg(all(target_arch = "x86_64", not(miri)))]
 #[inline(always)]
 pub(crate) fn has_hw_aes() -> bool {
     #[cfg(target_feature = "aes")]
@@ -294,8 +382,14 @@ pub(crate) fn has_hw_aes() -> bool {
     }
     #[cfg(not(target_feature = "aes"))]
     {
-        std::arch::is_x86_feature_detected!("aes")
+        x86_detect::detect_tier() >= x86_detect::TIER_AES
     }
+}
+
+#[cfg(all(target_arch = "x86_64", not(miri)))]
+#[inline(always)]
+pub(crate) fn has_hw_vaes() -> bool {
+    x86_detect::detect_tier() == x86_detect::TIER_VAES512
 }
 
 #[cfg(all(target_arch = "aarch64", not(miri)))]
@@ -1761,6 +1855,1283 @@ pub(crate) mod x86_aes {
             *lane = _mm_aesenc_si128(_mm_xor_si128(*lane, q), rk);
         }
         finalize(key, lanes, meta)
+    }
+}
+
+/// 512-bit VAES (`avx512f + avx512bw + avx512vl + vaes + aes`) backend mapping
+/// the 4 × 128-bit state lanes `[s0, s1, s2, s3]` 1:1 onto a single `__m512i`
+/// register so each 64-byte pixel block executes in one `vaesenc zmm` round,
+/// producing bit-identical digests and [`RectScanMeta`] to [`x86_aes`].
+#[cfg(all(target_arch = "x86_64", not(miri)))]
+pub(crate) mod x86_vaes {
+    use std::arch::x86_64::__m128i;
+    use std::arch::x86_64::__m512i;
+    use std::arch::x86_64::_mm_aesenc_si128;
+    use std::arch::x86_64::_mm_loadu_si128;
+    use std::arch::x86_64::_mm_set_epi64x;
+    use std::arch::x86_64::_mm_storeu_si128;
+    use std::arch::x86_64::_mm_xor_si128;
+    use std::arch::x86_64::_mm512_aesenc_epi128;
+    use std::arch::x86_64::_mm512_and_si512;
+    use std::arch::x86_64::_mm512_andnot_si512;
+    use std::arch::x86_64::_mm512_broadcast_i32x4;
+    use std::arch::x86_64::_mm512_castsi512_si128;
+    use std::arch::x86_64::_mm512_extracti32x4_epi32;
+    use std::arch::x86_64::_mm512_loadu_si512;
+    use std::arch::x86_64::_mm512_mask_and_epi32;
+    use std::arch::x86_64::_mm512_mask_blend_epi32;
+    use std::arch::x86_64::_mm512_mask_storeu_epi32;
+    use std::arch::x86_64::_mm512_maskz_loadu_epi32;
+    use std::arch::x86_64::_mm512_maskz_xor_epi32;
+    use std::arch::x86_64::_mm512_or_si512;
+    use std::arch::x86_64::_mm512_permutexvar_epi32;
+    use std::arch::x86_64::_mm512_set1_epi32;
+    use std::arch::x86_64::_mm512_setzero_si512;
+    use std::arch::x86_64::_mm512_storeu_si512;
+    use std::arch::x86_64::_mm512_test_epi32_mask;
+    use std::arch::x86_64::_mm512_xor_si512;
+    use std::mem::MaybeUninit;
+    use std::ptr;
+
+    use super::BandRowAction;
+    use super::RectScanMeta;
+    use super::RowTileHasher;
+    use super::SUBTILE_W;
+    use super::SlotScans;
+    use super::TileHash;
+    use super::TileHashKey;
+    use super::TileHashResult;
+    use super::XRGB_ALPHA_MASK_U32;
+    use super::leaf_meta;
+    use super::parent_meta;
+    use super::probe_three_pixels;
+    use crate::serialization::framing::TileRect;
+
+    #[repr(C, align(64))]
+    struct AlignedTailPerms([[i32; 16]; 4]);
+
+    /// `vpermd` lane routing for `< 64 B` row tails (`rem = 4..=60`), indexed
+    /// by `full16 = rem >> 4` (`0..=3`). Preserves full 128-bit lanes
+    /// `0..full16` in place and routes lane `full16` (holding any `4/8/12 B`
+    /// zero-padded sub-16B tail) into lane `3`, matching [`super::x86_aes`]
+    /// lane-for-lane under `lane_mask`.
+    const TAIL_LANE_PERM: AlignedTailPerms = AlignedTailPerms([
+        [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 0, 1, 2, 3],
+        [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 4, 5, 6, 7],
+        [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 8, 9, 10, 11],
+        [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15],
+    ]);
+
+    #[inline]
+    #[target_feature(enable = "avx512f,avx512bw,avx512vl,vaes")]
+    pub(crate) fn load_round_key(key: &TileHashKey) -> __m512i {
+        // SAFETY: `key.round_key` is `[u64; 2]` (16 readable initialized bytes).
+        unsafe { _mm512_broadcast_i32x4(_mm_loadu_si128(key.round_key.as_ptr().cast::<__m128i>())) }
+    }
+
+    #[inline]
+    #[target_feature(enable = "avx512f,avx512bw,avx512vl,vaes")]
+    pub(crate) fn init_state(key: &TileHashKey, meta_lo: u64, meta_hi: u64) -> (__m512i, __m128i) {
+        let meta = _mm_set_epi64x(meta_hi as i64, meta_lo as i64);
+        // SAFETY: `key.iv` is `[[u64; 2]; 4]` (64 readable initialized bytes).
+        let iv = unsafe { _mm512_loadu_si512(key.iv.as_ptr().cast()) };
+        let state = _mm512_xor_si512(iv, _mm512_broadcast_i32x4(meta));
+        (state, meta)
+    }
+
+    #[inline]
+    #[target_feature(enable = "avx512f,avx512bw,avx512vl,vaes")]
+    pub(crate) fn finalize(key: &TileHashKey, state: __m512i, meta: __m128i) -> TileHash {
+        // SAFETY: `key.final_keys` is `[[u64; 2]; 6]` (96 readable initialized bytes).
+        let fk03 = unsafe { _mm512_loadu_si512(key.final_keys.as_ptr().cast()) };
+        // Separate all 4 lanes with distinct keys in one 512-bit `vaesenc`.
+        let sep = _mm512_aesenc_epi128(state, fk03);
+        let s0 = _mm512_castsi512_si128(sep);
+        let s1 = _mm512_extracti32x4_epi32::<1>(sep);
+        let s2 = _mm512_extracti32x4_epi32::<2>(sep);
+        let s3 = _mm512_extracti32x4_epi32::<3>(sep);
+
+        // SAFETY: `key.final_keys[0..6]` are each 16 readable initialized bytes.
+        let (fk0, fk1, fk2, fk3, fk4, fk5) = unsafe {
+            (
+                _mm_loadu_si128(key.final_keys[0].as_ptr().cast::<__m128i>()),
+                _mm_loadu_si128(key.final_keys[1].as_ptr().cast::<__m128i>()),
+                _mm_loadu_si128(key.final_keys[2].as_ptr().cast::<__m128i>()),
+                _mm_loadu_si128(key.final_keys[3].as_ptr().cast::<__m128i>()),
+                _mm_loadu_si128(key.final_keys[4].as_ptr().cast::<__m128i>()),
+                _mm_loadu_si128(key.final_keys[5].as_ptr().cast::<__m128i>()),
+            )
+        };
+
+        let t0 = _mm_aesenc_si128(_mm_xor_si128(s0, s1), fk4);
+        let t1 = _mm_aesenc_si128(_mm_xor_si128(s2, s3), fk5);
+
+        let mut h = _mm_xor_si128(_mm_xor_si128(t0, t1), meta);
+        h = _mm_aesenc_si128(h, fk0);
+        h = _mm_aesenc_si128(h, fk1);
+        h = _mm_aesenc_si128(h, fk2);
+        h = _mm_aesenc_si128(h, fk3);
+        h = _mm_aesenc_si128(h, fk4);
+        h = _mm_aesenc_si128(h, fk5);
+
+        let mut out = [0u8; 16];
+        // SAFETY: `out` is 16 writable bytes.
+        unsafe { _mm_storeu_si128(out.as_mut_ptr().cast::<__m128i>(), h) };
+        out
+    }
+
+    #[inline]
+    #[target_feature(enable = "avx512f,avx512bw,avx512vl,vaes")]
+    pub(crate) fn zmm_all_opaque(aand: __m512i) -> bool {
+        let missing = _mm512_andnot_si512(aand, _mm512_set1_epi32(XRGB_ALPHA_MASK_U32 as i32));
+        _mm512_test_epi32_mask(missing, missing) == 0
+    }
+
+    /// Absorbs one row (`full64 + rem` bytes, `rem < 64` and a multiple of 4)
+    /// into 512-bit `state` using 1× `vaesenc zmm` per 64 B chunk and a
+    /// branchless masked ZMM tail that matches [`super::x86_aes::absorb_row`]
+    /// bit-for-bit across all widths.
+    ///
+    /// # Safety
+    /// `src_row` must be readable for `full64 + rem` bytes. When `COPY` is
+    /// `true`, `dst_row` must be writable for `full64 + rem` bytes and disjoint
+    /// from `src_row`.
+    #[inline]
+    #[target_feature(enable = "avx512f,avx512bw,avx512vl,vaes")]
+    pub(crate) unsafe fn absorb_row<
+        const HAS_ALPHA: bool,
+        const COPY: bool,
+        const TRACK_SOLID: bool,
+        const TRACK_OPAQUE: bool,
+    >(
+        src_row: *const u8,
+        dst_row: *mut u8,
+        full64: usize,
+        rem: usize,
+        rk: __m512i,
+        alpha_mask: __m512i,
+        first_px: __m512i,
+        state: &mut __m512i,
+        dacc: &mut __m512i,
+        aand: &mut __m512i,
+    ) {
+        let mut cur_state = *state;
+        let mut cur_dacc = *dacc;
+        let mut cur_aand = *aand;
+
+        let mut off = 0usize;
+        while off < full64 {
+            // SAFETY: `off + 64 <= full64`, within caller-validated row bounds.
+            let r = unsafe {
+                let v = _mm512_loadu_si512(src_row.add(off).cast());
+                if COPY {
+                    _mm512_storeu_si512(dst_row.add(off).cast(), v);
+                }
+                v
+            };
+            let m = if HAS_ALPHA {
+                r
+            } else {
+                _mm512_or_si512(r, alpha_mask)
+            };
+            if TRACK_SOLID {
+                cur_dacc = _mm512_or_si512(cur_dacc, _mm512_xor_si512(m, first_px));
+            }
+            if TRACK_OPAQUE {
+                cur_aand = _mm512_and_si512(cur_aand, m);
+            }
+            cur_state = _mm512_aesenc_epi128(_mm512_xor_si512(cur_state, m), rk);
+            off += 64;
+        }
+
+        if rem != 0 {
+            debug_assert!(rem < 64 && rem.is_multiple_of(4));
+            let px_mask = ((1u32 << ((rem >> 2) & 15)) - 1) as u16;
+            // SAFETY: `off + rem == full64 + rem`; masked dword load/store
+            // suppresses faults and accesses strictly `rem` bytes.
+            let r = unsafe {
+                let v = _mm512_maskz_loadu_epi32(px_mask, src_row.add(off).cast());
+                if COPY {
+                    _mm512_mask_storeu_epi32(dst_row.add(off).cast(), px_mask, v);
+                }
+                v
+            };
+            let m = if HAS_ALPHA {
+                r
+            } else {
+                _mm512_or_si512(r, alpha_mask)
+            };
+            if TRACK_SOLID {
+                cur_dacc = _mm512_or_si512(cur_dacc, _mm512_maskz_xor_epi32(px_mask, m, first_px));
+            }
+            if TRACK_OPAQUE {
+                cur_aand = _mm512_mask_and_epi32(cur_aand, px_mask, cur_aand, m);
+            }
+            let full16 = (rem >> 4) & 3;
+            let has_sub16 = (rem & 15) != 0;
+            let lane_mask =
+                (((1u32 << (full16 * 4)) - 1) as u16) | if has_sub16 { 0xF000 } else { 0 };
+            // SAFETY: `full16 <= 3`; each entry is 64 readable bytes.
+            let perm = unsafe { _mm512_loadu_si512(TAIL_LANE_PERM.0[full16].as_ptr().cast()) };
+            let tail_msg = _mm512_permutexvar_epi32(perm, m);
+            let next = _mm512_aesenc_epi128(_mm512_xor_si512(cur_state, tail_msg), rk);
+            cur_state = _mm512_mask_blend_epi32(lane_mask, cur_state, next);
+        }
+
+        *state = cur_state;
+        if TRACK_SOLID {
+            *dacc = cur_dacc;
+        }
+        if TRACK_OPAQUE {
+            *aand = cur_aand;
+        }
+    }
+
+    #[cold]
+    #[inline(never)]
+    #[target_feature(enable = "avx512f,avx512bw,avx512vl,vaes")]
+    fn empty_rect_result(key: &TileHashKey, rect: TileRect) -> TileHashResult {
+        let (meta_lo, meta_hi) = leaf_meta(rect.w, rect.h);
+        let (state, meta) = init_state(key, meta_lo, meta_hi);
+        TileHashResult {
+            hash: finalize(key, state, meta),
+            meta: RectScanMeta::EMPTY,
+        }
+    }
+
+    macro_rules! x86_vaes_absorb_rows_fast {
+        (
+            $src_start:expr, $dst_start:expr, $n_rows:expr, $stride:expr,
+            $full64:expr, $rem:expr, $has_alpha:expr, $copy:expr,
+            $rk:expr, $alpha_mask:expr, $state:expr, $still_opaque:expr
+        ) => {{
+            let mut src_ptr: *const u8 = $src_start;
+            let mut dst_ptr: *mut u8 = $dst_start;
+            let n_rows: usize = $n_rows;
+            let mut dummy_dacc = _mm512_setzero_si512();
+            let zero_px = _mm512_setzero_si512();
+            let row_bytes = $full64 + $rem;
+            let pf_rows = $copy
+                && $stride > row_bytes
+                && $stride >= crate::filtering::prefetch::MIN_PAGE_STRIDE_BYTES;
+            if $has_alpha && $still_opaque {
+                let mut aand = _mm512_set1_epi32(-1);
+                for ry in 0..n_rows {
+                    if pf_rows && ry + crate::filtering::prefetch::COLD_FILL_ROW_LOOKAHEAD < n_rows
+                    {
+                        crate::filtering::prefetch::row_nta(
+                            src_ptr
+                                .add(crate::filtering::prefetch::COLD_FILL_ROW_LOOKAHEAD * $stride),
+                            row_bytes,
+                        );
+                    }
+                    absorb_row::<true, $copy, false, true>(
+                        src_ptr,
+                        dst_ptr,
+                        $full64,
+                        $rem,
+                        $rk,
+                        $alpha_mask,
+                        zero_px,
+                        $state,
+                        &mut dummy_dacc,
+                        &mut aand,
+                    );
+                    src_ptr = src_ptr.add($stride);
+                    if $copy {
+                        dst_ptr = dst_ptr.add($stride);
+                    }
+                }
+                zmm_all_opaque(aand)
+            } else {
+                let mut dummy_aand = _mm512_setzero_si512();
+                for ry in 0..n_rows {
+                    if pf_rows && ry + crate::filtering::prefetch::COLD_FILL_ROW_LOOKAHEAD < n_rows
+                    {
+                        crate::filtering::prefetch::row_nta(
+                            src_ptr
+                                .add(crate::filtering::prefetch::COLD_FILL_ROW_LOOKAHEAD * $stride),
+                            row_bytes,
+                        );
+                    }
+                    absorb_row::<$has_alpha, $copy, false, false>(
+                        src_ptr,
+                        dst_ptr,
+                        $full64,
+                        $rem,
+                        $rk,
+                        $alpha_mask,
+                        zero_px,
+                        $state,
+                        &mut dummy_dacc,
+                        &mut dummy_aand,
+                    );
+                    src_ptr = src_ptr.add($stride);
+                    if $copy {
+                        dst_ptr = dst_ptr.add($stride);
+                    }
+                }
+                !$has_alpha
+            }
+        }};
+    }
+
+    macro_rules! x86_vaes_absorb_rows_solid_then_fast {
+        (
+            $src_start:expr, $dst_start:expr, $n_rows:expr, $stride:expr,
+            $full64:expr, $rem:expr, $has_alpha:expr, $copy:expr,
+            $rk:expr, $alpha_mask:expr, $first_word:expr, $state:expr,
+            $still_opaque_in:expr
+        ) => {{
+            let mut src_ptr: *const u8 = $src_start;
+            let mut dst_ptr: *mut u8 = $dst_start;
+            let n_rows: usize = $n_rows;
+            let first_word: u32 = $first_word;
+            let first_px = _mm512_set1_epi32(first_word as i32);
+            let mut dacc = _mm512_setzero_si512();
+            let mut aand = _mm512_set1_epi32(-1);
+            let mut ry = 0usize;
+            let mut still_solid = true;
+            let mut still_opaque: bool = $still_opaque_in;
+            while ry < n_rows {
+                absorb_row::<$has_alpha, $copy, true, $has_alpha>(
+                    src_ptr,
+                    dst_ptr,
+                    $full64,
+                    $rem,
+                    $rk,
+                    $alpha_mask,
+                    first_px,
+                    $state,
+                    &mut dacc,
+                    &mut aand,
+                );
+                src_ptr = src_ptr.add($stride);
+                if $copy {
+                    dst_ptr = dst_ptr.add($stride);
+                }
+                ry += 1;
+                if _mm512_test_epi32_mask(dacc, dacc) != 0 {
+                    still_solid = false;
+                    if $has_alpha && still_opaque {
+                        still_opaque = zmm_all_opaque(aand);
+                    }
+                    break;
+                }
+            }
+            if ry < n_rows {
+                still_opaque = x86_vaes_absorb_rows_fast!(
+                    src_ptr,
+                    dst_ptr,
+                    n_rows - ry,
+                    $stride,
+                    $full64,
+                    $rem,
+                    $has_alpha,
+                    $copy,
+                    $rk,
+                    $alpha_mask,
+                    $state,
+                    still_opaque
+                );
+            }
+            (still_solid, !$has_alpha || still_opaque)
+        }};
+    }
+
+    #[inline(never)]
+    #[target_feature(enable = "avx512f,avx512bw,avx512vl,vaes")]
+    unsafe fn hash_rect_solid_candidate<const HAS_ALPHA: bool>(
+        key: &TileHashKey,
+        row_ptr: *const u8,
+        stride: usize,
+        w_h: u64,
+        first_word: u32,
+    ) -> TileHashResult {
+        let w = (w_h >> 32) as u32;
+        let h = w_h as u32;
+        let (meta_lo, meta_hi) = leaf_meta(w, h);
+        let (mut state, meta) = init_state(key, meta_lo, meta_hi);
+        let row_bytes = w as usize * 4;
+        let th = h as usize;
+        let rk = load_round_key(key);
+        let alpha_mask = _mm512_set1_epi32(XRGB_ALPHA_MASK_U32 as i32);
+        let full64 = row_bytes & !63;
+        let rem = row_bytes & 63;
+        let still_opaque = !HAS_ALPHA || (first_word & XRGB_ALPHA_MASK_U32) == XRGB_ALPHA_MASK_U32;
+        // SAFETY: Caller guarantees `row_ptr` is readable for `th` rows of `row_bytes`.
+        let (still_solid, all_opaque) = unsafe {
+            x86_vaes_absorb_rows_solid_then_fast!(
+                row_ptr,
+                ptr::null_mut(),
+                th,
+                stride,
+                full64,
+                rem,
+                HAS_ALPHA,
+                false,
+                rk,
+                alpha_mask,
+                first_word,
+                &mut state,
+                still_opaque
+            )
+        };
+        TileHashResult {
+            hash: finalize(key, state, meta),
+            meta: RectScanMeta {
+                solid_px: still_solid.then(|| first_word.to_ne_bytes()),
+                all_opaque,
+            },
+        }
+    }
+
+    #[inline(never)]
+    #[target_feature(enable = "avx512f,avx512bw,avx512vl,vaes")]
+    unsafe fn copy_and_hash_solid_candidate<const HAS_ALPHA: bool>(
+        key: &TileHashKey,
+        src_ptr: *const u8,
+        sh_ptr: *mut u8,
+        stride: usize,
+        w_h: u64,
+    ) -> TileHashResult {
+        let w = (w_h >> 32) as u32;
+        let h = w_h as u32;
+        let (meta_lo, meta_hi) = leaf_meta(w, h);
+        let (mut state, meta) = init_state(key, meta_lo, meta_hi);
+        let row_bytes = w as usize * 4;
+        let th = h as usize;
+        let rk = load_round_key(key);
+        let alpha_mask = _mm512_set1_epi32(XRGB_ALPHA_MASK_U32 as i32);
+        let full64 = row_bytes & !63;
+        let rem = row_bytes & 63;
+        // SAFETY: Caller guarantees `src_ptr` is readable for `th > 0` rows of `w > 0` pixels.
+        let first_raw = unsafe { src_ptr.cast::<u32>().read_unaligned() };
+        let first_word = if HAS_ALPHA {
+            first_raw
+        } else {
+            first_raw | XRGB_ALPHA_MASK_U32
+        };
+        let still_opaque = !HAS_ALPHA || (first_word & XRGB_ALPHA_MASK_U32) == XRGB_ALPHA_MASK_U32;
+        // SAFETY: Caller guarantees `src_ptr` readable and `sh_ptr` writable for `th` rows.
+        let (still_solid, all_opaque) = unsafe {
+            x86_vaes_absorb_rows_solid_then_fast!(
+                src_ptr,
+                sh_ptr,
+                th,
+                stride,
+                full64,
+                rem,
+                HAS_ALPHA,
+                true,
+                rk,
+                alpha_mask,
+                first_word,
+                &mut state,
+                still_opaque
+            )
+        };
+        TileHashResult {
+            hash: finalize(key, state, meta),
+            meta: RectScanMeta {
+                solid_px: still_solid.then(|| first_word.to_ne_bytes()),
+                all_opaque,
+            },
+        }
+    }
+
+    #[inline(never)]
+    #[target_feature(enable = "avx512f,avx512bw,avx512vl,vaes")]
+    unsafe fn copy_and_hash_with_overlap_solid_candidate<const HAS_ALPHA: bool>(
+        key: &TileHashKey,
+        src_base: *const u8,
+        shadow_base: *mut u8,
+        stride: usize,
+        rect: TileRect,
+        copy_from_ry: usize,
+    ) -> TileHashResult {
+        let tw = rect.w as usize;
+        let th = rect.h as usize;
+        let row_bytes = tw * 4;
+        let x_bytes = rect.x as usize * 4;
+        let y0 = rect.y as usize;
+        let base_off = y0 * stride + x_bytes;
+        // SAFETY: Caller guarantees `copy_from_ry > 0`, `th > 0 && tw > 0`,
+        // `shadow_base` initialized for rows `0..copy_from_ry`, and `src_base`
+        // readable / `shadow_base` writable for rows `copy_from_ry..th`.
+        let src_ptr_base = unsafe { src_base.add(base_off) };
+        let sh_ptr = unsafe { shadow_base.add(base_off) };
+        let first_raw = unsafe { sh_ptr.cast_const().cast::<u32>().read_unaligned() };
+        let first_word = if HAS_ALPHA {
+            first_raw
+        } else {
+            first_raw | XRGB_ALPHA_MASK_U32
+        };
+        let (meta_lo, meta_hi) = leaf_meta(rect.w, rect.h);
+        let (mut state, meta) = init_state(key, meta_lo, meta_hi);
+        let rk = load_round_key(key);
+        let alpha_mask = _mm512_set1_epi32(XRGB_ALPHA_MASK_U32 as i32);
+        let full64 = row_bytes & !63;
+        let rem = row_bytes & 63;
+        let still_opaque = !HAS_ALPHA || (first_word & XRGB_ALPHA_MASK_U32) == XRGB_ALPHA_MASK_U32;
+
+        // SAFETY: Caller guarantees `sh_ptr` is initialized and readable for `0..copy_from_ry`.
+        let (mut still_solid, mut all_opaque) = unsafe {
+            x86_vaes_absorb_rows_solid_then_fast!(
+                sh_ptr.cast_const(),
+                ptr::null_mut(),
+                copy_from_ry,
+                stride,
+                full64,
+                rem,
+                HAS_ALPHA,
+                false,
+                rk,
+                alpha_mask,
+                first_word,
+                &mut state,
+                still_opaque
+            )
+        };
+
+        if copy_from_ry < th {
+            // SAFETY: Caller guarantees `src_ptr_base` readable and `sh_ptr` writable
+            // for rows `copy_from_ry..th`.
+            let src_ptr = unsafe { src_ptr_base.add(copy_from_ry * stride) };
+            let dst_ptr = unsafe { sh_ptr.add(copy_from_ry * stride) };
+            let rem_rows = th - copy_from_ry;
+            if still_solid {
+                (still_solid, all_opaque) = unsafe {
+                    x86_vaes_absorb_rows_solid_then_fast!(
+                        src_ptr, dst_ptr, rem_rows, stride, full64, rem, HAS_ALPHA, true, rk,
+                        alpha_mask, first_word, &mut state, all_opaque
+                    )
+                };
+            } else {
+                all_opaque = unsafe {
+                    x86_vaes_absorb_rows_fast!(
+                        src_ptr, dst_ptr, rem_rows, stride, full64, rem, HAS_ALPHA, true, rk,
+                        alpha_mask, &mut state, all_opaque
+                    )
+                };
+            }
+        }
+
+        TileHashResult {
+            hash: finalize(key, state, meta),
+            meta: RectScanMeta {
+                solid_px: still_solid.then(|| first_word.to_ne_bytes()),
+                all_opaque,
+            },
+        }
+    }
+
+    #[inline(never)]
+    #[target_feature(enable = "avx512f,avx512bw,avx512vl,vaes")]
+    unsafe fn copy_and_hash_with_overlap<const HAS_ALPHA: bool>(
+        key: &TileHashKey,
+        src_base: *const u8,
+        shadow_base: *mut u8,
+        stride: usize,
+        rect: TileRect,
+        copy_from_ry: usize,
+    ) -> TileHashResult {
+        let tw = rect.w as usize;
+        let th = rect.h as usize;
+        let row_bytes = tw * 4;
+        let x_bytes = rect.x as usize * 4;
+        let y0 = rect.y as usize;
+        let base_off = y0 * stride + x_bytes;
+        // SAFETY: Caller guarantees `copy_from_ry > 0`, `shadow_base` rows
+        // `0..copy_from_ry` are initialized and readable, and `src_base` rows
+        // `copy_from_ry..th` are readable, with `th > 0 && tw > 0`.
+        let src_ptr_base = unsafe { src_base.add(base_off) };
+        let sh_ptr = unsafe { shadow_base.add(base_off) };
+        let read_probe = |ry: usize, rx: usize| -> u32 {
+            let off = ry * stride + rx * 4;
+            unsafe {
+                let p = if ry < copy_from_ry {
+                    sh_ptr.cast_const().add(off)
+                } else {
+                    src_ptr_base.add(off)
+                };
+                p.cast::<u32>().read_unaligned()
+            }
+        };
+        let first_raw = unsafe { sh_ptr.cast_const().cast::<u32>().read_unaligned() };
+        let mid_raw = read_probe(th >> 1, tw >> 1);
+        let (_, still_solid, still_opaque) =
+            probe_three_pixels::<HAS_ALPHA>(first_raw, mid_raw, || read_probe(th - 1, tw - 1));
+        if still_solid {
+            // SAFETY: Bounds and exclusivity invariants forwarded from caller.
+            return unsafe {
+                copy_and_hash_with_overlap_solid_candidate::<HAS_ALPHA>(
+                    key,
+                    src_base,
+                    shadow_base,
+                    stride,
+                    rect,
+                    copy_from_ry,
+                )
+            };
+        }
+
+        let (meta_lo, meta_hi) = leaf_meta(rect.w, rect.h);
+        let (mut state, meta) = init_state(key, meta_lo, meta_hi);
+        let rk = load_round_key(key);
+        let alpha_mask = _mm512_set1_epi32(XRGB_ALPHA_MASK_U32 as i32);
+        let full64 = row_bytes & !63;
+        let rem = row_bytes & 63;
+
+        // SAFETY: `sh_ptr` is initialized and readable for `copy_from_ry` rows.
+        let mut all_opaque = unsafe {
+            x86_vaes_absorb_rows_fast!(
+                sh_ptr.cast_const(),
+                ptr::null_mut(),
+                copy_from_ry,
+                stride,
+                full64,
+                rem,
+                HAS_ALPHA,
+                false,
+                rk,
+                alpha_mask,
+                &mut state,
+                still_opaque
+            )
+        };
+        if copy_from_ry < th {
+            // SAFETY: Caller validated `src_base` bounds and exclusive
+            // `shadow_base` write access for rows `copy_from_ry..th`.
+            all_opaque = unsafe {
+                x86_vaes_absorb_rows_fast!(
+                    src_ptr_base.add(copy_from_ry * stride),
+                    sh_ptr.add(copy_from_ry * stride),
+                    th - copy_from_ry,
+                    stride,
+                    full64,
+                    rem,
+                    HAS_ALPHA,
+                    true,
+                    rk,
+                    alpha_mask,
+                    &mut state,
+                    all_opaque
+                )
+            };
+        }
+        TileHashResult {
+            hash: finalize(key, state, meta),
+            meta: RectScanMeta {
+                solid_px: None,
+                all_opaque,
+            },
+        }
+    }
+
+    /// # Safety
+    /// Caller must verify CPU `avx512f + avx512bw + avx512vl + vaes + aes`
+    /// support and uphold [`super::hash_rect_from_shadow`] bounds invariants.
+    #[target_feature(enable = "avx512f,avx512bw,avx512vl,vaes")]
+    pub(super) unsafe fn hash_rect_raw<const HAS_ALPHA: bool>(
+        key: &TileHashKey,
+        base: *const u8,
+        stride: usize,
+        rect: TileRect,
+    ) -> TileHashResult {
+        let tw = rect.w as usize;
+        let th = rect.h as usize;
+        let row_bytes = tw * 4;
+        if th == 0 || row_bytes == 0 {
+            return empty_rect_result(key, rect);
+        }
+        let x_bytes = rect.x as usize * 4;
+        let y0 = rect.y as usize;
+        // SAFETY: Caller guarantees `(y0 + ry, x_bytes..x_bytes + row_bytes)` is readable
+        // and `th > 0 && tw > 0`, so `(0, 0)`, `(tw/2, th/2)`, and `(tw-1, th-1)` are in-bounds.
+        let row_ptr = unsafe { base.add(y0 * stride + x_bytes) };
+        let (first_raw, mid_raw) = unsafe {
+            (
+                row_ptr.cast::<u32>().read_unaligned(),
+                row_ptr
+                    .add((th >> 1) * stride + (tw >> 1) * 4)
+                    .cast::<u32>()
+                    .read_unaligned(),
+            )
+        };
+        let (first_word, still_solid, still_opaque) =
+            probe_three_pixels::<HAS_ALPHA>(first_raw, mid_raw, || unsafe {
+                row_ptr
+                    .add((th - 1) * stride + (tw - 1) * 4)
+                    .cast::<u32>()
+                    .read_unaligned()
+            });
+        let w_h = (u64::from(rect.w) << 32) | u64::from(rect.h);
+        if still_solid {
+            // SAFETY: `row_ptr` is readable for `th` rows of `row_bytes`.
+            return unsafe {
+                hash_rect_solid_candidate::<HAS_ALPHA>(key, row_ptr, stride, w_h, first_word)
+            };
+        }
+
+        let (meta_lo, meta_hi) = leaf_meta(rect.w, rect.h);
+        let (mut state, meta) = init_state(key, meta_lo, meta_hi);
+        let rk = load_round_key(key);
+        let alpha_mask = _mm512_set1_epi32(XRGB_ALPHA_MASK_U32 as i32);
+        let full64 = row_bytes & !63;
+        let rem = row_bytes & 63;
+        // SAFETY: `row_ptr` is readable for `th` rows of `full64 + rem` bytes.
+        let all_opaque = unsafe {
+            x86_vaes_absorb_rows_fast!(
+                row_ptr,
+                ptr::null_mut(),
+                th,
+                stride,
+                full64,
+                rem,
+                HAS_ALPHA,
+                false,
+                rk,
+                alpha_mask,
+                &mut state,
+                still_opaque
+            )
+        };
+        TileHashResult {
+            hash: finalize(key, state, meta),
+            meta: RectScanMeta {
+                solid_px: None,
+                all_opaque,
+            },
+        }
+    }
+
+    /// # Safety
+    /// Caller must verify CPU `avx512f + avx512bw + avx512vl + vaes + aes`
+    /// support and uphold [`super::copy_and_hash_rect_to_shadow`] bounds and
+    /// exclusivity invariants.
+    #[target_feature(enable = "avx512f,avx512bw,avx512vl,vaes")]
+    pub(super) unsafe fn copy_and_hash_rect_to_shadow<const HAS_ALPHA: bool>(
+        key: &TileHashKey,
+        src_base: *const u8,
+        shadow_base: *mut u8,
+        stride: usize,
+        rect: TileRect,
+        copy_from_ry: usize,
+    ) -> TileHashResult {
+        let tw = rect.w as usize;
+        let th = rect.h as usize;
+        let row_bytes = tw * 4;
+        if th == 0 || row_bytes == 0 {
+            return empty_rect_result(key, rect);
+        }
+        if copy_from_ry > 0 {
+            // SAFETY: Bounds and exclusivity invariants forwarded from caller.
+            return unsafe {
+                copy_and_hash_with_overlap::<HAS_ALPHA>(
+                    key,
+                    src_base,
+                    shadow_base,
+                    stride,
+                    rect,
+                    copy_from_ry,
+                )
+            };
+        }
+        let x_bytes = rect.x as usize * 4;
+        let y0 = rect.y as usize;
+        let base_off = y0 * stride + x_bytes;
+
+        // SAFETY: `copy_from_ry == 0` and `th > 0 && tw > 0`, so `src_base` is
+        // readable and `shadow_base` is exclusively writable for all `th` rows.
+        let src_ptr = unsafe { src_base.add(base_off) };
+        let sh_ptr = unsafe { shadow_base.add(base_off) };
+        let (first_raw, mid_raw) = unsafe {
+            (
+                src_ptr.cast::<u32>().read_unaligned(),
+                src_ptr
+                    .add((th >> 1) * stride + (tw >> 1) * 4)
+                    .cast::<u32>()
+                    .read_unaligned(),
+            )
+        };
+        let (_, still_solid, still_opaque) =
+            probe_three_pixels::<HAS_ALPHA>(first_raw, mid_raw, || unsafe {
+                src_ptr
+                    .add((th - 1) * stride + (tw - 1) * 4)
+                    .cast::<u32>()
+                    .read_unaligned()
+            });
+        let w_h = (u64::from(rect.w) << 32) | u64::from(rect.h);
+        if still_solid {
+            // SAFETY: `src_ptr` readable and `sh_ptr` writable for `th` rows.
+            return unsafe {
+                copy_and_hash_solid_candidate::<HAS_ALPHA>(key, src_ptr, sh_ptr, stride, w_h)
+            };
+        }
+
+        let (meta_lo, meta_hi) = leaf_meta(rect.w, rect.h);
+        let (mut state, meta) = init_state(key, meta_lo, meta_hi);
+        let rk = load_round_key(key);
+        let alpha_mask = _mm512_set1_epi32(XRGB_ALPHA_MASK_U32 as i32);
+        let full64 = row_bytes & !63;
+        let rem = row_bytes & 63;
+
+        // SAFETY: Caller validated `src_base` bounds and exclusive `shadow_base`
+        // write access for all `th` rows.
+        let all_opaque = unsafe {
+            x86_vaes_absorb_rows_fast!(
+                src_ptr,
+                sh_ptr,
+                th,
+                stride,
+                full64,
+                rem,
+                HAS_ALPHA,
+                true,
+                rk,
+                alpha_mask,
+                &mut state,
+                still_opaque
+            )
+        };
+        TileHashResult {
+            hash: finalize(key, state, meta),
+            meta: RectScanMeta {
+                solid_px: None,
+                all_opaque,
+            },
+        }
+    }
+
+    #[inline]
+    #[target_feature(enable = "avx512f,avx512bw,avx512vl,vaes")]
+    pub(crate) unsafe fn load_hasher_state(h: &RowTileHasher) -> __m512i {
+        // SAFETY: `h.lanes` is `[[u64; 2]; 4]` (64 readable bytes, 16-byte aligned).
+        unsafe { _mm512_loadu_si512(h.lanes.as_ptr().cast()) }
+    }
+
+    #[inline]
+    #[target_feature(enable = "avx512f,avx512bw,avx512vl,vaes")]
+    pub(crate) unsafe fn store_hasher_state(h: &mut RowTileHasher, state: __m512i) {
+        // SAFETY: `h.lanes` is `[[u64; 2]; 4]` (64 writable bytes, 16-byte aligned).
+        unsafe { _mm512_storeu_si512(h.lanes.as_mut_ptr().cast(), state) };
+    }
+
+    #[cold]
+    #[inline(never)]
+    #[target_feature(enable = "avx512f,avx512bw,avx512vl,vaes")]
+    pub(crate) unsafe fn start_row_hasher_from_shadow<const HAS_ALPHA: bool>(
+        key: &TileHashKey,
+        shadow_base: *const u8,
+        stride: usize,
+        x_bytes: usize,
+        y0: usize,
+        cw: usize,
+        ch: usize,
+        absorbed_rows: usize,
+    ) -> RowTileHasher {
+        let rk = load_round_key(key);
+        let alpha_mask = _mm512_set1_epi32(XRGB_ALPHA_MASK_U32 as i32);
+        let row_bytes = cw * 4;
+        let full64 = row_bytes & !63;
+        let rem = row_bytes & 63;
+        let (meta_lo, meta_hi) = leaf_meta(cw as u32, ch as u32);
+        let (mut state, _) = init_state(key, meta_lo, meta_hi);
+
+        // SAFETY: Caller guarantees `absorbed_rows > 0`, `cw > 0`, and
+        // `[y0..y0 + absorbed_rows)` is readable for `row_bytes` at `x_bytes`.
+        let sh_ptr = unsafe { shadow_base.add(y0 * stride + x_bytes) };
+        let first_raw = unsafe { sh_ptr.cast::<u32>().read_unaligned() };
+        let first_word = if HAS_ALPHA {
+            first_raw
+        } else {
+            first_raw | XRGB_ALPHA_MASK_U32
+        };
+        let probe_ry = absorbed_rows - 1;
+        let probe_rx = if absorbed_rows > 1 { cw >> 1 } else { cw - 1 };
+        let probe_raw = unsafe {
+            sh_ptr
+                .add(probe_ry * stride + probe_rx * 4)
+                .cast::<u32>()
+                .read_unaligned()
+        };
+        let probe_word = if HAS_ALPHA {
+            probe_raw
+        } else {
+            probe_raw | XRGB_ALPHA_MASK_U32
+        };
+        let maybe_solid = first_word == probe_word;
+        let maybe_opaque =
+            !HAS_ALPHA || ((first_word & probe_word & XRGB_ALPHA_MASK_U32) == XRGB_ALPHA_MASK_U32);
+
+        let (still_solid, still_opaque) = if maybe_solid {
+            // SAFETY: `sh_ptr` is readable for `absorbed_rows` rows of `row_bytes`.
+            unsafe {
+                x86_vaes_absorb_rows_solid_then_fast!(
+                    sh_ptr,
+                    ptr::null_mut(),
+                    absorbed_rows,
+                    stride,
+                    full64,
+                    rem,
+                    HAS_ALPHA,
+                    false,
+                    rk,
+                    alpha_mask,
+                    first_word,
+                    &mut state,
+                    maybe_opaque
+                )
+            }
+        } else {
+            // SAFETY: `sh_ptr` is readable for `absorbed_rows` rows of `row_bytes`.
+            let opq = unsafe {
+                x86_vaes_absorb_rows_fast!(
+                    sh_ptr,
+                    ptr::null_mut(),
+                    absorbed_rows,
+                    stride,
+                    full64,
+                    rem,
+                    HAS_ALPHA,
+                    false,
+                    rk,
+                    alpha_mask,
+                    &mut state,
+                    maybe_opaque
+                )
+            };
+            (false, opq)
+        };
+
+        let mut out = RowTileHasher {
+            lanes: [[0; 2]; 4],
+            first_word,
+            w: cw as u16,
+            h: ch as u16,
+            still_solid,
+            still_opaque,
+        };
+        // SAFETY: `out.lanes` is valid for 64 bytes.
+        unsafe { store_hasher_state(&mut out, state) };
+        out
+    }
+
+    /// Expands one quadrant row absorption inline inside a
+    /// `#[target_feature(enable = "avx512f,avx512bw,avx512vl,vaes")]` loop so
+    /// LLVM keeps `state`, `rk`, and `alpha_mask` in ZMM registers with zero
+    /// per-quadrant call boundaries.
+    macro_rules! x86_vaes_absorb_one_hasher_row {
+        ($has_alpha:expr, $copy:expr, $h:expr, $src_row:expr, $dst_row:expr, $rk:expr, $alpha_mask:expr) => {{
+            let h: &mut crate::filtering::tile_hash::RowTileHasher = $h;
+            let src_row: *const u8 = $src_row;
+            let dst_row: *mut u8 = $dst_row;
+            let rk = $rk;
+            let alpha_mask = $alpha_mask;
+            let row_bytes = usize::from(h.w) * 4;
+            let full64 = row_bytes & !63;
+            let rem = row_bytes & 63;
+            let mut state = crate::filtering::tile_hash::x86_vaes::load_hasher_state(h);
+            if !h.still_solid {
+                let mut dummy_dacc = std::arch::x86_64::_mm512_setzero_si512();
+                let zero_px = std::arch::x86_64::_mm512_setzero_si512();
+                if $has_alpha && h.still_opaque {
+                    let mut aand = std::arch::x86_64::_mm512_set1_epi32(-1);
+                    crate::filtering::tile_hash::x86_vaes::absorb_row::<true, $copy, false, true>(
+                        src_row,
+                        dst_row,
+                        full64,
+                        rem,
+                        rk,
+                        alpha_mask,
+                        zero_px,
+                        &mut state,
+                        &mut dummy_dacc,
+                        &mut aand,
+                    );
+                    h.still_opaque = crate::filtering::tile_hash::x86_vaes::zmm_all_opaque(aand);
+                } else {
+                    let mut dummy_aand = std::arch::x86_64::_mm512_setzero_si512();
+                    crate::filtering::tile_hash::x86_vaes::absorb_row::<
+                        $has_alpha,
+                        $copy,
+                        false,
+                        false,
+                    >(
+                        src_row,
+                        dst_row,
+                        full64,
+                        rem,
+                        rk,
+                        alpha_mask,
+                        zero_px,
+                        &mut state,
+                        &mut dummy_dacc,
+                        &mut dummy_aand,
+                    );
+                }
+            } else {
+                let first_px = std::arch::x86_64::_mm512_set1_epi32(h.first_word as i32);
+                let mut dacc = std::arch::x86_64::_mm512_setzero_si512();
+                let mut aand = std::arch::x86_64::_mm512_set1_epi32(-1);
+                crate::filtering::tile_hash::x86_vaes::absorb_row::<
+                    $has_alpha,
+                    $copy,
+                    true,
+                    $has_alpha,
+                >(
+                    src_row, dst_row, full64, rem, rk, alpha_mask, first_px, &mut state, &mut dacc,
+                    &mut aand,
+                );
+                if std::arch::x86_64::_mm512_test_epi32_mask(dacc, dacc) != 0 {
+                    h.still_solid = false;
+                    if $has_alpha && h.still_opaque {
+                        h.still_opaque =
+                            crate::filtering::tile_hash::x86_vaes::zmm_all_opaque(aand);
+                    }
+                }
+            }
+            crate::filtering::tile_hash::x86_vaes::store_hasher_state(h, state);
+        }};
+    }
+    pub(crate) use x86_vaes_absorb_one_hasher_row;
+
+    #[inline(never)]
+    #[target_feature(enable = "avx512f,avx512bw,avx512vl,vaes")]
+    pub(super) unsafe fn process_band_row<const HAS_ALPHA: bool>(
+        key: &TileHashKey,
+        src_base: *const u8,
+        shadow_base: *mut u8,
+        stride: usize,
+        width: usize,
+        y0: usize,
+        ch: usize,
+        y: usize,
+        actions: &mut [BandRowAction],
+        hashers: &mut [MaybeUninit<RowTileHasher>],
+    ) {
+        let rk = load_round_key(key);
+        let alpha_mask = _mm512_set1_epi32(XRGB_ALPHA_MASK_U32 as i32);
+        let row_off = y * stride;
+        let absorbed_rows = (y - y0) + 1;
+        // SAFETY: Caller validated row `y` bounds in `src_base` and `shadow_base`.
+        let src_row_base = unsafe { src_base.add(row_off) };
+        let sh_row_base = unsafe { shadow_base.add(row_off) };
+
+        let mut x = 0usize;
+        for (act, slot_h) in actions.iter_mut().zip(hashers.iter_mut()) {
+            let cw = (width - x).min(SUBTILE_W);
+            let x_bytes = x * 4;
+            match *act {
+                BandRowAction::Skip => {},
+                BandRowAction::AbsorbShadow | BandRowAction::AbsorbShadowThenFull => {
+                    if *act == BandRowAction::AbsorbShadowThenFull {
+                        *act = BandRowAction::CopyAndAbsorb;
+                    }
+                    // SAFETY: Non-`Skip` guarantees `slot_h` is initialized.
+                    let h = unsafe { slot_h.assume_init_mut() };
+                    unsafe {
+                        x86_vaes_absorb_one_hasher_row!(
+                            HAS_ALPHA,
+                            false,
+                            h,
+                            sh_row_base.cast_const().add(x_bytes),
+                            ptr::null_mut(),
+                            rk,
+                            alpha_mask
+                        );
+                    }
+                },
+                BandRowAction::CopyAndAbsorb => {
+                    // SAFETY: `CopyAndAbsorb` guarantees `slot_h` is initialized.
+                    let h = unsafe { slot_h.assume_init_mut() };
+                    unsafe {
+                        x86_vaes_absorb_one_hasher_row!(
+                            HAS_ALPHA,
+                            true,
+                            h,
+                            src_row_base.add(x_bytes),
+                            sh_row_base.add(x_bytes),
+                            rk,
+                            alpha_mask
+                        );
+                    }
+                },
+                BandRowAction::StartAbsorb | BandRowAction::StartFull => {
+                    let next = if *act == BandRowAction::StartFull {
+                        BandRowAction::CopyAndAbsorb
+                    } else {
+                        BandRowAction::AbsorbShadow
+                    };
+                    // SAFETY: Rows `0..absorbed_rows` are finalized in `shadow_base`.
+                    let h = unsafe {
+                        start_row_hasher_from_shadow::<HAS_ALPHA>(
+                            key,
+                            shadow_base.cast_const(),
+                            stride,
+                            x_bytes,
+                            y0,
+                            cw,
+                            ch,
+                            absorbed_rows,
+                        )
+                    };
+                    slot_h.write(h);
+                    *act = next;
+                },
+            }
+            x += cw;
+        }
+    }
+
+    #[inline(never)]
+    #[target_feature(enable = "avx512f,avx512bw,avx512vl,vaes")]
+    pub(crate) unsafe fn copy_and_absorb_band_rows<const HAS_ALPHA: bool>(
+        key: &TileHashKey,
+        src_base: *const u8,
+        shadow_base: *mut u8,
+        stride: usize,
+        width: usize,
+        y_start: usize,
+        y_end: usize,
+        hashers: &mut [MaybeUninit<RowTileHasher>],
+    ) {
+        let rk = load_round_key(key);
+        let alpha_mask = _mm512_set1_epi32(XRGB_ALPHA_MASK_U32 as i32);
+        for y in y_start..y_end {
+            let row_off = y * stride;
+            // SAFETY: Caller validated `[y_start, y_end)` bounds and exclusive shadow access.
+            let src_row_base = unsafe { src_base.add(row_off) };
+            let sh_row_base = unsafe { shadow_base.add(row_off) };
+            let mut x = 0usize;
+            for slot_h in hashers.iter_mut() {
+                let cw = (width - x).min(SUBTILE_W);
+                let x_bytes = x * 4;
+                // SAFETY: Caller guarantees every slot in `hashers` is initialized.
+                let h = unsafe { slot_h.assume_init_mut() };
+                unsafe {
+                    x86_vaes_absorb_one_hasher_row!(
+                        HAS_ALPHA,
+                        true,
+                        h,
+                        src_row_base.add(x_bytes),
+                        sh_row_base.add(x_bytes),
+                        rk,
+                        alpha_mask
+                    );
+                }
+                x += cw;
+            }
+        }
+    }
+
+    #[inline(never)]
+    #[target_feature(enable = "avx512f,avx512bw,avx512vl,vaes")]
+    pub(crate) unsafe fn finish_band_hashers(
+        key: &TileHashKey,
+        actions: &[BandRowAction],
+        hashers: &[MaybeUninit<RowTileHasher>],
+        slot_base: usize,
+        scans: &SlotScans,
+    ) {
+        for (qx, (&act, slot_h)) in actions.iter().zip(hashers.iter()).enumerate() {
+            if act == BandRowAction::Skip {
+                continue;
+            }
+            // SAFETY: Every non-`Skip` slot was initialized by `process_band_row`.
+            let h = unsafe { slot_h.assume_init_ref() };
+            let state = unsafe { load_hasher_state(h) };
+            let (meta_lo, meta_hi) = leaf_meta(u32::from(h.w), u32::from(h.h));
+            let meta = _mm_set_epi64x(meta_hi as i64, meta_lo as i64);
+            let res = TileHashResult {
+                hash: finalize(key, state, meta),
+                meta: RectScanMeta {
+                    solid_px: h.still_solid.then(|| h.first_word.to_ne_bytes()),
+                    all_opaque: h.still_opaque,
+                },
+            };
+            // SAFETY: `slot_base + qx` is exclusively owned by this worker.
+            unsafe { scans.write(slot_base + qx, res) };
+        }
+    }
+
+    /// Pure keyed 128-bit digest of `rect` without solid/opaque metadata
+    /// tracking or 3-point probing.
+    ///
+    /// # Safety
+    /// Caller must verify CPU `avx512f + avx512bw + avx512vl + vaes + aes`
+    /// support and uphold [`super::hash_rect_only_from_shadow`] bounds
+    /// invariants.
+    #[inline(never)]
+    #[target_feature(enable = "avx512f,avx512bw,avx512vl,vaes")]
+    pub(crate) unsafe fn hash_rect_only_raw<const HAS_ALPHA: bool>(
+        key: &TileHashKey,
+        base: *const u8,
+        stride: usize,
+        rect: TileRect,
+    ) -> TileHash {
+        let tw = rect.w as usize;
+        let th = rect.h as usize;
+        let (meta_lo, meta_hi) = leaf_meta(rect.w, rect.h);
+        let (mut state, meta) = init_state(key, meta_lo, meta_hi);
+        let row_bytes = tw * 4;
+        if th == 0 || row_bytes == 0 {
+            return finalize(key, state, meta);
+        }
+        let rk = load_round_key(key);
+        let alpha_mask = _mm512_set1_epi32(XRGB_ALPHA_MASK_U32 as i32);
+        let full64 = row_bytes & !63;
+        let rem = row_bytes & 63;
+        let mut dummy0 = _mm512_setzero_si512();
+        let mut dummy1 = _mm512_setzero_si512();
+        let zero_px = _mm512_setzero_si512();
+        // SAFETY: Caller guarantees `(rect.y + ry, rect.x * 4 .. rect.x * 4 + row_bytes)` is readable.
+        let mut row_ptr = unsafe { base.add(rect.y as usize * stride + rect.x as usize * 4) };
+        for _ in 0..th {
+            // SAFETY: `row_ptr` is readable for `full64 + rem` bytes.
+            unsafe {
+                absorb_row::<HAS_ALPHA, false, false, false>(
+                    row_ptr,
+                    ptr::null_mut(),
+                    full64,
+                    rem,
+                    rk,
+                    alpha_mask,
+                    zero_px,
+                    &mut state,
+                    &mut dummy0,
+                    &mut dummy1,
+                );
+                row_ptr = row_ptr.add(stride);
+            }
+        }
+        finalize(key, state, meta)
+    }
+
+    /// # Safety
+    /// Caller must verify CPU `avx512f + avx512bw + avx512vl + vaes + aes`
+    /// support.
+    #[target_feature(enable = "avx512f,avx512bw,avx512vl,vaes")]
+    pub(super) unsafe fn combine_quad_hashes(
+        key: &TileHashKey,
+        w: u32,
+        h: u32,
+        quad_hashes: &[TileHash],
+    ) -> TileHash {
+        let n = quad_hashes.len().min(4);
+        let (meta_lo, meta_hi) = parent_meta(w, h, n);
+        let (mut state, meta) = init_state(key, meta_lo, meta_hi);
+        let rk = load_round_key(key);
+        if n > 0 {
+            let lane_mask = ((1u32 << (n * 4)) - 1) as u16;
+            // SAFETY: `quad_hashes` has `n * 16` readable bytes; masked load
+            // touches strictly `n * 4` dwords (`n * 16` bytes).
+            let q = unsafe { _mm512_maskz_loadu_epi32(lane_mask, quad_hashes.as_ptr().cast()) };
+            let next = _mm512_aesenc_epi128(_mm512_xor_si512(state, q), rk);
+            state = _mm512_mask_blend_epi32(lane_mask, state, next);
+        }
+        finalize(key, state, meta)
     }
 }
 
@@ -4113,9 +5484,21 @@ pub(crate) unsafe fn hash_rect_only_from_shadow<const HAS_ALPHA: bool>(
     rect: TileRect,
 ) -> TileHash {
     #[cfg(all(target_arch = "x86_64", not(miri)))]
-    if has_hw_aes() {
-        // SAFETY: `has_hw_aes()` verified AES-NI; caller upholds bounds invariants.
-        return unsafe { x86_aes::hash_rect_only_raw::<HAS_ALPHA>(key, shadow_base, stride, rect) };
+    match x86_detect::detect_tier() {
+        x86_detect::TIER_VAES512 => {
+            // SAFETY: `TIER_VAES512` verified `avx512f + avx512bw + avx512vl + vaes + aes`;
+            // caller upholds bounds invariants.
+            return unsafe {
+                x86_vaes::hash_rect_only_raw::<HAS_ALPHA>(key, shadow_base, stride, rect)
+            };
+        },
+        x86_detect::TIER_AES => {
+            // SAFETY: `TIER_AES` verified AES-NI; caller upholds bounds invariants.
+            return unsafe {
+                x86_aes::hash_rect_only_raw::<HAS_ALPHA>(key, shadow_base, stride, rect)
+            };
+        },
+        _ => {},
     }
     #[cfg(all(target_arch = "aarch64", not(miri)))]
     if has_hw_aes() {
@@ -4146,9 +5529,16 @@ pub(crate) fn hash_rect_only_from_ptr<const HAS_ALPHA: bool>(
     }
     let base = src.ptr();
     #[cfg(all(target_arch = "x86_64", not(miri)))]
-    if has_hw_aes() {
-        // SAFETY: `has_hw_aes()` verified AES-NI; `src` bounds checked above.
-        return unsafe { x86_aes::hash_rect_only_raw::<HAS_ALPHA>(key, base, stride, rect) };
+    match x86_detect::detect_tier() {
+        x86_detect::TIER_VAES512 => {
+            // SAFETY: `TIER_VAES512` verified VAES; `src` bounds checked above.
+            return unsafe { x86_vaes::hash_rect_only_raw::<HAS_ALPHA>(key, base, stride, rect) };
+        },
+        x86_detect::TIER_AES => {
+            // SAFETY: `TIER_AES` verified AES-NI; `src` bounds checked above.
+            return unsafe { x86_aes::hash_rect_only_raw::<HAS_ALPHA>(key, base, stride, rect) };
+        },
+        _ => {},
     }
     #[cfg(all(target_arch = "aarch64", not(miri)))]
     if has_hw_aes() {
@@ -4176,9 +5566,16 @@ pub(crate) unsafe fn hash_rect_from_shadow<const HAS_ALPHA: bool>(
     rect: TileRect,
 ) -> TileHashResult {
     #[cfg(all(target_arch = "x86_64", not(miri)))]
-    if has_hw_aes() {
-        // SAFETY: `has_hw_aes()` verified AES-NI; caller upholds bounds invariants.
-        return unsafe { x86_aes::hash_rect_raw::<HAS_ALPHA>(key, shadow_base, stride, rect) };
+    match x86_detect::detect_tier() {
+        x86_detect::TIER_VAES512 => {
+            // SAFETY: `TIER_VAES512` verified VAES; caller upholds bounds invariants.
+            return unsafe { x86_vaes::hash_rect_raw::<HAS_ALPHA>(key, shadow_base, stride, rect) };
+        },
+        x86_detect::TIER_AES => {
+            // SAFETY: `TIER_AES` verified AES-NI; caller upholds bounds invariants.
+            return unsafe { x86_aes::hash_rect_raw::<HAS_ALPHA>(key, shadow_base, stride, rect) };
+        },
+        _ => {},
     }
     #[cfg(all(target_arch = "aarch64", not(miri)))]
     if has_hw_aes() {
@@ -4228,19 +5625,36 @@ pub(crate) unsafe fn copy_and_hash_rect_to_shadow<const HAS_ALPHA: bool>(
         assert!(last_end <= src.len());
     }
     #[cfg(all(target_arch = "x86_64", not(miri)))]
-    if has_hw_aes() {
-        // SAFETY: `has_hw_aes()` verified AES-NI; `src` bounds checked above;
-        // caller upholds `shadow_base` bounds and exclusivity invariants.
-        return unsafe {
-            x86_aes::copy_and_hash_rect_to_shadow::<HAS_ALPHA>(
-                key,
-                src.ptr(),
-                shadow_base,
-                stride,
-                rect,
-                copy_from_ry,
-            )
-        };
+    match x86_detect::detect_tier() {
+        x86_detect::TIER_VAES512 => {
+            // SAFETY: `TIER_VAES512` verified VAES; `src` bounds checked above;
+            // caller upholds `shadow_base` bounds and exclusivity invariants.
+            return unsafe {
+                x86_vaes::copy_and_hash_rect_to_shadow::<HAS_ALPHA>(
+                    key,
+                    src.ptr(),
+                    shadow_base,
+                    stride,
+                    rect,
+                    copy_from_ry,
+                )
+            };
+        },
+        x86_detect::TIER_AES => {
+            // SAFETY: `TIER_AES` verified AES-NI; `src` bounds checked above;
+            // caller upholds `shadow_base` bounds and exclusivity invariants.
+            return unsafe {
+                x86_aes::copy_and_hash_rect_to_shadow::<HAS_ALPHA>(
+                    key,
+                    src.ptr(),
+                    shadow_base,
+                    stride,
+                    rect,
+                    copy_from_ry,
+                )
+            };
+        },
+        _ => {},
     }
     #[cfg(all(target_arch = "aarch64", not(miri)))]
     if has_hw_aes() {
@@ -4291,9 +5705,16 @@ pub(crate) fn hash_rect_from_ptr<const HAS_ALPHA: bool>(
     let stride = stride_px * 4;
     let base = aos.ptr().cast::<u8>();
     #[cfg(all(target_arch = "x86_64", not(miri)))]
-    if has_hw_aes() {
-        // SAFETY: `has_hw_aes()` verified AES-NI; `aos` bounds validated above.
-        return unsafe { x86_aes::hash_rect_raw::<HAS_ALPHA>(key, base, stride, rect) };
+    match x86_detect::detect_tier() {
+        x86_detect::TIER_VAES512 => {
+            // SAFETY: `TIER_VAES512` verified VAES; `aos` bounds validated above.
+            return unsafe { x86_vaes::hash_rect_raw::<HAS_ALPHA>(key, base, stride, rect) };
+        },
+        x86_detect::TIER_AES => {
+            // SAFETY: `TIER_AES` verified AES-NI; `aos` bounds validated above.
+            return unsafe { x86_aes::hash_rect_raw::<HAS_ALPHA>(key, base, stride, rect) };
+        },
+        _ => {},
     }
     #[cfg(all(target_arch = "aarch64", not(miri)))]
     if has_hw_aes() {
@@ -4335,23 +5756,44 @@ pub(crate) unsafe fn process_band_row<const HAS_ALPHA: bool>(
         assert!(row_end <= src.len());
     }
     #[cfg(all(target_arch = "x86_64", not(miri)))]
-    if has_hw_aes() {
-        // SAFETY: `has_hw_aes()` verified AES-NI; `src` bounds checked above.
-        unsafe {
-            x86_aes::process_band_row::<HAS_ALPHA>(
-                key,
-                src.ptr(),
-                shadow_base,
-                stride,
-                width,
-                y0,
-                ch,
-                y,
-                actions,
-                hashers,
-            );
-        }
-        return;
+    match x86_detect::detect_tier() {
+        x86_detect::TIER_VAES512 => {
+            // SAFETY: `TIER_VAES512` verified VAES; `src` bounds checked above.
+            unsafe {
+                x86_vaes::process_band_row::<HAS_ALPHA>(
+                    key,
+                    src.ptr(),
+                    shadow_base,
+                    stride,
+                    width,
+                    y0,
+                    ch,
+                    y,
+                    actions,
+                    hashers,
+                );
+            }
+            return;
+        },
+        x86_detect::TIER_AES => {
+            // SAFETY: `TIER_AES` verified AES-NI; `src` bounds checked above.
+            unsafe {
+                x86_aes::process_band_row::<HAS_ALPHA>(
+                    key,
+                    src.ptr(),
+                    shadow_base,
+                    stride,
+                    width,
+                    y0,
+                    ch,
+                    y,
+                    actions,
+                    hashers,
+                );
+            }
+            return;
+        },
+        _ => {},
     }
     #[cfg(all(target_arch = "aarch64", not(miri)))]
     if has_hw_aes() {
@@ -4414,21 +5856,40 @@ pub(crate) unsafe fn copy_and_absorb_band_rows<const HAS_ALPHA: bool>(
     let last_end = (y_end - 1) * stride + width * 4;
     assert!(last_end <= src.len());
     #[cfg(all(target_arch = "x86_64", not(miri)))]
-    if has_hw_aes() {
-        // SAFETY: `has_hw_aes()` verified AES-NI; `src` bounds checked above.
-        unsafe {
-            x86_aes::copy_and_absorb_band_rows::<HAS_ALPHA>(
-                key,
-                src.ptr(),
-                shadow_base,
-                stride,
-                width,
-                y_start,
-                y_end,
-                hashers,
-            );
-        }
-        return;
+    match x86_detect::detect_tier() {
+        x86_detect::TIER_VAES512 => {
+            // SAFETY: `TIER_VAES512` verified VAES; `src` bounds checked above.
+            unsafe {
+                x86_vaes::copy_and_absorb_band_rows::<HAS_ALPHA>(
+                    key,
+                    src.ptr(),
+                    shadow_base,
+                    stride,
+                    width,
+                    y_start,
+                    y_end,
+                    hashers,
+                );
+            }
+            return;
+        },
+        x86_detect::TIER_AES => {
+            // SAFETY: `TIER_AES` verified AES-NI; `src` bounds checked above.
+            unsafe {
+                x86_aes::copy_and_absorb_band_rows::<HAS_ALPHA>(
+                    key,
+                    src.ptr(),
+                    shadow_base,
+                    stride,
+                    width,
+                    y_start,
+                    y_end,
+                    hashers,
+                );
+            }
+            return;
+        },
+        _ => {},
     }
     #[cfg(all(target_arch = "aarch64", not(miri)))]
     if has_hw_aes() {
@@ -4479,10 +5940,18 @@ pub(crate) unsafe fn finish_band_hashers(
 ) {
     debug_assert_eq!(actions.len(), hashers.len());
     #[cfg(all(target_arch = "x86_64", not(miri)))]
-    if has_hw_aes() {
-        // SAFETY: `has_hw_aes()` verified AES-NI; caller upholds slot invariants.
-        unsafe { x86_aes::finish_band_hashers(key, actions, hashers, slot_base, scans) };
-        return;
+    match x86_detect::detect_tier() {
+        x86_detect::TIER_VAES512 => {
+            // SAFETY: `TIER_VAES512` verified VAES; caller upholds slot invariants.
+            unsafe { x86_vaes::finish_band_hashers(key, actions, hashers, slot_base, scans) };
+            return;
+        },
+        x86_detect::TIER_AES => {
+            // SAFETY: `TIER_AES` verified AES-NI; caller upholds slot invariants.
+            unsafe { x86_aes::finish_band_hashers(key, actions, hashers, slot_base, scans) };
+            return;
+        },
+        _ => {},
     }
     #[cfg(all(target_arch = "aarch64", not(miri)))]
     if has_hw_aes() {
@@ -4505,9 +5974,16 @@ pub(crate) fn combine_quad_hashes(
 ) -> TileHash {
     assert!((2..=4).contains(&quad_hashes.len()));
     #[cfg(all(target_arch = "x86_64", not(miri)))]
-    if has_hw_aes() {
-        // SAFETY: `has_hw_aes()` verified AES-NI.
-        return unsafe { x86_aes::combine_quad_hashes(key, w, h, quad_hashes) };
+    match x86_detect::detect_tier() {
+        x86_detect::TIER_VAES512 => {
+            // SAFETY: `TIER_VAES512` verified VAES.
+            return unsafe { x86_vaes::combine_quad_hashes(key, w, h, quad_hashes) };
+        },
+        x86_detect::TIER_AES => {
+            // SAFETY: `TIER_AES` verified AES-NI.
+            return unsafe { x86_aes::combine_quad_hashes(key, w, h, quad_hashes) };
+        },
+        _ => {},
     }
     #[cfg(all(target_arch = "aarch64", not(miri)))]
     if has_hw_aes() {
@@ -4529,6 +6005,8 @@ mod tests {
         Portable,
         #[cfg(all(target_arch = "x86_64", not(miri)))]
         X86Aes,
+        #[cfg(all(target_arch = "x86_64", not(miri)))]
+        X86Vaes,
         #[cfg(all(target_arch = "aarch64", not(miri)))]
         Aarch64Aes,
     }
@@ -4544,6 +6022,10 @@ mod tests {
                 #[cfg(target_arch = "x86_64")]
                 if has_hw_aes() {
                     v.push(Self::X86Aes);
+                }
+                #[cfg(target_arch = "x86_64")]
+                if has_hw_vaes() {
+                    v.push(Self::X86Vaes);
                 }
                 #[cfg(target_arch = "aarch64")]
                 if has_hw_aes() {
@@ -4565,6 +6047,8 @@ mod tests {
                 Self::Portable => "portable",
                 #[cfg(all(target_arch = "x86_64", not(miri)))]
                 Self::X86Aes => "x86_aes",
+                #[cfg(all(target_arch = "x86_64", not(miri)))]
+                Self::X86Vaes => "x86_vaes",
                 #[cfg(all(target_arch = "aarch64", not(miri)))]
                 Self::Aarch64Aes => "aarch64_aes",
             }
@@ -4584,6 +6068,10 @@ mod tests {
                 #[cfg(all(target_arch = "x86_64", not(miri)))]
                 Self::X86Aes => unsafe {
                     x86_aes::hash_rect_raw::<HAS_ALPHA>(key, base, stride, rect)
+                },
+                #[cfg(all(target_arch = "x86_64", not(miri)))]
+                Self::X86Vaes => unsafe {
+                    x86_vaes::hash_rect_raw::<HAS_ALPHA>(key, base, stride, rect)
                 },
                 #[cfg(all(target_arch = "aarch64", not(miri)))]
                 Self::Aarch64Aes => unsafe {
@@ -4623,6 +6111,17 @@ mod tests {
                         copy_from_ry,
                     )
                 },
+                #[cfg(all(target_arch = "x86_64", not(miri)))]
+                Self::X86Vaes => unsafe {
+                    x86_vaes::copy_and_hash_rect_to_shadow::<HAS_ALPHA>(
+                        key,
+                        src.ptr(),
+                        shadow_base,
+                        stride,
+                        rect,
+                        copy_from_ry,
+                    )
+                },
                 #[cfg(all(target_arch = "aarch64", not(miri)))]
                 Self::Aarch64Aes => unsafe {
                     aarch64_aes::copy_and_hash_rect_to_shadow::<HAS_ALPHA>(
@@ -4642,6 +6141,8 @@ mod tests {
                 Self::Portable => portable::combine_quad_hashes(key, w, h, quads),
                 #[cfg(all(target_arch = "x86_64", not(miri)))]
                 Self::X86Aes => unsafe { x86_aes::combine_quad_hashes(key, w, h, quads) },
+                #[cfg(all(target_arch = "x86_64", not(miri)))]
+                Self::X86Vaes => unsafe { x86_vaes::combine_quad_hashes(key, w, h, quads) },
                 #[cfg(all(target_arch = "aarch64", not(miri)))]
                 Self::Aarch64Aes => unsafe { aarch64_aes::combine_quad_hashes(key, w, h, quads) },
             }
@@ -5726,6 +7227,36 @@ mod tests {
                                                 );
                                             }
                                         },
+                                        #[cfg(all(target_arch = "x86_64", not(miri)))]
+                                        Backend::X86Vaes => unsafe {
+                                            if has_alpha {
+                                                x86_vaes::process_band_row::<true>(
+                                                    &key,
+                                                    src.as_ptr(),
+                                                    sh.as_mut_ptr(),
+                                                    stride,
+                                                    width,
+                                                    y0,
+                                                    ch,
+                                                    y,
+                                                    acts,
+                                                    hs,
+                                                );
+                                            } else {
+                                                x86_vaes::process_band_row::<false>(
+                                                    &key,
+                                                    src.as_ptr(),
+                                                    sh.as_mut_ptr(),
+                                                    stride,
+                                                    width,
+                                                    y0,
+                                                    ch,
+                                                    y,
+                                                    acts,
+                                                    hs,
+                                                );
+                                            }
+                                        },
                                         #[cfg(all(target_arch = "aarch64", not(miri)))]
                                         Backend::Aarch64Aes => unsafe {
                                             if has_alpha {
@@ -5817,6 +7348,32 @@ mod tests {
                                                 );
                                             }
                                         },
+                                        #[cfg(all(target_arch = "x86_64", not(miri)))]
+                                        Backend::X86Vaes => unsafe {
+                                            if has_alpha {
+                                                x86_vaes::copy_and_absorb_band_rows::<true>(
+                                                    &key,
+                                                    src.as_ptr(),
+                                                    shadow.as_mut_ptr(),
+                                                    stride,
+                                                    width,
+                                                    y0 + ry,
+                                                    y0 + ch,
+                                                    &mut hashers,
+                                                );
+                                            } else {
+                                                x86_vaes::copy_and_absorb_band_rows::<false>(
+                                                    &key,
+                                                    src.as_ptr(),
+                                                    shadow.as_mut_ptr(),
+                                                    stride,
+                                                    width,
+                                                    y0 + ry,
+                                                    y0 + ch,
+                                                    &mut hashers,
+                                                );
+                                            }
+                                        },
                                         #[cfg(all(target_arch = "aarch64", not(miri)))]
                                         Backend::Aarch64Aes => unsafe {
                                             if has_alpha {
@@ -5871,6 +7428,12 @@ mod tests {
                                         &key, &actions, &hashers, 0, &scans,
                                     );
                                 },
+                                #[cfg(all(target_arch = "x86_64", not(miri)))]
+                                Backend::X86Vaes => unsafe {
+                                    x86_vaes::finish_band_hashers(
+                                        &key, &actions, &hashers, 0, &scans,
+                                    );
+                                },
                                 #[cfg(all(target_arch = "aarch64", not(miri)))]
                                 Backend::Aarch64Aes => unsafe {
                                     aarch64_aes::finish_band_hashers(
@@ -5902,6 +7465,115 @@ mod tests {
                     }
                 }
             }
+        }
+    }
+
+    /// Verifies cached x86 feature detection consistency and, on hosts with
+    /// `avx512f + avx512bw + avx512vl + vaes + aes`, exhaustive bit-exact
+    /// parity between `x86_vaes` and `x86_aes` across every width `1..=256`,
+    /// heights `1..=128`, `HAS_ALPHA = false/true`, `hash_rect_only_raw`,
+    /// `copy_and_hash_rect_to_shadow`, `RowTileHasher`, and
+    /// `combine_quad_hashes`.
+    #[cfg(all(target_arch = "x86_64", not(miri)))]
+    #[test]
+    fn test_tile_hash_x86_vaes_matches_x86_aes() {
+        let expected_vaes = std::arch::is_x86_feature_detected!("avx512f")
+            && std::arch::is_x86_feature_detected!("avx512bw")
+            && std::arch::is_x86_feature_detected!("avx512vl")
+            && std::arch::is_x86_feature_detected!("vaes")
+            && std::arch::is_x86_feature_detected!("aes");
+        assert_eq!(has_hw_vaes(), expected_vaes);
+        assert_eq!(has_hw_aes(), std::arch::is_x86_feature_detected!("aes"));
+        if !expected_vaes {
+            return;
+        }
+
+        let key = TileHashKey::from_seed(0x5120_AE50_1234_5678);
+        for tw in 1..=256usize {
+            for &th in &[1usize, 3, 16] {
+                let stride = (tw + 3) * 4;
+                let byte_len = (th + 2) * stride;
+                let mut src = vec![0u8; byte_len];
+                fill_pseudo_random(&mut src, ((tw as u64) << 12) ^ th as u64);
+                let rect = TileRect {
+                    x: 1,
+                    y: 1,
+                    w: tw as u32,
+                    h: th as u32,
+                };
+
+                let aes_x =
+                    unsafe { x86_aes::hash_rect_raw::<false>(&key, src.as_ptr(), stride, rect) };
+                let vaes_x =
+                    unsafe { x86_vaes::hash_rect_raw::<false>(&key, src.as_ptr(), stride, rect) };
+                assert_eq!(vaes_x, aes_x, "Xrgb hash_rect_raw mismatch on {tw}x{th}");
+
+                let aes_a =
+                    unsafe { x86_aes::hash_rect_raw::<true>(&key, src.as_ptr(), stride, rect) };
+                let vaes_a =
+                    unsafe { x86_vaes::hash_rect_raw::<true>(&key, src.as_ptr(), stride, rect) };
+                assert_eq!(vaes_a, aes_a, "Argb hash_rect_raw mismatch on {tw}x{th}");
+
+                let aes_ox = unsafe {
+                    x86_aes::hash_rect_only_raw::<false>(&key, src.as_ptr(), stride, rect)
+                };
+                let vaes_ox = unsafe {
+                    x86_vaes::hash_rect_only_raw::<false>(&key, src.as_ptr(), stride, rect)
+                };
+                assert_eq!(vaes_ox, aes_ox, "Xrgb hash_rect_only mismatch on {tw}x{th}");
+                assert_eq!(vaes_ox, vaes_x.hash);
+
+                let aes_oa = unsafe {
+                    x86_aes::hash_rect_only_raw::<true>(&key, src.as_ptr(), stride, rect)
+                };
+                let vaes_oa = unsafe {
+                    x86_vaes::hash_rect_only_raw::<true>(&key, src.as_ptr(), stride, rect)
+                };
+                assert_eq!(vaes_oa, aes_oa, "Argb hash_rect_only mismatch on {tw}x{th}");
+                assert_eq!(vaes_oa, vaes_a.hash);
+
+                for copy_from_ry in [0usize, th / 2] {
+                    let mut sh_aes = vec![0xA5u8; byte_len];
+                    let mut sh_vaes = vec![0xA5u8; byte_len];
+                    for ry in 0..copy_from_ry {
+                        let off = (1 + ry) * stride + 4;
+                        sh_aes[off..off + tw * 4].copy_from_slice(&src[off..off + tw * 4]);
+                        sh_vaes[off..off + tw * 4].copy_from_slice(&src[off..off + tw * 4]);
+                    }
+                    let cp_aes = unsafe {
+                        x86_aes::copy_and_hash_rect_to_shadow::<false>(
+                            &key,
+                            src.as_ptr(),
+                            sh_aes.as_mut_ptr(),
+                            stride,
+                            rect,
+                            copy_from_ry,
+                        )
+                    };
+                    let cp_vaes = unsafe {
+                        x86_vaes::copy_and_hash_rect_to_shadow::<false>(
+                            &key,
+                            src.as_ptr(),
+                            sh_vaes.as_mut_ptr(),
+                            stride,
+                            rect,
+                            copy_from_ry,
+                        )
+                    };
+                    assert_eq!(cp_vaes, cp_aes, "copy_and_hash mismatch on {tw}x{th}");
+                    assert_eq!(sh_vaes, sh_aes, "shadow bytes mismatch on {tw}x{th}");
+                }
+            }
+        }
+
+        let mut quads = [[0u8; 16]; 4];
+        for (i, q) in quads.iter_mut().enumerate() {
+            fill_pseudo_random(q, 0x7000 + i as u64);
+        }
+        for n in 2..=4usize {
+            let aes_p = unsafe { x86_aes::combine_quad_hashes(&key, 256, 256, &quads[..n]) };
+            let vaes_p = unsafe { x86_vaes::combine_quad_hashes(&key, 256, 256, &quads[..n]) };
+            assert_eq!(vaes_p, aes_p, "combine_quad_hashes mismatch for n={n}");
         }
     }
 }
