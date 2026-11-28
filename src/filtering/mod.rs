@@ -9582,20 +9582,23 @@ mod tests {
                     "[{tier_name}] sweep subgreen_bgr3_to_bgra var tw={tw} stream={stream}"
                 );
 
+                // Alternate `const_alpha` between `0x00` (even `tw`, catching any
+                // leaked non-zero alpha byte from unmasked 64 B loads) and `0xC3`.
+                let ca_unpack = if tw.is_multiple_of(2) { 0x00u8 } else { 0xC3u8 };
                 dst.fill(Vec4u8(0, 0, 0, 0));
                 let dst_u: &mut [MaybeUninit<Vec4u8>] =
                     unsafe { slice::from_raw_parts_mut(dst.as_mut_ptr().cast(), tw) };
                 unsafe {
                     if do_stream {
-                        kernel.subgreen_bgr3_to_bgra::<true, true>(&bgr1_s, &[], 0xC3, dst_u);
+                        kernel.subgreen_bgr3_to_bgra::<true, true>(&bgr1_s, &[], ca_unpack, dst_u);
                     } else {
-                        kernel.subgreen_bgr3_to_bgra::<false, true>(&bgr1_s, &[], 0xC3, dst_u);
+                        kernel.subgreen_bgr3_to_bgra::<false, true>(&bgr1_s, &[], ca_unpack, dst_u);
                     }
                 }
                 for (got, exp) in dst.iter().zip(&raw1) {
                     assert_eq!(
                         *got,
-                        Vec4u8(exp.0, exp.1, exp.2, 0xC3),
+                        Vec4u8(exp.0, exp.1, exp.2, ca_unpack),
                         "[{tier_name}] sweep subgreen_bgr3_to_bgra const tw={tw} stream={stream}"
                     );
                 }
@@ -9664,6 +9667,7 @@ mod tests {
                         );
                     }
 
+                    let ca_up = if tw.is_multiple_of(2) { 0x00u8 } else { 0x9Du8 };
                     dec_buf.fill(0x77);
                     dst.fill(Vec4u8(0, 0, 0, 0));
                     let dst_u: &mut [MaybeUninit<Vec4u8>] =
@@ -9676,7 +9680,7 @@ mod tests {
                                     &bgr0_s,
                                     &mut dec_buf,
                                     &[],
-                                    0x9D,
+                                    ca_up,
                                     dst_u,
                                 ),
                             (true, false) => kernel
@@ -9685,7 +9689,7 @@ mod tests {
                                     &bgr0_s,
                                     &mut [],
                                     &[],
-                                    0x9D,
+                                    ca_up,
                                     dst_u,
                                 ),
                             (false, true) => kernel
@@ -9694,7 +9698,7 @@ mod tests {
                                     &bgr0_s,
                                     &mut dec_buf,
                                     &[],
-                                    0x9D,
+                                    ca_up,
                                     dst_u,
                                 ),
                             (false, false) => kernel
@@ -9703,7 +9707,7 @@ mod tests {
                                     &bgr0_s,
                                     &mut [],
                                     &[],
-                                    0x9D,
+                                    ca_up,
                                     dst_u,
                                 ),
                         }
@@ -9711,7 +9715,7 @@ mod tests {
                     for (got, exp) in dst.iter().zip(&raw1) {
                         assert_eq!(
                             *got,
-                            Vec4u8(exp.0, exp.1, exp.2, 0x9D),
+                            Vec4u8(exp.0, exp.1, exp.2, ca_up),
                             "[{tier_name}] sweep fused up const tw={tw} stream={stream} wd={write_dec}"
                         );
                     }
@@ -9772,8 +9776,11 @@ mod tests {
             assert_eq!(z_a, z_s, "[{tier_name}] SubUp winner out tw={tw}");
         }
 
-        // Verify `row_sub3_inverse` on arbitrary (including non-multiple-of-3) byte lengths `0..=65`.
-        for len in 0..=65usize {
+        // Verify `row_sub3_inverse` on arbitrary (including non-multiple-of-3) byte lengths
+        // across `0..=65` and the `192 B` / `48 B` AVX-512 loop boundaries.
+        for len in (0..=65usize).chain([
+            191, 192, 193, 194, 195, 239, 240, 241, 242, 383, 384, 385, 431, 432, 433,
+        ]) {
             let src: Vec<u8> = (0..len)
                 .map(|j| ((j * 37 + len * 13 + 7) & 0xFF) as u8)
                 .collect();

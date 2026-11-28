@@ -17,8 +17,10 @@
 //!
 //! Only tiers at or above the compile-time target-feature baseline are compiled:
 //! - `avx512` (`avx512bw + avx512vl + avx512vbmi`): always compiled on non-Miri
-//!   `x86_64`; 512-bit `vpermb`/`vpermt2b`, 48-byte masked load/store 3-byte
-//!   prefix sum, and 64-byte-aligned `_mm512_stream_si512` non-temporal stores.
+//!   `x86_64`; 512-bit `vpermb`/`vpermt2b`, unmasked 192-byte (`3 x 64 B`)
+//!   3-byte prefix sum & fused `Up+SubGreen->BGRA` (`48 B` `32 B + 16 B`
+//!   remainder, masked `< 48 B` tail only), and 64-byte-aligned
+//!   `_mm512_stream_si512` non-temporal stores.
 //! - `avx2`: compiled unless static AVX-512 (`avx512bw + avx512vl + avx512vbmi`)
 //!   is enabled; 256-bit AVX2 + parallel two-128b-lane (24-byte) 3-byte prefix
 //!   sum + fused `Up+SubGreen->BGRA` + 32-byte `_mm256_stream_si256` stores.
@@ -740,6 +742,7 @@ mod avx512 {
     use std::arch::x86_64::__m128i;
     use std::arch::x86_64::__m256i;
     use std::arch::x86_64::__m512i;
+    use std::arch::x86_64::_mm_add_epi8;
     use std::arch::x86_64::_mm_cvtsi128_si64;
     use std::arch::x86_64::_mm_extract_epi64;
     use std::arch::x86_64::_mm_loadl_epi64;
@@ -749,15 +752,18 @@ mod avx512 {
     use std::arch::x86_64::_mm_storeu_si128;
     use std::arch::x86_64::_mm_unpacklo_epi8;
     use std::arch::x86_64::_mm_xor_si128;
+    use std::arch::x86_64::_mm256_add_epi8;
     use std::arch::x86_64::_mm256_add_epi64;
     use std::arch::x86_64::_mm256_castsi256_si128;
     use std::arch::x86_64::_mm256_extracti128_si256;
+    use std::arch::x86_64::_mm256_loadu_si256;
     use std::arch::x86_64::_mm256_setr_epi32;
     use std::arch::x86_64::_mm256_storeu_si256;
     use std::arch::x86_64::_mm256_xor_si256;
     use std::arch::x86_64::_mm512_abs_epi8;
     use std::arch::x86_64::_mm512_add_epi8;
     use std::arch::x86_64::_mm512_add_epi64;
+    use std::arch::x86_64::_mm512_alignr_epi32;
     use std::arch::x86_64::_mm512_and_si512;
     use std::arch::x86_64::_mm512_andnot_si512;
     use std::arch::x86_64::_mm512_broadcast_i32x4;
@@ -774,10 +780,12 @@ mod avx512 {
     use std::arch::x86_64::_mm512_cvtepu8_epi32;
     use std::arch::x86_64::_mm512_extracti32x4_epi32;
     use std::arch::x86_64::_mm512_extracti64x4_epi64;
+    use std::arch::x86_64::_mm512_inserti32x4;
     use std::arch::x86_64::_mm512_inserti64x4;
     use std::arch::x86_64::_mm512_loadu_si512;
     use std::arch::x86_64::_mm512_madd_epi16;
     use std::arch::x86_64::_mm512_maddubs_epi16;
+    use std::arch::x86_64::_mm512_mask_alignr_epi32;
     use std::arch::x86_64::_mm512_mask_blend_epi8;
     use std::arch::x86_64::_mm512_mask_blend_epi32;
     use std::arch::x86_64::_mm512_mask_cmpneq_epi32_mask;
@@ -806,9 +814,11 @@ mod avx512 {
     use std::arch::x86_64::_mm512_stream_si512;
     use std::arch::x86_64::_mm512_sub_epi8;
     use std::arch::x86_64::_mm512_subs_epu8;
+    use std::arch::x86_64::_mm512_ternarylogic_epi32;
     use std::arch::x86_64::_mm512_test_epi8_mask;
     use std::arch::x86_64::_mm512_xor_si512;
     use std::arch::x86_64::_mm512_zextsi128_si512;
+    use std::arch::x86_64::_mm512_zextsi256_si512;
     use std::mem::MaybeUninit;
 
     use crate::buffer_pointer::BufferPointer;
@@ -871,7 +881,8 @@ mod avx512 {
     };
 
     /// Cross-lane `vpermb` indices unpacking 48 BGR bytes (`0..48`) into 16 BGRA
-    /// pixels, sourcing each alpha byte from lane `48` (zero-masked by load).
+    /// pixels; byte `3` of each pixel is overwritten via `vpternlogd` so lanes
+    /// `48..64` are never read.
     const UNPACK_BGR_IDX: [u8; 64] = {
         let mut t = [0u8; 64];
         let mut p = 0;
@@ -879,7 +890,7 @@ mod avx512 {
             t[p * 4] = (p * 3) as u8;
             t[p * 4 + 1] = (p * 3 + 1) as u8;
             t[p * 4 + 2] = (p * 3 + 2) as u8;
-            t[p * 4 + 3] = 48;
+            t[p * 4 + 3] = 0;
             p += 1;
         }
         t
@@ -986,6 +997,62 @@ mod avx512 {
         unsafe { _mm512_loadu_si512(table.as_ptr().cast()) }
     }
 
+    /// Loads 48 contiguous bytes without a masked byte load (`vmovdqu ymm` +
+    /// `vmovdqu xmm` + `vinserti32x4`), leaving lanes `48..64` zeroed.
+    #[target_feature(enable = "avx512bw,avx512vl,avx512vbmi")]
+    #[inline]
+    unsafe fn load_48(p: *const u8) -> __m512i {
+        // SAFETY: Caller guarantees AVX-512VL and `p` is readable for at least 48 bytes.
+        unsafe {
+            let lo = _mm256_loadu_si256(p.cast::<__m256i>());
+            let hi = _mm_loadu_si128(p.add(32).cast::<__m128i>());
+            _mm512_inserti32x4::<2>(_mm512_zextsi256_si512(lo), hi)
+        }
+    }
+
+    /// Stores the lower 48 bytes of `v` without a masked byte store (`vmovdqu ymm`
+    /// + `vextracti32x4` memory store), matching [`load_48`] for exact STLF.
+    #[target_feature(enable = "avx512bw,avx512vl,avx512vbmi")]
+    #[inline]
+    unsafe fn store_48(p: *mut u8, v: __m512i) {
+        // SAFETY: Caller guarantees AVX-512VL and `p` is writable for at least 48 bytes.
+        unsafe {
+            _mm256_storeu_si256(p.cast::<__m256i>(), _mm512_castsi512_si256(v));
+            _mm_storeu_si128(
+                p.add(32).cast::<__m128i>(),
+                _mm512_extracti32x4_epi32::<2>(v),
+            );
+        }
+    }
+
+    /// Splits 3 x 64 B (`192 B`) contiguous vectors into 4 x 48 B chunks in lanes
+    /// `0..48` via three 1-cycle `valignd` register shifts (lanes `48..64` hold
+    /// arbitrary non-zero bytes).
+    #[target_feature(enable = "avx512bw,avx512vl,avx512vbmi")]
+    #[inline]
+    fn split_192_to_4x48(v0: __m512i, v1: __m512i, v2: __m512i) -> [__m512i; 4] {
+        [
+            v0,
+            _mm512_alignr_epi32::<12>(v1, v0),
+            _mm512_alignr_epi32::<8>(v2, v1),
+            _mm512_alignr_epi32::<4>(v2, v2),
+        ]
+    }
+
+    /// Packs 4 x 48 B chunks (valid in lanes `0..48`, arbitrary in `48..64`) into
+    /// 3 x 64 B (`192 B`) contiguous vectors via five 1-cycle `valignd` shifts.
+    #[target_feature(enable = "avx512bw,avx512vl,avx512vbmi")]
+    #[inline]
+    fn pack_4x48_to_192(o0: __m512i, o1: __m512i, o2: __m512i, o3: __m512i) -> [__m512i; 3] {
+        // `w0 = [o0[0..12], o1[0..4]]`
+        let w0 = _mm512_mask_alignr_epi32::<4>(o0, 0xF000, o1, o1);
+        // `o1_hi[8..16] = o1[4..12]` -> `w1 = [o1[4..12], o2[0..8]]`
+        let w1 = _mm512_alignr_epi32::<8>(o2, _mm512_alignr_epi32::<12>(o1, o1));
+        // `o2_hi[12..16] = o2[8..12]` -> `w2 = [o2[8..12], o3[0..12]]`
+        let w2 = _mm512_alignr_epi32::<12>(o3, _mm512_alignr_epi32::<12>(o2, o2));
+        [w0, w1, w2]
+    }
+
     #[target_feature(enable = "avx512bw,avx512vl,avx512vbmi")]
     #[inline]
     fn prefix_sum_sub3_48(
@@ -995,10 +1062,52 @@ mod avx512 {
         sh12: __m512i,
         sh24: __m512i,
     ) -> __m512i {
+        // `u64::MAX << shift` zero-masks lanes `< shift` (which LLVM lowers to
+        // hoisted `vpandq` masks with zero in-loop `kmovq`), and for every lane
+        // `j in shift..48`, `PREFIX_SH*_IDX[j] = j - shift < 45`, so non-zero
+        // upper bytes in lanes `48..64` never affect output lanes `0..48`.
         v = _mm512_add_epi8(v, _mm512_maskz_permutexvar_epi8(u64::MAX << 3, sh3, v));
         v = _mm512_add_epi8(v, _mm512_maskz_permutexvar_epi8(u64::MAX << 6, sh6, v));
         v = _mm512_add_epi8(v, _mm512_maskz_permutexvar_epi8(u64::MAX << 12, sh12, v));
         _mm512_add_epi8(v, _mm512_maskz_permutexvar_epi8(u64::MAX << 24, sh24, v))
+    }
+
+    /// Computes four parallel 48 B (`192 B`) `Sub3` inverse chunks with a single
+    /// 1-cycle carry recurrence per 192 B, updating `carry` and returning packed
+    /// `3 x 64 B` contiguous vectors `[w0, w1, w2]`.
+    #[target_feature(enable = "avx512bw,avx512vl,avx512vbmi")]
+    #[inline]
+    fn sub3_inverse_192(
+        v0: __m512i,
+        v1: __m512i,
+        v2: __m512i,
+        carry: &mut __m512i,
+        sh3: __m512i,
+        sh6: __m512i,
+        sh12: __m512i,
+        sh24: __m512i,
+        carry_idx: __m512i,
+    ) -> [__m512i; 3] {
+        let [c0, c1, c2, c3] = split_192_to_4x48(v0, v1, v2);
+        let p0 = prefix_sum_sub3_48(c0, sh3, sh6, sh12, sh24);
+        let p1 = prefix_sum_sub3_48(c1, sh3, sh6, sh12, sh24);
+        let p2 = prefix_sum_sub3_48(c2, sh3, sh6, sh12, sh24);
+        let p3 = prefix_sum_sub3_48(c3, sh3, sh6, sh12, sh24);
+        let b0 = _mm512_permutexvar_epi8(carry_idx, p0);
+        let b1 = _mm512_permutexvar_epi8(carry_idx, p1);
+        let b2 = _mm512_permutexvar_epi8(carry_idx, p2);
+        let b3 = _mm512_permutexvar_epi8(carry_idx, p3);
+        let b01 = _mm512_add_epi8(b0, b1);
+        let b23 = _mm512_add_epi8(b2, b3);
+        let b012 = _mm512_add_epi8(b01, b2);
+        let b0123 = _mm512_add_epi8(b01, b23);
+        let c = *carry;
+        let o0 = _mm512_add_epi8(p0, c);
+        let o1 = _mm512_add_epi8(p1, _mm512_add_epi8(c, b0));
+        let o2 = _mm512_add_epi8(p2, _mm512_add_epi8(c, b01));
+        let o3 = _mm512_add_epi8(p3, _mm512_add_epi8(c, b012));
+        *carry = _mm512_add_epi8(c, b0123);
+        pack_4x48_to_192(o0, o1, o2, o3)
     }
 
     #[target_feature(enable = "avx512bw,avx512vl,avx512vbmi")]
@@ -1239,12 +1348,16 @@ mod avx512 {
     #[target_feature(enable = "avx512bw,avx512vl,avx512vbmi")]
     #[inline]
     unsafe fn row_sub3_inverse_impl(src: &[u8], dst: &mut [u8]) {
-        let len = src.len();
+        let len = src.len().min(dst.len());
+        debug_assert_eq!(src.len(), len);
         debug_assert_eq!(dst.len(), len);
-        let lim = (len / 48) * 48;
-        // SAFETY: Caller guarantees AVX-512BW/VL/VBMI; masked 48-byte loads/stores
-        // strictly access `i..i + 48 <= len` and the masked tail accesses strictly
-        // `lim..len` (`rem <= 47`).
+        let lim192 = (len / 192) * 192;
+        let lim48 = (len / 48) * 48;
+        // SAFETY: Caller guarantees AVX-512BW/VL/VBMI; `192 B` iterations
+        // access `i..i + 192 <= len` via unmasked 64 B loads/stores, `48 B`
+        // iterations access `i..i + 48 <= len` via unmasked 32 B + 16 B
+        // loads/stores, and the masked tail accesses strictly `lim48..len`
+        // (`rem <= 47`).
         unsafe {
             let sh3 = load_table(&PREFIX_SH3_IDX);
             let sh6 = load_table(&PREFIX_SH6_IDX);
@@ -1255,21 +1368,32 @@ mod avx512 {
             let dst_p = dst.as_mut_ptr();
             let mut carry = _mm512_setzero_si512();
             let mut i = 0usize;
-            while i < lim {
-                let v = _mm512_maskz_loadu_epi8(MASK_48, src_p.add(i).cast());
+            while i < lim192 {
+                let v0 = _mm512_loadu_si512(src_p.add(i).cast());
+                let v1 = _mm512_loadu_si512(src_p.add(i + 64).cast());
+                let v2 = _mm512_loadu_si512(src_p.add(i + 128).cast());
+                let [w0, w1, w2] =
+                    sub3_inverse_192(v0, v1, v2, &mut carry, sh3, sh6, sh12, sh24, carry_idx);
+                _mm512_storeu_si512(dst_p.add(i).cast(), w0);
+                _mm512_storeu_si512(dst_p.add(i + 64).cast(), w1);
+                _mm512_storeu_si512(dst_p.add(i + 128).cast(), w2);
+                i += 192;
+            }
+            while i < lim48 {
+                let v = load_48(src_p.add(i));
                 let v = prefix_sum_sub3_48(v, sh3, sh6, sh12, sh24);
                 let out = _mm512_add_epi8(v, carry);
                 carry = _mm512_add_epi8(carry, _mm512_permutexvar_epi8(carry_idx, v));
-                _mm512_mask_storeu_epi8(dst_p.add(i).cast(), MASK_48, out);
+                store_48(dst_p.add(i), out);
                 i += 48;
             }
-            let rem = len - lim;
+            let rem = len - lim48;
             if rem != 0 {
                 let mask = (1u64 << rem) - 1;
-                let v = _mm512_maskz_loadu_epi8(mask, src_p.add(lim).cast());
+                let v = _mm512_maskz_loadu_epi8(mask, src_p.add(lim48).cast());
                 let v = prefix_sum_sub3_48(v, sh3, sh6, sh12, sh24);
                 let v = _mm512_add_epi8(v, carry);
-                _mm512_mask_storeu_epi8(dst_p.add(lim).cast(), mask, v);
+                _mm512_mask_storeu_epi8(dst_p.add(lim48).cast(), mask, v);
             }
         }
     }
@@ -1304,10 +1428,13 @@ mod avx512 {
         debug_assert_eq!(prev.len(), len);
         debug_assert_eq!(dst.len(), len);
         debug_assert!(len.is_multiple_of(3));
-        let lim = (len / 48) * 48;
-        // SAFETY: Caller guarantees AVX-512BW/VL/VBMI; masked 48-byte loads/stores
-        // strictly access `i..i + 48 <= len` and the masked tail accesses strictly
-        // `lim..len` (`rem <= 47`).
+        let lim192 = (len / 192) * 192;
+        let lim48 = (len / 48) * 48;
+        // SAFETY: Caller guarantees AVX-512BW/VL/VBMI; `192 B` iterations
+        // access `i..i + 192 <= len` via unmasked 64 B loads/stores, `48 B`
+        // iterations access `i..i + 48 <= len` via unmasked 32 B + 16 B
+        // loads/stores, and the masked tail accesses strictly `lim48..len`
+        // (`rem <= 47`).
         unsafe {
             let sh3 = load_table(&PREFIX_SH3_IDX);
             let sh6 = load_table(&PREFIX_SH6_IDX);
@@ -1319,23 +1446,75 @@ mod avx512 {
             let dst_p = dst.as_mut_ptr();
             let mut carry = _mm512_setzero_si512();
             let mut i = 0usize;
-            while i < lim {
-                let v = _mm512_maskz_loadu_epi8(MASK_48, src_p.add(i).cast());
+            while i < lim192 {
+                let v0 = _mm512_loadu_si512(src_p.add(i).cast());
+                let v1 = _mm512_loadu_si512(src_p.add(i + 64).cast());
+                let v2 = _mm512_loadu_si512(src_p.add(i + 128).cast());
+                let [w0, w1, w2] =
+                    sub3_inverse_192(v0, v1, v2, &mut carry, sh3, sh6, sh12, sh24, carry_idx);
+                let u0 = _mm512_loadu_si512(prev_p.add(i).cast());
+                let u1 = _mm512_loadu_si512(prev_p.add(i + 64).cast());
+                let u2 = _mm512_loadu_si512(prev_p.add(i + 128).cast());
+                _mm512_storeu_si512(dst_p.add(i).cast(), _mm512_add_epi8(w0, u0));
+                _mm512_storeu_si512(dst_p.add(i + 64).cast(), _mm512_add_epi8(w1, u1));
+                _mm512_storeu_si512(dst_p.add(i + 128).cast(), _mm512_add_epi8(w2, u2));
+                i += 192;
+            }
+            while i < lim48 {
+                let v = load_48(src_p.add(i));
                 let v = prefix_sum_sub3_48(v, sh3, sh6, sh12, sh24);
                 let out = _mm512_add_epi8(v, carry);
                 carry = _mm512_add_epi8(carry, _mm512_permutexvar_epi8(carry_idx, v));
-                let u = _mm512_maskz_loadu_epi8(MASK_48, prev_p.add(i).cast());
-                _mm512_mask_storeu_epi8(dst_p.add(i).cast(), MASK_48, _mm512_add_epi8(out, u));
+                let u = load_48(prev_p.add(i));
+                store_48(dst_p.add(i), _mm512_add_epi8(out, u));
                 i += 48;
             }
-            let rem = len - lim;
+            let rem = len - lim48;
             if rem != 0 {
                 let mask = (1u64 << rem) - 1;
-                let v = _mm512_maskz_loadu_epi8(mask, src_p.add(lim).cast());
+                let v = _mm512_maskz_loadu_epi8(mask, src_p.add(lim48).cast());
                 let v = prefix_sum_sub3_48(v, sh3, sh6, sh12, sh24);
                 let v = _mm512_add_epi8(v, carry);
-                let u = _mm512_maskz_loadu_epi8(mask, prev_p.add(lim).cast());
-                _mm512_mask_storeu_epi8(dst_p.add(lim).cast(), mask, _mm512_add_epi8(v, u));
+                let u = _mm512_maskz_loadu_epi8(mask, prev_p.add(lim48).cast());
+                _mm512_mask_storeu_epi8(dst_p.add(lim48).cast(), mask, _mm512_add_epi8(v, u));
+            }
+        }
+    }
+
+    #[target_feature(enable = "avx512bw,avx512vl,avx512vbmi")]
+    #[inline]
+    unsafe fn unpack_16px_bgr_to_bgra<const STREAM: bool, const CONST_ALPHA: bool>(
+        bgr: __m512i,
+        shuf_g: __m512i,
+        unpack_bgr: __m512i,
+        unpack_bgra: __m512i,
+        rgb_mask: __m512i,
+        const_alpha_vec: __m512i,
+        alpha_p: *const u8,
+        dst_p: *mut MaybeUninit<Vec4u8>,
+        x: usize,
+    ) {
+        // SAFETY: Caller guarantees AVX-512BW/VL/VBMI, `x + 16 <= dst.len()`,
+        // `x + 16 <= alpha.len()` when `!CONST_ALPHA`, and 64-byte alignment on
+        // `dst_p.add(x)` when `STREAM` is `true`.
+        unsafe {
+            let bgra = if CONST_ALPHA {
+                let sg = _mm512_permutexvar_epi8(unpack_bgr, bgr);
+                let g = _mm512_shuffle_epi8(sg, shuf_g);
+                // `(A & B) | C` (`0xEA`): preserves B, G, R and overwrites alpha
+                // byte `3` with `const_alpha` using zero opmask registers.
+                _mm512_ternarylogic_epi32::<0xEA>(_mm512_add_epi8(sg, g), rgb_mask, const_alpha_vec)
+            } else {
+                let a128 = _mm_loadu_si128(alpha_p.add(x).cast::<__m128i>());
+                let sg = _mm512_permutex2var_epi8(bgr, unpack_bgra, _mm512_zextsi128_si512(a128));
+                let g = _mm512_shuffle_epi8(sg, shuf_g);
+                _mm512_add_epi8(sg, g)
+            };
+            let p = dst_p.add(x).cast::<__m512i>();
+            if STREAM {
+                _mm512_stream_si512(p, bgra);
+            } else {
+                _mm512_storeu_si512(p.cast(), bgra);
             }
         }
     }
@@ -1353,48 +1532,100 @@ mod avx512 {
         debug_assert!(CONST_ALPHA || alpha_row.len() == tw);
         debug_assert!(!STREAM || (dst.as_mut_ptr() as usize).is_multiple_of(64));
 
-        // Masked 48-byte loads never touch bytes `48..64`, and the masked tail
-        // handles `1..=15` trailing pixels with zero scalar loop.
-        let lim = (tw / 16) * 16;
+        // Main `64 px` (`192 B` = `3 x 64 B` unmasked loads) loop matches the
+        // 64 B store geometry of `row_sub3_inverse`, `row_subup3_inverse`, and
+        // `row_up_subgreen_bgr3_to_bgra` for exact STLF, followed by an unmasked
+        // `16 px` (`48 B` = `32 B + 16 B`) remainder loop and a masked tail
+        // strictly for `1..=15` trailing pixels.
+        let lim64 = tw & !63;
+        let lim16 = tw & !15;
         let mut x = 0usize;
         let mut si = 0usize;
 
-        // SAFETY: Caller guarantees AVX-512BW/VL/VBMI; `si + 48 <= src_bgr.len()`,
-        // `x + 16 <= dst.len()`, `x + 16 <= alpha_row.len()` when `!CONST_ALPHA`,
-        // caller upholds 64-byte alignment on `dst` when `STREAM` is `true`, and
-        // the masked tail accesses strictly `lim..tw` (`rem <= 15`).
+        // SAFETY: Caller guarantees AVX-512BW/VL/VBMI; `si + 192 <= src_bgr.len()`
+        // and `x + 64 <= tw` in the main loop, `si + 48 <= src_bgr.len()` and
+        // `x + 16 <= tw` in the 48 B loop, `alpha_row.len() == tw` when
+        // `!CONST_ALPHA`, caller upholds 64-byte alignment on `dst` when `STREAM`
+        // is `true`, and the masked tail accesses strictly `lim16..tw` (`rem <= 15`).
         unsafe {
             let shuf_g = load_table(&SHUF_G);
             let unpack_bgr = load_table(&UNPACK_BGR_IDX);
             let unpack_bgra = load_table(&UNPACK_BGRA_IDX);
+            let rgb_mask = _mm512_set1_epi32(0x00FF_FFFFu32 as i32);
             let const_alpha_vec = _mm512_set1_epi32((u32::from(const_alpha) << 24) as i32);
             let src_p = src_bgr.as_ptr();
             let alpha_p = alpha_row.as_ptr();
             let dst_p = dst.as_mut_ptr();
 
-            while x < lim {
-                let bgr = _mm512_maskz_loadu_epi8(MASK_48, src_p.add(si).cast());
-                let bgra = if CONST_ALPHA {
-                    let sg = _mm512_permutexvar_epi8(unpack_bgr, bgr);
-                    let g = _mm512_shuffle_epi8(sg, shuf_g);
-                    _mm512_or_si512(_mm512_add_epi8(sg, g), const_alpha_vec)
-                } else {
-                    let a128 = _mm_loadu_si128(alpha_p.add(x).cast::<__m128i>());
-                    let sg =
-                        _mm512_permutex2var_epi8(bgr, unpack_bgra, _mm512_zextsi128_si512(a128));
-                    let g = _mm512_shuffle_epi8(sg, shuf_g);
-                    _mm512_add_epi8(sg, g)
-                };
-                let p = dst_p.add(x).cast::<__m512i>();
-                if STREAM {
-                    _mm512_stream_si512(p, bgra);
-                } else {
-                    _mm512_storeu_si512(p.cast(), bgra);
-                }
+            while x < lim64 {
+                let v0 = _mm512_loadu_si512(src_p.add(si).cast());
+                let v1 = _mm512_loadu_si512(src_p.add(si + 64).cast());
+                let v2 = _mm512_loadu_si512(src_p.add(si + 128).cast());
+                let [c0, c1, c2, c3] = split_192_to_4x48(v0, v1, v2);
+                unpack_16px_bgr_to_bgra::<STREAM, CONST_ALPHA>(
+                    c0,
+                    shuf_g,
+                    unpack_bgr,
+                    unpack_bgra,
+                    rgb_mask,
+                    const_alpha_vec,
+                    alpha_p,
+                    dst_p,
+                    x,
+                );
+                unpack_16px_bgr_to_bgra::<STREAM, CONST_ALPHA>(
+                    c1,
+                    shuf_g,
+                    unpack_bgr,
+                    unpack_bgra,
+                    rgb_mask,
+                    const_alpha_vec,
+                    alpha_p,
+                    dst_p,
+                    x + 16,
+                );
+                unpack_16px_bgr_to_bgra::<STREAM, CONST_ALPHA>(
+                    c2,
+                    shuf_g,
+                    unpack_bgr,
+                    unpack_bgra,
+                    rgb_mask,
+                    const_alpha_vec,
+                    alpha_p,
+                    dst_p,
+                    x + 32,
+                );
+                unpack_16px_bgr_to_bgra::<STREAM, CONST_ALPHA>(
+                    c3,
+                    shuf_g,
+                    unpack_bgr,
+                    unpack_bgra,
+                    rgb_mask,
+                    const_alpha_vec,
+                    alpha_p,
+                    dst_p,
+                    x + 48,
+                );
+                x += 64;
+                si += 192;
+            }
+            while x < lim16 {
+                let bgr = load_48(src_p.add(si));
+                unpack_16px_bgr_to_bgra::<STREAM, CONST_ALPHA>(
+                    bgr,
+                    shuf_g,
+                    unpack_bgr,
+                    unpack_bgra,
+                    rgb_mask,
+                    const_alpha_vec,
+                    alpha_p,
+                    dst_p,
+                    x,
+                );
                 x += 16;
                 si += 48;
             }
-            let rem = tw - lim;
+            let rem = tw - lim16;
             if rem != 0 {
                 let bgr_mask = (1u64 << (rem * 3)) - 1;
                 let dst_mask = (1u64 << (rem * 4)) - 1;
@@ -1402,15 +1633,19 @@ mod avx512 {
                 let bgra = if CONST_ALPHA {
                     let sg = _mm512_permutexvar_epi8(unpack_bgr, bgr);
                     let g = _mm512_shuffle_epi8(sg, shuf_g);
-                    _mm512_or_si512(_mm512_add_epi8(sg, g), const_alpha_vec)
+                    _mm512_ternarylogic_epi32::<0xEA>(
+                        _mm512_add_epi8(sg, g),
+                        rgb_mask,
+                        const_alpha_vec,
+                    )
                 } else {
                     let alpha_mask = (1u64 << rem) - 1;
-                    let a = _mm512_maskz_loadu_epi8(alpha_mask, alpha_p.add(lim).cast());
+                    let a = _mm512_maskz_loadu_epi8(alpha_mask, alpha_p.add(lim16).cast());
                     let sg = _mm512_permutex2var_epi8(bgr, unpack_bgra, a);
                     let g = _mm512_shuffle_epi8(sg, shuf_g);
                     _mm512_add_epi8(sg, g)
                 };
-                _mm512_mask_storeu_epi8(dst_p.add(lim).cast(), dst_mask, bgra);
+                _mm512_mask_storeu_epi8(dst_p.add(lim16).cast(), dst_mask, bgra);
             }
         }
     }
@@ -1437,18 +1672,27 @@ mod avx512 {
         debug_assert!(CONST_ALPHA || alpha_row.len() == tw);
         debug_assert!(!STREAM || (dst.as_mut_ptr() as usize).is_multiple_of(64));
 
-        let lim = (tw / 16) * 16;
+        // Main `64 px` (`192 B` = `3 x 64 B` unmasked `vmovdqu64`) loop avoids
+        // microcoded 48 B masked byte loads/stores into `cur_dec`, preserving
+        // exact 64B-to-64B store-to-load forwarding across consecutive `Up`
+        // rows. Unmasked `32 B + 16 B` handles `16..=48 px` remainders and
+        // masked byte ops run strictly on the `< 16 px` end-of-row tail.
+        let lim64 = tw & !63;
+        let lim16 = tw & !15;
         let mut x = 0usize;
         let mut si = 0usize;
 
-        // SAFETY: Caller guarantees AVX-512BW/VL/VBMI; full iterations access
-        // `si..si + 48 <= row_b` and `x..x + 16 <= tw`, `cur_dec` has `row_b`
-        // bytes when `WRITE_DEC`, caller upholds 64-byte alignment on `dst`
-        // when `STREAM` is `true`, and the masked tail accesses strictly `lim..tw`.
+        // SAFETY: Caller guarantees AVX-512BW/VL/VBMI; `si + 192 <= row_b` and
+        // `x + 64 <= tw` in the main loop, `si + 48 <= row_b` and `x + 16 <= tw`
+        // in the 48 B loop, `cur_dec.len() == row_b` when `WRITE_DEC`,
+        // `alpha_row.len() == tw` when `!CONST_ALPHA`, caller upholds 64-byte
+        // alignment on `dst` when `STREAM` is `true`, and the masked tail
+        // accesses strictly `lim16..tw` (`rem <= 15`).
         unsafe {
             let shuf_g = load_table(&SHUF_G);
             let unpack_bgr = load_table(&UNPACK_BGR_IDX);
             let unpack_bgra = load_table(&UNPACK_BGRA_IDX);
+            let rgb_mask = _mm512_set1_epi32(0x00FF_FFFFu32 as i32);
             let const_alpha_vec = _mm512_set1_epi32((u32::from(const_alpha) << 24) as i32);
             let filt_p = filt_bgr.as_ptr();
             let prev_p = prev_bgr.as_ptr();
@@ -1456,35 +1700,101 @@ mod avx512 {
             let alpha_p = alpha_row.as_ptr();
             let dst_p = dst.as_mut_ptr();
 
-            while x < lim {
-                let f = _mm512_maskz_loadu_epi8(MASK_48, filt_p.add(si).cast());
-                let u = _mm512_maskz_loadu_epi8(MASK_48, prev_p.add(si).cast());
-                // Zero-masked loads guarantee lane 48 is `0 + 0 = 0` for `UNPACK_BGR_IDX`.
-                let dec = _mm512_add_epi8(f, u);
+            while x < lim64 {
+                let d0 = _mm512_add_epi8(
+                    _mm512_loadu_si512(filt_p.add(si).cast()),
+                    _mm512_loadu_si512(prev_p.add(si).cast()),
+                );
+                let d1 = _mm512_add_epi8(
+                    _mm512_loadu_si512(filt_p.add(si + 64).cast()),
+                    _mm512_loadu_si512(prev_p.add(si + 64).cast()),
+                );
+                let d2 = _mm512_add_epi8(
+                    _mm512_loadu_si512(filt_p.add(si + 128).cast()),
+                    _mm512_loadu_si512(prev_p.add(si + 128).cast()),
+                );
                 if WRITE_DEC {
-                    _mm512_mask_storeu_epi8(dec_p.add(si).cast(), MASK_48, dec);
+                    _mm512_storeu_si512(dec_p.add(si).cast(), d0);
+                    _mm512_storeu_si512(dec_p.add(si + 64).cast(), d1);
+                    _mm512_storeu_si512(dec_p.add(si + 128).cast(), d2);
                 }
-                let bgra = if CONST_ALPHA {
-                    let sg = _mm512_permutexvar_epi8(unpack_bgr, dec);
-                    let g = _mm512_shuffle_epi8(sg, shuf_g);
-                    _mm512_or_si512(_mm512_add_epi8(sg, g), const_alpha_vec)
-                } else {
-                    let a128 = _mm_loadu_si128(alpha_p.add(x).cast::<__m128i>());
-                    let sg =
-                        _mm512_permutex2var_epi8(dec, unpack_bgra, _mm512_zextsi128_si512(a128));
-                    let g = _mm512_shuffle_epi8(sg, shuf_g);
-                    _mm512_add_epi8(sg, g)
-                };
-                let p = dst_p.add(x).cast::<__m512i>();
-                if STREAM {
-                    _mm512_stream_si512(p, bgra);
-                } else {
-                    _mm512_storeu_si512(p.cast(), bgra);
+                let [c0, c1, c2, c3] = split_192_to_4x48(d0, d1, d2);
+                unpack_16px_bgr_to_bgra::<STREAM, CONST_ALPHA>(
+                    c0,
+                    shuf_g,
+                    unpack_bgr,
+                    unpack_bgra,
+                    rgb_mask,
+                    const_alpha_vec,
+                    alpha_p,
+                    dst_p,
+                    x,
+                );
+                unpack_16px_bgr_to_bgra::<STREAM, CONST_ALPHA>(
+                    c1,
+                    shuf_g,
+                    unpack_bgr,
+                    unpack_bgra,
+                    rgb_mask,
+                    const_alpha_vec,
+                    alpha_p,
+                    dst_p,
+                    x + 16,
+                );
+                unpack_16px_bgr_to_bgra::<STREAM, CONST_ALPHA>(
+                    c2,
+                    shuf_g,
+                    unpack_bgr,
+                    unpack_bgra,
+                    rgb_mask,
+                    const_alpha_vec,
+                    alpha_p,
+                    dst_p,
+                    x + 32,
+                );
+                unpack_16px_bgr_to_bgra::<STREAM, CONST_ALPHA>(
+                    c3,
+                    shuf_g,
+                    unpack_bgr,
+                    unpack_bgra,
+                    rgb_mask,
+                    const_alpha_vec,
+                    alpha_p,
+                    dst_p,
+                    x + 48,
+                );
+                x += 64;
+                si += 192;
+            }
+            while x < lim16 {
+                let d_lo = _mm256_add_epi8(
+                    _mm256_loadu_si256(filt_p.add(si).cast::<__m256i>()),
+                    _mm256_loadu_si256(prev_p.add(si).cast::<__m256i>()),
+                );
+                let d_hi = _mm_add_epi8(
+                    _mm_loadu_si128(filt_p.add(si + 32).cast::<__m128i>()),
+                    _mm_loadu_si128(prev_p.add(si + 32).cast::<__m128i>()),
+                );
+                if WRITE_DEC {
+                    _mm256_storeu_si256(dec_p.add(si).cast::<__m256i>(), d_lo);
+                    _mm_storeu_si128(dec_p.add(si + 32).cast::<__m128i>(), d_hi);
                 }
+                let dec = _mm512_inserti32x4::<2>(_mm512_zextsi256_si512(d_lo), d_hi);
+                unpack_16px_bgr_to_bgra::<STREAM, CONST_ALPHA>(
+                    dec,
+                    shuf_g,
+                    unpack_bgr,
+                    unpack_bgra,
+                    rgb_mask,
+                    const_alpha_vec,
+                    alpha_p,
+                    dst_p,
+                    x,
+                );
                 x += 16;
                 si += 48;
             }
-            let rem = tw - lim;
+            let rem = tw - lim16;
             if rem != 0 {
                 let bgr_mask = (1u64 << (rem * 3)) - 1;
                 let dst_mask = (1u64 << (rem * 4)) - 1;
@@ -1497,15 +1807,19 @@ mod avx512 {
                 let bgra = if CONST_ALPHA {
                     let sg = _mm512_permutexvar_epi8(unpack_bgr, dec);
                     let g = _mm512_shuffle_epi8(sg, shuf_g);
-                    _mm512_or_si512(_mm512_add_epi8(sg, g), const_alpha_vec)
+                    _mm512_ternarylogic_epi32::<0xEA>(
+                        _mm512_add_epi8(sg, g),
+                        rgb_mask,
+                        const_alpha_vec,
+                    )
                 } else {
                     let alpha_mask = (1u64 << rem) - 1;
-                    let a = _mm512_maskz_loadu_epi8(alpha_mask, alpha_p.add(lim).cast());
+                    let a = _mm512_maskz_loadu_epi8(alpha_mask, alpha_p.add(lim16).cast());
                     let sg = _mm512_permutex2var_epi8(dec, unpack_bgra, a);
                     let g = _mm512_shuffle_epi8(sg, shuf_g);
                     _mm512_add_epi8(sg, g)
                 };
-                _mm512_mask_storeu_epi8(dst_p.add(lim).cast(), dst_mask, bgra);
+                _mm512_mask_storeu_epi8(dst_p.add(lim16).cast(), dst_mask, bgra);
             }
         }
     }
