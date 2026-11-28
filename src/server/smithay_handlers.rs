@@ -220,6 +220,9 @@ impl WprsServerState {
                                 writer.send(SendType::RawBuffer(raw_buffer_to_send));
                             },
                         );
+                        if !synced.shadow.is_compressed() {
+                            synced.last_active = Instant::now();
+                        }
                         if diff.is_unchanged() {
                             return Ok(InnerOutcome::Unchanged { synced });
                         }
@@ -262,7 +265,11 @@ impl WprsServerState {
                             },
                         );
                         Ok(InnerOutcome::Sent {
-                            synced: SyncedSurfaceBuffer { metadata, shadow },
+                            synced: SyncedSurfaceBuffer {
+                                metadata,
+                                shadow,
+                                last_active: Instant::now(),
+                            },
                             metadata,
                             damage: None,
                         })
@@ -4923,5 +4930,216 @@ mod tests {
         assert!(hdr_reconn.reset_tile_cache);
         assert_eq!(hits_reconn, 0);
         assert_eq!(canvas, frame_a);
+    }
+
+    #[test]
+    #[cfg_attr(miri, ignore)]
+    fn test_dormant_shadow_compression_lifecycle_unchanged_wake_and_resize() {
+        use std::io::Seek;
+        use std::io::Write;
+        use std::num::NonZeroUsize;
+
+        use crate::filtering::ValidatedTileStream;
+        use crate::serialization::framing::CompressedTileStream;
+        use crate::sharding_compression::ShardingDecompressor;
+
+        let mut h = WaylandTestHarness::new(true);
+        let compositor = h.client_data.compositor.clone().unwrap();
+        let shm = h.client_data.shm.clone().unwrap();
+
+        // 512x512 Xrgb8888 = 1,048,576 B == `MIN_DORMANT_COMPRESS_BYTES`.
+        let width = 512usize;
+        let height = 512usize;
+        let stride = width * 4;
+        let byte_len = height * stride;
+        assert_eq!(byte_len, filtering::MIN_DORMANT_COMPRESS_BYTES);
+
+        let path = std::env::temp_dir().join(format!(
+            "wprs_dormant_shadow_test_{}_{}.bin",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let mut file = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create_new(true)
+            .open(&path)
+            .unwrap();
+        let mut frame = vec![0u8; byte_len];
+        for y in 0..height {
+            for x in 0..width {
+                let off = y * stride + x * 4;
+                frame[off] = ((x / 32) * 19 + (y / 32) * 7) as u8;
+                frame[off + 1] = ((y / 16) * 11) as u8;
+                frame[off + 2] = ((x / 64) * 23) as u8;
+                frame[off + 3] = 0xFF;
+            }
+        }
+        file.write_all(&frame).unwrap();
+        _ = std::fs::remove_file(&path);
+        let pool = shm.create_pool(file.as_fd(), byte_len as i32, &h.qh, ());
+        let buf = pool.create_buffer(
+            0,
+            width as i32,
+            height as i32,
+            stride as i32,
+            wl_shm::Format::Xrgb8888,
+            &h.qh,
+            (),
+        );
+        let surf = compositor.create_surface(&h.qh, ());
+
+        let mut decompressor = ShardingDecompressor::new(NonZeroUsize::new(2).unwrap()).unwrap();
+        let mut client_cache = filtering::ClientTileCache::new();
+        let mut canvas = vec![0u8; byte_len];
+        let mut decode_rb = |rb: crate::serialization::framing::StreamingCompressedTiles,
+                             dst: &mut [u8],
+                             cache: &mut filtering::ClientTileCache|
+         -> crate::serialization::framing::RawBufferHeader {
+            let mut wire = Vec::new();
+            rb.framed_write(&mut wire).unwrap();
+            let mut cursor = wire.as_slice();
+            let mut rx = None;
+            CompressedTileStream::read_from_stream(&mut cursor, |s| {
+                rx = Some(s);
+                Ok(())
+            })
+            .unwrap();
+            let stream = rx.unwrap();
+            let hdr = stream.header.clone();
+            let validated = ValidatedTileStream::new(stream).unwrap();
+            filtering::decompress_and_unfilter_streaming(
+                validated,
+                &mut decompressor,
+                dst,
+                Some(cache),
+            )
+            .unwrap();
+            hdr
+        };
+
+        // 1. Initial commit populates raw shadow + quadrant hashes.
+        surf.attach(Some(&buf), 0, 0);
+        surf.commit();
+        h.roundtrip();
+        let sid = h.server_surface_id(&surf);
+        let mut got_initial = false;
+        for msg in h.drain_messages() {
+            if let SendType::RawBuffer(rb) = msg {
+                let hdr = decode_rb(rb, &mut canvas, &mut client_cache);
+                h.ack_frame(hdr.frame_seq);
+                assert!(!hdr.incremental);
+                got_initial = true;
+            }
+        }
+        assert!(got_initial);
+        assert_eq!(canvas, frame);
+        assert!(!h.state.synced_buffers[&sid].shadow.is_compressed());
+
+        // 2. Sweep before timeout is a no-op; sweep at timeout compresses the dormant shadow.
+        let t_active = h.state.synced_buffers[&sid].last_active;
+        assert_eq!(
+            h.state.compress_dormant_shadows(
+                t_active + constants::DORMANT_SHADOW_IDLE_TIMEOUT - Duration::from_secs(1)
+            ),
+            0
+        );
+        assert!(!h.state.synced_buffers[&sid].shadow.is_compressed());
+
+        assert_eq!(
+            h.state
+                .compress_dormant_shadows(t_active + constants::DORMANT_SHADOW_IDLE_TIMEOUT),
+            1
+        );
+        let compressed_len = h.state.synced_buffers[&sid]
+            .shadow
+            .compressed_bytes()
+            .expect("expected shadow to be compressed after idle timeout");
+        assert!(compressed_len < byte_len / 10);
+
+        // 3. Unchanged repaint on a dormant compressed surface skips both wire bytes and decompression.
+        surf.attach(Some(&buf), 0, 0);
+        surf.commit();
+        h.roundtrip();
+        let raw_bufs = h
+            .drain_messages()
+            .into_iter()
+            .filter(|m| matches!(m, SendType::RawBuffer(_)))
+            .count();
+        assert_eq!(raw_bufs, 0);
+        assert!(
+            h.state.synced_buffers[&sid].shadow.is_compressed(),
+            "unchanged repaint must not decompress a dormant shadow with valid quad hashes"
+        );
+
+        // 4. Dirty edit wakes the dormant surface via incremental diff (zero full-frame resync).
+        for y in 20..36 {
+            for x in 20..36 {
+                let off = y * stride + x * 4;
+                frame[off] ^= 0x55;
+                frame[off + 1] ^= 0xAA;
+            }
+        }
+        file.rewind().unwrap();
+        file.write_all(&frame).unwrap();
+        surf.attach(Some(&buf), 0, 0);
+        surf.commit();
+        h.roundtrip();
+        let mut woke_hdr = None;
+        for msg in h.drain_messages() {
+            if let SendType::RawBuffer(rb) = msg {
+                let hdr = decode_rb(rb, &mut canvas, &mut client_cache);
+                h.ack_frame(hdr.frame_seq);
+                woke_hdr = Some(hdr);
+            }
+        }
+        let woke_hdr = woke_hdr.expect("expected incremental RawBuffer on wake");
+        assert!(woke_hdr.incremental);
+        assert_eq!(woke_hdr.tile_rects.len(), 1);
+        assert_eq!(canvas, frame);
+        assert!(!h.state.synced_buffers[&sid].shadow.is_compressed());
+
+        // 5. Re-compress and resize: full frame replaces compressed shadow cleanly without decompressing.
+        let t_woke = h.state.synced_buffers[&sid].last_active;
+        assert_eq!(
+            h.state
+                .compress_dormant_shadows(t_woke + constants::DORMANT_SHADOW_IDLE_TIMEOUT),
+            1
+        );
+        assert!(h.state.synced_buffers[&sid].shadow.is_compressed());
+
+        let new_w = 256usize;
+        let new_h = 256usize;
+        let new_stride = new_w * 4;
+        let new_len = new_h * new_stride;
+        let buf_resized = pool.create_buffer(
+            0,
+            new_w as i32,
+            new_h as i32,
+            new_stride as i32,
+            wl_shm::Format::Xrgb8888,
+            &h.qh,
+            (),
+        );
+        let mut resized_canvas = vec![0u8; new_len];
+        surf.attach(Some(&buf_resized), 0, 0);
+        surf.commit();
+        h.roundtrip();
+        let mut resized_hdr = None;
+        for msg in h.drain_messages() {
+            if let SendType::RawBuffer(rb) = msg {
+                let hdr = decode_rb(rb, &mut resized_canvas, &mut client_cache);
+                h.ack_frame(hdr.frame_seq);
+                resized_hdr = Some(hdr);
+            }
+        }
+        let resized_hdr = resized_hdr.expect("expected full RawBuffer on resize");
+        assert!(!resized_hdr.incremental);
+        assert_eq!(resized_canvas, frame[..new_len]);
+        assert!(!h.state.synced_buffers[&sid].shadow.is_compressed());
+        assert_eq!(h.state.synced_buffers[&sid].shadow.len(), new_len);
     }
 }

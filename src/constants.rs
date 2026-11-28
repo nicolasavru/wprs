@@ -19,3 +19,15 @@ pub const STALE_INPUT_THRESHOLD: Duration = Duration::from_secs(5);
 /// Duration without peer response or activity before `wprsc` or `wprsd` treats
 /// the connection as stalled and closes it cleanly.
 pub const STALL_TIMEOUT: Duration = Duration::from_secs(20);
+
+/// Interval between periodic sweeps that compress dormant surface shadow
+/// buffers on `wprsd`.
+pub const DORMANT_SHADOW_SWEEP_INTERVAL: Duration = Duration::from_secs(5);
+
+/// Idle duration without active buffer updates before a large surface shadow
+/// buffer is eligible for dormant Zstd compression.
+pub const DORMANT_SHADOW_IDLE_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// Maximum number of dormant shadow buffers attempted per sweep tick so
+/// aging-out multi-window sessions never stall the Wayland event loop.
+pub const MAX_DORMANT_COMPRESS_PER_TICK: usize = 2;

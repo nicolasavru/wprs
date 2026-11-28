@@ -293,6 +293,17 @@ impl ServerHeartbeatState {
 pub struct SyncedSurfaceBuffer {
     pub metadata: BufferMetadata,
     pub shadow: ShadowBuffer,
+    pub last_active: Instant,
+}
+
+/// Advises glibc to return freed `brk` heap pages (such as dropped dormant
+/// shadow buffers below dynamic `M_MMAP_THRESHOLD`) back to the OS.
+fn release_freed_heap_memory() {
+    #[cfg(all(target_os = "linux", target_env = "gnu", not(miri)))]
+    // SAFETY: `malloc_trim(0)` is a thread-safe glibc heap-trimming hint.
+    unsafe {
+        let _ = nix::libc::malloc_trim(0);
+    }
 }
 
 fn surface_destruction_callback(state: &mut WprsServerState, surface: &WlSurface) {
@@ -425,6 +436,15 @@ impl WprsServerState {
             |_, _, state| {
                 state.check_client_stall(Instant::now());
                 TimeoutAction::ToDuration(constants::HEARTBEAT_INTERVAL)
+            },
+        )
+        .expect("timer registration should never fail");
+
+        lh.insert_source(
+            Timer::from_duration(constants::DORMANT_SHADOW_SWEEP_INTERVAL),
+            |_, _, state| {
+                state.compress_dormant_shadows(Instant::now());
+                TimeoutAction::ToDuration(constants::DORMANT_SHADOW_SWEEP_INTERVAL)
             },
         )
         .expect("timer registration should never fail");
@@ -580,6 +600,46 @@ impl WprsServerState {
         }
     }
 
+    /// Compresses up to [`constants::MAX_DORMANT_COMPRESS_PER_TICK`] eligible
+    /// idle surface shadow buffers in place, returning the number of surfaces
+    /// compressed on this tick.
+    #[instrument(skip(self), level = "debug")]
+    pub(crate) fn compress_dormant_shadows(&mut self, now: Instant) -> usize {
+        let mut candidates: Vec<(Instant, WlSurfaceId)> = self
+            .synced_buffers
+            .iter()
+            .filter_map(|(&id, synced)| {
+                (synced.shadow.is_dormant_compressible()
+                    && now.saturating_duration_since(synced.last_active)
+                        >= constants::DORMANT_SHADOW_IDLE_TIMEOUT)
+                    .then_some((synced.last_active, id))
+            })
+            .collect();
+        if candidates.is_empty() {
+            return 0;
+        }
+        // Compress the oldest dormant surfaces first; break ties deterministically.
+        candidates.sort_unstable_by_key(|&(last_active, id)| (last_active, id.0));
+
+        let mut attempts = 0usize;
+        let mut compressed = 0usize;
+        for (_, id) in candidates {
+            if attempts >= constants::MAX_DORMANT_COMPRESS_PER_TICK {
+                break;
+            }
+            if let Some(synced) = self.synced_buffers.get_mut(&id) {
+                attempts += 1;
+                if synced.shadow.compress_dormant(&mut self.compressor) {
+                    compressed += 1;
+                }
+            }
+        }
+        if compressed > 0 {
+            release_freed_heap_memory();
+        }
+        compressed
+    }
+
     /// Inserts `surface` into `object_map` and initializes its
     /// `LockedSurfaceState` (every surface in `object_map` has
     /// `LockedSurfaceState`).
@@ -704,5 +764,145 @@ mod tests {
 
         hb.on_disconnected();
         assert!(!hb.is_stalled(t1 + timeout + Duration::from_secs(60)));
+    }
+
+    #[test]
+    #[cfg_attr(miri, ignore)]
+    fn test_compress_dormant_shadows_timeout_ordering_batch_cap_and_incompressible() {
+        use smithay::reexports::calloop::EventLoop;
+        use smithay::reexports::wayland_server::Display;
+
+        use crate::filtering::MIN_DORMANT_COMPRESS_BYTES;
+        use crate::serialization::wayland::BufferFormat;
+
+        let display: Display<WprsServerState> = Display::new().unwrap();
+        let event_loop: EventLoop<WprsServerState> = EventLoop::try_new().unwrap();
+        let serializer: Serializer<Request, Event> = Serializer::new_test_server();
+        let mut state = WprsServerState::new(
+            display.handle(),
+            event_loop.handle(),
+            serializer,
+            false,
+            Duration::from_millis(16),
+            false,
+        );
+
+        let big_meta = BufferMetadata {
+            width: 512,
+            height: 512,
+            stride: 512 * 4,
+            format: BufferFormat::Xrgb8888,
+        };
+        let tiny_meta = BufferMetadata {
+            width: 64,
+            height: 64,
+            stride: 64 * 4,
+            format: BufferFormat::Xrgb8888,
+        };
+        let make_compressible = |seed: u8| {
+            let mut v = vec![0u8; MIN_DORMANT_COMPRESS_BYTES];
+            for (i, b) in v.iter_mut().enumerate() {
+                *b = seed.wrapping_add(((i / 256) & 0xFF) as u8);
+            }
+            ShadowBuffer::from_pixels(v)
+        };
+        let make_noise = || {
+            let mut v = vec![0u8; MIN_DORMANT_COMPRESS_BYTES];
+            let mut prng = 0x9E37_79B9_7F4A_7C15u64;
+            for chunk in v.as_chunks_mut::<8>().0 {
+                prng = prng.wrapping_add(0x9E37_79B9_7F4A_7C15);
+                let mut z = prng;
+                z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+                z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+                z ^= z >> 31;
+                chunk.copy_from_slice(&z.to_le_bytes());
+            }
+            ShadowBuffer::from_pixels(v)
+        };
+
+        let t0 = Instant::now();
+        let s_noise = WlSurfaceId(1); // oldest (t0) — incompressible
+        let s_old = WlSurfaceId(2); // second oldest (t0 + 1s)
+        let s_mid = WlSurfaceId(3); // third oldest (t0 + 2s)
+        let s_fresh = WlSurfaceId(4); // active (t0 + 25s)
+        let s_tiny = WlSurfaceId(5); // tiny (< 1 MiB, oldest)
+
+        state.synced_buffers.insert(
+            s_noise,
+            SyncedSurfaceBuffer {
+                metadata: big_meta,
+                shadow: make_noise(),
+                last_active: t0,
+            },
+        );
+        state.synced_buffers.insert(
+            s_old,
+            SyncedSurfaceBuffer {
+                metadata: big_meta,
+                shadow: make_compressible(1),
+                last_active: t0 + Duration::from_secs(1),
+            },
+        );
+        state.synced_buffers.insert(
+            s_mid,
+            SyncedSurfaceBuffer {
+                metadata: big_meta,
+                shadow: make_compressible(2),
+                last_active: t0 + Duration::from_secs(2),
+            },
+        );
+        state.synced_buffers.insert(
+            s_fresh,
+            SyncedSurfaceBuffer {
+                metadata: big_meta,
+                shadow: make_compressible(3),
+                last_active: t0 + Duration::from_secs(25),
+            },
+        );
+        state.synced_buffers.insert(
+            s_tiny,
+            SyncedSurfaceBuffer {
+                metadata: tiny_meta,
+                shadow: ShadowBuffer::from_pixels(vec![0x42u8; 64 * 64 * 4]),
+                last_active: t0,
+            },
+        );
+
+        // Before idle timeout: nothing compressed.
+        let t_early = t0 + constants::DORMANT_SHADOW_IDLE_TIMEOUT - Duration::from_secs(1);
+        assert_eq!(state.compress_dormant_shadows(t_early), 0);
+
+        // Tick 1 at `t0 + 35s`: oldest 2 eligible surfaces (`s_noise`, `s_old`) are
+        // attempted (`MAX_DORMANT_COMPRESS_PER_TICK == 2`). `s_noise` is marked
+        // incompressible and stays raw; `s_old` compresses; `s_mid` waits for tick 2;
+        // `s_fresh` is not yet idle; `s_tiny` is always skipped.
+        let t1 = t0 + constants::DORMANT_SHADOW_IDLE_TIMEOUT + Duration::from_secs(5);
+        assert_eq!(state.compress_dormant_shadows(t1), 1);
+        assert!(!state.synced_buffers[&s_noise].shadow.is_compressed());
+        assert!(
+            !state.synced_buffers[&s_noise]
+                .shadow
+                .is_dormant_compressible()
+        );
+        assert!(state.synced_buffers[&s_old].shadow.is_compressed());
+        assert!(!state.synced_buffers[&s_mid].shadow.is_compressed());
+        assert!(!state.synced_buffers[&s_fresh].shadow.is_compressed());
+        assert!(!state.synced_buffers[&s_tiny].shadow.is_compressed());
+
+        // Tick 2 at `t1`: `s_noise` is skipped (already marked incompressible),
+        // so `s_mid` compresses cleanly.
+        assert_eq!(state.compress_dormant_shadows(t1), 1);
+        assert!(state.synced_buffers[&s_mid].shadow.is_compressed());
+        assert!(!state.synced_buffers[&s_fresh].shadow.is_compressed());
+
+        // Tick 3 at `t1`: no eligible surfaces left until `s_fresh` ages out.
+        assert_eq!(state.compress_dormant_shadows(t1), 0);
+
+        // Once `s_fresh` reaches `DORMANT_SHADOW_IDLE_TIMEOUT`, it compresses too;
+        // `s_tiny` stays raw forever.
+        let t2 = t0 + Duration::from_secs(25) + constants::DORMANT_SHADOW_IDLE_TIMEOUT;
+        assert_eq!(state.compress_dormant_shadows(t2), 1);
+        assert!(state.synced_buffers[&s_fresh].shadow.is_compressed());
+        assert!(!state.synced_buffers[&s_tiny].shadow.is_compressed());
     }
 }

@@ -950,6 +950,7 @@ pub(crate) struct CompressorWorkerState {
     pub(crate) jpeg_pixels: Vec<u8>,
     jpeg_out: Vec<u8>,
     pub(crate) worker_idx: usize,
+    shadow_decompressor: Option<Decompressor<'static>>,
 }
 
 impl CompressorWorkerState {
@@ -978,7 +979,17 @@ impl CompressorWorkerState {
             jpeg_pixels: Vec::new(),
             jpeg_out: Vec::new(),
             worker_idx,
+            shadow_decompressor: None,
         })
+    }
+
+    /// Returns this worker's lazily allocated Zstd decompressor for waking
+    /// dormant compressed [`crate::filtering::ShadowBuffer`] instances.
+    pub(crate) fn shadow_decompressor(&mut self) -> Result<&mut Decompressor<'static>> {
+        if self.shadow_decompressor.is_none() {
+            self.shadow_decompressor = Some(Decompressor::new().location(loc!())?);
+        }
+        Ok(self.shadow_decompressor.as_mut().unwrap())
     }
 
     /// Compresses a `width x height` BGRX rectangle starting at `src` with row

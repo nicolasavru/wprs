@@ -718,6 +718,7 @@ pub use tile_cache::ClientTileCache;
 pub use tile_cache::ServerTileCache;
 use zstd::bulk::Compressor;
 use zstd::bulk::Decompressor;
+use zstd::zstd_safe;
 
 use crate::buffer_pointer::BufferPointer;
 use crate::filtering::palette::HybridScan;
@@ -777,6 +778,7 @@ use crate::sharding_compression::CompressorWorkerState;
 use crate::sharding_compression::DecompressorWorkerState;
 use crate::sharding_compression::ShardingCompressor;
 use crate::sharding_compression::ShardingDecompressor;
+use crate::sharding_compression::WorkerPool;
 use crate::sharding_compression::compress_bytes;
 use crate::vec4u8::Vec4u8;
 
@@ -3844,15 +3846,255 @@ pub(crate) struct PhaseAQuadHashes {
     dense_dirty_bands: u64,
 }
 
+/// Minimum shadow buffer size (bytes) eligible for dormant Zstd compression.
+/// Tiny surfaces (cursors, tooltips, small popups) stay raw so idle sweeps skip
+/// trivial buffers.
+pub const MIN_DORMANT_COMPRESS_BYTES: usize = 1024 * 1024;
+
+/// Chunk size (bytes) for parallel dormant shadow Zstd compression.
+///
+/// `256 KiB` keeps each chunk plus its Zstd scratch inside a 512 KiB L2 cache
+/// while exposing 4 chunks on 1 MiB, 32 chunks on 1080p, and 127 chunks on 4K
+/// for balanced work-stealing across up to 16 workers.
+const DORMANT_COMPRESS_CHUNK_BYTES: usize = 256 * 1024;
+
+/// [`zstd_safe::WriteBuf`] adapter writing directly into uninitialized
+/// `MaybeUninit<u8>` spare capacity without pre-zeroing.
+struct UninitWriteBuf<'a>(&'a mut [MaybeUninit<u8>]);
+
+// SAFETY: `zstd_safe::WriteBuf::write_from` only writes up to `capacity()`
+// bytes into `as_mut_ptr()` without reading uninitialized memory; callers
+// verify the returned byte count equals the full slice before assuming init.
+unsafe impl zstd_safe::WriteBuf for UninitWriteBuf<'_> {
+    #[inline]
+    fn as_slice(&self) -> &[u8] {
+        &[]
+    }
+
+    #[inline]
+    fn capacity(&self) -> usize {
+        self.0.len()
+    }
+
+    #[inline]
+    fn as_mut_ptr(&mut self) -> *mut u8 {
+        self.0.as_mut_ptr().cast::<u8>()
+    }
+
+    #[inline]
+    unsafe fn filled_until(&mut self, _n: usize) {}
+}
+
+/// Strict-provenance `Send + Sync` mutable pointer handle for parallel workers
+/// writing strictly disjoint indices or byte ranges.
+struct SyncMutPtr<T>(*mut T);
+
+// SAFETY: Callers partition the underlying buffer into strictly disjoint
+// elements/byte ranges claimed at most once via `AtomicUsize`.
+unsafe impl<T> Send for SyncMutPtr<T> {}
+unsafe impl<T> Sync for SyncMutPtr<T> {}
+
+impl<T> SyncMutPtr<T> {
+    /// # Safety
+    /// Caller must ensure `count` is in bounds of the underlying allocation.
+    #[inline]
+    unsafe fn add(&self, count: usize) -> *mut T {
+        // SAFETY: Caller upholds in-bounds offset invariants.
+        unsafe { self.0.add(count) }
+    }
+}
+
+#[derive(Clone)]
+struct CompressedShadow {
+    uncompressed_len: usize,
+    chunk_size: usize,
+    /// Concatenated chunk payloads stored as a single allocation so dormant
+    /// surfaces do not scatter many small allocations across worker arenas.
+    data: Box<[u8]>,
+    /// Cumulative end offset in `data` for each chunk.
+    chunk_ends: Box<[usize]>,
+}
+
+fn parallel_compress_chunks_with<S, F>(
+    raw: &[u8],
+    chunk_size: usize,
+    max_compressed: usize,
+    pool: &mut WorkerPool<S>,
+    compress_chunk: F,
+) -> Option<CompressedShadow>
+where
+    S: Send + 'static,
+    F: Fn(&mut S, &[u8], &mut Vec<u8>) -> usize + Sync,
+{
+    let byte_len = raw.len();
+    if byte_len == 0 || chunk_size == 0 || max_compressed == 0 {
+        return None;
+    }
+    let n_chunks = byte_len.div_ceil(chunk_size);
+    let mut chunk_vecs: Vec<Vec<u8>> = (0..n_chunks).map(|_| Vec::new()).collect();
+    let slots = SyncMutPtr(chunk_vecs.as_mut_ptr());
+    let next_chunk = AtomicUsize::new(0);
+    let total_compressed = AtomicUsize::new(0);
+    let aborted = AtomicBool::new(false);
+
+    pool.execute(n_chunks, |state| {
+        let mut scratch = Vec::new();
+        loop {
+            if aborted.load(Ordering::Relaxed) {
+                break;
+            }
+            let idx = next_chunk.fetch_add(1, Ordering::Relaxed);
+            if idx >= n_chunks {
+                break;
+            }
+            let start = idx * chunk_size;
+            let end = (start + chunk_size).min(byte_len);
+            let n = compress_chunk(state, &raw[start..end], &mut scratch);
+            if total_compressed
+                .fetch_add(n, Ordering::Relaxed)
+                .saturating_add(n)
+                >= max_compressed
+            {
+                aborted.store(true, Ordering::Relaxed);
+                break;
+            }
+            let chunk_bytes = scratch[..n].to_vec();
+            // SAFETY: `idx < n_chunks` is claimed at most once via `next_chunk`,
+            // and `chunk_vecs` is untouched by the caller until `pool.execute` joins.
+            unsafe {
+                *slots.add(idx) = chunk_bytes;
+            }
+        }
+    });
+
+    if aborted.load(Ordering::Relaxed) {
+        return None;
+    }
+    let total_len: usize = chunk_vecs.iter().map(Vec::len).sum();
+    if total_len >= max_compressed {
+        return None;
+    }
+    let mut data = Vec::with_capacity(total_len);
+    let mut chunk_ends = Vec::with_capacity(n_chunks);
+    for chunk in chunk_vecs {
+        data.extend_from_slice(&chunk);
+        chunk_ends.push(data.len());
+    }
+    Some(CompressedShadow {
+        uncompressed_len: byte_len,
+        chunk_size,
+        data: data.into_boxed_slice(),
+        chunk_ends: chunk_ends.into_boxed_slice(),
+    })
+}
+
+fn parallel_decompress_chunks_uninit_with<S, F>(
+    compressed: &CompressedShadow,
+    pool: &mut WorkerPool<S>,
+    decompress_chunk: F,
+) -> Result<Vec<u8>>
+where
+    S: Send + 'static,
+    F: Fn(&mut S, &[u8], &mut [MaybeUninit<u8>]) -> Result<usize> + Sync,
+{
+    let total_len = compressed.uncompressed_len;
+    if total_len == 0 {
+        return Ok(Vec::new());
+    }
+    let chunk_size = compressed.chunk_size;
+    let n_chunks = compressed.chunk_ends.len();
+    let mut out = Vec::<u8>::with_capacity(total_len);
+    let base = SyncMutPtr(out.as_mut_ptr().cast::<MaybeUninit<u8>>());
+    let next_chunk = AtomicUsize::new(0);
+    let chunks_ok = AtomicUsize::new(0);
+    let failed = AtomicBool::new(false);
+    let first_err: Mutex<Option<anyhow::Error>> = Mutex::new(None);
+
+    pool.execute(n_chunks, |state| {
+        loop {
+            if failed.load(Ordering::Relaxed) {
+                break;
+            }
+            let idx = next_chunk.fetch_add(1, Ordering::Relaxed);
+            if idx >= n_chunks {
+                break;
+            }
+            let src_start = if idx == 0 {
+                0
+            } else {
+                compressed.chunk_ends[idx - 1]
+            };
+            let src_end = compressed.chunk_ends[idx];
+            let dst_start = idx * chunk_size;
+            let dst_len = (total_len - dst_start).min(chunk_size);
+            // SAFETY: Chunk destination ranges `[dst_start .. dst_start + dst_len)`
+            // partition `0..total_len <= out.capacity()`, each `idx` is claimed at
+            // most once, and `out` is untouched until `pool.execute` joins.
+            let dst = unsafe { slice::from_raw_parts_mut(base.add(dst_start), dst_len) };
+            match decompress_chunk(state, &compressed.data[src_start..src_end], dst) {
+                Ok(written) if written == dst_len => {
+                    chunks_ok.fetch_add(1, Ordering::Relaxed);
+                },
+                Ok(written) => {
+                    let mut guard = first_err.lock().unwrap();
+                    if guard.is_none() {
+                        *guard = Some(anyhow!(
+                            "dormant shadow chunk {idx} decompressed {written} bytes, expected {dst_len}"
+                        ));
+                    }
+                    failed.store(true, Ordering::Relaxed);
+                    break;
+                },
+                Err(err) => {
+                    let mut guard = first_err.lock().unwrap();
+                    if guard.is_none() {
+                        *guard = Some(err);
+                    }
+                    failed.store(true, Ordering::Relaxed);
+                    break;
+                },
+            }
+        }
+    });
+
+    if let Some(err) = first_err.into_inner().unwrap() {
+        return Err(err);
+    }
+    let completed = chunks_ok.into_inner();
+    if completed != n_chunks {
+        bail!("incomplete dormant shadow decompression: {completed}/{n_chunks} chunks");
+    }
+    // SAFETY: Every chunk in `0..n_chunks` succeeded and initialized its exact
+    // disjoint `[dst_start .. dst_start + dst_len)` slice covering `0..total_len`.
+    unsafe { out.set_len(total_len) };
+    Ok(out)
+}
+
+#[derive(Clone)]
+enum ShadowStorage {
+    Raw(Vec<u8>),
+    Compressed(CompressedShadow),
+}
+
+impl Default for ShadowStorage {
+    fn default() -> Self {
+        Self::Raw(Vec::new())
+    }
+}
+
 /// Per-surface server shadow pixel buffer paired with synchronized per-quadrant
 /// keyed 128-bit hashes for half-DRAM Phase-A change screening.
 ///
-/// Mutating raw pixels via [`Self::pixels_mut`] automatically invalidates all
-/// cached quadrant hashes so hashes can never desync from pixel contents.
+/// Dormant large surfaces (`>= MIN_DORMANT_COMPRESS_BYTES`) can be compressed
+/// in place via [`Self::compress_dormant`] while preserving cached quadrant
+/// hashes intact across sleep/wake cycles. Mutating raw pixels via
+/// [`Self::pixels_mut`] automatically invalidates all cached quadrant hashes so
+/// hashes can never desync from pixel contents.
 #[derive(Clone, Default)]
 pub struct ShadowBuffer {
-    pixels: Vec<u8>,
+    storage: ShadowStorage,
     quad_hashes: ShadowQuadHashes,
+    incompressible: bool,
 }
 
 impl ShadowBuffer {
@@ -3864,58 +4106,269 @@ impl ShadowBuffer {
     #[inline]
     pub fn from_pixels(pixels: Vec<u8>) -> Self {
         Self {
-            pixels,
+            storage: ShadowStorage::Raw(pixels),
             quad_hashes: ShadowQuadHashes::default(),
+            incompressible: false,
+        }
+    }
+
+    /// Returns raw shadow pixels.
+    ///
+    /// # Panics
+    /// Panics if this buffer is currently compressed; call [`Self::ensure_raw`]
+    /// first.
+    #[inline]
+    pub fn pixels(&self) -> &[u8] {
+        match &self.storage {
+            ShadowStorage::Raw(pixels) => pixels,
+            ShadowStorage::Compressed(_) => {
+                panic!("ShadowBuffer::pixels() called while compressed; call ensure_raw() first")
+            },
+        }
+    }
+
+    /// Returns raw shadow pixels as a byte slice.
+    ///
+    /// # Panics
+    /// Panics if this buffer is currently compressed; call [`Self::ensure_raw`]
+    /// first.
+    #[inline]
+    pub fn as_slice(&self) -> &[u8] {
+        self.pixels()
+    }
+
+    /// Returns mutable raw shadow pixels, invalidating cached quadrant hashes
+    /// and clearing any incompressible mark.
+    ///
+    /// # Panics
+    /// Panics if this buffer is currently compressed; call [`Self::ensure_raw`]
+    /// first.
+    #[inline]
+    pub fn pixels_mut(&mut self) -> &mut [u8] {
+        self.quad_hashes.invalidate_all();
+        self.incompressible = false;
+        match &mut self.storage {
+            ShadowStorage::Raw(pixels) => pixels,
+            ShadowStorage::Compressed(_) => {
+                panic!(
+                    "ShadowBuffer::pixels_mut() called while compressed; call ensure_raw() first"
+                )
+            },
+        }
+    }
+
+    /// Logical uncompressed pixel byte length (whether currently raw or
+    /// dormant-compressed).
+    #[inline]
+    pub fn len(&self) -> usize {
+        match &self.storage {
+            ShadowStorage::Raw(pixels) => pixels.len(),
+            ShadowStorage::Compressed(compressed) => compressed.uncompressed_len,
         }
     }
 
     #[inline]
-    pub fn pixels(&self) -> &[u8] {
-        &self.pixels
-    }
-
-    #[inline]
-    pub fn as_slice(&self) -> &[u8] {
-        &self.pixels
-    }
-
-    #[inline]
-    pub fn pixels_mut(&mut self) -> &mut [u8] {
-        self.quad_hashes.invalidate_all();
-        &mut self.pixels
-    }
-
-    #[inline]
-    pub fn len(&self) -> usize {
-        self.pixels.len()
-    }
-
-    #[inline]
     pub fn is_empty(&self) -> bool {
-        self.pixels.is_empty()
+        self.len() == 0
+    }
+
+    /// Returns `true` when pixel storage is currently dormant-compressed.
+    #[inline]
+    pub fn is_compressed(&self) -> bool {
+        matches!(self.storage, ShadowStorage::Compressed(_))
+    }
+
+    /// Returns the compressed payload byte size when currently compressed.
+    #[inline]
+    pub fn compressed_bytes(&self) -> Option<usize> {
+        match &self.storage {
+            ShadowStorage::Raw(_) => None,
+            ShadowStorage::Compressed(compressed) => Some(compressed.data.len()),
+        }
+    }
+
+    /// Returns `true` when this raw shadow buffer is eligible for dormant
+    /// compression (`>= MIN_DORMANT_COMPRESS_BYTES` and not marked
+    /// incompressible).
+    #[inline]
+    pub(crate) fn is_dormant_compressible(&self) -> bool {
+        !self.incompressible
+            && matches!(
+                &self.storage,
+                ShadowStorage::Raw(pixels) if pixels.len() >= MIN_DORMANT_COMPRESS_BYTES
+            )
     }
 
     #[inline]
     pub fn clear(&mut self) {
-        self.pixels.clear();
+        match &mut self.storage {
+            ShadowStorage::Raw(pixels) => pixels.clear(),
+            ShadowStorage::Compressed(_) => self.storage = ShadowStorage::Raw(Vec::new()),
+        }
         self.quad_hashes.invalidate_all();
+        self.incompressible = false;
     }
 
     #[inline]
     pub fn copy_from(&mut self, other: &Self) {
-        self.pixels.clear();
-        self.pixels.extend_from_slice(&other.pixels);
+        match (&mut self.storage, &other.storage) {
+            (ShadowStorage::Raw(dst), ShadowStorage::Raw(src)) => {
+                dst.clear();
+                dst.extend_from_slice(src);
+            },
+            _ => self.storage.clone_from(&other.storage),
+        }
         self.quad_hashes.clone_from(&other.quad_hashes);
+        self.incompressible = other.incompressible;
+    }
+
+    /// Consumes this buffer and returns its raw pixel vector.
+    ///
+    /// # Panics
+    /// Panics if this buffer is currently compressed; call [`Self::ensure_raw`]
+    /// first.
+    #[inline]
+    pub fn into_pixels(self) -> Vec<u8> {
+        match self.storage {
+            ShadowStorage::Raw(pixels) => pixels,
+            ShadowStorage::Compressed(_) => {
+                panic!(
+                    "ShadowBuffer::into_pixels() called while compressed; call ensure_raw() first"
+                )
+            },
+        }
+    }
+
+    /// Compresses raw pixel storage in place with parallel chunked Zstd L1
+    /// while keeping [`ShadowQuadHashes`] intact.
+    ///
+    /// Returns `true` if raw pixels were replaced with compressed storage, or
+    /// `false` if the buffer was already compressed, smaller than
+    /// [`MIN_DORMANT_COMPRESS_BYTES`], or incompressible (`>= 75%` of original
+    /// size, in which case it stays raw and is skipped on subsequent sweeps
+    /// until its pixels change).
+    #[instrument(skip_all, level = "debug")]
+    pub fn compress_dormant(&mut self, compressor: &mut ShardingCompressor) -> bool {
+        self.compress_dormant_with_chunk_size(compressor, DORMANT_COMPRESS_CHUNK_BYTES)
+    }
+
+    fn compress_dormant_with_chunk_size(
+        &mut self,
+        compressor: &mut ShardingCompressor,
+        chunk_size: usize,
+    ) -> bool {
+        if self.incompressible {
+            return false;
+        }
+        let ShadowStorage::Raw(raw) = &self.storage else {
+            return false;
+        };
+        let byte_len = raw.len();
+        if byte_len < MIN_DORMANT_COMPRESS_BYTES {
+            return false;
+        }
+        let max_compressed = (byte_len / 4) * 3;
+        let compressed = parallel_compress_chunks_with(
+            raw,
+            chunk_size,
+            max_compressed,
+            &mut compressor.pool,
+            |state, chunk, scratch| {
+                let bound = zstd_safe::compress_bound(chunk.len());
+                scratch.clear();
+                scratch.reserve(bound);
+                state
+                    .compressor
+                    .compress_to_buffer(chunk, scratch)
+                    .expect("dst reserved to compress_bound")
+            },
+        );
+        match compressed {
+            Some(compressed) => {
+                self.storage = ShadowStorage::Compressed(compressed);
+                true
+            },
+            None => {
+                self.incompressible = true;
+                false
+            },
+        }
+    }
+
+    /// Ensures pixel storage is decompressed in place, preserving
+    /// [`ShadowQuadHashes`], and returns the raw pixel slice.
+    #[inline]
+    pub fn ensure_raw(&mut self, compressor: &mut ShardingCompressor) -> &[u8] {
+        if self.is_compressed() {
+            self.decompress_cold(compressor);
+        }
+        self.raw_pixels()
+    }
+
+    #[cold]
+    #[inline(never)]
+    #[instrument(skip_all, level = "debug")]
+    fn decompress_cold(&mut self, compressor: &mut ShardingCompressor) {
+        let ShadowStorage::Compressed(compressed) = &self.storage else {
+            return;
+        };
+        let raw = parallel_decompress_chunks_uninit_with(
+            compressed,
+            &mut compressor.pool,
+            |state, src, dst| {
+                let decompressor = state.shadow_decompressor()?;
+                let mut wb = UninitWriteBuf(dst);
+                decompressor
+                    .decompress_to_buffer(src, &mut wb)
+                    .location(loc!())
+            },
+        )
+        .expect("in-process dormant shadow Zstd decompression failed");
+        self.storage = ShadowStorage::Raw(raw);
+    }
+
+    /// Prepares raw capacity for a full-frame overwrite, dropping any dormant
+    /// compressed payload without decompressing it.
+    fn prepare_raw_for_full(&mut self, byte_len: usize) {
+        self.quad_hashes.invalidate_all();
+        self.incompressible = false;
+        match &mut self.storage {
+            ShadowStorage::Raw(pixels) => {
+                pixels.clear();
+                if pixels.capacity() < byte_len {
+                    pixels.reserve_exact(byte_len);
+                } else if pixels.capacity() > byte_len.saturating_mul(2) {
+                    pixels.shrink_to(byte_len);
+                }
+            },
+            ShadowStorage::Compressed(_) => {
+                self.storage = ShadowStorage::Raw(Vec::with_capacity(byte_len));
+            },
+        }
     }
 
     #[inline]
-    pub fn into_pixels(self) -> Vec<u8> {
-        self.pixels
+    fn raw_pixels(&self) -> &[u8] {
+        match &self.storage {
+            ShadowStorage::Raw(pixels) => pixels,
+            ShadowStorage::Compressed(_) => unreachable!("ShadowBuffer must be raw here"),
+        }
+    }
+
+    #[inline]
+    fn raw_pixels_mut(&mut self) -> &mut Vec<u8> {
+        match &mut self.storage {
+            ShadowStorage::Raw(pixels) => pixels,
+            ShadowStorage::Compressed(_) => unreachable!("ShadowBuffer must be raw here"),
+        }
     }
 
     #[cfg(test)]
     pub(crate) fn capacity(&self) -> usize {
-        self.pixels.capacity()
+        match &self.storage {
+            ShadowStorage::Raw(pixels) => pixels.capacity(),
+            ShadowStorage::Compressed(compressed) => compressed.data.len(),
+        }
     }
 
     #[cfg(test)]
@@ -6100,13 +6553,7 @@ fn filter_and_compress_full_streaming_with_tier(
 
     let mut shadow_opt = shadow_out;
     if let Some(shadow) = shadow_opt.as_deref_mut() {
-        shadow.quad_hashes.invalidate_all();
-        shadow.pixels.clear();
-        if shadow.pixels.capacity() < byte_len {
-            shadow.pixels.reserve_exact(byte_len);
-        } else if shadow.pixels.capacity() > byte_len.saturating_mul(2) {
-            shadow.pixels.shrink_to(byte_len);
-        }
+        shadow.prepare_raw_for_full(byte_len);
     }
 
     // SAFETY: Vec4u8 is a repr(C, packed) wrapper around [u8; 4].
@@ -6149,7 +6596,7 @@ fn filter_and_compress_full_streaming_with_tier(
 
             let (shadow_rows, sync_qh) = if let Some(shadow) = shadow_opt.as_deref_mut() {
                 let rows = ShadowRows {
-                    base: shadow.pixels.as_mut_ptr(),
+                    base: shadow.raw_pixels_mut().as_mut_ptr(),
                     stride,
                 };
                 let qh = if seed_quad_hashes {
@@ -6446,7 +6893,7 @@ fn filter_and_compress_full_streaming_with_tier(
                 // every tile was written (even on early stream disconnect), and
                 // right-edge tiles zeroed trailing row-stride padding, so all
                 // `byte_len` bytes are initialized.
-                unsafe { shadow.pixels.set_len(byte_len) };
+                unsafe { shadow.raw_pixels_mut().set_len(byte_len) };
                 if seed_quad_hashes && !was_disconnected {
                     shadow.quad_hashes.mark_all_valid();
                 } else {
@@ -6478,7 +6925,7 @@ fn filter_and_compress_full_streaming_with_tier(
             let _hash_span = debug_span!("tile_cache_hash_full").entered();
             let (shadow_rows, sync_qh) = if let Some(shadow) = shadow_opt.as_deref_mut() {
                 let rows = ShadowRows {
-                    base: shadow.pixels.as_mut_ptr(),
+                    base: shadow.raw_pixels_mut().as_mut_ptr(),
                     stride,
                 };
                 let qh = if seed_quad_hashes {
@@ -6640,7 +7087,7 @@ fn filter_and_compress_full_streaming_with_tier(
             // SAFETY: Phase A workers have joined after writing every base tile
             // and zeroing trailing row-stride padding, initializing all
             // `byte_len` bytes.
-            unsafe { shadow.pixels.set_len(byte_len) };
+            unsafe { shadow.raw_pixels_mut().set_len(byte_len) };
             if seed_quad_hashes {
                 shadow.quad_hashes.mark_all_valid();
             }
@@ -6667,8 +7114,8 @@ fn filter_and_compress_full_streaming_with_tier(
 
         let shadow_ptr_storage;
         let encode_aos = if let Some(shadow) = shadow_opt.as_deref() {
-            shadow_ptr_storage = shadow.pixels.as_ptr().cast::<Vec4u8>();
-            // SAFETY: Phase A workers have joined, `shadow.pixels.len() == total_pixels * 4`,
+            shadow_ptr_storage = shadow.raw_pixels().as_ptr().cast::<Vec4u8>();
+            // SAFETY: Phase A workers have joined, `shadow.raw_pixels().len() == total_pixels * 4`,
             // and `Vec4u8` has alignment 1.
             unsafe { BufferPointer::new(&shadow_ptr_storage, total_pixels) }
         } else {
@@ -6792,7 +7239,7 @@ fn filter_and_compress_full_streaming_with_tier(
     let n_tiles = tile_rects.len();
     let rects_for_workers = tile_rects.clone();
     let shadow_rows = shadow_opt.as_deref_mut().map(|shadow| ShadowRows {
-        base: shadow.pixels.as_mut_ptr(),
+        base: shadow.raw_pixels_mut().as_mut_ptr(),
         stride,
     });
 
@@ -6900,7 +7347,7 @@ fn filter_and_compress_full_streaming_with_tier(
         // SAFETY: Every tile in `rects_for_workers` was copied into `shadow`
         // (even on early stream disconnect) and right-edge tiles zeroed
         // trailing row-stride padding, initializing all `byte_len` bytes.
-        unsafe { shadow.pixels.set_len(byte_len) };
+        unsafe { shadow.raw_pixels_mut().set_len(byte_len) };
     }
 }
 
@@ -7111,6 +7558,114 @@ where
     run(&schedule);
 }
 
+/// Screens `data` (`wl_shm`) against cached [`ShadowQuadHashes`] while `shadow`
+/// is dormant-compressed so periodic unchanged repaints skip decompressing the
+/// `shadow` buffer completely.
+///
+/// Only runs on full-frame or grid-aligned band commits whose covered `128`-row
+/// bands are all valid, returning `true` iff every covered quadrant's keyed
+/// 128-bit digest matches `quad_hashes`. Any mismatch bails immediately so the
+/// caller falls through to decompression and normal incremental diffing.
+#[cold]
+#[inline(never)]
+fn try_prescreen_compressed_shadow(
+    data: BufferPointer<u8>,
+    metadata: BufferMetadata,
+    bands: Option<&[RowBand]>,
+    quad_hashes: &ShadowQuadHashes,
+    hash_key: &tile_hash::TileHashKey,
+    compressor: &mut ShardingCompressor,
+) -> bool {
+    let width = metadata.width as usize;
+    let height = metadata.height as usize;
+    let stride = metadata.stride as usize;
+    let has_alpha = metadata.format == BufferFormat::Argb8888;
+    if !quad_hashes.matches(width, height, stride, has_alpha, hash_key) {
+        return false;
+    }
+    let n_qx = quad_hashes.n_qx;
+    let n_qy = quad_hashes.n_qy;
+    let stride_quads = quad_hashes.stride_quads;
+
+    let mut check_bands = Vec::with_capacity(n_qy);
+    match bands {
+        None => {
+            for qy in 0..n_qy {
+                if quad_hashes.band_valid[qy] == 0 {
+                    return false;
+                }
+                check_bands.push(qy);
+            }
+        },
+        Some(row_bands) => {
+            let mut seen = vec![false; n_qy];
+            for rb in row_bands {
+                let y0 = rb.y0 as usize;
+                let y1 = rb.y1 as usize;
+                if y0 >= y1 {
+                    continue;
+                }
+                // Only pre-screen grid-aligned bands so we never read rows
+                // outside the caller's fault-probed `bands` range.
+                if !y0.is_multiple_of(SUBTILE_H) || (y1 != height && !y1.is_multiple_of(SUBTILE_H))
+                {
+                    return false;
+                }
+                let qy0 = y0 / SUBTILE_H;
+                let qy1 = y1.div_ceil(SUBTILE_H).min(n_qy);
+                for (offset, is_seen) in seen[qy0..qy1].iter_mut().enumerate() {
+                    if !*is_seen {
+                        let qy = qy0 + offset;
+                        if quad_hashes.band_valid[qy] == 0 {
+                            return false;
+                        }
+                        *is_seen = true;
+                        check_bands.push(qy);
+                    }
+                }
+            }
+        },
+    }
+    if check_bands.is_empty() {
+        return true;
+    }
+
+    let total_quads = check_bands.len() * n_qx;
+    let next_q = AtomicUsize::new(0);
+    let mismatch = AtomicBool::new(false);
+    compressor.pool.execute(total_quads, |_state| {
+        loop {
+            if mismatch.load(Ordering::Relaxed) {
+                break;
+            }
+            let idx = next_q.fetch_add(1, Ordering::Relaxed);
+            if idx >= total_quads {
+                break;
+            }
+            let qy = check_bands[idx / n_qx];
+            let qx = idx % n_qx;
+            let y0 = qy * SUBTILE_H;
+            let x0 = qx * SUBTILE_W;
+            let rect = TileRect {
+                x: x0 as u32,
+                y: y0 as u32,
+                w: (width - x0).min(SUBTILE_W) as u32,
+                h: (height - y0).min(SUBTILE_H) as u32,
+            };
+            let h = if has_alpha {
+                tile_hash::hash_rect_only_from_ptr::<true>(hash_key, data, stride, rect)
+            } else {
+                tile_hash::hash_rect_only_from_ptr::<false>(hash_key, data, stride, rect)
+            };
+            if h != quad_hashes.hashes[qy * stride_quads + qx] {
+                mismatch.store(true, Ordering::Relaxed);
+                break;
+            }
+        }
+    });
+    !mismatch.load(Ordering::Relaxed)
+}
+
 fn filter_and_compress_incremental_streaming_impl(
     tier: arch::Tier,
     data: BufferPointer<u8>,
@@ -7133,7 +7688,7 @@ fn filter_and_compress_incremental_streaming_impl(
         .expect("server passed invalid CompressionMode");
     let byte_len = total_pixels * 4;
     assert!(data.len() >= byte_len);
-    assert!(shadow.pixels.len() >= byte_len);
+    assert!(shadow.len() >= byte_len);
 
     let (sub_bands, base_entries, total_slots) =
         plan_incremental_scan(&metadata, bands).expect("server generated invalid row bands");
@@ -7142,6 +7697,25 @@ fn filter_and_compress_incremental_streaming_impl(
             scroll_rect: None,
             dirty_tiles: Vec::new(),
         };
+    }
+
+    if shadow.is_compressed() {
+        if let Some(cache) = tile_cache.as_deref()
+            && try_prescreen_compressed_shadow(
+                data,
+                metadata,
+                bands,
+                &shadow.quad_hashes,
+                cache.hash_key(),
+                compressor,
+            )
+        {
+            return IncrementalFrameResult {
+                scroll_rect: None,
+                dirty_tiles: Vec::new(),
+            };
+        }
+        shadow.decompress_cold(compressor);
     }
 
     let width = metadata.width as usize;
@@ -7168,8 +7742,13 @@ fn filter_and_compress_incremental_streaming_impl(
     // column-stripe shadow scrolling into Phase A when present, leaving the
     // non-scroll Phase A worker loop untouched for zero codegen overhead on
     // non-scroll frames.
-    let scroll_outcome =
-        scroll::detect_scroll_and_activity_with_tier(data, &shadow.pixels, metadata, bands, tier);
+    let scroll_outcome = scroll::detect_scroll_and_activity_with_tier(
+        data,
+        shadow.raw_pixels(),
+        metadata,
+        bands,
+        tier,
+    );
     let scroll_rect = scroll_outcome.scroll_rect;
 
     // Phase A: parallel dirty scan + tight bbox tracking + shadow update (+
@@ -7197,7 +7776,7 @@ fn filter_and_compress_incremental_streaming_impl(
     {
         if let Some(sr) = scroll_rect {
             let shadow_rows = ShadowRows {
-                base: shadow.pixels.as_mut_ptr(),
+                base: shadow.raw_pixels_mut().as_mut_ptr(),
                 stride,
             };
             let (sb_start, sb_end) = scroll_sub_band_range(&sub_bands, sr);
@@ -7306,7 +7885,7 @@ fn filter_and_compress_incremental_streaming_impl(
                 None
             };
             let shadow_rows = ShadowRows {
-                base: shadow.pixels.as_mut_ptr(),
+                base: shadow.raw_pixels_mut().as_mut_ptr(),
                 stride,
             };
             let mut run_non_scroll = |schedule: &PhaseASchedule<'_>| {
@@ -7352,6 +7931,7 @@ fn filter_and_compress_incremental_streaming_impl(
             dirty_tiles: Vec::new(),
         };
     }
+    shadow.incompressible = false;
 
     let (dirty_tiles, actions, metas, reset_tile_cache, evict_slots) = if let Some(cache) =
         tile_cache.as_deref_mut()
@@ -7461,8 +8041,8 @@ fn filter_and_compress_incremental_streaming_impl(
         tiles: tiles_rx,
     });
 
-    let shadow_ptr = shadow.pixels.as_ptr().cast::<Vec4u8>();
-    // SAFETY: `shadow.pixels` has length `>= total_pixels * 4`, Phase A workers have
+    let shadow_ptr = shadow.raw_pixels().as_ptr().cast::<Vec4u8>();
+    // SAFETY: `shadow.raw_pixels()` has length `>= total_pixels * 4`, Phase A workers have
     // joined, and `Vec4u8` is `repr(C, packed)` with alignment 1.
     let shadow_aos = unsafe { BufferPointer::new(&shadow_ptr, total_pixels) };
     let is_hybrid = actions.is_some() && matches!(mode, CompressionMode::Hybrid { .. });
@@ -19981,5 +20561,332 @@ mod tests {
         assert_eq!(res.dirty_tiles.len(), 1);
         assert_eq!(sh.valid_band_count(), 0);
         assert_eq!(sh.pixels(), f_edit.as_slice());
+    }
+
+    #[test]
+    fn test_dormant_shadow_parallel_chunks_miri_sound() {
+        // Pure-Rust codec exercising the exact parallel disjoint-slot compress
+        // and uninitialized `Vec<u8>` decompress paths under both native and
+        // `--cfg miri` builds.
+        let mut comp = ShardingCompressor::new(
+            NonZeroUsize::new(if cfg!(miri) { 2 } else { 4 }).unwrap(),
+            1,
+        )
+        .unwrap();
+
+        for &(len, chunk_size) in &[(4096usize, 1024usize), (4321, 1024), (512, 1024)] {
+            let input: Vec<u8> = (0..len)
+                .map(|i| ((i.wrapping_mul(31) ^ (i >> 3)) & 0xFF) as u8)
+                .collect();
+
+            // Mock RLE/half-size transform: emit 2-byte XOR pair -> 50% size.
+            let compressed = parallel_compress_chunks_with(
+                &input,
+                chunk_size,
+                (len / 4) * 3 + 1,
+                &mut comp.pool,
+                |_state, chunk, scratch| {
+                    scratch.clear();
+                    for &b in chunk {
+                        scratch.push(b ^ 0xA5);
+                    }
+                    // Store every byte; use a mock limit > len below for exact copy,
+                    // or pack 2:1 when testing threshold. Here test exact roundtrip
+                    // by giving `max_compressed = len + 1` in the second loop below.
+                    scratch.len()
+                },
+            );
+            // `len >= (len / 4) * 3 + 1` -> incompressible abort returns `None`.
+            assert!(compressed.is_none());
+
+            let compressed = parallel_compress_chunks_with(
+                &input,
+                chunk_size,
+                len + 1,
+                &mut comp.pool,
+                |_state, chunk, scratch| {
+                    scratch.clear();
+                    scratch.extend(chunk.iter().map(|&b| b ^ 0xA5));
+                    scratch.len()
+                },
+            )
+            .expect("expected mock compression to succeed under generous threshold");
+
+            let restored = parallel_decompress_chunks_uninit_with(
+                &compressed,
+                &mut comp.pool,
+                |_state, src, dst| {
+                    assert_eq!(src.len(), dst.len());
+                    for (&b, slot) in src.iter().zip(dst.iter_mut()) {
+                        slot.write(b ^ 0xA5);
+                    }
+                    Ok(src.len())
+                },
+            )
+            .unwrap();
+            assert_eq!(restored, input);
+
+            // Error & short-write paths must drop uninit `Vec<u8>` cleanly without
+            // calling `set_len` (sound under Miri).
+            let short_err = parallel_decompress_chunks_uninit_with(
+                &compressed,
+                &mut comp.pool,
+                |_state, src, dst| {
+                    let half = src.len() / 2;
+                    for (&b, slot) in src[..half].iter().zip(dst[..half].iter_mut()) {
+                        slot.write(b ^ 0xA5);
+                    }
+                    Ok(half)
+                },
+            );
+            assert!(short_err.is_err());
+
+            let explicit_err = parallel_decompress_chunks_uninit_with(
+                &compressed,
+                &mut comp.pool,
+                |_state, _src, _dst| bail!("synthetic decode error"),
+            );
+            assert!(explicit_err.is_err());
+        }
+    }
+
+    #[test]
+    #[cfg_attr(miri, ignore)]
+    fn test_dormant_shadow_zstd_roundtrip_hashes_prescreen_incompressible_and_resize() {
+        let mut comp1 = ShardingCompressor::new(NonZeroUsize::new(1).unwrap(), 1).unwrap();
+        let mut comp4 = ShardingCompressor::new(NonZeroUsize::new(4).unwrap(), 1).unwrap();
+        let mut decomp = ShardingDecompressor::new(NonZeroUsize::new(2).unwrap()).unwrap();
+
+        // 1. Small buffer (< MIN_DORMANT_COMPRESS_BYTES) is never compressed.
+        let mut tiny = ShadowBuffer::from_pixels(vec![0x11u8; MIN_DORMANT_COMPRESS_BYTES - 4]);
+        assert!(!tiny.is_dormant_compressible());
+        assert!(!tiny.compress_dormant(&mut comp4));
+        assert!(!tiny.is_compressed());
+        assert_eq!(tiny.compressed_bytes(), None);
+
+        // 2. Incompressible noise buffer (>= 1 MiB) stays Raw, sets incompressible
+        //    so retries skip immediately, and clears incompressible on pixel update.
+        let mut noise = vec![0u8; MIN_DORMANT_COMPRESS_BYTES + 1234];
+        let mut prng = 0x9E37_79B9_7F4A_7C15u64;
+        for chunk in noise.as_chunks_mut::<8>().0 {
+            prng = prng.wrapping_add(0x9E37_79B9_7F4A_7C15);
+            let mut z = prng;
+            z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+            z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+            z ^= z >> 31;
+            chunk.copy_from_slice(&z.to_le_bytes());
+        }
+        let mut sh_noise = ShadowBuffer::from_pixels(noise.clone());
+        assert!(sh_noise.is_dormant_compressible());
+        assert!(!sh_noise.compress_dormant(&mut comp4));
+        assert!(!sh_noise.is_compressed());
+        assert!(!sh_noise.is_dormant_compressible());
+        assert_eq!(sh_noise.pixels(), noise.as_slice());
+        // Mutating clears the incompressible flag.
+        sh_noise.pixels_mut().fill(0x2A);
+        assert!(sh_noise.is_dormant_compressible());
+        assert!(sh_noise.compress_dormant(&mut comp4));
+        assert!(sh_noise.is_compressed());
+        assert_eq!(sh_noise.len(), noise.len());
+        assert!(sh_noise.compressed_bytes().unwrap() < 4096);
+        assert_eq!(
+            sh_noise.ensure_raw(&mut comp1),
+            vec![0x2Au8; noise.len()].as_slice()
+        );
+        assert!(!sh_noise.is_compressed());
+
+        // 3. Full-frame -> compress -> preserved `ShadowQuadHashes` -> unchanged
+        //    pre-screen (stays compressed!) -> dirty wake -> bit-exact incremental
+        //    diff + resize without decompress across Xrgb8888 & Argb8888 and 1T/4T.
+        //    Non-128-multiple dimensions with row-stride padding (`533x519`, stride `+16 B`).
+        let w = 533usize;
+        let h = 519usize;
+        let stride = (w + 4) * 4;
+        let byte_len = h * stride;
+        assert!(byte_len >= MIN_DORMANT_COMPRESS_BYTES);
+        let n_qy = h.div_ceil(SUBTILE_H);
+
+        for format in [BufferFormat::Xrgb8888, BufferFormat::Argb8888] {
+            let has_alpha = format == BufferFormat::Argb8888;
+            let meta = BufferMetadata {
+                width: w as i32,
+                height: h as i32,
+                stride: stride as i32,
+                format,
+            };
+            let mut f0 = vec![0u8; byte_len];
+            for y in 0..h {
+                for x in 0..w {
+                    let off = y * stride + x * 4;
+                    f0[off] = ((x / 16) * 13 + (y / 16) * 7) as u8;
+                    f0[off + 1] = ((y / 8) * 11) as u8;
+                    f0[off + 2] = ((x / 32) * 17) as u8;
+                    f0[off + 3] = if has_alpha {
+                        0x80u8.wrapping_add(((x / 8 + y / 8) & 0x7F) as u8)
+                    } else {
+                        ((x + y) & 0xFF) as u8
+                    };
+                }
+            }
+
+            let mut srv = ServerTileCache::new();
+            let mut cli = ClientTileCache::new();
+            let mut canvas = vec![0u8; byte_len];
+            let mut shadow = ShadowBuffer::new();
+
+            let p0 = f0.as_ptr();
+            let bp0 = unsafe { BufferPointer::new(&p0, byte_len) };
+            let mut st0 = None;
+            filter_and_compress_full_streaming(
+                bp0,
+                ClientId(1),
+                WlSurfaceId(1),
+                meta,
+                CompressionMode::Lossless,
+                Some(&mut shadow),
+                Some(&mut srv),
+                &mut comp4,
+                |s| st0 = Some(s),
+            );
+            let mut w0 = Vec::new();
+            st0.unwrap().framed_write(&mut w0).unwrap();
+            let decode = |wire: &[u8],
+                          dst: &mut [u8],
+                          cli: &mut ClientTileCache,
+                          decomp: &mut ShardingDecompressor| {
+                let mut cursor = wire;
+                let mut rx = None;
+                CompressedTileStream::read_from_stream(&mut cursor, |s| {
+                    rx = Some(s);
+                    Ok(())
+                })
+                .unwrap();
+                let val = ValidatedTileStream::new(rx.unwrap()).unwrap();
+                decompress_and_unfilter_streaming(val, decomp, dst, Some(cli)).unwrap();
+            };
+            decode(&w0, &mut canvas, &mut cli, &mut decomp);
+            assert_eq!(shadow.valid_band_count(), n_qy);
+
+            // Compress dormant (4T) and verify `ShadowQuadHashes` stayed intact.
+            assert!(shadow.compress_dormant(&mut comp4));
+            assert!(shadow.is_compressed());
+            assert_eq!(shadow.len(), byte_len);
+            assert_eq!(shadow.valid_band_count(), n_qy);
+            // Already compressed -> second call is a no-op returning false.
+            assert!(!shadow.compress_dormant(&mut comp4));
+
+            // Unchanged repaint (with X-byte noise on Xrgb8888): pre-screen
+            // proves unchanged WITHOUT decompressing shadow!
+            let mut f_same = f0.clone();
+            if !has_alpha {
+                for y in 0..h {
+                    f_same[y * stride + 3 * 4 + 3] ^= 0x5A;
+                }
+            }
+            let ps = f_same.as_ptr();
+            let bps = unsafe { BufferPointer::new(&ps, byte_len) };
+            let mut st_same = None;
+            let res_same = filter_and_compress_incremental_streaming(
+                bps,
+                ClientId(1),
+                WlSurfaceId(1),
+                meta,
+                CompressionMode::Lossless,
+                None,
+                &mut shadow,
+                Some(&mut srv),
+                &mut comp4,
+                |s| st_same = Some(s),
+            );
+            assert!(res_same.is_unchanged());
+            assert!(st_same.is_none());
+            assert!(shadow.is_compressed());
+
+            // Grid-aligned unchanged partial band also stays compressed!
+            let aligned_band = [RowBand {
+                y0: SUBTILE_H as u32,
+                y1: (2 * SUBTILE_H) as u32,
+            }];
+            let res_band = filter_and_compress_incremental_streaming(
+                bps,
+                ClientId(1),
+                WlSurfaceId(1),
+                meta,
+                CompressionMode::Lossless,
+                Some(&aligned_band),
+                &mut shadow,
+                Some(&mut srv),
+                &mut comp1,
+                |_| panic!("expected unchanged"),
+            );
+            assert!(res_band.is_unchanged());
+            assert!(shadow.is_compressed());
+
+            // 1-pixel dirty edit wakes compressed shadow, decompresses bit-exact,
+            // keeps `ShadowQuadHashes` valid for Phase-A screening, and emits
+            // only 1 cropped dirty tile!
+            let mut f1 = f0.clone();
+            f1[150 * stride + 200 * 4] ^= 0x77;
+            let p1 = f1.as_ptr();
+            let bp1 = unsafe { BufferPointer::new(&p1, byte_len) };
+            let mut st1 = None;
+            let res1 = filter_and_compress_incremental_streaming(
+                bp1,
+                ClientId(1),
+                WlSurfaceId(1),
+                meta,
+                CompressionMode::Lossless,
+                None,
+                &mut shadow,
+                Some(&mut srv),
+                &mut comp4,
+                |s| st1 = Some(s),
+            );
+            assert!(!shadow.is_compressed());
+            assert_eq!(shadow.valid_band_count(), n_qy);
+            assert_eq!(res1.dirty_tiles.len(), 1);
+            let mut w1 = Vec::new();
+            st1.unwrap().framed_write(&mut w1).unwrap();
+            decode(&w1, &mut canvas, &mut cli, &mut decomp);
+            for y in 0..h {
+                for x in 0..w {
+                    let off = y * stride + x * 4;
+                    assert_eq!(canvas[off..off + 3], f1[off..off + 3]);
+                    if has_alpha {
+                        assert_eq!(canvas[off + 3], f1[off + 3]);
+                    }
+                }
+            }
+
+            // Re-compress (1T) then overwrite with a smaller full frame (resize):
+            // must drop compressed storage cleanly without decompressing.
+            assert!(shadow.compress_dormant(&mut comp1));
+            assert!(shadow.is_compressed());
+            let small_meta = BufferMetadata {
+                width: 128,
+                height: 128,
+                stride: 128 * 4,
+                format,
+            };
+            let small_len = 128 * 128 * 4;
+            let f_small = vec![0x33u8; small_len];
+            let p_sm = f_small.as_ptr();
+            let bp_sm = unsafe { BufferPointer::new(&p_sm, small_len) };
+            let mut st_sm = None;
+            filter_and_compress_full_streaming(
+                bp_sm,
+                ClientId(1),
+                WlSurfaceId(1),
+                small_meta,
+                CompressionMode::Lossless,
+                Some(&mut shadow),
+                Some(&mut srv),
+                &mut comp4,
+                |s| st_sm = Some(s),
+            );
+            drop(st_sm);
+            assert!(!shadow.is_compressed());
+            assert_eq!(shadow.pixels(), f_small.as_slice());
+        }
     }
 }
